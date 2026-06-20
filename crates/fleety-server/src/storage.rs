@@ -6,7 +6,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 
-use agent_core::{CoreError, Message, Result};
+use agent_core::{CoreError, Event, Message, Result};
 
 /// Filesystem-backed conversation store rooted at the Agent home.
 pub struct Storage {
@@ -71,5 +71,35 @@ impl Storage {
             messages.push(message);
         }
         Ok(messages)
+    }
+
+    /// The store for rollback backups, outside any workspace.
+    pub fn backups_dir(&self) -> PathBuf {
+        self.home.join("fleet").join("backups")
+    }
+
+    /// Append an event to a device's audit log (`history.jsonl`).
+    pub fn append_history(&self, device_id: &str, event: &Event) -> Result<()> {
+        let path = self
+            .home
+            .join("fleet")
+            .join("devices")
+            .join(device_id)
+            .join("history.jsonl");
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| {
+                CoreError::Message(format!("cannot create {}: {e}", parent.display()))
+            })?;
+        }
+        let line = serde_json::to_string(event)
+            .map_err(|e| CoreError::Message(format!("serialize audit event failed: {e}")))?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| CoreError::Message(format!("cannot open {}: {e}", path.display())))?;
+        writeln!(file, "{line}")
+            .map_err(|e| CoreError::Message(format!("write audit failed: {e}")))?;
+        Ok(())
     }
 }

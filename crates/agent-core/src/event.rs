@@ -3,12 +3,14 @@
 //! M0/M1 keeps events in memory; later milestones persist them as the
 //! `conversations/{id}.jsonl` event stream that powers resume and compaction.
 
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::model::{Message, ToolCall};
 
 /// One recorded step of the agent loop.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
 pub enum Event {
     /// The assistant message returned by the provider.
     Assistant(Message),

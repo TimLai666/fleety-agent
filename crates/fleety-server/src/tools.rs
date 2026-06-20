@@ -13,8 +13,9 @@ use serde_json::{json, Value};
 
 use agent_core::{CoreError, Result, Tool, ToolRegistry, ToolSpec};
 
-/// Build the read-only workspace tool registry rooted at `workspace`.
-pub fn build_registry(workspace: &Path) -> ToolRegistry {
+/// Build the workspace tool registry rooted at `workspace`. Mutating tools back
+/// up to `backups_dir` (outside the workspace) before changing files.
+pub fn build_registry(workspace: &Path, backups_dir: &Path) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(ReadFile {
         root: workspace.to_path_buf(),
@@ -28,7 +29,61 @@ pub fn build_registry(workspace: &Path) -> ToolRegistry {
     registry.register(Box::new(GitDiff {
         root: workspace.to_path_buf(),
     }));
+    registry.register(Box::new(WriteFile {
+        root: workspace.to_path_buf(),
+        backups: backups_dir.to_path_buf(),
+    }));
+    registry.register(Box::new(RunCommand {
+        root: workspace.to_path_buf(),
+    }));
     registry
+}
+
+/// Resolve a path for writing: the parent must exist and stay within the root,
+/// but the target file itself may be new.
+fn resolve_for_write(root: &Path, rel: &str) -> Result<PathBuf> {
+    let canon_root = root
+        .canonicalize()
+        .map_err(|e| CoreError::Message(format!("workspace root unavailable: {e}")))?;
+    let target = canon_root.join(rel);
+    let parent = target
+        .parent()
+        .ok_or_else(|| CoreError::Message(format!("invalid path '{rel}'")))?;
+    let canon_parent = parent
+        .canonicalize()
+        .map_err(|e| CoreError::Message(format!("parent directory of '{rel}' not found: {e}")))?;
+    if !canon_parent.starts_with(&canon_root) {
+        return Err(CoreError::Message(format!(
+            "path '{rel}' escapes the workspace"
+        )));
+    }
+    let file_name = target
+        .file_name()
+        .ok_or_else(|| CoreError::Message(format!("path '{rel}' has no file name")))?;
+    Ok(canon_parent.join(file_name))
+}
+
+/// v0 critical-command guard (deliberately permissive: only clearly
+/// irreversible commands are refused). A real semantic classifier comes later.
+fn critical_reason(command: &str) -> Option<&'static str> {
+    let c = command.to_lowercase();
+    const PATTERNS: &[(&str, &str)] = &[
+        ("rm -rf /", "recursive delete of the filesystem root"),
+        ("rm -rf /*", "recursive delete of the filesystem root"),
+        ("mkfs", "formatting a filesystem"),
+        ("dd if=", "raw disk write"),
+        (":(){", "fork bomb"),
+        ("shutdown", "shutting down the host"),
+        ("reboot", "rebooting the host"),
+        ("format ", "formatting a disk"),
+        ("del /f /s /q", "mass file deletion"),
+        ("rd /s", "recursive directory deletion"),
+        ("diskpart", "disk partitioning"),
+    ];
+    PATTERNS
+        .iter()
+        .find(|(p, _)| c.contains(p))
+        .map(|(_, why)| *why)
 }
 
 /// Resolve `rel` against `root`, refusing paths that escape the workspace.
@@ -170,6 +225,104 @@ impl Tool for GitDiff {
     }
 }
 
+struct WriteFile {
+    root: PathBuf,
+    backups: PathBuf,
+}
+
+#[async_trait]
+impl Tool for WriteFile {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "write_file".to_string(),
+            description: "Write a UTF-8 text file within the workspace (its parent directory must exist). The previous content, if any, is backed up for rollback.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "workspace-relative path" },
+                    "content": { "type": "string" }
+                },
+                "required": ["path", "content"]
+            }),
+        }
+    }
+
+    async fn call(&self, args: Value) -> Result<Value> {
+        let path = require_str(&args, "path")?;
+        let content = require_str(&args, "content")?;
+        let resolved = resolve_for_write(&self.root, path)?;
+
+        // Back up existing content (outside the workspace) before overwriting.
+        let mut backup = Value::Null;
+        if resolved.exists() {
+            let id = uuid::Uuid::new_v4().to_string();
+            let backup_path = self.backups.join(&id).join(path);
+            if let Some(parent) = backup_path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| CoreError::Message(format!("cannot create backup dir: {e}")))?;
+            }
+            std::fs::copy(&resolved, &backup_path)
+                .map_err(|e| CoreError::Message(format!("backup of '{path}' failed: {e}")))?;
+            backup = json!({ "id": id, "path": backup_path.display().to_string() });
+        }
+
+        std::fs::write(&resolved, content)
+            .map_err(|e| CoreError::Message(format!("cannot write '{path}': {e}")))?;
+        Ok(json!({ "path": path, "bytes_written": content.len(), "backup": backup }))
+    }
+}
+
+struct RunCommand {
+    root: PathBuf,
+}
+
+#[async_trait]
+impl Tool for RunCommand {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "run_command".to_string(),
+            description: "Run a shell command in the workspace and capture stdout/stderr/exit code. Clearly destructive commands are refused.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string" },
+                    "cwd": { "type": "string", "description": "workspace-relative working dir (default workspace root)" }
+                },
+                "required": ["command"]
+            }),
+        }
+    }
+
+    async fn call(&self, args: Value) -> Result<Value> {
+        let command = require_str(&args, "command")?;
+        if let Some(reason) = critical_reason(command) {
+            return Err(CoreError::Message(format!(
+                "refused critical command ({reason}): '{command}'. Irreversible actions need explicit user confirmation, which is not available here; do not retry this command."
+            )));
+        }
+        let cwd = match args.get("cwd").and_then(Value::as_str) {
+            Some(rel) => resolve_in_root(&self.root, rel)?,
+            None => self.root.clone(),
+        };
+        let (shell, flag) = if cfg!(windows) {
+            ("cmd", "/C")
+        } else {
+            ("sh", "-c")
+        };
+        let output = Command::new(shell)
+            .arg(flag)
+            .arg(command)
+            .current_dir(&cwd)
+            .output()
+            .map_err(|e| CoreError::Message(format!("cannot run command: {e}")))?;
+        Ok(json!({
+            "exit_code": output.status.code(),
+            "stdout": String::from_utf8_lossy(&output.stdout),
+            "stderr": String::from_utf8_lossy(&output.stderr),
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,7 +330,7 @@ mod tests {
     #[tokio::test]
     async fn read_and_list_within_root() {
         let root = std::env::current_dir().expect("cwd");
-        let registry = build_registry(&root);
+        let registry = build_registry(&root, &root);
         // Cargo.toml exists at the repo/workspace root in tests run from a crate dir's parent;
         // use list_dir on "." which always resolves.
         let listed = registry
@@ -190,7 +343,7 @@ mod tests {
     #[tokio::test]
     async fn path_escape_is_rejected() {
         let root = std::env::current_dir().expect("cwd");
-        let registry = build_registry(&root);
+        let registry = build_registry(&root, &root);
         let result = registry
             .call("read_file", json!({ "path": "../../../../etc/passwd" }))
             .await;
@@ -200,11 +353,75 @@ mod tests {
     #[tokio::test]
     async fn missing_arg_is_actionable() {
         let root = std::env::current_dir().expect("cwd");
-        let registry = build_registry(&root);
+        let registry = build_registry(&root, &root);
         let err = registry
             .call("read_file", json!({}))
             .await
             .expect_err("should require path");
         assert!(err.report().message.contains("path"));
+    }
+
+    fn temp_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("fleety-tools-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("mk temp");
+        dir
+    }
+
+    #[tokio::test]
+    async fn write_file_creates_and_backs_up() {
+        let ws = temp_dir();
+        let backups = temp_dir();
+        let registry = build_registry(&ws, &backups);
+
+        let created = registry
+            .call("write_file", json!({ "path": "a.txt", "content": "one" }))
+            .await
+            .expect("write1");
+        assert_eq!(created["backup"], Value::Null);
+        assert_eq!(
+            std::fs::read_to_string(ws.join("a.txt")).expect("read"),
+            "one"
+        );
+
+        let overwritten = registry
+            .call("write_file", json!({ "path": "a.txt", "content": "two" }))
+            .await
+            .expect("write2");
+        assert!(overwritten["backup"]["id"].is_string());
+        assert_eq!(
+            std::fs::read_to_string(ws.join("a.txt")).expect("read"),
+            "two"
+        );
+
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&backups);
+    }
+
+    #[tokio::test]
+    async fn run_command_captures_output() {
+        let ws = temp_dir();
+        let registry = build_registry(&ws, &ws);
+        let result = registry
+            .call("run_command", json!({ "command": "echo hello" }))
+            .await
+            .expect("run");
+        assert_eq!(result["exit_code"], json!(0));
+        assert!(result["stdout"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("hello"));
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn critical_command_refused() {
+        let ws = temp_dir();
+        let registry = build_registry(&ws, &ws);
+        let err = registry
+            .call("run_command", json!({ "command": "rm -rf /" }))
+            .await
+            .expect_err("should refuse");
+        assert!(err.report().message.contains("refused"));
+        let _ = std::fs::remove_dir_all(&ws);
     }
 }

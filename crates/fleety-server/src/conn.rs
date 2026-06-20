@@ -59,7 +59,7 @@ pub async fn handle_conn(
     )
     .await?;
 
-    let tools = crate::tools::build_registry(&workspace);
+    let tools = crate::tools::build_registry(&workspace, &storage.backups_dir());
 
     while let Some(msg) = read_client(&mut rx).await? {
         match msg {
@@ -83,6 +83,11 @@ pub async fn handle_conn(
                     &LoopConfig::default(),
                 )
                 .await?;
+
+                // Audit: persist the turn's events (tool calls, results, replies).
+                for event in events.events() {
+                    storage.append_history(&device_id, event)?;
+                }
 
                 let reply = outcome.output;
                 storage.append(
