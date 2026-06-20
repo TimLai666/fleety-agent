@@ -1,5 +1,6 @@
 //! Per-connection handling: WebSocket handshake, session, and the turn loop.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use futures::stream::{SplitSink, SplitStream};
@@ -9,17 +10,21 @@ use tokio_tungstenite::tungstenite::error::ProtocolError;
 use tokio_tungstenite::tungstenite::{Error as WsErr, Message as WsMessage};
 use tokio_tungstenite::WebSocketStream;
 
-use agent_core::{run_turn, CoreError, EventLog, LoopConfig, Message, Result, ToolRegistry};
+use agent_core::{run_turn, CoreError, EventLog, LoopConfig, Message, ModelProvider, Result};
 use fleety_protocol::{ClientMsg, ServerMsg, WireError, PROTOCOL_VERSION};
 
-use crate::echo::EchoProvider;
 use crate::storage::Storage;
 
 type Tx = SplitSink<WebSocketStream<TcpStream>, WsMessage>;
 type Rx = SplitStream<WebSocketStream<TcpStream>>;
 
 /// Handle one client connection to completion.
-pub async fn handle_conn(stream: TcpStream, storage: Arc<Storage>) -> Result<()> {
+pub async fn handle_conn(
+    stream: TcpStream,
+    storage: Arc<Storage>,
+    provider: Arc<dyn ModelProvider>,
+    workspace: Arc<PathBuf>,
+) -> Result<()> {
     let ws = tokio_tungstenite::accept_async(stream)
         .await
         .map_err(|e| CoreError::Provider(format!("websocket handshake failed: {e}")))?;
@@ -54,6 +59,8 @@ pub async fn handle_conn(stream: TcpStream, storage: Arc<Storage>) -> Result<()>
     )
     .await?;
 
+    let tools = crate::tools::build_registry(&workspace);
+
     while let Some(msg) = read_client(&mut rx).await? {
         match msg {
             ClientMsg::UserMessage {
@@ -66,12 +73,10 @@ pub async fn handle_conn(stream: TcpStream, storage: Arc<Storage>) -> Result<()>
 
                 // Persist the user message, then run the turn over the history.
                 storage.append(&device_id, &conversation, &Message::user(text))?;
-                let provider = EchoProvider;
-                let tools = ToolRegistry::new();
                 let mut messages = storage.load(&device_id, &conversation)?;
                 let mut events = EventLog::new();
                 let outcome = run_turn(
-                    &provider,
+                    provider.as_ref(),
                     &tools,
                     &mut messages,
                     &mut events,

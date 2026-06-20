@@ -6,17 +6,20 @@
 //! client can never crash the server.
 #![forbid(unsafe_code)]
 #![warn(clippy::unwrap_used, clippy::expect_used)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod conn;
 mod echo;
 mod storage;
+mod tools;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use agent_core::obs;
+use agent_core::{obs, ModelProvider, OpenAiCompat};
 use tokio::net::TcpListener;
 
+use crate::echo::EchoProvider;
 use crate::storage::Storage;
 
 /// Resolve the Agent home (durable store), separate from any workspace.
@@ -30,6 +33,33 @@ fn agent_home() -> PathBuf {
     PathBuf::from(base).join(".fleety").join("agent")
 }
 
+/// Workspace the read-only tools operate on (`FLEETY_WORKSPACE`, else cwd).
+fn workspace_root() -> PathBuf {
+    if let Ok(path) = std::env::var("FLEETY_WORKSPACE") {
+        return PathBuf::from(path);
+    }
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// Choose the model provider: an OpenAI-compatible endpoint if configured via
+/// `FLEETY_MODEL_BASE_URL` + `FLEETY_MODEL`, otherwise the offline echo stub.
+fn build_provider() -> Arc<dyn ModelProvider> {
+    match (
+        std::env::var("FLEETY_MODEL_BASE_URL"),
+        std::env::var("FLEETY_MODEL"),
+    ) {
+        (Ok(base_url), Ok(model)) => {
+            let key = std::env::var("FLEETY_MODEL_KEY").ok();
+            tracing::info!(%base_url, %model, "using OpenAI-compatible provider");
+            Arc::new(OpenAiCompat::new(base_url, model, key))
+        }
+        _ => {
+            tracing::info!("no FLEETY_MODEL_BASE_URL/FLEETY_MODEL set; using echo provider");
+            Arc::new(EchoProvider)
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     obs::init();
@@ -38,6 +68,10 @@ async fn main() {
     tracing::info!(version = agent_core::VERSION, %addr, home = %home.display(), "fleety-server starting");
 
     let storage = Arc::new(Storage::new(home));
+    let provider = build_provider();
+    let workspace = Arc::new(workspace_root());
+    tracing::info!(workspace = %workspace.display(), "workspace for tools");
+
     let listener = match TcpListener::bind(&addr).await {
         Ok(listener) => listener,
         Err(e) => {
@@ -56,10 +90,12 @@ async fn main() {
             }
         };
         let storage = Arc::clone(&storage);
+        let provider = Arc::clone(&provider);
+        let workspace = Arc::clone(&workspace);
         // Each connection runs in its own task: an error or panic here is
         // isolated and never brings the server down.
         tokio::spawn(async move {
-            match conn::handle_conn(stream, storage).await {
+            match conn::handle_conn(stream, storage, provider, workspace).await {
                 Ok(()) => {}
                 Err(e) => tracing::warn!(%peer, report = ?e.report(), "connection error"),
             }
