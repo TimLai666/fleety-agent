@@ -32,7 +32,19 @@ pub async fn handle_conn(
 
     // The first frame must be Hello.
     let device_id = match read_client(&mut rx).await? {
-        Some(ClientMsg::Hello { device_id, .. }) => device_id,
+        Some(ClientMsg::Hello {
+            device_id,
+            protocol,
+        }) => {
+            if protocol != PROTOCOL_VERSION {
+                tracing::warn!(
+                    client_protocol = protocol,
+                    server_protocol = PROTOCOL_VERSION,
+                    "protocol version mismatch; proceeding (only v0 exists)"
+                );
+            }
+            device_id
+        }
         Some(_) => {
             send_error(
                 &mut tx,
@@ -59,7 +71,8 @@ pub async fn handle_conn(
     )
     .await?;
 
-    let tools = crate::tools::build_registry(&workspace, &storage.backups_dir());
+    let tools =
+        crate::tools::build_registry(&workspace, &storage.backups_dir(), &storage.memory_dir());
 
     while let Some(msg) = read_client(&mut rx).await? {
         match msg {

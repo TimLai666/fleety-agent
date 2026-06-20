@@ -13,9 +13,13 @@ use serde_json::{json, Value};
 
 use agent_core::{CoreError, Result, RiskLevel, Tool, ToolRegistry, ToolSpec};
 
+/// Agent-level core memory files the agent may read/update.
+const MEMORY_FILES: &[&str] = &["ME.md", "USER.md", "TODO.md", "TOOLS.md"];
+
 /// Build the workspace tool registry rooted at `workspace`. Mutating tools back
-/// up to `backups_dir` (outside the workspace) before changing files.
-pub fn build_registry(workspace: &Path, backups_dir: &Path) -> ToolRegistry {
+/// up to `backups_dir` (outside the workspace) before changing files;
+/// `memory_dir` holds the agent-level core memory files.
+pub fn build_registry(workspace: &Path, backups_dir: &Path, memory_dir: &Path) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(ReadFile {
         root: workspace.to_path_buf(),
@@ -36,7 +40,22 @@ pub fn build_registry(workspace: &Path, backups_dir: &Path) -> ToolRegistry {
     registry.register(Box::new(RunCommand {
         root: workspace.to_path_buf(),
     }));
+    registry.register(Box::new(MemoryRead {
+        dir: memory_dir.to_path_buf(),
+    }));
+    registry.register(Box::new(MemoryWrite {
+        dir: memory_dir.to_path_buf(),
+    }));
     registry
+}
+
+fn memory_path(dir: &Path, file: &str) -> Result<PathBuf> {
+    if !MEMORY_FILES.contains(&file) {
+        return Err(CoreError::Message(format!(
+            "memory file must be one of {MEMORY_FILES:?}, got '{file}'"
+        )));
+    }
+    Ok(dir.join(file))
 }
 
 /// Resolve a path for writing: the parent must exist and stay within the root,
@@ -329,6 +348,98 @@ impl Tool for RunCommand {
     }
 }
 
+struct MemoryRead {
+    dir: PathBuf,
+}
+
+#[async_trait]
+impl Tool for MemoryRead {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "memory_read".to_string(),
+            description: "Read an agent core memory file (ME.md, USER.md, TODO.md, or TOOLS.md)."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "file": { "type": "string", "enum": ["ME.md", "USER.md", "TODO.md", "TOOLS.md"] } },
+                "required": ["file"]
+            }),
+            risk: RiskLevel::Read,
+        }
+    }
+
+    async fn call(&self, args: Value) -> Result<Value> {
+        let file = require_str(&args, "file")?;
+        let path = memory_path(&self.dir, file)?;
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(CoreError::Message(format!("cannot read {file}: {e}"))),
+        };
+        Ok(json!({ "file": file, "content": content }))
+    }
+}
+
+struct MemoryWrite {
+    dir: PathBuf,
+}
+
+#[async_trait]
+impl Tool for MemoryWrite {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "memory_write".to_string(),
+            description: "Update an agent core memory file (ME.md/USER.md/TODO.md/TOOLS.md); mode 'replace' (default) or 'append'.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "file": { "type": "string", "enum": ["ME.md", "USER.md", "TODO.md", "TOOLS.md"] },
+                    "content": { "type": "string" },
+                    "mode": { "type": "string", "enum": ["replace", "append"] }
+                },
+                "required": ["file", "content"]
+            }),
+            risk: RiskLevel::Mutate,
+        }
+    }
+
+    async fn call(&self, args: Value) -> Result<Value> {
+        let file = require_str(&args, "file")?;
+        let content = require_str(&args, "content")?;
+        let mode = args
+            .get("mode")
+            .and_then(Value::as_str)
+            .unwrap_or("replace");
+        let path = memory_path(&self.dir, file)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| CoreError::Message(format!("cannot create memory dir: {e}")))?;
+        }
+        match mode {
+            "append" => {
+                use std::io::Write;
+                let mut handle = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .map_err(|e| CoreError::Message(format!("cannot open {file}: {e}")))?;
+                writeln!(handle, "{content}")
+                    .map_err(|e| CoreError::Message(format!("append {file} failed: {e}")))?;
+            }
+            "replace" => {
+                std::fs::write(&path, content)
+                    .map_err(|e| CoreError::Message(format!("write {file} failed: {e}")))?;
+            }
+            other => {
+                return Err(CoreError::Message(format!(
+                    "mode must be 'replace' or 'append', got '{other}'"
+                )))
+            }
+        }
+        Ok(json!({ "file": file, "mode": mode, "bytes": content.len() }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,7 +447,7 @@ mod tests {
     #[tokio::test]
     async fn read_and_list_within_root() {
         let root = std::env::current_dir().expect("cwd");
-        let registry = build_registry(&root, &root);
+        let registry = build_registry(&root, &root, &root);
         // Cargo.toml exists at the repo/workspace root in tests run from a crate dir's parent;
         // use list_dir on "." which always resolves.
         let listed = registry
@@ -349,7 +460,7 @@ mod tests {
     #[tokio::test]
     async fn path_escape_is_rejected() {
         let root = std::env::current_dir().expect("cwd");
-        let registry = build_registry(&root, &root);
+        let registry = build_registry(&root, &root, &root);
         let result = registry
             .call("read_file", json!({ "path": "../../../../etc/passwd" }))
             .await;
@@ -359,7 +470,7 @@ mod tests {
     #[tokio::test]
     async fn missing_arg_is_actionable() {
         let root = std::env::current_dir().expect("cwd");
-        let registry = build_registry(&root, &root);
+        let registry = build_registry(&root, &root, &root);
         let err = registry
             .call("read_file", json!({}))
             .await
@@ -377,7 +488,7 @@ mod tests {
     async fn write_file_creates_and_backs_up() {
         let ws = temp_dir();
         let backups = temp_dir();
-        let registry = build_registry(&ws, &backups);
+        let registry = build_registry(&ws, &backups, &ws);
 
         let created = registry
             .call("write_file", json!({ "path": "a.txt", "content": "one" }))
@@ -406,7 +517,7 @@ mod tests {
     #[tokio::test]
     async fn run_command_captures_output() {
         let ws = temp_dir();
-        let registry = build_registry(&ws, &ws);
+        let registry = build_registry(&ws, &ws, &ws);
         let result = registry
             .call("run_command", json!({ "command": "echo hello" }))
             .await
@@ -422,12 +533,41 @@ mod tests {
     #[tokio::test]
     async fn critical_command_refused() {
         let ws = temp_dir();
-        let registry = build_registry(&ws, &ws);
+        let registry = build_registry(&ws, &ws, &ws);
         let err = registry
             .call("run_command", json!({ "command": "rm -rf /" }))
             .await
             .expect_err("should refuse");
         assert!(err.report().message.contains("refused"));
         let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn memory_write_then_read_and_reject_unknown() {
+        let dir = temp_dir();
+        let registry = build_registry(&dir, &dir, &dir);
+
+        registry
+            .call(
+                "memory_write",
+                json!({ "file": "USER.md", "content": "likes Rust" }),
+            )
+            .await
+            .expect("write");
+        let read = registry
+            .call("memory_read", json!({ "file": "USER.md" }))
+            .await
+            .expect("read");
+        assert_eq!(read["content"], json!("likes Rust"));
+
+        let bad = registry
+            .call(
+                "memory_write",
+                json!({ "file": "secrets.md", "content": "x" }),
+            )
+            .await;
+        assert!(bad.is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

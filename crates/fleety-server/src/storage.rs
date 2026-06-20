@@ -116,6 +116,11 @@ impl Storage {
         self.home.join("fleet").join("backups")
     }
 
+    /// Directory holding agent-level core memory files (ME/USER/TODO/TOOLS).
+    pub fn memory_dir(&self) -> PathBuf {
+        self.home.join("fleet")
+    }
+
     fn core_file(&self, name: &str, default: &str) -> Result<String> {
         let path = self.home.join("fleet").join(name);
         match fs::read_to_string(&path) {
