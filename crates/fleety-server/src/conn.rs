@@ -73,7 +73,10 @@ pub async fn handle_conn(
 
                 // Persist the user message, then run the turn over the history.
                 storage.append(&device_id, &conversation, &Message::user(text))?;
-                let mut messages = storage.load(&device_id, &conversation)?;
+                // Inject agent-level core memory (ME/USER/TODO) as the system
+                // preamble each turn; it is ephemeral, not persisted to the convo.
+                let mut messages = vec![Message::system(storage.core_memory()?)];
+                messages.extend(storage.load(&device_id, &conversation)?);
                 let mut events = EventLog::new();
                 let outcome = run_turn(
                     provider.as_ref(),

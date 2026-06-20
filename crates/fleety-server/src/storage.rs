@@ -9,6 +9,10 @@ use std::path::{Path, PathBuf};
 use agent_core::{CoreError, Event, Message, Result};
 use serde_json::Value;
 
+const DEFAULT_ME: &str = "Your name is Fleety. You are a cross-device, full-access agent that helps the user operate their devices. You act autonomously, keep an audit trail, and can roll back; you confirm only genuinely irreversible actions.";
+const DEFAULT_USER: &str = "(Unknown so far. Record what you learn about the user here.)";
+const DEFAULT_TODO: &str = "(No current to-dos.)";
+
 /// A persisted conversation event with its monotonic sequence number.
 #[derive(Debug, Clone)]
 pub struct StoredEvent {
@@ -110,6 +114,39 @@ impl Storage {
     /// The store for rollback backups, outside any workspace.
     pub fn backups_dir(&self) -> PathBuf {
         self.home.join("fleet").join("backups")
+    }
+
+    fn core_file(&self, name: &str, default: &str) -> Result<String> {
+        let path = self.home.join("fleet").join(name);
+        match fs::read_to_string(&path) {
+            Ok(content) => Ok(content),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).map_err(|e| {
+                        CoreError::Message(format!("cannot create {}: {e}", parent.display()))
+                    })?;
+                }
+                fs::write(&path, default).map_err(|e| {
+                    CoreError::Message(format!("cannot write {}: {e}", path.display()))
+                })?;
+                Ok(default.to_string())
+            }
+            Err(e) => Err(CoreError::Message(format!(
+                "cannot read {}: {e}",
+                path.display()
+            ))),
+        }
+    }
+
+    /// Read agent-level core memory (ME/USER/TODO), creating defaults if missing,
+    /// as a single system-prompt block to inject each turn (`ME.md` defaults to Fleety).
+    pub fn core_memory(&self) -> Result<String> {
+        let me = self.core_file("ME.md", DEFAULT_ME)?;
+        let user = self.core_file("USER.md", DEFAULT_USER)?;
+        let todo = self.core_file("TODO.md", DEFAULT_TODO)?;
+        Ok(format!(
+            "You are operating with the following core memory.\n\n## ME (self)\n{me}\n\n## USER\n{user}\n\n## TODO\n{todo}"
+        ))
     }
 
     /// Append an event to a device's audit log (`history.jsonl`).
