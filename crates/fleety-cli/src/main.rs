@@ -36,6 +36,17 @@ async fn main() {
                 }
             }
         }
+        Some("resume") => {
+            let conversation_id = args.get(2).cloned().unwrap_or_default();
+            let after_seq = args.get(3).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+            if conversation_id.is_empty() {
+                eprintln!("usage: fleety resume <conversation_id> [after_seq]");
+                return;
+            }
+            if let Err(e) = resume(conversation_id, after_seq).await {
+                eprintln!("error: {}", e.report().message);
+            }
+        }
         _ => {
             println!("fleety {} — try: fleety ask \"hello\"", agent_core::VERSION);
         }
@@ -103,10 +114,61 @@ async fn ask(text: String) -> Result<()> {
                 eprintln!("agent error: {}", error.message);
                 break;
             }
-            Some(ServerMsg::Welcome { .. }) => {}
+            Some(ServerMsg::Welcome { .. }) | Some(ServerMsg::Replay { .. }) => {}
         }
     }
     // Close the connection gracefully so the server sees a clean disconnect.
+    let _ = tx.close().await;
+    Ok(())
+}
+
+/// Reconnect to a conversation and print events replayed after `after_seq`.
+async fn resume(conversation_id: String, after_seq: u64) -> Result<()> {
+    let url =
+        std::env::var("FLEETY_AGENT_URL").unwrap_or_else(|_| "ws://127.0.0.1:8787".to_string());
+    let (ws, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .map_err(|e| CoreError::Provider(format!("cannot connect to {url}: {e}")))?;
+    let (mut tx, mut rx) = ws.split();
+
+    send(
+        &mut tx,
+        &ClientMsg::Hello {
+            device_id: device_id(),
+            protocol: PROTOCOL_VERSION,
+        },
+    )
+    .await?;
+    match recv(&mut rx).await? {
+        Some(ServerMsg::Welcome { .. }) => {}
+        other => {
+            return Err(CoreError::Provider(format!(
+                "expected welcome, got {other:?}"
+            )))
+        }
+    }
+
+    send(
+        &mut tx,
+        &ClientMsg::Resume {
+            conversation_id,
+            after_seq,
+        },
+    )
+    .await?;
+    loop {
+        match recv(&mut rx).await? {
+            Some(ServerMsg::Replay {
+                seq, role, content, ..
+            }) => println!("[{seq}] {role}: {content}"),
+            Some(ServerMsg::Done { .. }) | None => break,
+            Some(ServerMsg::Error { error }) => {
+                eprintln!("agent error: {}", error.message);
+                break;
+            }
+            _ => {}
+        }
+    }
     let _ = tx.close().await;
     Ok(())
 }

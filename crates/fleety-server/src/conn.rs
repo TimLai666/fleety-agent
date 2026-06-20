@@ -10,7 +10,7 @@ use tokio_tungstenite::tungstenite::error::ProtocolError;
 use tokio_tungstenite::tungstenite::{Error as WsErr, Message as WsMessage};
 use tokio_tungstenite::WebSocketStream;
 
-use agent_core::{run_turn, CoreError, EventLog, LoopConfig, Message, ModelProvider, Result};
+use agent_core::{run_turn, CoreError, EventLog, LoopConfig, Message, ModelProvider, Result, Role};
 use fleety_protocol::{ClientMsg, ServerMsg, WireError, PROTOCOL_VERSION};
 
 use crate::storage::Storage;
@@ -90,7 +90,7 @@ pub async fn handle_conn(
                 }
 
                 let reply = outcome.output;
-                storage.append(
+                let seq = storage.append(
                     &device_id,
                     &conversation,
                     &Message::assistant(reply.clone()),
@@ -100,6 +100,7 @@ pub async fn handle_conn(
                     &ServerMsg::Assistant {
                         conversation_id: conversation.clone(),
                         text: reply,
+                        seq,
                     },
                 )
                 .await?;
@@ -110,6 +111,32 @@ pub async fn handle_conn(
                     },
                 )
                 .await?;
+            }
+            ClientMsg::Resume {
+                conversation_id,
+                after_seq,
+            } => {
+                tracing::info!(%device_id, conversation = %conversation_id, after_seq, "resume");
+                let missed = storage.load_after(&device_id, &conversation_id, after_seq)?;
+                for stored in missed {
+                    let role = match stored.message.role {
+                        Role::User => "user",
+                        Role::Assistant => "assistant",
+                        Role::System => "system",
+                        Role::Tool => "tool",
+                    };
+                    send(
+                        &mut tx,
+                        &ServerMsg::Replay {
+                            conversation_id: conversation_id.clone(),
+                            seq: stored.seq,
+                            role: role.to_string(),
+                            content: stored.message.content.clone().unwrap_or_default(),
+                        },
+                    )
+                    .await?;
+                }
+                send(&mut tx, &ServerMsg::Done { conversation_id }).await?;
             }
             ClientMsg::Hello { .. } => {
                 // Ignore a duplicate Hello.

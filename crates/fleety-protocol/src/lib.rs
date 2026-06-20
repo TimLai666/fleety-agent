@@ -46,6 +46,12 @@ pub enum ClientMsg {
         #[serde(default)]
         origin: OriginContext,
     },
+    /// Reconnect to an existing conversation; the server replays events after
+    /// `after_seq`.
+    Resume {
+        conversation_id: String,
+        after_seq: u64,
+    },
 }
 
 /// Frames sent server -> client over the WebSocket.
@@ -58,10 +64,18 @@ pub enum ServerMsg {
         conversation_id: String,
         protocol: u32,
     },
-    /// An assistant message for a conversation.
+    /// An assistant message for a conversation, with its event `seq`.
     Assistant {
         conversation_id: String,
         text: String,
+        seq: u64,
+    },
+    /// A replayed past event (sent in response to `Resume`).
+    Replay {
+        conversation_id: String,
+        seq: u64,
+        role: String,
+        content: String,
     },
     /// The turn is complete.
     Done { conversation_id: String },
