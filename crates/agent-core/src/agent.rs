@@ -7,7 +7,7 @@
 use serde_json::json;
 
 use crate::event::{Event, EventLog};
-use crate::model::{Message, ModelProvider};
+use crate::model::{Message, ModelProvider, Role};
 use crate::tools::ToolRegistry;
 use crate::{CoreError, Result};
 
@@ -20,6 +20,11 @@ pub struct LoopConfig {
     /// truncated for the model (spec §10.1 tool-output budgeting); the **full**
     /// result is always kept in the event log, so truncation is reversible.
     pub max_tool_result_chars: usize,
+    /// When the in-context messages exceed this many characters, older turns are
+    /// summarized (compaction); the full history stays in the event log.
+    pub compact_threshold_chars: usize,
+    /// Number of most-recent messages kept verbatim during compaction.
+    pub recent_keep_messages: usize,
 }
 
 impl Default for LoopConfig {
@@ -27,6 +32,8 @@ impl Default for LoopConfig {
         Self {
             max_steps: 16,
             max_tool_result_chars: 8000,
+            compact_threshold_chars: 24_000,
+            recent_keep_messages: 8,
         }
     }
 }
@@ -54,6 +61,7 @@ pub async fn run_turn(
     let specs = tools.specs();
 
     for step in 1..=config.max_steps {
+        compact_if_needed(provider, messages, config).await?;
         let response = provider.complete(messages, &specs).await?;
         let assistant = response.message;
         events.push(Event::Assistant(assistant.clone()));
@@ -97,6 +105,73 @@ fn budget_text(text: &str, max_chars: usize) -> String {
     let kept: String = text.chars().take(max_chars).collect();
     let omitted = text.chars().count() - max_chars;
     format!("{kept}\n... [truncated {omitted} chars; full result retained in the event log]")
+}
+
+/// Estimate the in-context size of `messages` (chars across content + tool args).
+fn estimate_chars(messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .map(|m| {
+            m.content.as_ref().map(String::len).unwrap_or(0)
+                + m.tool_calls
+                    .iter()
+                    .map(|c| c.arguments.to_string().len())
+                    .sum::<usize>()
+        })
+        .sum()
+}
+
+fn render_message(m: &Message) -> String {
+    let role = match m.role {
+        Role::System => "system",
+        Role::User => "user",
+        Role::Assistant => "assistant",
+        Role::Tool => "tool",
+    };
+    format!("{role}: {}", m.content.clone().unwrap_or_default())
+}
+
+/// If the context is over budget, summarize the older middle messages via the
+/// provider, keeping a leading system message and the most recent ones verbatim.
+/// Reversible: the full history lives in the event log; only the in-context view
+/// shrinks.
+async fn compact_if_needed(
+    provider: &dyn ModelProvider,
+    messages: &mut Vec<Message>,
+    config: &LoopConfig,
+) -> Result<()> {
+    if estimate_chars(messages) <= config.compact_threshold_chars {
+        return Ok(());
+    }
+    let keep_head = usize::from(
+        messages
+            .first()
+            .map(|m| m.role == Role::System)
+            .unwrap_or(false),
+    );
+    if messages.len() <= keep_head + config.recent_keep_messages + 1 {
+        return Ok(());
+    }
+    let split = messages.len() - config.recent_keep_messages;
+    let middle_text = messages[keep_head..split]
+        .iter()
+        .map(render_message)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let prompt = format!(
+        "Summarize the following earlier conversation concisely, preserving user intent, decisions, file changes, errors, and pending tasks:\n\n{middle_text}"
+    );
+    let response = provider.complete(&[Message::user(prompt)], &[]).await?;
+    let summary = response.message.content.unwrap_or_default();
+
+    let mut rebuilt = Vec::with_capacity(keep_head + 1 + config.recent_keep_messages);
+    rebuilt.extend_from_slice(&messages[..keep_head]);
+    rebuilt.push(Message::system(format!(
+        "[Summary of earlier conversation]\n{summary}"
+    )));
+    rebuilt.extend_from_slice(&messages[split..]);
+    *messages = rebuilt;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -255,6 +330,7 @@ mod tests {
         let config = LoopConfig {
             max_steps: 8,
             max_tool_result_chars: 1000,
+            ..LoopConfig::default()
         };
 
         run_turn(&provider, &tools, &mut messages, &mut events, &config)
@@ -283,5 +359,45 @@ mod tests {
         let long = "x".repeat(100);
         let out = budget_text(&long, 10);
         assert!(out.contains("truncated 90 chars"));
+    }
+
+    #[tokio::test]
+    async fn compaction_summarizes_old_messages() {
+        // Provider returns a summary (for compaction), then a final answer.
+        let provider = MockProvider::new(vec![
+            ModelResponse {
+                message: Message::assistant("SUMMARY"),
+            },
+            final_response(),
+        ]);
+        let tools = ToolRegistry::new();
+
+        let mut messages = vec![Message::system("sys")];
+        for i in 0..20 {
+            messages.push(Message::user(format!(
+                "message number {i} with padding text"
+            )));
+            messages.push(Message::assistant(format!("reply {i} with padding text")));
+        }
+        let mut events = EventLog::new();
+        let config = LoopConfig {
+            max_steps: 4,
+            max_tool_result_chars: 8000,
+            compact_threshold_chars: 50,
+            recent_keep_messages: 4,
+        };
+
+        let outcome = run_turn(&provider, &tools, &mut messages, &mut events, &config)
+            .await
+            .expect("turn ok");
+
+        assert_eq!(outcome.output, "done");
+        assert!(messages.len() < 20);
+        assert!(messages.iter().any(|m| {
+            m.content
+                .as_deref()
+                .map(|c| c.contains("Summary of earlier conversation"))
+                .unwrap_or(false)
+        }));
     }
 }
