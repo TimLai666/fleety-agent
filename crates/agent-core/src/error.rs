@@ -44,6 +44,14 @@ pub enum CoreError {
     #[error("task failed: {0}")]
     Task(String),
 
+    /// A requested tool is not registered.
+    #[error("tool not found: {0}")]
+    ToolNotFound(String),
+
+    /// The model provider failed (network, API error, or unexpected response).
+    #[error("model provider error: {0}")]
+    Provider(String),
+
     /// A generic, already-described error.
     #[error("{0}")]
     Message(String),
@@ -60,6 +68,12 @@ impl CoreError {
             CoreError::Task(msg) => ErrorReport::new("task", msg.clone()).with_remediation(
                 "the background task did not complete — retry, or check the logs for the underlying cause",
             ),
+            CoreError::ToolNotFound(name) => {
+                ErrorReport::new("tool_not_found", format!("no tool named '{name}' is registered"))
+                    .with_remediation("call a tool that exists; list the available tools and pick a valid name")
+            }
+            CoreError::Provider(msg) => ErrorReport::new("provider", msg.clone())
+                .with_remediation("the model provider call failed — retry; if it persists, check the endpoint, key, and model id"),
             CoreError::Message(msg) => ErrorReport::new("error", msg.clone()),
         }
     }

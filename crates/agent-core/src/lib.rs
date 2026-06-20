@@ -9,11 +9,21 @@
 #![warn(clippy::unwrap_used, clippy::expect_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod agent;
 pub mod error;
+pub mod event;
+pub mod model;
 pub mod obs;
+pub mod openai;
 pub mod panic;
+pub mod tools;
 
+pub use agent::{run_turn, TurnOutcome};
 pub use error::{CoreError, ErrorReport, Result};
+pub use event::{Event, EventLog};
+pub use model::{Message, MockProvider, ModelProvider, ModelResponse, Role, ToolCall, ToolSpec};
+pub use openai::OpenAiCompat;
+pub use tools::{Tool, ToolRegistry};
 
 /// Version of agent-core. In M0 this also stands in for the runtime version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
