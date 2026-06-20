@@ -10,6 +10,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod agent;
+pub mod approval;
 pub mod error;
 pub mod event;
 pub mod model;
@@ -19,6 +20,7 @@ pub mod panic;
 pub mod tools;
 
 pub use agent::{run_turn, LoopConfig, TurnOutcome};
+pub use approval::{ApprovalDecision, ApprovalGate, AutoApprove, Policy};
 pub use error::{CoreError, ErrorReport, Result};
 pub use event::{Event, EventLog};
 pub use model::{

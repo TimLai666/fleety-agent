@@ -6,8 +6,9 @@
 
 use serde_json::json;
 
+use crate::approval::{ApprovalDecision, ApprovalGate, Policy};
 use crate::event::{Event, EventLog};
-use crate::model::{Message, ModelProvider, Role};
+use crate::model::{Message, ModelProvider, RiskLevel, Role, ToolSpec};
 use crate::tools::ToolRegistry;
 use crate::{CoreError, Result};
 
@@ -51,12 +52,15 @@ pub struct TurnOutcome {
 /// A failing tool is **not fatal**: its actionable error report is fed back as a
 /// tool result so the model can recover, rather than aborting the turn. Large
 /// tool results are budgeted before being fed back (full copy kept in `events`).
+#[allow(clippy::too_many_arguments)]
 pub async fn run_turn(
     provider: &dyn ModelProvider,
     tools: &ToolRegistry,
     messages: &mut Vec<Message>,
     events: &mut EventLog,
     config: &LoopConfig,
+    policy: Policy,
+    gate: &mut dyn ApprovalGate,
 ) -> Result<TurnOutcome> {
     let specs = tools.specs();
 
@@ -76,6 +80,27 @@ pub async fn run_turn(
 
         for call in &assistant.tool_calls {
             events.push(Event::ToolCall(call.clone()));
+
+            // Gate the call by policy/risk; a denial is fed back, not executed.
+            let risk = risk_of(&specs, &call.name);
+            if policy.needs_approval(risk) {
+                if let ApprovalDecision::Deny =
+                    gate.request(&call.name, &call.arguments, risk).await?
+                {
+                    let denied = json!({
+                        "denied": true,
+                        "tool": call.name,
+                        "reason": "the user denied this action; do not retry it"
+                    });
+                    events.push(Event::ToolResult {
+                        id: call.id.clone(),
+                        result: denied.clone(),
+                    });
+                    messages.push(Message::tool_result(call.id.clone(), denied.to_string()));
+                    continue;
+                }
+            }
+
             let result = match tools.call(&call.name, call.arguments.clone()).await {
                 Ok(value) => value,
                 Err(err) => json!({ "error": err.report() }),
@@ -105,6 +130,15 @@ fn budget_text(text: &str, max_chars: usize) -> String {
     let kept: String = text.chars().take(max_chars).collect();
     let omitted = text.chars().count() - max_chars;
     format!("{kept}\n... [truncated {omitted} chars; full result retained in the event log]")
+}
+
+/// Look up a tool's declared risk by name (defaults to read if unknown).
+fn risk_of(specs: &[ToolSpec], name: &str) -> RiskLevel {
+    specs
+        .iter()
+        .find(|s| s.name == name)
+        .map(|s| s.risk)
+        .unwrap_or(RiskLevel::Read)
 }
 
 /// Estimate the in-context size of `messages` (chars across content + tool args).
@@ -177,6 +211,7 @@ async fn compact_if_needed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::approval::AutoApprove;
     use crate::model::{MockProvider, ModelResponse, RiskLevel, Role, ToolCall, ToolSpec};
     use crate::tools::Tool;
     use serde_json::Value;
@@ -239,6 +274,8 @@ mod tests {
             &mut messages,
             &mut events,
             &LoopConfig::default(),
+            Policy::FullAccess,
+            &mut AutoApprove,
         )
         .await
         .expect("turn ok");
@@ -263,6 +300,8 @@ mod tests {
             &mut messages,
             &mut events,
             &LoopConfig::default(),
+            Policy::FullAccess,
+            &mut AutoApprove,
         )
         .await
         .expect("turn ok");
@@ -295,6 +334,8 @@ mod tests {
                 max_steps: 1,
                 ..LoopConfig::default()
             },
+            Policy::FullAccess,
+            &mut AutoApprove,
         )
         .await
         .expect_err("should hit max steps");
@@ -333,9 +374,17 @@ mod tests {
             ..LoopConfig::default()
         };
 
-        run_turn(&provider, &tools, &mut messages, &mut events, &config)
-            .await
-            .expect("turn ok");
+        run_turn(
+            &provider,
+            &tools,
+            &mut messages,
+            &mut events,
+            &config,
+            Policy::FullAccess,
+            &mut AutoApprove,
+        )
+        .await
+        .expect("turn ok");
 
         // What the model sees is truncated...
         let tool_msg = messages
@@ -387,9 +436,17 @@ mod tests {
             recent_keep_messages: 4,
         };
 
-        let outcome = run_turn(&provider, &tools, &mut messages, &mut events, &config)
-            .await
-            .expect("turn ok");
+        let outcome = run_turn(
+            &provider,
+            &tools,
+            &mut messages,
+            &mut events,
+            &config,
+            Policy::FullAccess,
+            &mut AutoApprove,
+        )
+        .await
+        .expect("turn ok");
 
         assert_eq!(outcome.output, "done");
         assert!(messages.len() < 20);
@@ -399,5 +456,72 @@ mod tests {
                 .map(|c| c.contains("Summary of earlier conversation"))
                 .unwrap_or(false)
         }));
+    }
+
+    struct DenyGate;
+
+    #[async_trait::async_trait]
+    impl ApprovalGate for DenyGate {
+        async fn request(
+            &mut self,
+            _tool: &str,
+            _args: &Value,
+            _risk: RiskLevel,
+        ) -> Result<ApprovalDecision> {
+            Ok(ApprovalDecision::Deny)
+        }
+    }
+
+    struct MutateTool;
+
+    #[async_trait::async_trait]
+    impl Tool for MutateTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "danger".to_string(),
+                description: "mutates something".to_string(),
+                parameters: json!({ "type": "object", "properties": {} }),
+                risk: RiskLevel::Mutate,
+            }
+        }
+
+        async fn call(&self, _args: Value) -> Result<Value> {
+            Ok(json!({ "executed": true }))
+        }
+    }
+
+    #[tokio::test]
+    async fn require_approval_denies_mutate_tool() {
+        let provider = MockProvider::new(vec![tool_call_response("danger"), final_response()]);
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(MutateTool));
+        let mut messages = vec![Message::user("do danger")];
+        let mut events = EventLog::new();
+        let mut gate = DenyGate;
+
+        let outcome = run_turn(
+            &provider,
+            &tools,
+            &mut messages,
+            &mut events,
+            &LoopConfig::default(),
+            Policy::RequireApproval,
+            &mut gate,
+        )
+        .await
+        .expect("turn ok");
+
+        assert_eq!(outcome.output, "done");
+        // A denial was fed back, and the tool did NOT execute.
+        assert!(messages.iter().any(|m| m
+            .content
+            .as_deref()
+            .map(|c| c.contains("denied"))
+            .unwrap_or(false)));
+        assert!(!messages.iter().any(|m| m
+            .content
+            .as_deref()
+            .map(|c| c.contains("\"executed\""))
+            .unwrap_or(false)));
     }
 }

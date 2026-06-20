@@ -10,7 +10,10 @@ use tokio_tungstenite::tungstenite::error::ProtocolError;
 use tokio_tungstenite::tungstenite::{Error as WsErr, Message as WsMessage};
 use tokio_tungstenite::WebSocketStream;
 
-use agent_core::{run_turn, CoreError, EventLog, LoopConfig, Message, ModelProvider, Result, Role};
+use agent_core::{
+    run_turn, AutoApprove, CoreError, EventLog, LoopConfig, Message, ModelProvider, Policy, Result,
+    Role,
+};
 use fleety_protocol::{ClientMsg, ServerMsg, WireError, PROTOCOL_VERSION};
 
 use crate::storage::Storage;
@@ -105,6 +108,8 @@ pub async fn handle_conn(
                     &mut messages,
                     &mut events,
                     &LoopConfig::default(),
+                    Policy::FullAccess,
+                    &mut AutoApprove,
                 )
                 .await?;
 
