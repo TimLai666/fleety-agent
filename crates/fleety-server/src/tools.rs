@@ -46,6 +46,9 @@ pub fn build_registry(
     registry.register(Box::new(RunCommand {
         root: workspace.to_path_buf(),
     }));
+    registry.register(Box::new(SearchFiles {
+        root: workspace.to_path_buf(),
+    }));
     registry.register(Box::new(MemoryRead {
         dir: memory_dir.to_path_buf(),
     }));
@@ -135,6 +138,50 @@ fn resolve_in_root(root: &Path, rel: &str) -> Result<PathBuf> {
         )));
     }
     Ok(resolved)
+}
+
+/// Recursively search files under `dir` for lines containing `query`, pushing
+/// matches (relative to `root`) into `out`, bounded by `max`.
+fn search_dir(dir: &Path, root: &Path, query: &str, max: usize, out: &mut Vec<Value>) {
+    if out.len() >= max {
+        return;
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        if out.len() >= max {
+            return;
+        }
+        let path = entry.path();
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if is_dir {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if matches!(
+                name.as_ref(),
+                ".git" | "target" | "node_modules" | ".fleety-backups"
+            ) {
+                continue;
+            }
+            search_dir(&path, root, query, max, out);
+        } else if let Ok(content) = std::fs::read_to_string(&path) {
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .display()
+                .to_string();
+            for (index, line) in content.lines().enumerate() {
+                if line.contains(query) {
+                    out.push(json!({ "file": rel, "line": index + 1, "text": line.trim() }));
+                    if out.len() >= max {
+                        return;
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn require_str<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
@@ -360,6 +407,55 @@ impl Tool for RunCommand {
             "stdout": String::from_utf8_lossy(&output.stdout),
             "stderr": String::from_utf8_lossy(&output.stderr),
         }))
+    }
+}
+
+struct SearchFiles {
+    root: PathBuf,
+}
+
+#[async_trait]
+impl Tool for SearchFiles {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "search_files".to_string(),
+            description: "Search file contents in the workspace for a substring; returns file/line/text matches.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" },
+                    "path": { "type": "string", "description": "workspace-relative subdir (default whole workspace)" },
+                    "max_results": { "type": "integer", "description": "default 100" }
+                },
+                "required": ["query"]
+            }),
+            risk: RiskLevel::Read,
+        }
+    }
+
+    async fn call(&self, args: Value) -> Result<Value> {
+        let query = require_str(&args, "query")?;
+        if query.is_empty() {
+            return Err(CoreError::Message(
+                "search query must not be empty".to_string(),
+            ));
+        }
+        let canon_root = self
+            .root
+            .canonicalize()
+            .map_err(|e| CoreError::Message(format!("workspace root unavailable: {e}")))?;
+        let base = match args.get("path").and_then(Value::as_str) {
+            Some(path) => resolve_in_root(&self.root, path)?,
+            None => canon_root.clone(),
+        };
+        let max = args
+            .get("max_results")
+            .and_then(Value::as_u64)
+            .unwrap_or(100) as usize;
+        let mut matches = Vec::new();
+        search_dir(&base, &canon_root, query, max, &mut matches);
+        let truncated = matches.len() >= max;
+        Ok(json!({ "matches": matches, "truncated": truncated }))
     }
 }
 
@@ -707,6 +803,22 @@ mod tests {
         assert!(bad.is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn search_files_finds_matches() {
+        let ws = temp_dir();
+        std::fs::write(ws.join("a.txt"), "hello world\nfoo bar\n").expect("write");
+        let history = ws.join("h.jsonl");
+        let registry = build_registry(&ws, &ws, &ws, &history, &ws);
+        let result = registry
+            .call("search_files", json!({ "query": "foo" }))
+            .await
+            .expect("search");
+        let matches = result["matches"].as_array().expect("matches array");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0]["line"], json!(2));
+        let _ = std::fs::remove_dir_all(&ws);
     }
 
     #[tokio::test]
