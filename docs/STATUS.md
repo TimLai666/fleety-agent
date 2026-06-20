@@ -21,6 +21,7 @@ Done and on `main` since this backlog was generated:
 - **#2 approval gating (core)** — `Policy` + `ApprovalGate` in agent-core; under `RequireApproval`, non-read tools are gated and a denial is fed back rather than executed. (Interactive WebSocket gate still pending; server runs `FullAccess`.)
 - **model discovery** — `OpenAiCompat::list_models()` (GET /models) with a unit-tested parser.
 - **fleetyd connect** — the daemon connects on startup, registers the device, and holds the connection. (Heartbeat/reconnect/autostart/on-device tools + the `client_daemon` connector type still pending.)
+- **git_log + git_show** — completes git read tools (status/diff/log/show). Server tool set: 17 tools.
 
 Still open below — and these are the **heavier, architectural** items that need fresh design context to do well: approval pause/wait flow (#2), device-scoping enforcement on handles (#5), client_session tool bridge (#11), SSE streaming, `/models` discovery, connectors (SSH/HTTP/daemon), fleetyd daemon, ratatui TUI, context compaction, scheduling fire-loop, browser/computer-use, wiki, skills/MCP runtime, updater.
 
