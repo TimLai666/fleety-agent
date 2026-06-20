@@ -5,6 +5,8 @@
 #![forbid(unsafe_code)]
 #![warn(clippy::unwrap_used, clippy::expect_used)]
 
+use std::path::PathBuf;
+
 use agent_core::{obs, CoreError, Result};
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
@@ -22,6 +24,20 @@ async fn main() {
     obs::init();
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
+        Some("init") => {
+            let url = args.get(2).cloned().unwrap_or_default();
+            if url.is_empty() {
+                eprintln!("usage: fleety init <agent-url>   (e.g. ws://host:8787)");
+                return;
+            }
+            if let Err(e) = init(url).await {
+                let report = e.report();
+                eprintln!("error: {}", report.message);
+                if let Some(hint) = report.remediation {
+                    eprintln!("hint: {hint}");
+                }
+            }
+        }
         Some("ask") => {
             let text = args.get(2).cloned().unwrap_or_default();
             if text.is_empty() {
@@ -53,6 +69,30 @@ async fn main() {
     }
 }
 
+fn fleety_dir() -> Option<PathBuf> {
+    let base = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()?;
+    Some(PathBuf::from(base).join(".fleety"))
+}
+
+/// Resolve the agent URL: `FLEETY_AGENT_URL`, else saved config, else default.
+fn agent_url() -> String {
+    if let Ok(url) = std::env::var("FLEETY_AGENT_URL") {
+        return url;
+    }
+    if let Some(dir) = fleety_dir() {
+        if let Ok(text) = std::fs::read_to_string(dir.join("config.json")) {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                if let Some(url) = value.get("agent_url").and_then(|v| v.as_str()) {
+                    return url.to_string();
+                }
+            }
+        }
+    }
+    "ws://127.0.0.1:8787".to_string()
+}
+
 fn device_id() -> String {
     std::env::var("FLEETY_DEVICE_ID")
         .or_else(|_| std::env::var("COMPUTERNAME"))
@@ -72,9 +112,51 @@ fn origin() -> OriginContext {
     }
 }
 
+/// `fleety init <agent-url>`: connect, register this device, and save config.
+async fn init(url: String) -> Result<()> {
+    let (ws, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .map_err(|e| CoreError::Provider(format!("cannot connect to {url}: {e}")))?;
+    let (mut tx, mut rx) = ws.split();
+
+    send(
+        &mut tx,
+        &ClientMsg::Hello {
+            device_id: device_id(),
+            protocol: PROTOCOL_VERSION,
+        },
+    )
+    .await?;
+    match recv(&mut rx).await? {
+        Some(ServerMsg::Welcome { session_id, .. }) => {
+            if let Some(dir) = fleety_dir() {
+                std::fs::create_dir_all(&dir)
+                    .map_err(|e| CoreError::Message(format!("cannot create ~/.fleety: {e}")))?;
+                let config = serde_json::json!({ "agent_url": url, "device_id": device_id() });
+                std::fs::write(
+                    dir.join("config.json"),
+                    serde_json::to_string_pretty(&config).unwrap_or_default(),
+                )
+                .map_err(|e| CoreError::Message(format!("cannot write config: {e}")))?;
+            }
+            println!("✓ connected to {url}");
+            println!(
+                "✓ registered device '{}' (session {session_id})",
+                device_id()
+            );
+        }
+        other => {
+            return Err(CoreError::Provider(format!(
+                "unexpected reply during init: {other:?}"
+            )))
+        }
+    }
+    let _ = tx.close().await;
+    Ok(())
+}
+
 async fn ask(text: String) -> Result<()> {
-    let url =
-        std::env::var("FLEETY_AGENT_URL").unwrap_or_else(|_| "ws://127.0.0.1:8787".to_string());
+    let url = agent_url();
     let (ws, _) = tokio_tungstenite::connect_async(&url)
         .await
         .map_err(|e| CoreError::Provider(format!("cannot connect to {url}: {e}")))?;
@@ -124,8 +206,7 @@ async fn ask(text: String) -> Result<()> {
 
 /// Reconnect to a conversation and print events replayed after `after_seq`.
 async fn resume(conversation_id: String, after_seq: u64) -> Result<()> {
-    let url =
-        std::env::var("FLEETY_AGENT_URL").unwrap_or_else(|_| "ws://127.0.0.1:8787".to_string());
+    let url = agent_url();
     let (ws, _) = tokio_tungstenite::connect_async(&url)
         .await
         .map_err(|e| CoreError::Provider(format!("cannot connect to {url}: {e}")))?;
