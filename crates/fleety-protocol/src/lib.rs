@@ -52,6 +52,10 @@ pub enum ClientMsg {
         conversation_id: String,
         after_seq: u64,
     },
+    /// Approve a pending tool call (reply to `ApprovalRequested`).
+    Approve { approval_id: String },
+    /// Deny a pending tool call (reply to `ApprovalRequested`).
+    Deny { approval_id: String },
 }
 
 /// Frames sent server -> client over the WebSocket.
@@ -76,6 +80,13 @@ pub enum ServerMsg {
         seq: u64,
         role: String,
         content: String,
+    },
+    /// A tool call needs the user's approval before it runs.
+    ApprovalRequested {
+        approval_id: String,
+        tool: String,
+        summary: String,
+        risk: String,
     },
     /// The turn is complete.
     Done { conversation_id: String },

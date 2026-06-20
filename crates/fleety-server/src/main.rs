@@ -60,6 +60,15 @@ fn build_provider() -> Arc<dyn ModelProvider> {
     }
 }
 
+/// Approval policy from `FLEETY_POLICY` (`require_approval` → gate non-read
+/// tools; default full access).
+fn policy_from_env() -> agent_core::Policy {
+    match std::env::var("FLEETY_POLICY").as_deref() {
+        Ok("require_approval") => agent_core::Policy::RequireApproval,
+        _ => agent_core::Policy::FullAccess,
+    }
+}
+
 #[tokio::main]
 async fn main() {
     obs::init();
@@ -69,6 +78,7 @@ async fn main() {
 
     let storage = Arc::new(Storage::new(home));
     let provider = build_provider();
+    let policy = policy_from_env();
     let workspace = Arc::new(workspace_root());
     tracing::info!(workspace = %workspace.display(), "workspace for tools");
 
@@ -95,7 +105,7 @@ async fn main() {
         // Each connection runs in its own task: an error or panic here is
         // isolated and never brings the server down.
         tokio::spawn(async move {
-            match conn::handle_conn(stream, storage, provider, workspace).await {
+            match conn::handle_conn(stream, storage, provider, workspace, policy).await {
                 Ok(()) => {}
                 Err(e) => tracing::warn!(%peer, report = ?e.report(), "connection error"),
             }

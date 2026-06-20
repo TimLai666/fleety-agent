@@ -196,6 +196,23 @@ async fn ask(text: String) -> Result<()> {
                 eprintln!("agent error: {}", error.message);
                 break;
             }
+            Some(ServerMsg::ApprovalRequested {
+                approval_id,
+                tool,
+                risk,
+                summary,
+            }) => {
+                eprintln!("Approve tool '{tool}' (risk: {risk})? {summary}");
+                eprint!("[y/N] ");
+                let mut line = String::new();
+                let _ = std::io::stdin().read_line(&mut line);
+                let decision = if line.trim().eq_ignore_ascii_case("y") {
+                    ClientMsg::Approve { approval_id }
+                } else {
+                    ClientMsg::Deny { approval_id }
+                };
+                send(&mut tx, &decision).await?;
+            }
             Some(ServerMsg::Welcome { .. }) | Some(ServerMsg::Replay { .. }) => {}
         }
     }
