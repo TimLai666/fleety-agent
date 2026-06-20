@@ -22,6 +22,7 @@ Done and on `main` since this backlog was generated:
 - **model discovery** — `OpenAiCompat::list_models()` (GET /models) with a unit-tested parser.
 - **fleetyd connect** — the daemon connects on startup, registers the device, and holds the connection. (Heartbeat/reconnect/autostart/on-device tools + the `client_daemon` connector type still pending.)
 - **git_log + git_show** — completes git read tools (status/diff/log/show). Server tool set: 17 tools.
+- **#2 approval flow (end-to-end)** — `ApprovalRequested`/`Approve`/`Deny` over WebSocket; `ConnGate` drives it; `FLEETY_POLICY=require_approval` gates non-read tools; `fleety ask` prompts y/N. Verified by a WS integration test (denied write does not execute).
 
 Still open below — and these are the **heavier, architectural** items that need fresh design context to do well: approval pause/wait flow (#2), device-scoping enforcement on handles (#5), client_session tool bridge (#11), SSE streaming, `/models` discovery, connectors (SSH/HTTP/daemon), fleetyd daemon, ratatui TUI, context compaction, scheduling fire-loop, browser/computer-use, wiki, skills/MCP runtime, updater.
 
