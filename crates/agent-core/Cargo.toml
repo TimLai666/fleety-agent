@@ -1,0 +1,16 @@
+[package]
+name = "agent-core"
+description = "Generic agent core: errors, never-crash primitives, observability. The future standalone framework; depends on no Fleety crate."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde = { workspace = true }
+tokio = { workspace = true }

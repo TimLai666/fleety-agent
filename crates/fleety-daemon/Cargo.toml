@@ -1,0 +1,19 @@
+[package]
+name = "fleety-daemon"
+description = "fleetyd — Fleety device background service (M0 skeleton)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "fleetyd"
+path = "src/main.rs"
+
+[dependencies]
+agent-core = { workspace = true }
+fleety-protocol = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

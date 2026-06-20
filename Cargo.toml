@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "Apache-2.0"
+repository = "https://github.com/TimLai666/fleety-agent"
+publish = false
+
+[workspace.dependencies]
+# internal crates
+agent-core = { path = "crates/agent-core" }
+fleety-protocol = { path = "crates/fleety-protocol" }
+# external
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
+thiserror = "1.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
