@@ -16,7 +16,7 @@ Done and on `main` since this backlog was generated:
 - **#9 (partial)** — `Hello` protocol-version check; `history_list` tool over the audit log.
 - **#8 (core)** — device registry: `device.json` + initial `NOTES.md` created/refreshed on connect; `device_list` / `device_show` tools.
 - **enrollment UX** — `fleety init <agent-url>` connects, registers the device, saves `~/.fleety/config.json`; `ask`/`resume` fall back to the saved URL. (Pairing codes + tokens still pending.)
-- **search_files** — recursive workspace content search tool (completes read/list/search/write/run/git tool set).
+- **search_files** + **edit_file** — recursive content search and precise unique find/replace (with backup). Workspace tool set now: read/list/search/write/edit/run/git_status/git_diff (8) + memory×2 + history + device×2 = 15 tools.
 
 Still open below — and these are the **heavier, architectural** items that need fresh design context to do well: approval pause/wait flow (#2), device-scoping enforcement on handles (#5), client_session tool bridge (#11), SSE streaming, `/models` discovery, connectors (SSH/HTTP/daemon), fleetyd daemon, ratatui TUI, context compaction, scheduling fire-loop, browser/computer-use, wiki, skills/MCP runtime, updater.
 
