@@ -21,7 +21,9 @@ pub mod tools;
 pub use agent::{run_turn, LoopConfig, TurnOutcome};
 pub use error::{CoreError, ErrorReport, Result};
 pub use event::{Event, EventLog};
-pub use model::{Message, MockProvider, ModelProvider, ModelResponse, Role, ToolCall, ToolSpec};
+pub use model::{
+    Message, MockProvider, ModelProvider, ModelResponse, RiskLevel, Role, ToolCall, ToolSpec,
+};
 pub use openai::OpenAiCompat;
 pub use tools::{Tool, ToolRegistry};
 

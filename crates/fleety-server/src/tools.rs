@@ -11,7 +11,7 @@ use std::process::Command;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use agent_core::{CoreError, Result, Tool, ToolRegistry, ToolSpec};
+use agent_core::{CoreError, Result, RiskLevel, Tool, ToolRegistry, ToolSpec};
 
 /// Build the workspace tool registry rooted at `workspace`. Mutating tools back
 /// up to `backups_dir` (outside the workspace) before changing files.
@@ -141,6 +141,7 @@ impl Tool for ReadFile {
                 "properties": { "path": { "type": "string", "description": "workspace-relative path" } },
                 "required": ["path"]
             }),
+            risk: RiskLevel::Read,
         }
     }
 
@@ -167,6 +168,7 @@ impl Tool for ListDir {
                 "type": "object",
                 "properties": { "path": { "type": "string", "description": "workspace-relative dir (default '.')" } }
             }),
+            risk: RiskLevel::Read,
         }
     }
 
@@ -196,6 +198,7 @@ impl Tool for GitStatus {
             name: "git_status".to_string(),
             description: "Show `git status --porcelain` for the workspace.".to_string(),
             parameters: json!({ "type": "object", "properties": {} }),
+            risk: RiskLevel::Read,
         }
     }
 
@@ -216,6 +219,7 @@ impl Tool for GitDiff {
             name: "git_diff".to_string(),
             description: "Show the unstaged `git diff` for the workspace.".to_string(),
             parameters: json!({ "type": "object", "properties": {} }),
+            risk: RiskLevel::Read,
         }
     }
 
@@ -244,6 +248,7 @@ impl Tool for WriteFile {
                 },
                 "required": ["path", "content"]
             }),
+            risk: RiskLevel::Mutate,
         }
     }
 
@@ -290,6 +295,7 @@ impl Tool for RunCommand {
                 },
                 "required": ["command"]
             }),
+            risk: RiskLevel::Mutate,
         }
     }
 

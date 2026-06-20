@@ -77,13 +77,27 @@ impl Message {
     }
 }
 
-/// A tool the model may call (name + JSON-schema parameters).
+/// How risky a tool is to run. Drives gating (read runs freely; mutate is
+/// audited/rollback-backed; critical needs confirmation). See the spec policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RiskLevel {
+    #[default]
+    Read,
+    Mutate,
+    Critical,
+}
+
+/// A tool the model may call (name + JSON-schema parameters + risk class).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolSpec {
     pub name: String,
     pub description: String,
     /// JSON Schema for the tool's arguments.
     pub parameters: Value,
+    /// Risk class for gating; defaults to `read`.
+    #[serde(default)]
+    pub risk: RiskLevel,
 }
 
 /// A provider's response for one step of the loop.

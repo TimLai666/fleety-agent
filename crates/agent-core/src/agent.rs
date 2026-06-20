@@ -102,7 +102,7 @@ fn budget_text(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{MockProvider, ModelResponse, Role, ToolCall, ToolSpec};
+    use crate::model::{MockProvider, ModelResponse, RiskLevel, Role, ToolCall, ToolSpec};
     use crate::tools::Tool;
     use serde_json::Value;
 
@@ -119,6 +119,7 @@ mod tests {
                     "properties": { "text": { "type": "string" } },
                     "required": ["text"]
                 }),
+                risk: RiskLevel::Read,
             }
         }
 
@@ -234,6 +235,7 @@ mod tests {
                 name: "big".to_string(),
                 description: "returns a large payload".to_string(),
                 parameters: json!({ "type": "object", "properties": {} }),
+                risk: RiskLevel::Read,
             }
         }
 
