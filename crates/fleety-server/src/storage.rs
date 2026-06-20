@@ -5,6 +5,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_core::{CoreError, Event, Message, Result};
 use serde_json::Value;
@@ -128,6 +129,52 @@ impl Storage {
             .join("devices")
             .join(device_id)
             .join("history.jsonl")
+    }
+
+    /// Directory holding all device records.
+    pub fn devices_dir(&self) -> PathBuf {
+        self.home.join("fleet").join("devices")
+    }
+
+    /// Ensure a device is registered: create `devices/{id}/device.json` (with
+    /// defaults) and an initial `NOTES.md` if missing, and stamp `last_seen`.
+    /// v0 stores the record as JSON; the spec's device.yaml has the same fields.
+    pub fn ensure_device(&self, device_id: &str, connector_type: &str) -> Result<()> {
+        let dir = self.devices_dir().join(device_id);
+        fs::create_dir_all(&dir)
+            .map_err(|e| CoreError::Message(format!("cannot create device dir: {e}")))?;
+        let record_path = dir.join("device.json");
+        let mut record = match fs::read_to_string(&record_path) {
+            Ok(text) => serde_json::from_str::<Value>(&text).unwrap_or(Value::Null),
+            Err(_) => Value::Null,
+        };
+        if !record.is_object() {
+            record = serde_json::json!({
+                "id": device_id,
+                "status": "active",
+                "mobility": "unknown",
+                "site": "unknown",
+                "connectors": [{ "type": connector_type, "scope": "local" }],
+            });
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        record["last_seen"] = serde_json::json!(now);
+        let pretty = serde_json::to_string_pretty(&record)
+            .map_err(|e| CoreError::Message(format!("serialize device record: {e}")))?;
+        fs::write(&record_path, pretty)
+            .map_err(|e| CoreError::Message(format!("write device record: {e}")))?;
+        let notes = dir.join("NOTES.md");
+        if !notes.exists() {
+            fs::write(
+                &notes,
+                format!("# {device_id}\n\nAuto-registered device.\n"),
+            )
+            .map_err(|e| CoreError::Message(format!("write NOTES.md: {e}")))?;
+        }
+        Ok(())
     }
 
     fn core_file(&self, name: &str, default: &str) -> Result<String> {

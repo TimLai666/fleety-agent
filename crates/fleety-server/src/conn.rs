@@ -58,6 +58,9 @@ pub async fn handle_conn(
         None => return Ok(()),
     };
 
+    // Register / refresh this device in the registry.
+    storage.ensure_device(&device_id, "client_session")?;
+
     let session_id = uuid::Uuid::new_v4().to_string();
     let default_conversation = uuid::Uuid::new_v4().to_string();
     tracing::info!(%device_id, %session_id, "client connected");
@@ -76,6 +79,7 @@ pub async fn handle_conn(
         &storage.backups_dir(),
         &storage.memory_dir(),
         &storage.history_path(&device_id),
+        &storage.devices_dir(),
     );
 
     while let Some(msg) = read_client(&mut rx).await? {

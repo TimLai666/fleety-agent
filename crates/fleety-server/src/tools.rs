@@ -24,6 +24,7 @@ pub fn build_registry(
     backups_dir: &Path,
     memory_dir: &Path,
     history_path: &Path,
+    devices_dir: &Path,
 ) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(ReadFile {
@@ -53,6 +54,12 @@ pub fn build_registry(
     }));
     registry.register(Box::new(HistoryList {
         path: history_path.to_path_buf(),
+    }));
+    registry.register(Box::new(DeviceList {
+        devices_dir: devices_dir.to_path_buf(),
+    }));
+    registry.register(Box::new(DeviceShow {
+        devices_dir: devices_dir.to_path_buf(),
     }));
     registry
 }
@@ -488,6 +495,89 @@ impl Tool for HistoryList {
     }
 }
 
+struct DeviceList {
+    devices_dir: PathBuf,
+}
+
+#[async_trait]
+impl Tool for DeviceList {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "device_list".to_string(),
+            description: "List registered devices and their records.".to_string(),
+            parameters: json!({ "type": "object", "properties": {} }),
+            risk: RiskLevel::Read,
+        }
+    }
+
+    async fn call(&self, _args: Value) -> Result<Value> {
+        let mut devices = Vec::new();
+        match std::fs::read_dir(&self.devices_dir) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry =
+                        entry.map_err(|e| CoreError::Message(format!("dir entry error: {e}")))?;
+                    if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                        let record_path = entry.path().join("device.json");
+                        if let Ok(text) = std::fs::read_to_string(&record_path) {
+                            if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                                devices.push(value);
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(CoreError::Message(format!("cannot list devices: {e}"))),
+        }
+        Ok(json!({ "devices": devices }))
+    }
+}
+
+struct DeviceShow {
+    devices_dir: PathBuf,
+}
+
+#[async_trait]
+impl Tool for DeviceShow {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "device_show".to_string(),
+            description: "Show one device's record and NOTES.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "device": { "type": "string" } },
+                "required": ["device"]
+            }),
+            risk: RiskLevel::Read,
+        }
+    }
+
+    async fn call(&self, args: Value) -> Result<Value> {
+        let device = require_str(&args, "device")?;
+        if device.contains('/') || device.contains('\\') || device.contains("..") {
+            return Err(CoreError::Message(format!("invalid device id '{device}'")));
+        }
+        let dir = self.devices_dir.join(device);
+        let record: Value = match std::fs::read_to_string(dir.join("device.json")) {
+            Ok(text) => serde_json::from_str(&text)
+                .map_err(|e| CoreError::Message(format!("corrupt device record: {e}")))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(CoreError::Message(format!(
+                    "no such device '{device}'; use device_list to see registered devices"
+                )))
+            }
+            Err(e) => {
+                return Err(CoreError::Message(format!(
+                    "cannot read device record: {e}"
+                )))
+            }
+        };
+        let notes = std::fs::read_to_string(dir.join("NOTES.md")).unwrap_or_default();
+        Ok(json!({ "record": record, "notes": notes }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -495,7 +585,7 @@ mod tests {
     #[tokio::test]
     async fn read_and_list_within_root() {
         let root = std::env::current_dir().expect("cwd");
-        let registry = build_registry(&root, &root, &root, &root);
+        let registry = build_registry(&root, &root, &root, &root, &root);
         // Cargo.toml exists at the repo/workspace root in tests run from a crate dir's parent;
         // use list_dir on "." which always resolves.
         let listed = registry
@@ -508,7 +598,7 @@ mod tests {
     #[tokio::test]
     async fn path_escape_is_rejected() {
         let root = std::env::current_dir().expect("cwd");
-        let registry = build_registry(&root, &root, &root, &root);
+        let registry = build_registry(&root, &root, &root, &root, &root);
         let result = registry
             .call("read_file", json!({ "path": "../../../../etc/passwd" }))
             .await;
@@ -518,7 +608,7 @@ mod tests {
     #[tokio::test]
     async fn missing_arg_is_actionable() {
         let root = std::env::current_dir().expect("cwd");
-        let registry = build_registry(&root, &root, &root, &root);
+        let registry = build_registry(&root, &root, &root, &root, &root);
         let err = registry
             .call("read_file", json!({}))
             .await
@@ -536,7 +626,7 @@ mod tests {
     async fn write_file_creates_and_backs_up() {
         let ws = temp_dir();
         let backups = temp_dir();
-        let registry = build_registry(&ws, &backups, &ws, &ws);
+        let registry = build_registry(&ws, &backups, &ws, &ws, &ws);
 
         let created = registry
             .call("write_file", json!({ "path": "a.txt", "content": "one" }))
@@ -565,7 +655,7 @@ mod tests {
     #[tokio::test]
     async fn run_command_captures_output() {
         let ws = temp_dir();
-        let registry = build_registry(&ws, &ws, &ws, &ws);
+        let registry = build_registry(&ws, &ws, &ws, &ws, &ws);
         let result = registry
             .call("run_command", json!({ "command": "echo hello" }))
             .await
@@ -581,7 +671,7 @@ mod tests {
     #[tokio::test]
     async fn critical_command_refused() {
         let ws = temp_dir();
-        let registry = build_registry(&ws, &ws, &ws, &ws);
+        let registry = build_registry(&ws, &ws, &ws, &ws, &ws);
         let err = registry
             .call("run_command", json!({ "command": "rm -rf /" }))
             .await
@@ -593,7 +683,7 @@ mod tests {
     #[tokio::test]
     async fn memory_write_then_read_and_reject_unknown() {
         let dir = temp_dir();
-        let registry = build_registry(&dir, &dir, &dir, &dir);
+        let registry = build_registry(&dir, &dir, &dir, &dir, &dir);
 
         registry
             .call(
@@ -617,5 +707,31 @@ mod tests {
         assert!(bad.is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn device_list_and_show() {
+        let devices = temp_dir();
+        let pi = devices.join("pi");
+        std::fs::create_dir_all(&pi).expect("mkdir");
+        std::fs::write(pi.join("device.json"), r#"{"id":"pi","status":"active"}"#).expect("write");
+        let history = devices.join("h.jsonl");
+        let registry = build_registry(&devices, &devices, &devices, &history, &devices);
+
+        let list = registry.call("device_list", json!({})).await.expect("list");
+        assert_eq!(list["devices"].as_array().map(Vec::len).unwrap_or(0), 1);
+
+        let show = registry
+            .call("device_show", json!({ "device": "pi" }))
+            .await
+            .expect("show");
+        assert_eq!(show["record"]["id"], json!("pi"));
+
+        let escape = registry
+            .call("device_show", json!({ "device": "../secret" }))
+            .await;
+        assert!(escape.is_err());
+
+        let _ = std::fs::remove_dir_all(&devices);
     }
 }
