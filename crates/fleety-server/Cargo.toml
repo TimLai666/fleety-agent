@@ -1,6 +1,6 @@
 [package]
 name = "fleety-server"
-description = "Fleety Agent server (M0 skeleton)."
+description = "Fleety Agent server."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,5 +15,10 @@ path = "src/main.rs"
 [dependencies]
 agent-core = { workspace = true }
 fleety-protocol = { workspace = true }
+async-trait = { workspace = true }
 tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
 tracing = { workspace = true }

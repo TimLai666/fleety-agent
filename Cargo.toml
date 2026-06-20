@@ -15,7 +15,7 @@ publish = false
 agent-core = { path = "crates/agent-core" }
 fleety-protocol = { path = "crates/fleety-protocol" }
 # external
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "net", "io-util", "sync"] }
 thiserror = "1.0"
 anyhow = "1.0"
 tracing = "0.1"
@@ -25,3 +25,5 @@ serde_json = "1"
 async-trait = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 futures = "0.3"
+tokio-tungstenite = "0.24"
+uuid = { version = "1", features = ["v4"] }

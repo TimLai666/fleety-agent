@@ -20,6 +20,55 @@ pub struct WireError {
     pub remediation: Option<String>,
 }
 
+/// Origin context the CLI attaches so the agent knows where a message came from.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct OriginContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+}
+
+/// Frames sent client -> server over the WebSocket.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ClientMsg {
+    /// First frame: identify the origin device.
+    Hello { device_id: String, protocol: u32 },
+    /// A user turn. `conversation_id` continues an existing conversation, or
+    /// `None` starts a new one.
+    UserMessage {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conversation_id: Option<String>,
+        text: String,
+        #[serde(default)]
+        origin: OriginContext,
+    },
+}
+
+/// Frames sent server -> client over the WebSocket.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ServerMsg {
+    /// Reply to `Hello`: the session and (initial) conversation.
+    Welcome {
+        session_id: String,
+        conversation_id: String,
+        protocol: u32,
+    },
+    /// An assistant message for a conversation.
+    Assistant {
+        conversation_id: String,
+        text: String,
+    },
+    /// The turn is complete.
+    Done { conversation_id: String },
+    /// Something went wrong (actionable).
+    Error { error: WireError },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
