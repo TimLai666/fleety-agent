@@ -36,6 +36,45 @@ impl OpenAiCompat {
     fn endpoint(&self) -> String {
         format!("{}/chat/completions", self.base_url)
     }
+
+    /// Discover available model ids via `GET {base_url}/models`.
+    pub async fn list_models(&self) -> Result<Vec<String>> {
+        let url = format!("{}/models", self.base_url);
+        let mut request = self.client.get(&url);
+        if let Some(key) = &self.api_key {
+            request = request.bearer_auth(key);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|e| CoreError::Provider(format!("request to {url} failed: {e}")))?;
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .map_err(|e| CoreError::Provider(format!("reading /models body failed: {e}")))?;
+        if !status.is_success() {
+            return Err(CoreError::Provider(format!(
+                "/models returned HTTP {status}: {text}"
+            )));
+        }
+        parse_models(&text)
+    }
+}
+
+fn parse_models(body: &str) -> Result<Vec<String>> {
+    #[derive(Deserialize)]
+    struct ModelsResponse {
+        data: Vec<ModelEntry>,
+    }
+    #[derive(Deserialize)]
+    struct ModelEntry {
+        id: String,
+    }
+    let parsed: ModelsResponse = serde_json::from_str(body).map_err(|e| {
+        CoreError::Provider(format!("unexpected /models response: {e}; body: {body}"))
+    })?;
+    Ok(parsed.data.into_iter().map(|m| m.id).collect())
 }
 
 #[async_trait::async_trait]
@@ -234,6 +273,13 @@ mod tests {
         assert_eq!(parse_args(""), json!({}));
         assert_eq!(parse_args("{\"a\":1}"), json!({ "a": 1 }));
         assert_eq!(parse_args("not json"), json!({ "_unparsed": "not json" }));
+    }
+
+    #[test]
+    fn parse_models_extracts_ids() {
+        let body = r#"{"object":"list","data":[{"id":"gpt-5.5","object":"model"},{"id":"qwen3"}]}"#;
+        let ids = parse_models(body).expect("parse");
+        assert_eq!(ids, vec!["gpt-5.5".to_string(), "qwen3".to_string()]);
     }
 
     #[test]
