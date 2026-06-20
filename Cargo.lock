@@ -184,7 +184,10 @@ version = "0.1.0"
 dependencies = [
  "agent-core",
  "fleety-protocol",
+ "futures",
+ "serde_json",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
 ]
 
