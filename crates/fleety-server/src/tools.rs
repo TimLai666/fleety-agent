@@ -43,6 +43,10 @@ pub fn build_registry(
         root: workspace.to_path_buf(),
         backups: backups_dir.to_path_buf(),
     }));
+    registry.register(Box::new(EditFile {
+        root: workspace.to_path_buf(),
+        backups: backups_dir.to_path_buf(),
+    }));
     registry.register(Box::new(RunCommand {
         root: workspace.to_path_buf(),
     }));
@@ -98,6 +102,20 @@ fn resolve_for_write(root: &Path, rel: &str) -> Result<PathBuf> {
         .file_name()
         .ok_or_else(|| CoreError::Message(format!("path '{rel}' has no file name")))?;
     Ok(canon_parent.join(file_name))
+}
+
+/// Copy an existing file into the backups store (outside the workspace) and
+/// return a `{id, path}` handle for rollback.
+fn backup_existing(backups: &Path, rel: &str, resolved: &Path) -> Result<Value> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let backup_path = backups.join(&id).join(rel);
+    if let Some(parent) = backup_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| CoreError::Message(format!("cannot create backup dir: {e}")))?;
+    }
+    std::fs::copy(resolved, &backup_path)
+        .map_err(|e| CoreError::Message(format!("backup of '{rel}' failed: {e}")))?;
+    Ok(json!({ "id": id, "path": backup_path.display().to_string() }))
 }
 
 /// v0 critical-command guard (deliberately permissive: only clearly
@@ -355,6 +373,56 @@ impl Tool for WriteFile {
         std::fs::write(&resolved, content)
             .map_err(|e| CoreError::Message(format!("cannot write '{path}': {e}")))?;
         Ok(json!({ "path": path, "bytes_written": content.len(), "backup": backup }))
+    }
+}
+
+struct EditFile {
+    root: PathBuf,
+    backups: PathBuf,
+}
+
+#[async_trait]
+impl Tool for EditFile {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "edit_file".to_string(),
+            description: "Replace an exact, unique substring in a workspace file (precise edit). The prior content is backed up for rollback.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "old": { "type": "string", "description": "exact text to replace (must be unique in the file)" },
+                    "new": { "type": "string" }
+                },
+                "required": ["path", "old", "new"]
+            }),
+            risk: RiskLevel::Mutate,
+        }
+    }
+
+    async fn call(&self, args: Value) -> Result<Value> {
+        let path = require_str(&args, "path")?;
+        let old = require_str(&args, "old")?;
+        let new = require_str(&args, "new")?;
+        let resolved = resolve_in_root(&self.root, path)?;
+        let content = std::fs::read_to_string(&resolved)
+            .map_err(|e| CoreError::Message(format!("cannot read '{path}': {e}")))?;
+        let count = content.matches(old).count();
+        if count == 0 {
+            return Err(CoreError::Message(format!(
+                "the 'old' text was not found in '{path}'; read the file and copy the exact text"
+            )));
+        }
+        if count > 1 {
+            return Err(CoreError::Message(format!(
+                "the 'old' text appears {count} times in '{path}'; include more surrounding context to make it unique"
+            )));
+        }
+        let backup = backup_existing(&self.backups, path, &resolved)?;
+        let updated = content.replacen(old, new, 1);
+        std::fs::write(&resolved, &updated)
+            .map_err(|e| CoreError::Message(format!("cannot write '{path}': {e}")))?;
+        Ok(json!({ "path": path, "replaced": 1, "backup": backup }))
     }
 }
 
@@ -803,6 +871,39 @@ mod tests {
         assert!(bad.is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn edit_file_replaces_unique_and_rejects_ambiguous() {
+        let ws = temp_dir();
+        let backups = temp_dir();
+        std::fs::write(ws.join("c.txt"), "alpha\nbeta\nalpha\n").expect("write");
+        let registry = build_registry(&ws, &backups, &ws, &ws.join("h.jsonl"), &ws);
+
+        // "beta" is unique -> replaced
+        let ok = registry
+            .call(
+                "edit_file",
+                json!({ "path": "c.txt", "old": "beta", "new": "BETA" }),
+            )
+            .await
+            .expect("edit");
+        assert_eq!(ok["replaced"], json!(1));
+        assert!(std::fs::read_to_string(ws.join("c.txt"))
+            .expect("read")
+            .contains("BETA"));
+
+        // "alpha" appears twice -> rejected
+        let ambiguous = registry
+            .call(
+                "edit_file",
+                json!({ "path": "c.txt", "old": "alpha", "new": "A" }),
+            )
+            .await;
+        assert!(ambiguous.is_err());
+
+        let _ = std::fs::remove_dir_all(&ws);
+        let _ = std::fs::remove_dir_all(&backups);
     }
 
     #[tokio::test]
