@@ -121,6 +121,15 @@ impl Storage {
         self.home.join("fleet")
     }
 
+    /// Path to a device's audit log.
+    pub fn history_path(&self, device_id: &str) -> PathBuf {
+        self.home
+            .join("fleet")
+            .join("devices")
+            .join(device_id)
+            .join("history.jsonl")
+    }
+
     fn core_file(&self, name: &str, default: &str) -> Result<String> {
         let path = self.home.join("fleet").join(name);
         match fs::read_to_string(&path) {
@@ -156,12 +165,7 @@ impl Storage {
 
     /// Append an event to a device's audit log (`history.jsonl`).
     pub fn append_history(&self, device_id: &str, event: &Event) -> Result<()> {
-        let path = self
-            .home
-            .join("fleet")
-            .join("devices")
-            .join(device_id)
-            .join("history.jsonl");
+        let path = self.history_path(device_id);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| {
                 CoreError::Message(format!("cannot create {}: {e}", parent.display()))

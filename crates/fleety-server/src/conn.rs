@@ -71,8 +71,12 @@ pub async fn handle_conn(
     )
     .await?;
 
-    let tools =
-        crate::tools::build_registry(&workspace, &storage.backups_dir(), &storage.memory_dir());
+    let tools = crate::tools::build_registry(
+        &workspace,
+        &storage.backups_dir(),
+        &storage.memory_dir(),
+        &storage.history_path(&device_id),
+    );
 
     while let Some(msg) = read_client(&mut rx).await? {
         match msg {

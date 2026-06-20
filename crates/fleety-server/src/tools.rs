@@ -19,7 +19,12 @@ const MEMORY_FILES: &[&str] = &["ME.md", "USER.md", "TODO.md", "TOOLS.md"];
 /// Build the workspace tool registry rooted at `workspace`. Mutating tools back
 /// up to `backups_dir` (outside the workspace) before changing files;
 /// `memory_dir` holds the agent-level core memory files.
-pub fn build_registry(workspace: &Path, backups_dir: &Path, memory_dir: &Path) -> ToolRegistry {
+pub fn build_registry(
+    workspace: &Path,
+    backups_dir: &Path,
+    memory_dir: &Path,
+    history_path: &Path,
+) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(ReadFile {
         root: workspace.to_path_buf(),
@@ -45,6 +50,9 @@ pub fn build_registry(workspace: &Path, backups_dir: &Path, memory_dir: &Path) -
     }));
     registry.register(Box::new(MemoryWrite {
         dir: memory_dir.to_path_buf(),
+    }));
+    registry.register(Box::new(HistoryList {
+        path: history_path.to_path_buf(),
     }));
     registry
 }
@@ -440,6 +448,46 @@ impl Tool for MemoryWrite {
     }
 }
 
+struct HistoryList {
+    path: PathBuf,
+}
+
+#[async_trait]
+impl Tool for HistoryList {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "history_list".to_string(),
+            description:
+                "List recent audit-log entries (tool calls, results, replies) for this device."
+                    .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "limit": { "type": "integer", "description": "max entries (default 20)" } }
+            }),
+            risk: RiskLevel::Read,
+        }
+    }
+
+    async fn call(&self, args: Value) -> Result<Value> {
+        let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(20) as usize;
+        let content = match std::fs::read_to_string(&self.path) {
+            Ok(content) => content,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(CoreError::Message(format!("cannot read history: {e}"))),
+        };
+        let mut entries: Vec<Value> = content
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        let total = entries.len();
+        if entries.len() > limit {
+            entries = entries.split_off(entries.len() - limit);
+        }
+        Ok(json!({ "total": total, "returned": entries.len(), "entries": entries }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,7 +495,7 @@ mod tests {
     #[tokio::test]
     async fn read_and_list_within_root() {
         let root = std::env::current_dir().expect("cwd");
-        let registry = build_registry(&root, &root, &root);
+        let registry = build_registry(&root, &root, &root, &root);
         // Cargo.toml exists at the repo/workspace root in tests run from a crate dir's parent;
         // use list_dir on "." which always resolves.
         let listed = registry
@@ -460,7 +508,7 @@ mod tests {
     #[tokio::test]
     async fn path_escape_is_rejected() {
         let root = std::env::current_dir().expect("cwd");
-        let registry = build_registry(&root, &root, &root);
+        let registry = build_registry(&root, &root, &root, &root);
         let result = registry
             .call("read_file", json!({ "path": "../../../../etc/passwd" }))
             .await;
@@ -470,7 +518,7 @@ mod tests {
     #[tokio::test]
     async fn missing_arg_is_actionable() {
         let root = std::env::current_dir().expect("cwd");
-        let registry = build_registry(&root, &root, &root);
+        let registry = build_registry(&root, &root, &root, &root);
         let err = registry
             .call("read_file", json!({}))
             .await
@@ -488,7 +536,7 @@ mod tests {
     async fn write_file_creates_and_backs_up() {
         let ws = temp_dir();
         let backups = temp_dir();
-        let registry = build_registry(&ws, &backups, &ws);
+        let registry = build_registry(&ws, &backups, &ws, &ws);
 
         let created = registry
             .call("write_file", json!({ "path": "a.txt", "content": "one" }))
@@ -517,7 +565,7 @@ mod tests {
     #[tokio::test]
     async fn run_command_captures_output() {
         let ws = temp_dir();
-        let registry = build_registry(&ws, &ws, &ws);
+        let registry = build_registry(&ws, &ws, &ws, &ws);
         let result = registry
             .call("run_command", json!({ "command": "echo hello" }))
             .await
@@ -533,7 +581,7 @@ mod tests {
     #[tokio::test]
     async fn critical_command_refused() {
         let ws = temp_dir();
-        let registry = build_registry(&ws, &ws, &ws);
+        let registry = build_registry(&ws, &ws, &ws, &ws);
         let err = registry
             .call("run_command", json!({ "command": "rm -rf /" }))
             .await
@@ -545,7 +593,7 @@ mod tests {
     #[tokio::test]
     async fn memory_write_then_read_and_reject_unknown() {
         let dir = temp_dir();
-        let registry = build_registry(&dir, &dir, &dir);
+        let registry = build_registry(&dir, &dir, &dir, &dir);
 
         registry
             .call(
