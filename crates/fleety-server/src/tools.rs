@@ -39,6 +39,12 @@ pub fn build_registry(
     registry.register(Box::new(GitDiff {
         root: workspace.to_path_buf(),
     }));
+    registry.register(Box::new(GitLog {
+        root: workspace.to_path_buf(),
+    }));
+    registry.register(Box::new(GitShow {
+        root: workspace.to_path_buf(),
+    }));
     registry.register(Box::new(WriteFile {
         root: workspace.to_path_buf(),
         backups: backups_dir.to_path_buf(),
@@ -325,6 +331,56 @@ impl Tool for GitDiff {
     async fn call(&self, _args: Value) -> Result<Value> {
         let diff = run_git(&self.root, &["diff"])?;
         Ok(json!({ "diff": diff }))
+    }
+}
+
+struct GitLog {
+    root: PathBuf,
+}
+
+#[async_trait]
+impl Tool for GitLog {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "git_log".to_string(),
+            description: "Show recent commits (`git log --oneline`).".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "limit": { "type": "integer", "description": "max commits (default 20)" } }
+            }),
+            risk: RiskLevel::Read,
+        }
+    }
+
+    async fn call(&self, args: Value) -> Result<Value> {
+        let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(20);
+        let log = run_git(&self.root, &["log", "--oneline", "-n", &limit.to_string()])?;
+        Ok(json!({ "log": log }))
+    }
+}
+
+struct GitShow {
+    root: PathBuf,
+}
+
+#[async_trait]
+impl Tool for GitShow {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "git_show".to_string(),
+            description: "Show a commit or object (`git show <ref>`).".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "ref": { "type": "string", "description": "commit/ref (default HEAD)" } }
+            }),
+            risk: RiskLevel::Read,
+        }
+    }
+
+    async fn call(&self, args: Value) -> Result<Value> {
+        let reference = args.get("ref").and_then(Value::as_str).unwrap_or("HEAD");
+        let show = run_git(&self.root, &["show", "--stat", reference])?;
+        Ok(json!({ "show": show }))
     }
 }
 
@@ -919,6 +975,45 @@ mod tests {
         let matches = result["matches"].as_array().expect("matches array");
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0]["line"], json!(2));
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn git_log_and_show_on_real_repo() {
+        let ws = temp_dir();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&ws)
+                .args(args)
+                .output()
+        };
+        let _ = git(&["init"]);
+        let _ = git(&["config", "user.email", "t@example.com"]);
+        let _ = git(&["config", "user.name", "tester"]);
+        std::fs::write(ws.join("f.txt"), "hi").expect("write");
+        let _ = git(&["add", "."]);
+        let committed = git(&["commit", "-m", "first commit"])
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !committed {
+            // git unavailable in this environment; skip.
+            let _ = std::fs::remove_dir_all(&ws);
+            return;
+        }
+        let registry = build_registry(&ws, &ws, &ws, &ws.join("h.jsonl"), &ws);
+
+        let log = registry.call("git_log", json!({})).await.expect("log");
+        assert!(log["log"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("first commit"));
+        let show = registry.call("git_show", json!({})).await.expect("show");
+        assert!(show["show"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("first commit"));
+
         let _ = std::fs::remove_dir_all(&ws);
     }
 
