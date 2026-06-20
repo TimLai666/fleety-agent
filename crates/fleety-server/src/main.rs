@@ -10,6 +10,7 @@
 
 mod conn;
 mod echo;
+mod schedules;
 mod storage;
 mod tools;
 

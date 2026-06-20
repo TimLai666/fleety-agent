@@ -25,6 +25,7 @@ pub fn build_registry(
     memory_dir: &Path,
     history_path: &Path,
     devices_dir: &Path,
+    schedules_dir: &Path,
 ) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(ReadFile {
@@ -74,6 +75,7 @@ pub fn build_registry(
     registry.register(Box::new(DeviceShow {
         devices_dir: devices_dir.to_path_buf(),
     }));
+    crate::schedules::register(&mut registry, schedules_dir);
     registry
 }
 
@@ -805,7 +807,7 @@ mod tests {
     #[tokio::test]
     async fn read_and_list_within_root() {
         let root = std::env::current_dir().expect("cwd");
-        let registry = build_registry(&root, &root, &root, &root, &root);
+        let registry = build_registry(&root, &root, &root, &root, &root, &root);
         // Cargo.toml exists at the repo/workspace root in tests run from a crate dir's parent;
         // use list_dir on "." which always resolves.
         let listed = registry
@@ -818,7 +820,7 @@ mod tests {
     #[tokio::test]
     async fn path_escape_is_rejected() {
         let root = std::env::current_dir().expect("cwd");
-        let registry = build_registry(&root, &root, &root, &root, &root);
+        let registry = build_registry(&root, &root, &root, &root, &root, &root);
         let result = registry
             .call("read_file", json!({ "path": "../../../../etc/passwd" }))
             .await;
@@ -828,7 +830,7 @@ mod tests {
     #[tokio::test]
     async fn missing_arg_is_actionable() {
         let root = std::env::current_dir().expect("cwd");
-        let registry = build_registry(&root, &root, &root, &root, &root);
+        let registry = build_registry(&root, &root, &root, &root, &root, &root);
         let err = registry
             .call("read_file", json!({}))
             .await
@@ -846,7 +848,7 @@ mod tests {
     async fn write_file_creates_and_backs_up() {
         let ws = temp_dir();
         let backups = temp_dir();
-        let registry = build_registry(&ws, &backups, &ws, &ws, &ws);
+        let registry = build_registry(&ws, &backups, &ws, &ws, &ws, &ws);
 
         let created = registry
             .call("write_file", json!({ "path": "a.txt", "content": "one" }))
@@ -875,7 +877,7 @@ mod tests {
     #[tokio::test]
     async fn run_command_captures_output() {
         let ws = temp_dir();
-        let registry = build_registry(&ws, &ws, &ws, &ws, &ws);
+        let registry = build_registry(&ws, &ws, &ws, &ws, &ws, &ws);
         let result = registry
             .call("run_command", json!({ "command": "echo hello" }))
             .await
@@ -891,7 +893,7 @@ mod tests {
     #[tokio::test]
     async fn critical_command_refused() {
         let ws = temp_dir();
-        let registry = build_registry(&ws, &ws, &ws, &ws, &ws);
+        let registry = build_registry(&ws, &ws, &ws, &ws, &ws, &ws);
         let err = registry
             .call("run_command", json!({ "command": "rm -rf /" }))
             .await
@@ -903,7 +905,7 @@ mod tests {
     #[tokio::test]
     async fn memory_write_then_read_and_reject_unknown() {
         let dir = temp_dir();
-        let registry = build_registry(&dir, &dir, &dir, &dir, &dir);
+        let registry = build_registry(&dir, &dir, &dir, &dir, &dir, &dir);
 
         registry
             .call(
@@ -934,7 +936,7 @@ mod tests {
         let ws = temp_dir();
         let backups = temp_dir();
         std::fs::write(ws.join("c.txt"), "alpha\nbeta\nalpha\n").expect("write");
-        let registry = build_registry(&ws, &backups, &ws, &ws.join("h.jsonl"), &ws);
+        let registry = build_registry(&ws, &backups, &ws, &ws.join("h.jsonl"), &ws, &ws);
 
         // "beta" is unique -> replaced
         let ok = registry
@@ -967,7 +969,7 @@ mod tests {
         let ws = temp_dir();
         std::fs::write(ws.join("a.txt"), "hello world\nfoo bar\n").expect("write");
         let history = ws.join("h.jsonl");
-        let registry = build_registry(&ws, &ws, &ws, &history, &ws);
+        let registry = build_registry(&ws, &ws, &ws, &history, &ws, &ws);
         let result = registry
             .call("search_files", json!({ "query": "foo" }))
             .await
@@ -1001,7 +1003,7 @@ mod tests {
             let _ = std::fs::remove_dir_all(&ws);
             return;
         }
-        let registry = build_registry(&ws, &ws, &ws, &ws.join("h.jsonl"), &ws);
+        let registry = build_registry(&ws, &ws, &ws, &ws.join("h.jsonl"), &ws, &ws);
 
         let log = registry.call("git_log", json!({})).await.expect("log");
         assert!(log["log"]
@@ -1024,7 +1026,7 @@ mod tests {
         std::fs::create_dir_all(&pi).expect("mkdir");
         std::fs::write(pi.join("device.json"), r#"{"id":"pi","status":"active"}"#).expect("write");
         let history = devices.join("h.jsonl");
-        let registry = build_registry(&devices, &devices, &devices, &history, &devices);
+        let registry = build_registry(&devices, &devices, &devices, &history, &devices, &devices);
 
         let list = registry.call("device_list", json!({})).await.expect("list");
         assert_eq!(list["devices"].as_array().map(Vec::len).unwrap_or(0), 1);

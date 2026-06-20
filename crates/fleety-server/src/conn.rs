@@ -84,6 +84,7 @@ pub async fn handle_conn(
         &storage.memory_dir(),
         &storage.history_path(&device_id),
         &storage.devices_dir(),
+        &storage.schedules_dir(),
     );
 
     while let Some(msg) = read_client(&mut rx).await? {

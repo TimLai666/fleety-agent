@@ -136,6 +136,11 @@ impl Storage {
         self.home.join("fleet").join("devices")
     }
 
+    /// Directory holding the agent's schedules.
+    pub fn schedules_dir(&self) -> PathBuf {
+        self.home.join("fleet").join("schedules")
+    }
+
     /// Ensure a device is registered: create `devices/{id}/device.json` (with
     /// defaults) and an initial `NOTES.md` if missing, and stamp `last_seen`.
     /// v0 stores the record as JSON; the spec's device.yaml has the same fields.
