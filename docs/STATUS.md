@@ -17,6 +17,8 @@ Done and on `main` since this backlog was generated:
 - **#8 (core)** — device registry: `device.json` + initial `NOTES.md` created/refreshed on connect; `device_list` / `device_show` tools.
 - **enrollment UX** — `fleety init <agent-url>` connects, registers the device, saves `~/.fleety/config.json`; `ask`/`resume` fall back to the saved URL. (Pairing codes + tokens still pending.)
 - **search_files** + **edit_file** — recursive content search and precise unique find/replace (with backup). Workspace tool set now: read/list/search/write/edit/run/git_status/git_diff (8) + memory×2 + history + device×2 = 15 tools.
+- **context compaction** — `run_turn` summarizes older turns once over `compact_threshold_chars` (reversible; full history in the event log).
+- **#2 approval gating (core)** — `Policy` + `ApprovalGate` in agent-core; under `RequireApproval`, non-read tools are gated and a denial is fed back rather than executed. (Interactive WebSocket gate still pending; server runs `FullAccess`.)
 
 Still open below — and these are the **heavier, architectural** items that need fresh design context to do well: approval pause/wait flow (#2), device-scoping enforcement on handles (#5), client_session tool bridge (#11), SSE streaming, `/models` discovery, connectors (SSH/HTTP/daemon), fleetyd daemon, ratatui TUI, context compaction, scheduling fire-loop, browser/computer-use, wiki, skills/MCP runtime, updater.
 
