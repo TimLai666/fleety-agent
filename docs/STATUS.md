@@ -14,7 +14,9 @@ Done and on `main` since this backlog was generated:
 - **#1 risk class** — `RiskLevel` (read/mutate/critical) on `ToolSpec`; tools self-classify.
 - **#6 core memory** — `ME.md`/`USER.md`/`TODO.md` auto-injected each turn (ME defaults to Fleety); `memory_read`/`memory_write` tools so the agent records what it learns.
 - **#9 (partial)** — `Hello` protocol-version check; `history_list` tool over the audit log.
-- **#8 (core)** — device registry: `device.json` + initial `NOTES.md` created/refreshed on connect; `device_list` / `device_show` tools. (Full enrollment — `fleety init`, pairing codes, tokens — still pending.)
+- **#8 (core)** — device registry: `device.json` + initial `NOTES.md` created/refreshed on connect; `device_list` / `device_show` tools.
+- **enrollment UX** — `fleety init <agent-url>` connects, registers the device, saves `~/.fleety/config.json`; `ask`/`resume` fall back to the saved URL. (Pairing codes + tokens still pending.)
+- **search_files** — recursive workspace content search tool (completes read/list/search/write/run/git tool set).
 
 Still open below — and these are the **heavier, architectural** items that need fresh design context to do well: approval pause/wait flow (#2), device-scoping enforcement on handles (#5), client_session tool bridge (#11), SSE streaming, `/models` discovery, connectors (SSH/HTTP/daemon), fleetyd daemon, ratatui TUI, context compaction, scheduling fire-loop, browser/computer-use, wiki, skills/MCP runtime, updater.
 
