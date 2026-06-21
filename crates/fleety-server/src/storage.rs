@@ -71,11 +71,17 @@ fn validate_id(kind: &str, id: &str) -> Result<()> {
 /// Filesystem-backed conversation store rooted at the Agent home.
 pub struct Storage {
     home: PathBuf,
+    /// Serializes the read-count-then-write critical section in `append` so
+    /// concurrent appends can't assign the same `seq` (TOCTOU).
+    append_lock: std::sync::Mutex<()>,
 }
 
 impl Storage {
     pub fn new(home: PathBuf) -> Self {
-        Self { home }
+        Self {
+            home,
+            append_lock: std::sync::Mutex::new(()),
+        }
     }
 
     fn conversation_path(&self, device_id: &str, conversation_id: &str) -> PathBuf {
@@ -98,6 +104,11 @@ impl Storage {
                 CoreError::Message(format!("cannot create {}: {e}", parent.display()))
             })?;
         }
+        // Atomically assign seq: hold the lock across the count-then-write.
+        let _guard = self
+            .append_lock
+            .lock()
+            .map_err(|_| CoreError::Message("storage append lock poisoned".to_string()))?;
         let seq = read_events(&path)?.len() as u64 + 1;
         let record = serde_json::json!({ "seq": seq, "message": message });
         let line = serde_json::to_string(&record)
