@@ -56,8 +56,9 @@ fn build_provider() -> Arc<dyn ModelProvider> {
     ) {
         (Ok(base_url), Ok(model)) => {
             let key = std::env::var("FLEETY_MODEL_KEY").ok();
-            tracing::info!(%base_url, %model, "using OpenAI-compatible provider");
-            Arc::new(OpenAiCompat::new(base_url, model, key))
+            let stream = std::env::var("FLEETY_MODEL_STREAM").as_deref() == Ok("1");
+            tracing::info!(%base_url, %model, stream, "using OpenAI-compatible provider");
+            Arc::new(OpenAiCompat::new(base_url, model, key).with_streaming(stream))
         }
         _ => {
             tracing::info!("no FLEETY_MODEL_BASE_URL/FLEETY_MODEL set; using echo provider");

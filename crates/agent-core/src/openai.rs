@@ -16,6 +16,7 @@ pub struct OpenAiCompat {
     model: String,
     api_key: Option<String>,
     client: reqwest::Client,
+    stream: bool,
 }
 
 impl OpenAiCompat {
@@ -30,7 +31,16 @@ impl OpenAiCompat {
             model: model.into(),
             api_key,
             client: reqwest::Client::new(),
+            stream: false,
         }
+    }
+
+    /// Request the streaming (`stream: true`) chat-completions API and assemble
+    /// the SSE chunks into a full response. The result is identical to the
+    /// non-streaming path; useful for endpoints that prefer/require streaming.
+    pub fn with_streaming(mut self, stream: bool) -> Self {
+        self.stream = stream;
+        self
     }
 
     fn endpoint(&self) -> String {
@@ -92,6 +102,9 @@ impl ModelProvider for OpenAiCompat {
                 json!(tools.iter().map(wire_tool).collect::<Vec<_>>()),
             );
         }
+        if self.stream {
+            body.insert("stream".to_string(), json!(true));
+        }
 
         let mut request = self.client.post(self.endpoint()).json(&Value::Object(body));
         if let Some(key) = &self.api_key {
@@ -112,11 +125,86 @@ impl ModelProvider for OpenAiCompat {
             )));
         }
 
+        if self.stream {
+            return assemble_sse(&text);
+        }
         let parsed: ChatResponse = serde_json::from_str(&text).map_err(|e| {
             CoreError::Provider(format!("unexpected response shape: {e}; body: {text}"))
         })?;
         parse_response(parsed)
     }
+}
+
+/// Assemble an OpenAI SSE stream body (`data: {chunk}` lines, terminated by
+/// `data: [DONE]`) into a full [`ModelResponse`]: concatenated content and
+/// tool-call deltas merged by index.
+fn assemble_sse(body: &str) -> Result<ModelResponse> {
+    let mut content = String::new();
+    // (id, name, accumulated-arguments) per tool-call index.
+    let mut calls: Vec<(String, String, String)> = Vec::new();
+    for line in body.lines() {
+        let data = match line.trim().strip_prefix("data:") {
+            Some(d) => d.trim(),
+            None => continue,
+        };
+        if data == "[DONE]" {
+            break;
+        }
+        let Ok(chunk) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
+        let delta = &chunk["choices"][0]["delta"];
+        if let Some(c) = delta.get("content").and_then(Value::as_str) {
+            content.push_str(c);
+        }
+        if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
+            for tc in tool_calls {
+                let idx = tc.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                while calls.len() <= idx {
+                    calls.push((String::new(), String::new(), String::new()));
+                }
+                if let Some(id) = tc.get("id").and_then(Value::as_str) {
+                    if !id.is_empty() {
+                        calls[idx].0 = id.to_string();
+                    }
+                }
+                if let Some(func) = tc.get("function") {
+                    if let Some(name) = func.get("name").and_then(Value::as_str) {
+                        calls[idx].1.push_str(name);
+                    }
+                    if let Some(args) = func.get("arguments").and_then(Value::as_str) {
+                        calls[idx].2.push_str(args);
+                    }
+                }
+            }
+        }
+    }
+    let tool_calls: Vec<ToolCall> = calls
+        .into_iter()
+        .filter(|(_, name, _)| !name.is_empty())
+        .map(|(id, name, args)| ToolCall {
+            id: if id.is_empty() {
+                format!("call_{name}")
+            } else {
+                id
+            },
+            name,
+            arguments: parse_args(&args),
+        })
+        .collect();
+    let content = if content.is_empty() && !tool_calls.is_empty() {
+        None
+    } else {
+        Some(content)
+    };
+    Ok(ModelResponse {
+        message: Message {
+            role: Role::Assistant,
+            content,
+            tool_calls,
+            tool_call_id: None,
+        },
+    })
 }
 
 // --- wire mapping (pure, unit-tested without network) ---
@@ -235,6 +323,38 @@ struct ResponseFunction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn assemble_sse_streams_content_and_tool_calls() {
+        let mut body = String::new();
+        body.push_str(&format!(
+            "data: {}\n",
+            json!({"choices":[{"delta":{"content":"Hel"}}]})
+        ));
+        body.push_str(&format!(
+            "data: {}\n",
+            json!({"choices":[{"delta":{"content":"lo"}}]})
+        ));
+        body.push_str("data: [DONE]\n");
+        let r = assemble_sse(&body).expect("assemble");
+        assert_eq!(r.message.content.as_deref(), Some("Hello"));
+        assert!(r.message.tool_calls.is_empty());
+
+        let mut tb = String::new();
+        tb.push_str(&format!(
+            "data: {}\n",
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"echo","arguments":"{\"x\":"}}]}}]})
+        ));
+        tb.push_str(&format!(
+            "data: {}\n",
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]}}]})
+        ));
+        tb.push_str("data: [DONE]\n");
+        let r2 = assemble_sse(&tb).expect("assemble2");
+        assert_eq!(r2.message.tool_calls.len(), 1);
+        assert_eq!(r2.message.tool_calls[0].name, "echo");
+        assert_eq!(r2.message.tool_calls[0].arguments, json!({ "x": 1 }));
+    }
 
     #[test]
     fn endpoint_trims_trailing_slash() {
