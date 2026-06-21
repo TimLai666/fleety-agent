@@ -1,8 +1,8 @@
 # Fleety
 
-Fleety is a cross-device, full-access agent and device-fleet assistant. Summon the
-agent from any device; it knows where the message came from, what each device can
-do, and routes each task to the device best able to finish it.
+Fleety is a real J.A.R.V.I.S. — a cross-device, full-access agent and device-fleet
+assistant. Summon the agent from any device; it knows where the message came from,
+what each device can do, and routes each task to the device best able to finish it.
 
 > **Status: v0 implemented.** Working cross-device agent — WebSocket server +
 > agent loop, CLI and interactive TUI, on-device execution (client_session bridge
