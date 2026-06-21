@@ -178,53 +178,62 @@ fn resolve_in_root(root: &Path, rel: &str) -> Result<PathBuf> {
     Ok(resolved)
 }
 
-/// Recursively search files under `dir` for lines containing `query`, pushing
-/// matches (relative to `root`) into `out`, bounded by `max`.
-fn search_dir(dir: &Path, root: &Path, query: &str, max: usize, out: &mut Vec<Value>) {
-    if out.len() >= max {
-        return;
-    }
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
+/// Search files under `base` (within `root`) for a regex, using the ripgrep
+/// engine: respects `.gitignore`, skips hidden/binary files, never follows
+/// symlinks (workspace boundary), bounded by `max`. Returns `{file,line,text}`.
+fn ripgrep_search(base: &Path, root: &Path, pattern: &str, max: usize) -> Result<Vec<Value>> {
+    use grep::regex::RegexMatcher;
+    use grep::searcher::sinks::UTF8;
+    use grep::searcher::Searcher;
+    use ignore::WalkBuilder;
+
+    let matcher = RegexMatcher::new(pattern)
+        .map_err(|e| CoreError::Message(format!("invalid search regex '{pattern}': {e}")))?;
+    let mut out: Vec<Value> = Vec::new();
+
+    let walker = WalkBuilder::new(base)
+        .hidden(true) // skip dotfiles
+        .parents(false) // don't consult .gitignore above the workspace
+        .follow_links(false) // never follow symlinks out of the workspace
+        .filter_entry(|entry| {
+            let name = entry.file_name().to_string_lossy();
+            !matches!(
+                name.as_ref(),
+                "target" | "node_modules" | ".fleety-backups" | ".git"
+            )
+        })
+        .build();
+
+    for dent in walker {
         if out.len() >= max {
-            return;
+            break;
         }
-        let path = entry.path();
-        // Skip symlinks: following them (file or dir) can read outside the
-        // workspace boundary that resolve_in_root otherwise enforces.
-        if entry.file_type().map(|t| t.is_symlink()).unwrap_or(false) {
+        let dent = match dent {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        if !dent.file_type().map(|t| t.is_file()).unwrap_or(false) {
             continue;
         }
-        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        if is_dir {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if matches!(
-                name.as_ref(),
-                ".git" | "target" | "node_modules" | ".fleety-backups"
-            ) {
-                continue;
-            }
-            search_dir(&path, root, query, max, out);
-        } else if let Ok(content) = std::fs::read_to_string(&path) {
-            let rel = path
-                .strip_prefix(root)
-                .unwrap_or(&path)
-                .display()
-                .to_string();
-            for (index, line) in content.lines().enumerate() {
-                if line.contains(query) {
-                    out.push(json!({ "file": rel, "line": index + 1, "text": line.trim() }));
-                    if out.len() >= max {
-                        return;
-                    }
+        let path = dent.path();
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .display()
+            .to_string();
+        let mut searcher = Searcher::new();
+        let _ = searcher.search_path(
+            &matcher,
+            path,
+            UTF8(|lnum, line| {
+                if out.len() < max {
+                    out.push(json!({ "file": rel, "line": lnum, "text": line.trim_end() }));
                 }
-            }
-        }
+                Ok(out.len() < max)
+            }),
+        );
     }
+    Ok(out)
 }
 
 fn require_str<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
@@ -562,7 +571,7 @@ impl Tool for SearchFiles {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "search_files".to_string(),
-            description: "Search file contents in the workspace for a substring; returns file/line/text matches.".to_string(),
+            description: "Search workspace file contents by regex (ripgrep engine: respects .gitignore, skips binaries); returns file/line/text matches.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -595,8 +604,7 @@ impl Tool for SearchFiles {
             .get("max_results")
             .and_then(Value::as_u64)
             .unwrap_or(100) as usize;
-        let mut matches = Vec::new();
-        search_dir(&base, &canon_root, query, max, &mut matches);
+        let matches = ripgrep_search(&base, &canon_root, query, max)?;
         let truncated = matches.len() >= max;
         Ok(json!({ "matches": matches, "truncated": truncated }))
     }

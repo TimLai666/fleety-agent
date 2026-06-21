@@ -23,3 +23,5 @@ serde_json = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
 reqwest = { workspace = true }
+grep = "0.3"
+ignore = "0.4"
