@@ -4,9 +4,41 @@ Fleety is a cross-device, full-access agent and device-fleet assistant. Summon t
 agent from any device; it knows where the message came from, what each device can
 do, and routes each task to the device best able to finish it.
 
-> **Status: M0 — workspace skeleton.** Compiles and runs; no agent service yet.
-> Design lives in [`docs/spec-v0.md`](docs/spec-v0.md); the agent system prompt is
-> in [`prompts/`](prompts/).
+> **Status: v0 implemented.** Working cross-device agent — WebSocket server +
+> agent loop, CLI and interactive TUI, on-device execution (client_session bridge
+> + SSH), browser automation (CDP), scheduling, skills/MCP/wiki, and fleetyd
+> connect/autostart/self-update. See [`docs/STATUS.md`](docs/STATUS.md) for the
+> full picture; design is in [`docs/spec-v0.md`](docs/spec-v0.md).
+
+## Install
+
+Install the `fleety` CLI with one line — it fetches the latest release for your
+platform and puts `fleety` on your PATH:
+
+**macOS / Linux**
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/TimLai666/fleety-agent/main/scripts/install.sh | sh
+```
+
+**Windows (PowerShell)**
+
+```powershell
+irm https://raw.githubusercontent.com/TimLai666/fleety-agent/main/scripts/install.ps1 | iex
+```
+
+Then point it at your agent and chat:
+
+```sh
+fleety init ws://your-agent-host:8787   # save the agent URL
+fleety tui                              # interactive UI  (or: fleety ask "hello")
+```
+
+Override the install location with `FLEETY_INSTALL_DIR`. The one-liners pull from
+the newest [GitHub Release](https://github.com/TimLai666/fleety-agent/releases) —
+maintainers cut one by pushing a tag (`git tag v0.1.0 && git push origin v0.1.0`),
+which triggers [`.github/workflows/release.yml`](.github/workflows/release.yml) to
+build and attach the per-platform binaries.
 
 ## Workspace
 
