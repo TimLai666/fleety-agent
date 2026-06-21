@@ -138,27 +138,81 @@ fn backup_existing(backups: &Path, rel: &str, resolved: &Path) -> Result<Value> 
     Ok(json!({ "id": id, "path": backup_path.display().to_string() }))
 }
 
-/// v0 critical-command guard (deliberately permissive: only clearly
-/// irreversible commands are refused). A real semantic classifier comes later.
+/// Critical-command guard: refuses clearly irreversible commands. Deliberately
+/// conservative to avoid blocking ordinary work (e.g. `rm -rf ./build` or
+/// `rm -rf node_modules`); a semantic classifier is future work. Whitespace is
+/// normalized first so spacing variations don't slip past.
 fn critical_reason(command: &str) -> Option<&'static str> {
-    let c = command.to_lowercase();
+    let norm = command
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if let Some(reason) = catastrophic_delete(&norm) {
+        return Some(reason);
+    }
+
     const PATTERNS: &[(&str, &str)] = &[
-        ("rm -rf /", "recursive delete of the filesystem root"),
-        ("rm -rf /*", "recursive delete of the filesystem root"),
         ("mkfs", "formatting a filesystem"),
-        ("dd if=", "raw disk write"),
+        ("dd if=", "raw disk read/write"),
+        ("of=/dev/", "raw write to a block device"),
+        ("> /dev/sd", "overwriting a block device"),
+        ("> /dev/nvme", "overwriting a block device"),
+        ("wipefs", "wiping filesystem signatures"),
+        ("shred ", "secure-erasing data"),
+        ("fdisk", "disk partitioning"),
+        ("parted", "disk partitioning"),
         (":(){", "fork bomb"),
         ("shutdown", "shutting down the host"),
         ("reboot", "rebooting the host"),
+        ("poweroff", "powering off the host"),
+        ("init 0", "shutting down the host"),
+        ("init 6", "rebooting the host"),
+        // Windows / PowerShell
         ("format ", "formatting a disk"),
         ("del /f /s /q", "mass file deletion"),
+        ("del /s", "recursive file deletion"),
         ("rd /s", "recursive directory deletion"),
+        ("rmdir /s", "recursive directory deletion"),
         ("diskpart", "disk partitioning"),
+        ("format-volume", "formatting a volume"),
+        ("clear-disk", "wiping a disk"),
+        ("cipher /w", "wiping free disk space"),
     ];
     PATTERNS
         .iter()
-        .find(|(p, _)| c.contains(p))
+        .find(|(p, _)| norm.contains(p))
         .map(|(_, why)| *why)
+}
+
+/// A recursive+forced delete aimed at a *catastrophic* target (filesystem root,
+/// home, or `--no-preserve-root`) — not an ordinary `rm -rf ./build`.
+fn catastrophic_delete(norm: &str) -> Option<&'static str> {
+    let is_rm = norm.starts_with("rm ")
+        || norm.contains("; rm ")
+        || norm.contains("&& rm ")
+        || norm.contains("sudo rm ");
+    if !is_rm {
+        return None;
+    }
+    let recursive = norm.contains(" -r") || norm.contains("--recursive");
+    let force = norm.contains(" -f")
+        || norm.contains(" -rf")
+        || norm.contains(" -fr")
+        || norm.contains("--force");
+    if !(recursive && force) {
+        return None;
+    }
+    let catastrophic_target = norm
+        .split(' ')
+        .any(|t| matches!(t, "/" | "/*" | "~" | "~/" | "~/*" | "$home" | "$home/*"))
+        || norm.contains("--no-preserve-root");
+    if catastrophic_target {
+        Some("recursive forced delete of a root/home path")
+    } else {
+        None
+    }
 }
 
 /// Resolve `rel` against `root`, refusing paths that escape the workspace.
@@ -925,6 +979,36 @@ mod tests {
             .expect_err("should refuse");
         assert!(err.report().message.contains("refused"));
         let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn critical_guard_flags_irreversible_but_not_ordinary() {
+        // Catastrophic — refused.
+        for c in [
+            "rm -rf /",
+            "rm  -rf   /",
+            "sudo rm -rf ~",
+            "rm -rf --no-preserve-root /",
+            "mkfs.ext4 /dev/sda1",
+            "dd if=/dev/zero of=/dev/sda",
+            "echo x > /dev/sda",
+            "shutdown -h now",
+            "diskpart",
+            "Remove-Item; del /s /q C:\\data",
+        ] {
+            assert!(critical_reason(c).is_some(), "should refuse: {c}");
+        }
+        // Ordinary — allowed.
+        for c in [
+            "rm -rf ./build",
+            "rm -rf node_modules",
+            "rm -rf target/debug",
+            "ls -la /",
+            "cargo build",
+            "git status",
+        ] {
+            assert!(critical_reason(c).is_none(), "should allow: {c}");
+        }
     }
 
     #[tokio::test]
