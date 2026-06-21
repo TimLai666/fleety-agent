@@ -24,6 +24,11 @@ This is the source of truth for the tools the Fleety Agent (the LLM) may call. `
 | `harness` | Open a session; returns `session_id` + runtime/policy info. Call first. | — | read |
 | `device_list` | List known devices with status, roles, connectors. | `status?`, `tag?` | read |
 | `device_show` | Full record for one device: device.yaml, all `connectors[]` + each one's state and scope (`local`/`remote`), `mobility` (stationary/mobile/unknown), `site`, last_seen. | `device` | read |
+| `site_list` | List known sites (locations). | — | read |
+| `site_show` | A site plus the devices located there. | `site` | read |
+| `site_set` | Create/update a site (location). | `id`, `name?`, `description?` | mutate |
+| `site_delete` | Delete a site (leaves device records). | `id` | mutate |
+| `device_set_site` | Assign a device to a registered site. | `device`, `site` | mutate |
 | `project_list` | List registered projects/workspaces (optionally for one device). | `device?` | read |
 | `project_current` | Resolve which workspace a `device`/`project` points at. | `device?`, `project?` | read |
 | `list_skills` | List available skills + metadata. | — | read |
