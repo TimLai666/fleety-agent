@@ -44,27 +44,61 @@ build and attach the per-platform binaries.
 
 | Crate | Role |
 |---|---|
-| [`crates/agent-core`](crates/agent-core) | Generic agent core (errors, never-crash primitives, observability). The future standalone framework — depends on no Fleety crate. |
-| [`crates/fleety-protocol`](crates/fleety-protocol) | Wire types shared by CLI / daemon / server. |
-| [`crates/fleety-server`](crates/fleety-server) | Fleety Agent server (`fleety-server`). |
-| [`crates/fleety-daemon`](crates/fleety-daemon) | Device background service (`fleetyd`). |
-| [`crates/fleety-cli`](crates/fleety-cli) | CLI / TUI (`fleety`). |
+| [`crates/agent-core`](crates/agent-core) | Generic agent core: the never-crash tool-calling loop, `ModelProvider` (OpenAI-compatible), approval gating, context compaction, errors/observability. The future standalone framework — depends on no Fleety crate. |
+| [`crates/fleety-protocol`](crates/fleety-protocol) | Wire types shared by CLI / daemon / server (incl. the on-device `RunTool`/`ToolResult` frames). |
+| [`crates/fleety-server`](crates/fleety-server) | Fleety Agent server (`fleety-server`): runs the agent loop, the tool surface, cross-device routing, and the scheduler. |
+| [`crates/fleety-daemon`](crates/fleety-daemon) | Device background service (`fleetyd`): connects, runs on-device tools, `install`/`update`. |
+| [`crates/fleety-cli`](crates/fleety-cli) | CLI + interactive TUI (`fleety`): `init` / `ask` / `resume` / `tui`. |
 
 Dependency rule: everything may depend on `agent-core`; `agent-core` depends on
 nothing Fleety-specific, so it can later be extracted to its own repo and mounted
 back as a git submodule.
 
-## Build
+## What it can do
+
+The agent exposes ~38 tools: workspace files + git (`read_file`, `list_dir`,
+`search_files`, `write_file`, `edit_file`, `run_command`, `git_*`), memory and
+audit history, a knowledge wiki, HTTP (`fetch_url` / `http_request`), self-managed
+scheduling (`schedule_*` with a fire loop + per-schedule mandate), a skills + MCP
+runtime, and **cross-device execution** — run tools on another connected device
+(`device_exec`, via the daemon), over SSH (`ssh_exec`), or drive a Chrome over the
+DevTools Protocol (`browser_navigate` / `browser_eval` / `browser_screenshot`).
+Safety throughout: risk classes + approval gating, workspace path-escape and SSRF
+guards, rollback backups, and device-scoped handles. The loop never crashes —
+errors come back as messages.
+
+## Build & test
 
 ```sh
 cargo build --workspace
 cargo test --workspace
-cargo run -p fleety-server
 ```
+
+## Run
+
+```sh
+# Server (defaults to ws://127.0.0.1:8787). With no model env set it echoes;
+# point it at any OpenAI-compatible endpoint to use a real model:
+FLEETY_MODEL_BASE_URL=http://localhost:1234/v1 FLEETY_MODEL=your-model \
+  cargo run -p fleety-server
+
+# Client (separate shell): save the URL, then chat.
+cargo run -p fleety-cli -- init ws://127.0.0.1:8787
+cargo run -p fleety-cli -- tui        # or: ask "hello"  /  resume <conversation_id>
+
+# A device daemon (optional): connect a device so the agent can operate it.
+cargo run -p fleety-daemon            # fleetyd install → autostart; fleetyd update → self-update
+```
+
+Useful env vars: `FLEETY_MODEL_BASE_URL` / `FLEETY_MODEL` / `FLEETY_MODEL_KEY`
+(+ `FLEETY_MODEL_STREAM=1`), `FLEETY_POLICY=require_approval` (gate non-read
+tools), `FLEETY_ADDR`, `FLEETY_WORKSPACE`, `FLEETY_AGENT_HOME`, `FLEETY_DEVICE_ROOT`,
+`FLEETY_CHROME_URL`.
 
 ## Design docs
 
 - [`docs/spec-v0.md`](docs/spec-v0.md) — v0 scope, architecture, milestones M0–M11
+- [`docs/STATUS.md`](docs/STATUS.md) — what's implemented vs. remaining (current status)
 - [`docs/tools.md`](docs/tools.md) — agent tool surface
 - [`prompts/`](prompts/) — protocol / memory / policy / rules (the agent system prompt)
 
