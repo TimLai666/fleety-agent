@@ -56,6 +56,14 @@ pub enum ClientMsg {
     Approve { approval_id: String },
     /// Deny a pending tool call (reply to `ApprovalRequested`).
     Deny { approval_id: String },
+    /// Result of an on-device tool the server dispatched (reply to `RunTool`).
+    /// `result_json` is the JSON-encoded tool result.
+    ToolResult {
+        call_id: String,
+        result_json: String,
+    },
+    /// Failure of an on-device tool the server dispatched (reply to `RunTool`).
+    ToolError { call_id: String, error: WireError },
 }
 
 /// Frames sent server -> client over the WebSocket.
@@ -88,6 +96,13 @@ pub enum ServerMsg {
         summary: String,
         risk: String,
     },
+    /// Ask the connected device's daemon to run a tool locally (on-device
+    /// execution). `args_json` is the JSON-encoded arguments object.
+    RunTool {
+        call_id: String,
+        tool: String,
+        args_json: String,
+    },
     /// The turn is complete.
     Done { conversation_id: String },
     /// Something went wrong (actionable).
@@ -108,6 +123,24 @@ mod tests {
         let json = serde_json::to_string(&err).expect("serialize");
         let back: WireError = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(err, back);
+    }
+
+    #[test]
+    fn on_device_tool_frames_roundtrip() {
+        let run = ServerMsg::RunTool {
+            call_id: "c1".into(),
+            tool: "run_command".into(),
+            args_json: r#"{"command":"echo hi"}"#.into(),
+        };
+        let json = serde_json::to_string(&run).expect("serialize");
+        assert_eq!(run, serde_json::from_str(&json).expect("deserialize"));
+
+        let result = ClientMsg::ToolResult {
+            call_id: "c1".into(),
+            result_json: r#"{"ok":true}"#.into(),
+        };
+        let json = serde_json::to_string(&result).expect("serialize");
+        assert_eq!(result, serde_json::from_str(&json).expect("deserialize"));
     }
 
     #[test]
