@@ -345,8 +345,8 @@ name = "fleety-daemon"
 version = "0.1.0"
 dependencies = [
  "agent-core",
- "async-trait",
  "fleety-protocol",
+ "fleety-tools",
  "futures",
  "reqwest",
  "serde_json",
@@ -371,15 +371,28 @@ dependencies = [
  "agent-core",
  "async-trait",
  "fleety-protocol",
+ "fleety-tools",
  "futures",
- "grep",
- "ignore",
  "reqwest",
  "serde",
  "serde_json",
  "tokio",
  "tokio-tungstenite",
  "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "fleety-tools"
+version = "0.1.0"
+dependencies = [
+ "agent-core",
+ "async-trait",
+ "grep",
+ "ignore",
+ "serde_json",
+ "similar",
+ "tokio",
  "uuid",
 ]
 
@@ -1533,6 +1546,12 @@ dependencies = [
  "errno",
  "libc",
 ]
+
+[[package]]
+name = "similar"
+version = "2.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbbb5d9659141646ae647b42fe094daf6c6192d1620870b449d9557f748b2daa"
 
 [[package]]
 name = "slab"

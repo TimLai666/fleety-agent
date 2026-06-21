@@ -1,0 +1,21 @@
+[package]
+name = "fleety-tools"
+description = "Shared workspace tools (read/list/search/write/edit/run/git/diff), root-relative so they run on the server's workspace or any device via fleetyd."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+agent-core = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+grep = "0.3"
+ignore = "0.4"
+similar = "2"
+
+[dev-dependencies]
+tokio = { workspace = true }
