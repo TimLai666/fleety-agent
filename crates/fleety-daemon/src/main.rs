@@ -70,6 +70,8 @@ async fn run() -> Result<()> {
     let hello = serde_json::to_string(&ClientMsg::Hello {
         device_id: device_id(),
         protocol: PROTOCOL_VERSION,
+        token: std::env::var("FLEETY_TOKEN").ok(),
+        pairing_code: std::env::var("FLEETY_PAIRING_CODE").ok(),
     })
     .map_err(|e| CoreError::Message(format!("serialize hello: {e}")))?;
     tx.send(WsMessage::Text(hello))

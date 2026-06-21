@@ -18,6 +18,7 @@ use agent_core::{
 };
 use fleety_protocol::{ClientMsg, ServerMsg, WireError, PROTOCOL_VERSION};
 
+use crate::auth::{self, AuthStore};
 use crate::bridge::{self, Handles, Hub, Pending};
 use crate::storage::Storage;
 
@@ -38,17 +39,20 @@ pub async fn handle_conn(
     hub: Hub,
     pending: Pending,
     handles: Handles,
+    auth: Arc<AuthStore>,
 ) -> Result<()> {
     let ws = tokio_tungstenite::accept_async(stream)
         .await
         .map_err(|e| CoreError::Provider(format!("websocket handshake failed: {e}")))?;
     let (mut tx, mut rx) = ws.split();
 
-    // The first frame must be Hello.
-    let device_id = match read_client(&mut rx).await? {
+    // The first frame must be Hello; enforce auth if the server requires it.
+    let (device_id, minted_token) = match read_client(&mut rx).await? {
         Some(ClientMsg::Hello {
             device_id,
             protocol,
+            token,
+            pairing_code,
         }) => {
             if protocol != PROTOCOL_VERSION {
                 tracing::warn!(
@@ -57,7 +61,20 @@ pub async fn handle_conn(
                     "protocol version mismatch; proceeding (only v0 exists)"
                 );
             }
-            device_id
+            match authenticate(&auth, &device_id, token, pairing_code) {
+                Ok(minted) => (device_id, minted),
+                Err(message) => {
+                    tracing::warn!(%device_id, "rejected unauthenticated connection");
+                    send_error(
+                        &mut tx,
+                        "unauthenticated",
+                        &message,
+                        "pass a valid token, or a pairing_code from `pair_create` on a paired device",
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
         }
         Some(_) => {
             send_error(
@@ -98,6 +115,8 @@ pub async fn handle_conn(
         &hub,
         &pending,
         &handles,
+        &auth,
+        minted_token,
         &device_id,
     )
     .await;
@@ -121,6 +140,8 @@ async fn serve(
     hub: &Hub,
     pending: &Pending,
     handles: &Handles,
+    auth: &Arc<AuthStore>,
+    minted_token: Option<String>,
     device_id: &str,
 ) -> Result<()> {
     let session_id = uuid::Uuid::new_v4().to_string();
@@ -132,6 +153,7 @@ async fn serve(
             session_id,
             conversation_id: default_conversation.clone(),
             protocol: PROTOCOL_VERSION,
+            token: minted_token,
         },
     )?;
 
@@ -153,6 +175,7 @@ async fn serve(
     crate::wiki::register(&mut tools, &storage.wiki_dir());
     crate::ssh::register(&mut tools);
     crate::browser::register(&mut tools);
+    auth::register(&mut tools, Arc::clone(auth));
     bridge::register(
         &mut tools,
         Arc::clone(hub),
@@ -264,6 +287,32 @@ async fn serve(
     }
 
     Ok(())
+}
+
+/// Authenticate a Hello. `Ok(Some(token))` = pairing minted a token to return;
+/// `Ok(None)` = already authenticated or auth disabled; `Err(msg)` = rejected.
+fn authenticate(
+    auth: &AuthStore,
+    device_id: &str,
+    token: Option<String>,
+    pairing_code: Option<String>,
+) -> std::result::Result<Option<String>, String> {
+    if !auth.required() {
+        return Ok(None);
+    }
+    if let Some(code) = pairing_code {
+        return auth
+            .redeem(&code, device_id)
+            .map(Some)
+            .map_err(|e| e.report().message);
+    }
+    if let Some(tok) = token {
+        if auth.verify(&tok).is_some() {
+            return Ok(None);
+        }
+        return Err("invalid token".to_string());
+    }
+    Err("this server requires authentication".to_string())
 }
 
 /// Send a frame to this connection's writer task.
@@ -405,6 +454,22 @@ mod tests {
         tx.send(WsMessage::Text(json)).await.expect("send");
     }
 
+    fn open_auth() -> Arc<AuthStore> {
+        let path = std::env::temp_dir()
+            .join(format!("fleety-auth-{}", uuid::Uuid::new_v4()))
+            .join("auth.json");
+        Arc::new(AuthStore::load(path, None, false))
+    }
+
+    fn hello(device_id: &str) -> ClientMsg {
+        ClientMsg::Hello {
+            device_id: device_id.to_string(),
+            protocol: PROTOCOL_VERSION,
+            token: None,
+            pairing_code: None,
+        }
+    }
+
     #[tokio::test]
     async fn require_approval_denies_over_websocket() {
         // Provider asks to write a file, then (after denial) finishes.
@@ -447,6 +512,7 @@ mod tests {
                     bridge::new_hub(),
                     bridge::new_pending(),
                     bridge::new_handles(),
+                    open_auth(),
                 )
                 .await;
             }
@@ -458,14 +524,7 @@ mod tests {
             .expect("connect");
         let (mut ctx, mut crx) = client.split();
 
-        send_client(
-            &mut ctx,
-            &ClientMsg::Hello {
-                device_id: "d".into(),
-                protocol: PROTOCOL_VERSION,
-            },
-        )
-        .await;
+        send_client(&mut ctx, &hello("d")).await;
         assert!(matches!(
             recv_server(&mut crx).await,
             Some(ServerMsg::Welcome { .. })
@@ -541,6 +600,7 @@ mod tests {
         let hub = bridge::new_hub();
         let pending = bridge::new_pending();
         let handles = bridge::new_handles();
+        let auth = open_auth();
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -553,20 +613,22 @@ mod tests {
             let hub = Arc::clone(&hub);
             let pending = Arc::clone(&pending);
             let handles = Arc::clone(&handles);
+            let auth = Arc::clone(&auth);
             tokio::spawn(async move {
                 for _ in 0..2 {
                     if let Ok((stream, _)) = listener.accept().await {
-                        let (s, p, w, h, pe, hd) = (
+                        let (s, p, w, h, pe, hd, a) = (
                             Arc::clone(&storage),
                             Arc::clone(&provider),
                             Arc::clone(&workspace),
                             Arc::clone(&hub),
                             Arc::clone(&pending),
                             Arc::clone(&handles),
+                            Arc::clone(&auth),
                         );
                         tokio::spawn(async move {
-                            let _ =
-                                handle_conn(stream, s, p, w, Policy::FullAccess, h, pe, hd).await;
+                            let _ = handle_conn(stream, s, p, w, Policy::FullAccess, h, pe, hd, a)
+                                .await;
                         });
                     }
                 }
@@ -580,14 +642,7 @@ mod tests {
             .await
             .expect("daemon connect");
         let (mut dtx, mut drx) = dws.split();
-        send_client(
-            &mut dtx,
-            &ClientMsg::Hello {
-                device_id: "pi".into(),
-                protocol: PROTOCOL_VERSION,
-            },
-        )
-        .await;
+        send_client(&mut dtx, &hello("pi")).await;
         assert!(matches!(
             recv_server(&mut drx).await,
             Some(ServerMsg::Welcome { .. })
@@ -609,14 +664,7 @@ mod tests {
             .await
             .expect("user connect");
         let (mut utx, mut urx) = uws.split();
-        send_client(
-            &mut utx,
-            &ClientMsg::Hello {
-                device_id: "user".into(),
-                protocol: PROTOCOL_VERSION,
-            },
-        )
-        .await;
+        send_client(&mut utx, &hello("user")).await;
         assert!(matches!(
             recv_server(&mut urx).await,
             Some(ServerMsg::Welcome { .. })
@@ -651,6 +699,108 @@ mod tests {
         );
 
         daemon.abort();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn auth_required_rejects_then_pairs() {
+        let provider: Arc<dyn ModelProvider> = Arc::new(MockProvider::new(vec![]));
+        let home = std::env::temp_dir().join(format!("fleety-authws-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&home).expect("mk");
+        let storage = Arc::new(Storage::new(home.clone()));
+        let workspace = Arc::new(home.clone());
+        let hub = bridge::new_hub();
+        let pending = bridge::new_pending();
+        let handles = bridge::new_handles();
+        let auth = Arc::new(AuthStore::load(
+            home.join("auth.json"),
+            Some("admintok".to_string()),
+            true,
+        ));
+        let code = auth.create_pairing().expect("code");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        {
+            let (storage, provider, workspace, hub, pending, handles, auth) = (
+                Arc::clone(&storage),
+                Arc::clone(&provider),
+                Arc::clone(&workspace),
+                Arc::clone(&hub),
+                Arc::clone(&pending),
+                Arc::clone(&handles),
+                Arc::clone(&auth),
+            );
+            tokio::spawn(async move {
+                for _ in 0..3 {
+                    if let Ok((stream, _)) = listener.accept().await {
+                        let (s, p, w, h, pe, hd, a) = (
+                            Arc::clone(&storage),
+                            Arc::clone(&provider),
+                            Arc::clone(&workspace),
+                            Arc::clone(&hub),
+                            Arc::clone(&pending),
+                            Arc::clone(&handles),
+                            Arc::clone(&auth),
+                        );
+                        tokio::spawn(async move {
+                            let _ = handle_conn(stream, s, p, w, Policy::FullAccess, h, pe, hd, a)
+                                .await;
+                        });
+                    }
+                }
+            });
+        }
+        let url = format!("ws://{addr}");
+
+        // 1. No credentials -> rejected.
+        let (c1, _) = tokio_tungstenite::connect_async(&url).await.expect("c1");
+        let (mut t1, mut r1) = c1.split();
+        send_client(&mut t1, &hello("d")).await;
+        assert!(matches!(
+            recv_server(&mut r1).await,
+            Some(ServerMsg::Error { .. })
+        ));
+
+        // 2. Bootstrap token -> accepted.
+        let (c2, _) = tokio_tungstenite::connect_async(&url).await.expect("c2");
+        let (mut t2, mut r2) = c2.split();
+        send_client(
+            &mut t2,
+            &ClientMsg::Hello {
+                device_id: "d".into(),
+                protocol: PROTOCOL_VERSION,
+                token: Some("admintok".into()),
+                pairing_code: None,
+            },
+        )
+        .await;
+        assert!(matches!(
+            recv_server(&mut r2).await,
+            Some(ServerMsg::Welcome { .. })
+        ));
+
+        // 3. Pairing code -> Welcome mints a token that then validates.
+        let (c3, _) = tokio_tungstenite::connect_async(&url).await.expect("c3");
+        let (mut t3, mut r3) = c3.split();
+        send_client(
+            &mut t3,
+            &ClientMsg::Hello {
+                device_id: "newdev".into(),
+                protocol: PROTOCOL_VERSION,
+                token: None,
+                pairing_code: Some(code),
+            },
+        )
+        .await;
+        let minted = match recv_server(&mut r3).await {
+            Some(ServerMsg::Welcome { token: Some(t), .. }) => t,
+            other => panic!("expected Welcome with token, got {other:?}"),
+        };
+        assert!(auth.verify(&minted).is_some());
+
         let _ = std::fs::remove_dir_all(&home);
     }
 }

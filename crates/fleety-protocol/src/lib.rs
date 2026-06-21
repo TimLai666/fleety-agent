@@ -35,8 +35,18 @@ pub struct OriginContext {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMsg {
-    /// First frame: identify the origin device.
-    Hello { device_id: String, protocol: u32 },
+    /// First frame: identify the origin device. `token` authenticates an
+    /// enrolled device; `pairing_code` enrolls a new one (the server mints and
+    /// returns a token in `Welcome`). Both optional — auth is enforced only when
+    /// the server runs with `FLEETY_REQUIRE_AUTH`.
+    Hello {
+        device_id: String,
+        protocol: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pairing_code: Option<String>,
+    },
     /// A user turn. `conversation_id` continues an existing conversation, or
     /// `None` starts a new one.
     UserMessage {
@@ -70,11 +80,15 @@ pub enum ClientMsg {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMsg {
-    /// Reply to `Hello`: the session and (initial) conversation.
+    /// Reply to `Hello`: the session and (initial) conversation. `token` is set
+    /// only right after a successful pairing — the client should save it and
+    /// authenticate with it on future connects.
     Welcome {
         session_id: String,
         conversation_id: String,
         protocol: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
     },
     /// An assistant message for a conversation, with its event `seq`.
     Assistant {

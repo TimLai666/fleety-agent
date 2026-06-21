@@ -184,6 +184,11 @@ impl Storage {
         self.home.join("skills").join("installed")
     }
 
+    /// Path to the connection-auth store (tokens + pairing codes).
+    pub fn auth_path(&self) -> PathBuf {
+        self.home.join("auth.json")
+    }
+
     /// Path to the user-installed MCP server config (JSON).
     pub fn mcp_config_path(&self) -> PathBuf {
         self.home.join("mcp").join("installed.json")

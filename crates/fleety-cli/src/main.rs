@@ -71,9 +71,21 @@ async fn main() {
                 eprintln!("error: {}", e.report().message);
             }
         }
+        Some("pair") => {
+            let code = args.get(2).cloned().unwrap_or_default();
+            if code.is_empty() {
+                eprintln!(
+                    "usage: fleety pair <pairing-code>   (from `pair_create` on a paired device)"
+                );
+                return;
+            }
+            if let Err(e) = pair(code).await {
+                eprintln!("error: {}", e.report().message);
+            }
+        }
         _ => {
             println!(
-                "fleety {} — try: fleety ask \"hello\"  |  fleety tui",
+                "fleety {} — try: fleety ask \"hello\"  |  fleety tui  |  fleety pair <code>",
                 agent_core::VERSION
             );
         }
@@ -89,14 +101,7 @@ async fn run_tui() -> Result<()> {
         .await
         .map_err(|e| CoreError::Provider(format!("cannot connect to {url}: {e}")))?;
     let (mut tx, mut rx) = ws.split();
-    send(
-        &mut tx,
-        &ClientMsg::Hello {
-            device_id: device_id(),
-            protocol: PROTOCOL_VERSION,
-        },
-    )
-    .await?;
+    send(&mut tx, &hello(None)).await?;
 
     // Blocking key reads happen on a thread and arrive over a channel.
     let (key_tx, mut key_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -198,6 +203,92 @@ fn device_id() -> String {
         .unwrap_or_else(|_| "cli-device".to_string())
 }
 
+/// The auth token saved in config (or `FLEETY_TOKEN`), for authenticated connects.
+fn saved_token() -> Option<String> {
+    if let Ok(tok) = std::env::var("FLEETY_TOKEN") {
+        if !tok.is_empty() {
+            return Some(tok);
+        }
+    }
+    let dir = fleety_dir()?;
+    let text = std::fs::read_to_string(dir.join("config.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    value
+        .get("token")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+}
+
+/// Build a Hello carrying our saved token (and an optional pairing code).
+fn hello(pairing_code: Option<String>) -> ClientMsg {
+    ClientMsg::Hello {
+        device_id: device_id(),
+        protocol: PROTOCOL_VERSION,
+        token: saved_token(),
+        pairing_code,
+    }
+}
+
+/// Persist config, preserving fields not being changed.
+fn write_config(agent_url: Option<&str>, token: Option<&str>) -> Result<()> {
+    let dir =
+        fleety_dir().ok_or_else(|| CoreError::Message("no home dir for config".to_string()))?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| CoreError::Message(format!("cannot create ~/.fleety: {e}")))?;
+    let path = dir.join("config.json");
+    let mut value: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let obj = value
+        .as_object_mut()
+        .ok_or_else(|| CoreError::Message("corrupt config.json".to_string()))?;
+    obj.insert("device_id".to_string(), serde_json::json!(device_id()));
+    if let Some(url) = agent_url {
+        obj.insert("agent_url".to_string(), serde_json::json!(url));
+    }
+    if let Some(tok) = token {
+        obj.insert("token".to_string(), serde_json::json!(tok));
+    }
+    std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&value).unwrap_or_default(),
+    )
+    .map_err(|e| CoreError::Message(format!("cannot write config: {e}")))?;
+    Ok(())
+}
+
+/// `fleety pair <code>`: enroll this device with a pairing code; saves the token.
+async fn pair(code: String) -> Result<()> {
+    let url = agent_url();
+    let (ws, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .map_err(|e| CoreError::Provider(format!("cannot connect to {url}: {e}")))?;
+    let (mut tx, mut rx) = ws.split();
+    send(&mut tx, &hello(Some(code))).await?;
+    let result = match recv(&mut rx).await? {
+        Some(ServerMsg::Welcome {
+            token: Some(tok), ..
+        }) => {
+            write_config(Some(&url), Some(&tok))?;
+            println!("✓ paired with {url}; token saved");
+            Ok(())
+        }
+        Some(ServerMsg::Welcome { token: None, .. }) => Err(CoreError::Message(
+            "server returned no token (is it running with FLEETY_REQUIRE_AUTH=1?)".to_string(),
+        )),
+        Some(ServerMsg::Error { error }) => Err(CoreError::Provider(format!(
+            "pairing failed: {}",
+            error.message
+        ))),
+        other => Err(CoreError::Provider(format!(
+            "unexpected reply during pair: {other:?}"
+        ))),
+    };
+    let _ = tx.close().await;
+    result
+}
+
 fn origin() -> OriginContext {
     OriginContext {
         hostname: std::env::var("COMPUTERNAME")
@@ -217,26 +308,10 @@ async fn init(url: String) -> Result<()> {
         .map_err(|e| CoreError::Provider(format!("cannot connect to {url}: {e}")))?;
     let (mut tx, mut rx) = ws.split();
 
-    send(
-        &mut tx,
-        &ClientMsg::Hello {
-            device_id: device_id(),
-            protocol: PROTOCOL_VERSION,
-        },
-    )
-    .await?;
+    send(&mut tx, &hello(None)).await?;
     match recv(&mut rx).await? {
         Some(ServerMsg::Welcome { session_id, .. }) => {
-            if let Some(dir) = fleety_dir() {
-                std::fs::create_dir_all(&dir)
-                    .map_err(|e| CoreError::Message(format!("cannot create ~/.fleety: {e}")))?;
-                let config = serde_json::json!({ "agent_url": url, "device_id": device_id() });
-                std::fs::write(
-                    dir.join("config.json"),
-                    serde_json::to_string_pretty(&config).unwrap_or_default(),
-                )
-                .map_err(|e| CoreError::Message(format!("cannot write config: {e}")))?;
-            }
+            write_config(Some(&url), None)?;
             println!("✓ connected to {url}");
             println!(
                 "✓ registered device '{}' (session {session_id})",
@@ -260,14 +335,7 @@ async fn ask(text: String) -> Result<()> {
         .map_err(|e| CoreError::Provider(format!("cannot connect to {url}: {e}")))?;
     let (mut tx, mut rx) = ws.split();
 
-    send(
-        &mut tx,
-        &ClientMsg::Hello {
-            device_id: device_id(),
-            protocol: PROTOCOL_VERSION,
-        },
-    )
-    .await?;
+    send(&mut tx, &hello(None)).await?;
     match recv(&mut rx).await? {
         Some(ServerMsg::Welcome { .. }) => {}
         other => {
@@ -329,14 +397,7 @@ async fn resume(conversation_id: String, after_seq: u64) -> Result<()> {
         .map_err(|e| CoreError::Provider(format!("cannot connect to {url}: {e}")))?;
     let (mut tx, mut rx) = ws.split();
 
-    send(
-        &mut tx,
-        &ClientMsg::Hello {
-            device_id: device_id(),
-            protocol: PROTOCOL_VERSION,
-        },
-    )
-    .await?;
+    send(&mut tx, &hello(None)).await?;
     match recv(&mut rx).await? {
         Some(ServerMsg::Welcome { .. }) => {}
         other => {

@@ -8,6 +8,7 @@
 #![warn(clippy::unwrap_used, clippy::expect_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+mod auth;
 mod bridge;
 mod browser;
 mod conn;
@@ -97,6 +98,16 @@ async fn main() {
     let pending = bridge::new_pending();
     let handles = bridge::new_handles();
 
+    // Connection auth: enforced only with FLEETY_REQUIRE_AUTH=1; FLEETY_TOKEN is
+    // a bootstrap admin token for pairing the first device.
+    let require_auth = std::env::var("FLEETY_REQUIRE_AUTH").as_deref() == Ok("1");
+    let auth = Arc::new(auth::AuthStore::load(
+        storage.auth_path(),
+        std::env::var("FLEETY_TOKEN").ok(),
+        require_auth,
+    ));
+    tracing::info!(require_auth, "connection auth");
+
     // Schedule fire loop (unattended): checks for due schedules periodically.
     let tick_secs = std::env::var("FLEETY_SCHED_TICK")
         .ok()
@@ -132,11 +143,12 @@ async fn main() {
         let hub = Arc::clone(&hub);
         let pending = Arc::clone(&pending);
         let handles = Arc::clone(&handles);
+        let auth = Arc::clone(&auth);
         // Each connection runs in its own task: an error or panic here is
         // isolated and never brings the server down.
         tokio::spawn(async move {
             match conn::handle_conn(
-                stream, storage, provider, workspace, policy, hub, pending, handles,
+                stream, storage, provider, workspace, policy, hub, pending, handles, auth,
             )
             .await
             {
