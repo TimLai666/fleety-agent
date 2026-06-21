@@ -148,6 +148,7 @@ async fn serve(
     crate::web::register(&mut tools);
     crate::mcp::register(&mut tools, &storage.mcp_config_path());
     crate::wiki::register(&mut tools, &storage.wiki_dir());
+    crate::ssh::register(&mut tools);
     bridge::register(&mut tools, Arc::clone(hub), Arc::clone(pending));
 
     while let Some(msg) = read_client(rx).await? {

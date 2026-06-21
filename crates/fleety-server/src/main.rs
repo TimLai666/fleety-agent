@@ -15,6 +15,7 @@ mod mcp;
 mod scheduler;
 mod schedules;
 mod skills;
+mod ssh;
 mod storage;
 mod tools;
 mod web;

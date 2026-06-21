@@ -1,0 +1,151 @@
+//! SSH connector: run commands on remote hosts via the system `ssh` client.
+//!
+//! No extra dependency — shells out to `ssh` in non-interactive `BatchMode`
+//! (so it fails fast instead of prompting). This lets the agent operate hosts
+//! that don't run fleetyd. The arg construction is pure and unit-tested; the
+//! live connection follows the codebase's logic-tested/live-manual posture.
+
+use std::process::Command;
+
+use async_trait::async_trait;
+use serde_json::{json, Value};
+
+use agent_core::{CoreError, Result, RiskLevel, Tool, ToolRegistry, ToolSpec};
+
+/// Register the `ssh_exec` connector tool.
+pub fn register(registry: &mut ToolRegistry) {
+    registry.register(Box::new(SshExec));
+}
+
+fn require_str<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
+    args.get(key)
+        .and_then(Value::as_str)
+        .ok_or_else(|| CoreError::Message(format!("missing required string argument '{key}'")))
+}
+
+/// Build the `ssh` argument vector (everything after the program name).
+fn build_ssh_args(
+    host: &str,
+    command: &str,
+    user: Option<&str>,
+    port: Option<u64>,
+    identity: Option<&str>,
+) -> Vec<String> {
+    let mut args = vec![
+        "-o".to_string(),
+        "BatchMode=yes".to_string(),
+        "-o".to_string(),
+        "StrictHostKeyChecking=accept-new".to_string(),
+    ];
+    if let Some(p) = port {
+        args.push("-p".to_string());
+        args.push(p.to_string());
+    }
+    if let Some(id) = identity {
+        args.push("-i".to_string());
+        args.push(id.to_string());
+    }
+    let target = match user {
+        Some(u) => format!("{u}@{host}"),
+        None => host.to_string(),
+    };
+    args.push(target);
+    args.push(command.to_string());
+    args
+}
+
+struct SshExec;
+
+#[async_trait]
+impl Tool for SshExec {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "ssh_exec".to_string(),
+            description: "Run a command on a remote host over SSH (system ssh client, non-interactive BatchMode).".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "host": { "type": "string" },
+                    "command": { "type": "string" },
+                    "user": { "type": "string" },
+                    "port": { "type": "integer" },
+                    "identity": { "type": "string", "description": "path to a private key file" }
+                },
+                "required": ["host", "command"]
+            }),
+            risk: RiskLevel::Mutate,
+        }
+    }
+
+    async fn call(&self, args: Value) -> Result<Value> {
+        let host = require_str(&args, "host")?;
+        if host.is_empty() || host.starts_with('-') || host.split_whitespace().count() != 1 {
+            return Err(CoreError::Message(format!(
+                "invalid ssh host '{host}': must be a single token not starting with '-'"
+            )));
+        }
+        let command = require_str(&args, "command")?;
+        let user = args.get("user").and_then(Value::as_str);
+        let port = args.get("port").and_then(Value::as_u64);
+        let identity = args.get("identity").and_then(Value::as_str);
+
+        let ssh_args = build_ssh_args(host, command, user, port, identity);
+        let output = Command::new("ssh").args(&ssh_args).output().map_err(|e| {
+            CoreError::Message(format!(
+                "cannot run ssh (is the ssh client installed?): {e}"
+            ))
+        })?;
+        Ok(json!({
+            "status": output.status.code(),
+            "stdout": String::from_utf8_lossy(&output.stdout),
+            "stderr": String::from_utf8_lossy(&output.stderr),
+        }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_args_includes_target_and_options() {
+        let args = build_ssh_args(
+            "pi.local",
+            "uptime",
+            Some("admin"),
+            Some(2222),
+            Some("~/.ssh/id"),
+        );
+        assert!(args.contains(&"admin@pi.local".to_string()));
+        assert!(args.contains(&"uptime".to_string()));
+        assert!(args
+            .windows(2)
+            .any(|w| w == ["-p".to_string(), "2222".to_string()]));
+        assert!(args
+            .windows(2)
+            .any(|w| w == ["-i".to_string(), "~/.ssh/id".to_string()]));
+        assert!(args.contains(&"BatchMode=yes".to_string()));
+
+        let plain = build_ssh_args("host", "ls", None, None, None);
+        assert_eq!(plain.last(), Some(&"ls".to_string()));
+        assert!(plain.contains(&"host".to_string()));
+        assert!(!plain.contains(&"-p".to_string()));
+    }
+
+    #[tokio::test]
+    async fn rejects_option_injection_host() {
+        let mut registry = ToolRegistry::new();
+        register(&mut registry);
+        assert!(registry
+            .call(
+                "ssh_exec",
+                json!({ "host": "-oProxyCommand=evil", "command": "x" })
+            )
+            .await
+            .is_err());
+        assert!(registry
+            .call("ssh_exec", json!({ "host": "a b", "command": "x" }))
+            .await
+            .is_err());
+    }
+}
