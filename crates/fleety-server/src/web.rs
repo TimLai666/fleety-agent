@@ -93,7 +93,13 @@ impl Tool for FetchUrl {
             .map(|n| n as usize)
             .unwrap_or(DEFAULT_MAX_BYTES);
 
-        let response = reqwest::Client::new()
+        // Do not auto-follow redirects: a public URL could 3xx to a private host
+        // and bypass the SSRF guard above.
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| CoreError::Message(format!("http client build failed: {e}")))?;
+        let response = client
             .get(url)
             .send()
             .await
