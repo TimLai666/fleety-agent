@@ -148,8 +148,12 @@ async fn run_tui() -> Result<()> {
                 Some(Ok(f)) if f.is_text() => {
                     if let Ok(text) = f.to_text() {
                         match serde_json::from_str::<ServerMsg>(text) {
+                            Ok(ServerMsg::AssistantDelta { chunk, .. }) => {
+                                app.push_delta(&chunk);
+                                app.status = "streaming…".to_string();
+                            }
                             Ok(ServerMsg::Assistant { text, .. }) => {
-                                app.push("fleety", text);
+                                app.finish_assistant(text);
                                 app.status = "ready".to_string();
                             }
                             Ok(ServerMsg::Error { error }) => {
@@ -381,7 +385,8 @@ async fn ask(text: String) -> Result<()> {
             }
             Some(ServerMsg::Welcome { .. })
             | Some(ServerMsg::Replay { .. })
-            | Some(ServerMsg::RunTool { .. }) => {}
+            | Some(ServerMsg::RunTool { .. })
+            | Some(ServerMsg::AssistantDelta { .. }) => {}
         }
     }
     // Close the connection gracefully so the server sees a clean disconnect.

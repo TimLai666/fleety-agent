@@ -1,8 +1,8 @@
 //! OpenAI-compatible model provider.
 //!
 //! Speaks the `/chat/completions` API (OpenAI, OpenRouter, LM Studio, Ollama,
-//! vLLM, …). M1: non-streaming request/response with tool-calling. Token
-//! streaming over SSE is a later addition; the loop works without it.
+//! vLLM, …): non-streaming request/response with tool-calling, plus SSE
+//! streaming (`with_streaming` / `complete_streaming`) for token-by-token output.
 
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -90,23 +90,10 @@ fn parse_models(body: &str) -> Result<Vec<String>> {
 #[async_trait::async_trait]
 impl ModelProvider for OpenAiCompat {
     async fn complete(&self, messages: &[Message], tools: &[ToolSpec]) -> Result<ModelResponse> {
-        let mut body = Map::new();
-        body.insert("model".to_string(), json!(self.model));
-        body.insert(
-            "messages".to_string(),
-            json!(messages.iter().map(wire_message).collect::<Vec<_>>()),
-        );
-        if !tools.is_empty() {
-            body.insert(
-                "tools".to_string(),
-                json!(tools.iter().map(wire_tool).collect::<Vec<_>>()),
-            );
-        }
-        if self.stream {
-            body.insert("stream".to_string(), json!(true));
-        }
-
-        let mut request = self.client.post(self.endpoint()).json(&Value::Object(body));
+        let mut request = self
+            .client
+            .post(self.endpoint())
+            .json(&self.request_body(messages, tools));
         if let Some(key) = &self.api_key {
             request = request.bearer_auth(key);
         }
@@ -133,15 +120,156 @@ impl ModelProvider for OpenAiCompat {
         })?;
         parse_response(parsed)
     }
+
+    async fn complete_streaming(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        on_delta: &mut (dyn for<'a> FnMut(&'a str) + Send),
+    ) -> Result<ModelResponse> {
+        if !self.stream {
+            return self.complete(messages, tools).await;
+        }
+        let mut request = self
+            .client
+            .post(self.endpoint())
+            .json(&self.request_body(messages, tools));
+        if let Some(key) = &self.api_key {
+            request = request.bearer_auth(key);
+        }
+        let response = request.send().await.map_err(|e| {
+            CoreError::Provider(format!("request to {} failed: {e}", self.endpoint()))
+        })?;
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(CoreError::Provider(format!(
+                "endpoint returned HTTP {status}: {text}"
+            )));
+        }
+
+        use futures::StreamExt;
+        let mut stream = response.bytes_stream();
+        let mut acc = SseAccumulator::default();
+        let mut buf = String::new();
+        while let Some(chunk) = stream.next().await {
+            let bytes =
+                chunk.map_err(|e| CoreError::Provider(format!("stream read failed: {e}")))?;
+            buf.push_str(&String::from_utf8_lossy(&bytes));
+            while let Some(nl) = buf.find('\n') {
+                let line: String = buf.drain(..=nl).collect();
+                if let Some(data) = line.trim().strip_prefix("data:") {
+                    let data = data.trim();
+                    if data == "[DONE]" {
+                        return Ok(acc.finish());
+                    }
+                    if let Ok(chunk_json) = serde_json::from_str::<Value>(data) {
+                        acc.push(&chunk_json, on_delta);
+                    }
+                }
+            }
+        }
+        Ok(acc.finish())
+    }
 }
 
-/// Assemble an OpenAI SSE stream body (`data: {chunk}` lines, terminated by
-/// `data: [DONE]`) into a full [`ModelResponse`]: concatenated content and
-/// tool-call deltas merged by index.
+impl OpenAiCompat {
+    fn request_body(&self, messages: &[Message], tools: &[ToolSpec]) -> Value {
+        let mut body = Map::new();
+        body.insert("model".to_string(), json!(self.model));
+        body.insert(
+            "messages".to_string(),
+            json!(messages.iter().map(wire_message).collect::<Vec<_>>()),
+        );
+        if !tools.is_empty() {
+            body.insert(
+                "tools".to_string(),
+                json!(tools.iter().map(wire_tool).collect::<Vec<_>>()),
+            );
+        }
+        if self.stream {
+            body.insert("stream".to_string(), json!(true));
+        }
+        Value::Object(body)
+    }
+}
+
+/// Accumulates OpenAI SSE delta chunks (content + tool-call deltas merged by
+/// index) into a final [`ModelResponse`]; `push` reports content slices to
+/// `on_delta` for live display.
+#[derive(Default)]
+struct SseAccumulator {
+    content: String,
+    calls: Vec<(String, String, String)>,
+}
+
+impl SseAccumulator {
+    fn push<F: FnMut(&str) + ?Sized>(&mut self, chunk: &Value, on_delta: &mut F) {
+        let delta = &chunk["choices"][0]["delta"];
+        if let Some(c) = delta.get("content").and_then(Value::as_str) {
+            self.content.push_str(c);
+            on_delta(c);
+        }
+        if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
+            for tc in tool_calls {
+                let idx = tc.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                while self.calls.len() <= idx {
+                    self.calls
+                        .push((String::new(), String::new(), String::new()));
+                }
+                if let Some(id) = tc.get("id").and_then(Value::as_str) {
+                    if !id.is_empty() {
+                        self.calls[idx].0 = id.to_string();
+                    }
+                }
+                if let Some(func) = tc.get("function") {
+                    if let Some(name) = func.get("name").and_then(Value::as_str) {
+                        self.calls[idx].1.push_str(name);
+                    }
+                    if let Some(args) = func.get("arguments").and_then(Value::as_str) {
+                        self.calls[idx].2.push_str(args);
+                    }
+                }
+            }
+        }
+    }
+
+    fn finish(self) -> ModelResponse {
+        let tool_calls: Vec<ToolCall> = self
+            .calls
+            .into_iter()
+            .filter(|(_, name, _)| !name.is_empty())
+            .map(|(id, name, args)| ToolCall {
+                id: if id.is_empty() {
+                    format!("call_{name}")
+                } else {
+                    id
+                },
+                name,
+                arguments: parse_args(&args),
+            })
+            .collect();
+        let content = if self.content.is_empty() && !tool_calls.is_empty() {
+            None
+        } else {
+            Some(self.content)
+        };
+        ModelResponse {
+            message: Message {
+                role: Role::Assistant,
+                content,
+                tool_calls,
+                tool_call_id: None,
+            },
+        }
+    }
+}
+
+/// Assemble a full SSE body into a [`ModelResponse`] (used when `complete`
+/// collects the whole stream at once).
 fn assemble_sse(body: &str) -> Result<ModelResponse> {
-    let mut content = String::new();
-    // (id, name, accumulated-arguments) per tool-call index.
-    let mut calls: Vec<(String, String, String)> = Vec::new();
+    let mut acc = SseAccumulator::default();
+    let mut noop = |_: &str| {};
     for line in body.lines() {
         let data = match line.trim().strip_prefix("data:") {
             Some(d) => d.trim(),
@@ -150,61 +278,11 @@ fn assemble_sse(body: &str) -> Result<ModelResponse> {
         if data == "[DONE]" {
             break;
         }
-        let Ok(chunk) = serde_json::from_str::<Value>(data) else {
-            continue;
-        };
-        let delta = &chunk["choices"][0]["delta"];
-        if let Some(c) = delta.get("content").and_then(Value::as_str) {
-            content.push_str(c);
-        }
-        if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
-            for tc in tool_calls {
-                let idx = tc.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-                while calls.len() <= idx {
-                    calls.push((String::new(), String::new(), String::new()));
-                }
-                if let Some(id) = tc.get("id").and_then(Value::as_str) {
-                    if !id.is_empty() {
-                        calls[idx].0 = id.to_string();
-                    }
-                }
-                if let Some(func) = tc.get("function") {
-                    if let Some(name) = func.get("name").and_then(Value::as_str) {
-                        calls[idx].1.push_str(name);
-                    }
-                    if let Some(args) = func.get("arguments").and_then(Value::as_str) {
-                        calls[idx].2.push_str(args);
-                    }
-                }
-            }
+        if let Ok(chunk) = serde_json::from_str::<Value>(data) {
+            acc.push(&chunk, &mut noop);
         }
     }
-    let tool_calls: Vec<ToolCall> = calls
-        .into_iter()
-        .filter(|(_, name, _)| !name.is_empty())
-        .map(|(id, name, args)| ToolCall {
-            id: if id.is_empty() {
-                format!("call_{name}")
-            } else {
-                id
-            },
-            name,
-            arguments: parse_args(&args),
-        })
-        .collect();
-    let content = if content.is_empty() && !tool_calls.is_empty() {
-        None
-    } else {
-        Some(content)
-    };
-    Ok(ModelResponse {
-        message: Message {
-            role: Role::Assistant,
-            content,
-            tool_calls,
-            tool_call_id: None,
-        },
-    })
+    Ok(acc.finish())
 }
 
 // --- wire mapping (pure, unit-tested without network) ---

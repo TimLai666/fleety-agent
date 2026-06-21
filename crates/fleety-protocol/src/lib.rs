@@ -90,6 +90,12 @@ pub enum ServerMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         token: Option<String>,
     },
+    /// A streamed slice of the in-progress assistant reply (token-by-token
+    /// display). The full reply still arrives as `Assistant` when the turn ends.
+    AssistantDelta {
+        conversation_id: String,
+        chunk: String,
+    },
     /// An assistant message for a conversation, with its event `seq`.
     Assistant {
         conversation_id: String,
@@ -155,6 +161,16 @@ mod tests {
         };
         let json = serde_json::to_string(&result).expect("serialize");
         assert_eq!(result, serde_json::from_str(&json).expect("deserialize"));
+    }
+
+    #[test]
+    fn assistant_delta_roundtrips() {
+        let msg = ServerMsg::AssistantDelta {
+            conversation_id: "c1".into(),
+            chunk: "hello".into(),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert_eq!(msg, serde_json::from_str(&json).expect("deserialize"));
     }
 
     #[test]

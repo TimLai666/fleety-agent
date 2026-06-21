@@ -62,11 +62,41 @@ pub async fn run_turn(
     policy: Policy,
     gate: &mut dyn ApprovalGate,
 ) -> Result<TurnOutcome> {
+    let mut noop: Box<dyn FnMut(&str) + Send> = Box::new(|_| {});
+    run_turn_streaming(
+        provider,
+        tools,
+        messages,
+        events,
+        config,
+        policy,
+        gate,
+        noop.as_mut(),
+    )
+    .await
+}
+
+/// Like [`run_turn`], but streams assistant content chunks to `on_delta` as the
+/// model produces them (token-by-token display). Tool calls and the final
+/// message are unaffected.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_turn_streaming(
+    provider: &dyn ModelProvider,
+    tools: &ToolRegistry,
+    messages: &mut Vec<Message>,
+    events: &mut EventLog,
+    config: &LoopConfig,
+    policy: Policy,
+    gate: &mut dyn ApprovalGate,
+    on_delta: &mut (dyn for<'a> FnMut(&'a str) + Send),
+) -> Result<TurnOutcome> {
     let specs = tools.specs();
 
     for step in 1..=config.max_steps {
         compact_if_needed(provider, messages, config).await?;
-        let response = provider.complete(messages, &specs).await?;
+        let response = provider
+            .complete_streaming(messages, &specs, on_delta)
+            .await?;
         let assistant = response.message;
         events.push(Event::Assistant(assistant.clone()));
         messages.push(assistant.clone());
@@ -572,6 +602,63 @@ mod tests {
                     .any(|p| p.role == Role::Assistant && p.tool_calls.iter().any(|c| c.id == id)));
             }
         }
+    }
+
+    struct StreamingMock;
+
+    #[async_trait::async_trait]
+    impl crate::model::ModelProvider for StreamingMock {
+        async fn complete(
+            &self,
+            _m: &[Message],
+            _t: &[crate::model::ToolSpec],
+        ) -> Result<crate::model::ModelResponse> {
+            Ok(crate::model::ModelResponse {
+                message: Message::assistant("hello world"),
+            })
+        }
+        async fn complete_streaming(
+            &self,
+            _m: &[Message],
+            _t: &[crate::model::ToolSpec],
+            on_delta: &mut (dyn for<'a> FnMut(&'a str) + Send),
+        ) -> Result<crate::model::ModelResponse> {
+            on_delta("hello ");
+            on_delta("world");
+            Ok(crate::model::ModelResponse {
+                message: Message::assistant("hello world"),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn run_turn_streaming_forwards_deltas() {
+        use std::sync::{Arc, Mutex};
+        let provider = StreamingMock;
+        let tools = ToolRegistry::new();
+        let mut messages = vec![Message::user("hi")];
+        let mut events = EventLog::new();
+        let chunks = Arc::new(Mutex::new(Vec::<String>::new()));
+        let captured = Arc::clone(&chunks);
+        let mut sink: Box<dyn FnMut(&str) + Send> =
+            Box::new(move |c: &str| captured.lock().expect("lock").push(c.to_string()));
+        let outcome = run_turn_streaming(
+            &provider,
+            &tools,
+            &mut messages,
+            &mut events,
+            &LoopConfig::default(),
+            Policy::FullAccess,
+            &mut AutoApprove,
+            sink.as_mut(),
+        )
+        .await
+        .expect("turn");
+        assert_eq!(outcome.output, "hello world");
+        assert_eq!(
+            *chunks.lock().expect("lock"),
+            vec!["hello ".to_string(), "world".to_string()]
+        );
     }
 
     struct DenyGate;

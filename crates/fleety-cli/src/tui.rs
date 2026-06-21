@@ -15,6 +15,8 @@ pub struct App {
     pub input: String,
     pub status: String,
     pub should_quit: bool,
+    /// Whether the last message is an assistant reply still streaming in.
+    streaming: bool,
 }
 
 impl App {
@@ -24,11 +26,38 @@ impl App {
             input: String::new(),
             status: status.into(),
             should_quit: false,
+            streaming: false,
         }
     }
 
     pub fn push(&mut self, role: impl Into<String>, text: impl Into<String>) {
         self.messages.push((role.into(), text.into()));
+        self.streaming = false;
+    }
+
+    /// Append a streamed assistant chunk to the in-progress reply.
+    pub fn push_delta(&mut self, chunk: &str) {
+        if self.streaming {
+            if let Some(last) = self.messages.last_mut() {
+                last.1.push_str(chunk);
+                return;
+            }
+        }
+        self.messages
+            .push(("fleety".to_string(), chunk.to_string()));
+        self.streaming = true;
+    }
+
+    /// Finalize the assistant reply with the authoritative full text.
+    pub fn finish_assistant(&mut self, text: String) {
+        if self.streaming {
+            if let Some(last) = self.messages.last_mut() {
+                last.1 = text;
+            }
+            self.streaming = false;
+        } else {
+            self.push("fleety", text);
+        }
     }
 }
 
@@ -127,6 +156,24 @@ mod tests {
         assert_eq!(on_key(&mut app, key(KeyCode::Enter)), Action::None);
         assert_eq!(on_key(&mut app, key(KeyCode::Esc)), Action::Quit);
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn streaming_deltas_then_finalize() {
+        let mut app = App::new("ready");
+        app.push("you", "hi");
+        app.push_delta("Hel");
+        app.push_delta("lo");
+        assert_eq!(app.messages.last().map(|(_, t)| t.as_str()), Some("Hello"));
+        // The final authoritative text replaces the streamed accumulation.
+        app.finish_assistant("Hello!".to_string());
+        assert_eq!(app.messages.last().map(|(_, t)| t.as_str()), Some("Hello!"));
+        // A fresh reply with no prior deltas just appends.
+        app.finish_assistant("again".to_string());
+        assert_eq!(
+            app.messages.last(),
+            Some(&("fleety".to_string(), "again".to_string()))
+        );
     }
 
     #[test]

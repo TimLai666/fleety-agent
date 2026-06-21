@@ -13,7 +13,7 @@ use tokio_tungstenite::WebSocketStream;
 use tokio::sync::mpsc;
 
 use agent_core::{
-    run_turn, ApprovalDecision, ApprovalGate, CoreError, EventLog, LoopConfig, Message,
+    run_turn_streaming, ApprovalDecision, ApprovalGate, CoreError, EventLog, LoopConfig, Message,
     ModelProvider, Policy, Result, RiskLevel, Role,
 };
 use fleety_protocol::{ClientMsg, ServerMsg, WireError, PROTOCOL_VERSION};
@@ -200,12 +200,25 @@ async fn serve(
                 let mut messages = vec![Message::system(storage.core_memory()?)];
                 messages.extend(storage.load(device_id, &conversation)?);
                 let mut events = EventLog::new();
+                // Stream content chunks to the client for token-by-token display;
+                // the full reply still arrives as `Assistant` below.
+                let delta_out = out.clone();
+                let delta_conv = conversation.clone();
+                let mut on_delta: Box<dyn FnMut(&str) + Send> = Box::new(move |chunk: &str| {
+                    let frame = ServerMsg::AssistantDelta {
+                        conversation_id: delta_conv.clone(),
+                        chunk: chunk.to_string(),
+                    };
+                    if let Ok(json) = serde_json::to_string(&frame) {
+                        let _ = delta_out.send(WsMessage::Text(json));
+                    }
+                });
                 let outcome = {
                     let mut gate = ConnGate {
                         out: out.clone(),
                         rx,
                     };
-                    run_turn(
+                    run_turn_streaming(
                         provider,
                         &tools,
                         &mut messages,
@@ -213,6 +226,7 @@ async fn serve(
                         &LoopConfig::default(),
                         policy,
                         &mut gate,
+                        on_delta.as_mut(),
                     )
                     .await?
                 };

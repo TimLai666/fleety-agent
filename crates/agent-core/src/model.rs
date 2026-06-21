@@ -112,6 +112,19 @@ pub struct ModelResponse {
 pub trait ModelProvider: Send + Sync {
     /// Produce the next assistant message, given the conversation and tools.
     async fn complete(&self, messages: &[Message], tools: &[ToolSpec]) -> Result<ModelResponse>;
+
+    /// Like [`complete`](Self::complete) but invokes `on_delta` with each content
+    /// chunk as it streams, for token-by-token display. The default ignores
+    /// `on_delta` and falls back to a single `complete` call; streaming providers
+    /// override it.
+    async fn complete_streaming(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSpec],
+        _on_delta: &mut (dyn for<'a> FnMut(&'a str) + Send),
+    ) -> Result<ModelResponse> {
+        self.complete(messages, tools).await
+    }
 }
 
 /// A scripted provider for tests and demos: returns queued responses in order.
