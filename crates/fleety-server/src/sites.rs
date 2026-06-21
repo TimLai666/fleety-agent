@@ -30,6 +30,28 @@ pub fn register(registry: &mut ToolRegistry, sites_dir: &Path, devices_dir: &Pat
         sites_dir: sites_dir.to_path_buf(),
         devices_dir: devices_dir.to_path_buf(),
     }));
+    registry.register(Box::new(DeviceSetMobility {
+        devices_dir: devices_dir.to_path_buf(),
+    }));
+}
+
+/// Read a device record, set one field, and write it back.
+fn update_device_field(devices_dir: &Path, device: &str, key: &str, value: Value) -> Result<()> {
+    let record_path = devices_dir.join(device).join("device.json");
+    let text = std::fs::read_to_string(&record_path).map_err(|e| {
+        CoreError::Message(format!(
+            "no such device '{device}' ({e}); use device_list to see devices"
+        ))
+    })?;
+    let mut record: Value = serde_json::from_str(&text)
+        .map_err(|e| CoreError::Message(format!("corrupt device record: {e}")))?;
+    if let Some(obj) = record.as_object_mut() {
+        obj.insert(key.to_string(), value);
+    }
+    let pretty = serde_json::to_string_pretty(&record)
+        .map_err(|e| CoreError::Message(format!("serialize device record: {e}")))?;
+    std::fs::write(&record_path, pretty)
+        .map_err(|e| CoreError::Message(format!("write device record: {e}")))
 }
 
 fn require_str<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
@@ -231,14 +253,12 @@ impl Tool for DeviceSetSite {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "device_set_site".to_string(),
-            description:
-                "Assign a device to a site (the site must exist; create it with site_set)."
-                    .to_string(),
+            description: "Set a device's current site. Use a registered site id, or the reserved `away` / `unknown` for a mobile device that's elsewhere or untracked. A device that relocates: just set its new site.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "device": { "type": "string" },
-                    "site": { "type": "string" }
+                    "site": { "type": "string", "description": "a registered site id, or 'away' / 'unknown'" }
                 },
                 "required": ["device", "site"]
             }),
@@ -251,27 +271,52 @@ impl Tool for DeviceSetSite {
         let site = require_str(&args, "site")?;
         safe_id("device id", device)?;
         safe_id("site id", site)?;
-        if !self.sites_dir.join(format!("{site}.json")).exists() {
+        // `away`/`unknown` are reserved transient states (mobile / in-transit
+        // devices); any other site must be registered first.
+        let reserved = matches!(site, "away" | "unknown");
+        if !reserved && !self.sites_dir.join(format!("{site}.json")).exists() {
             return Err(CoreError::Message(format!(
-                "unknown site '{site}'; register it first with site_set"
+                "unknown site '{site}'; register it with site_set, or use 'away'/'unknown' for a device in transit"
             )));
         }
-        let record_path = self.devices_dir.join(device).join("device.json");
-        let text = std::fs::read_to_string(&record_path).map_err(|e| {
-            CoreError::Message(format!(
-                "no such device '{device}' ({e}); use device_list to see devices"
-            ))
-        })?;
-        let mut record: Value = serde_json::from_str(&text)
-            .map_err(|e| CoreError::Message(format!("corrupt device record: {e}")))?;
-        if let Some(obj) = record.as_object_mut() {
-            obj.insert("site".to_string(), json!(site));
-        }
-        let pretty = serde_json::to_string_pretty(&record)
-            .map_err(|e| CoreError::Message(format!("serialize device record: {e}")))?;
-        std::fs::write(&record_path, pretty)
-            .map_err(|e| CoreError::Message(format!("write device record: {e}")))?;
+        update_device_field(&self.devices_dir, device, "site", json!(site))?;
         Ok(json!({ "device": device, "site": site, "set": true }))
+    }
+}
+
+struct DeviceSetMobility {
+    devices_dir: PathBuf,
+}
+
+#[async_trait]
+impl Tool for DeviceSetMobility {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "device_set_mobility".to_string(),
+            description: "Set a device's mobility: `stationary` (fixed in one place), `mobile` (moves around — its site is a current, changing value), or `unknown`.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "device": { "type": "string" },
+                    "mobility": { "type": "string", "enum": ["stationary", "mobile", "unknown"] }
+                },
+                "required": ["device", "mobility"]
+            }),
+            risk: RiskLevel::Mutate,
+        }
+    }
+
+    async fn call(&self, args: Value) -> Result<Value> {
+        let device = require_str(&args, "device")?;
+        let mobility = require_str(&args, "mobility")?;
+        safe_id("device id", device)?;
+        if !matches!(mobility, "stationary" | "mobile" | "unknown") {
+            return Err(CoreError::Message(format!(
+                "mobility must be stationary|mobile|unknown, got '{mobility}'"
+            )));
+        }
+        update_device_field(&self.devices_dir, device, "mobility", json!(mobility))?;
+        Ok(json!({ "device": device, "mobility": mobility, "set": true }))
     }
 }
 
@@ -333,6 +378,31 @@ mod tests {
         let devices = shown["devices"].as_array().expect("devices");
         assert_eq!(devices.len(), 1);
         assert_eq!(devices[0]["id"], json!("pi"));
+
+        // A mobile device elsewhere: reserved `away`/`unknown` need no registration.
+        registry
+            .call("device_set_site", json!({ "device": "pi", "site": "away" }))
+            .await
+            .expect("away");
+        registry
+            .call(
+                "device_set_mobility",
+                json!({ "device": "pi", "mobility": "mobile" }),
+            )
+            .await
+            .expect("mobility");
+        assert!(registry
+            .call(
+                "device_set_mobility",
+                json!({ "device": "pi", "mobility": "teleport" })
+            )
+            .await
+            .is_err());
+        let raw =
+            std::fs::read_to_string(devices_dir.join("pi").join("device.json")).expect("read");
+        let rec: Value = serde_json::from_str(&raw).expect("json");
+        assert_eq!(rec["site"], json!("away"));
+        assert_eq!(rec["mobility"], json!("mobile"));
 
         // Path-escape guard.
         assert!(registry

@@ -28,7 +28,8 @@ This is the source of truth for the tools the Fleety Agent (the LLM) may call. `
 | `site_show` | A site plus the devices located there. | `site` | read |
 | `site_set` | Create/update a site (location). | `id`, `name?`, `description?` | mutate |
 | `site_delete` | Delete a site (leaves device records). | `id` | mutate |
-| `device_set_site` | Assign a device to a registered site. | `device`, `site` | mutate |
+| `device_set_site` | Set a device's current site (a registered id, or `away`/`unknown` for a mobile/in-transit device). | `device`, `site` | mutate |
+| `device_set_mobility` | Mark a device `stationary` / `mobile` / `unknown`. | `device`, `mobility` | mutate |
 | `project_list` | List registered projects/workspaces (optionally for one device). | `device?` | read |
 | `project_current` | Resolve which workspace a `device`/`project` points at. | `device?`, `project?` | read |
 | `list_skills` | List available skills + metadata. | — | read |

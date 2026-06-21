@@ -52,6 +52,8 @@ A device record carries more than one way to reach it and where it physically li
 
 **Maintain a site registry, not just per-device fields.** Sites are first-class records you keep current: `site_set` to create/update a place (id + name + description), `site_list` to see all places, `site_show` to see a place and the devices located there, `device_set_site` to put a device at a registered site. When you learn that some devices are at one location and others elsewhere, record the sites and assign each device — then you can reason about "what's at the office" vs "what's at home" instead of guessing from device names.
 
+**Mobile devices and relocations.** Mark a device that travels with `device_set_mobility mobile`; its `site` is a *current, changing* value — keep it updated with `device_set_site`, using the reserved `away` / `unknown` (no registration needed) whenever you can't place it. A mobile device's stored `site` is a hint, not truth: before any location-sensitive action, re-confirm where it actually is from co-location signals (below), not the stale field. When a device **relocates for good** (it moved house / rooms), just `device_set_site` it to the new place — register that place with `site_set` first if it's new; its connectors/network refresh on the next reconnect.
+
 **Reachability is not presence.** Because a device can be reached from anywhere through its connectors, the fact that you *can* reach it tells you nothing about where the user physically is. To reason about physical presence, use co-location signals, never reachability:
 
 - Two devices are **co-located** when they share a **local network** (same LAN / subnet / gateway), verifiable from facts — not when one reaches the other through a relay or the internet.
