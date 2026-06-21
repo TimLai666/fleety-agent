@@ -1,3 +1,5 @@
 /target
 **/*.rs.bk
 *.pdb
+# docker-compose bind-mount workspace (runtime)
+/workspace

@@ -1,0 +1,25 @@
+# Deploy the Fleety server:
+#   docker compose up -d --build
+# Then point a client at it:  fleety init ws://<host>:8787
+services:
+  fleety-server:
+    build: .
+    image: fleety-server:latest
+    container_name: fleety-server
+    ports:
+      - "8787:8787"
+    environment:
+      # Approval policy: full_access (default) or require_approval.
+      FLEETY_POLICY: ${FLEETY_POLICY:-full_access}
+      # Uncomment + set to use a real model (any OpenAI-compatible endpoint).
+      # On Docker Desktop, reach a model on the host via host.docker.internal.
+      # FLEETY_MODEL_BASE_URL: http://host.docker.internal:1234/v1
+      # FLEETY_MODEL: your-model
+      # FLEETY_MODEL_KEY: your-key
+    volumes:
+      - fleety-data:/data # durable agent home (conversations, memory, schedules)
+      - ./workspace:/workspace # the workspace the agent's file/git tools operate on
+    restart: unless-stopped
+
+volumes:
+  fleety-data:
