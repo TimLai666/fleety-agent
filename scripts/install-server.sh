@@ -60,6 +60,20 @@ chmod 755 "$tmp/$BIN"
 mv "$tmp/$BIN" "$dir/$BIN"
 
 echo "$BIN: installed to $dir/$BIN"
+
+# Best-effort: also install the fleety-insyra data-analysis sidecar next to the
+# server so the `insyra_exec` tool works out of the box. Non-fatal if the asset
+# isn't published yet — insyra_exec then returns an actionable error until it is.
+sidecar_asset="fleety-insyra-${target}.tar.gz"
+sidecar_url="https://github.com/${REPO}/releases/latest/download/${sidecar_asset}"
+if curl -fsSL "$sidecar_url" -o "$tmp/$sidecar_asset" 2>/dev/null; then
+  tar -C "$tmp" -xzf "$tmp/$sidecar_asset"
+  chmod 755 "$tmp/fleety-insyra"
+  mv "$tmp/fleety-insyra" "$dir/fleety-insyra"
+  echo "fleety-insyra: installed to $dir/fleety-insyra (data-analysis sidecar)"
+else
+  echo "fleety-insyra: sidecar asset not available yet; insyra_exec stays off until it is" >&2
+fi
 echo
 echo "Run it (listens on FLEETY_ADDR, default 127.0.0.1:8787 — set 0.0.0.0:8787 to expose):"
 echo "  FLEETY_ADDR=0.0.0.0:8787 $BIN"

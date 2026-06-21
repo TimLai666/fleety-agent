@@ -38,20 +38,37 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }} --bin fleety --bin fleety-server --bin fleetyd
+      # The fleety-insyra sidecar embeds Insyra; ship the latest at release time.
+      # A breaking Insyra change surfaces here as a build/test failure (fix the
+      # sidecar, don't pin around it). Each runner's arch matches its target, so
+      # a native `go build` produces the right binary.
+      - name: Build insyra sidecar (latest Insyra)
+        shell: bash
+        run: |
+          cd sidecars/fleety-insyra
+          go get -u github.com/HazelnutParadise/insyra@latest
+          go mod tidy
+          go test ./...
+          out="$GITHUB_WORKSPACE/target/${{ matrix.target }}/release/fleety-insyra"
+          [ "${{ matrix.archive }}" = "zip" ] && out="$out.exe"
+          go build -trimpath -o "$out" .
       - name: Package (tar.gz)
         if: matrix.archive == 'tar.gz'
         run: |
           cd target/${{ matrix.target }}/release
-          for b in fleety fleety-server fleetyd; do
+          for b in fleety fleety-server fleetyd fleety-insyra; do
             tar -czf "$GITHUB_WORKSPACE/$b-${{ matrix.target }}.tar.gz" "$b"
           done
       - name: Package (zip)
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
-          foreach ($b in 'fleety', 'fleety-server', 'fleetyd') {
+          foreach ($b in 'fleety', 'fleety-server', 'fleetyd', 'fleety-insyra') {
             Compress-Archive -Path "target/${{ matrix.target }}/release/$b.exe" -DestinationPath "$b-${{ matrix.target }}.zip"
           }
       - name: Attach to release
@@ -61,3 +78,4 @@ jobs:
             fleety-${{ matrix.target }}.${{ matrix.archive }}
             fleety-server-${{ matrix.target }}.${{ matrix.archive }}
             fleetyd-${{ matrix.target }}.${{ matrix.archive }}
+            fleety-insyra-${{ matrix.target }}.${{ matrix.archive }}

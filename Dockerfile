@@ -4,12 +4,20 @@ WORKDIR /src
 COPY . .
 RUN cargo build --release --locked --bin fleety-server
 
+# Build the fleety-insyra data-analysis sidecar (Go) at the pinned Insyra version
+# (go.mod). Release CI bumps that to @latest; Docker builds stay reproducible.
+FROM golang:1-bookworm AS gobuild
+WORKDIR /sidecar
+COPY sidecars/fleety-insyra/ ./
+RUN go build -trimpath -o /out/fleety-insyra .
+
 # Slim runtime with the tools the agent shells out to (git, ssh, TLS roots).
 FROM debian:bookworm-slim
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates git openssh-client \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/fleety-server /usr/local/bin/fleety-server
+COPY --from=gobuild /out/fleety-insyra /usr/local/bin/fleety-insyra
 # Listen on all interfaces inside the container; persist state under /data.
 ENV FLEETY_ADDR=0.0.0.0:8787 \
     FLEETY_AGENT_HOME=/data/agent \
