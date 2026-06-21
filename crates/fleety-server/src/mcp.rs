@@ -173,6 +173,43 @@ async fn read_response<R: AsyncBufReadExt + Unpin>(
     }
 }
 
+/// The MCP stdio handshake + one `tools/call`, over any reader/writer pair
+/// (a child's stdio in production; an in-memory duplex in tests).
+async fn mcp_exchange<W, R>(
+    stdin: &mut W,
+    reader: &mut tokio::io::Lines<R>,
+    tool: &str,
+    arguments: &Value,
+) -> Result<Value>
+where
+    W: AsyncWriteExt + Unpin,
+    R: AsyncBufReadExt + Unpin,
+{
+    let init = jsonrpc_request(
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": { "name": "fleety", "version": env!("CARGO_PKG_VERSION") }
+        }),
+    );
+    write_line(stdin, &init).await?;
+    read_response(reader, 1).await?;
+    write_line(
+        stdin,
+        &jsonrpc_notification("notifications/initialized", json!({})),
+    )
+    .await?;
+    let call = jsonrpc_request(
+        2,
+        "tools/call",
+        json!({ "name": tool, "arguments": arguments }),
+    );
+    write_line(stdin, &call).await?;
+    read_response(reader, 2).await
+}
+
 struct McpList {
     config: PathBuf,
 }
@@ -329,32 +366,7 @@ impl Tool for McpCall {
             .ok_or_else(|| CoreError::Message("mcp server has no stdout".to_string()))?;
         let mut reader = BufReader::new(stdout).lines();
 
-        let exchange = async {
-            let init = jsonrpc_request(
-                1,
-                "initialize",
-                json!({
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {},
-                    "clientInfo": { "name": "fleety", "version": env!("CARGO_PKG_VERSION") }
-                }),
-            );
-            write_line(&mut stdin, &init).await?;
-            read_response(&mut reader, 1).await?;
-            write_line(
-                &mut stdin,
-                &jsonrpc_notification("notifications/initialized", json!({})),
-            )
-            .await?;
-            let call = jsonrpc_request(
-                2,
-                "tools/call",
-                json!({ "name": tool, "arguments": arguments }),
-            );
-            write_line(&mut stdin, &call).await?;
-            read_response(&mut reader, 2).await
-        };
-
+        let exchange = mcp_exchange(&mut stdin, &mut reader, &tool, &arguments);
         let result = tokio::time::timeout(CALL_TIMEOUT, exchange).await;
         let _ = child.start_kill();
         match result {
@@ -375,6 +387,53 @@ mod tests {
         std::env::temp_dir()
             .join(format!("fleety-mcp-{}", uuid::Uuid::new_v4()))
             .join("installed.json")
+    }
+
+    #[tokio::test]
+    async fn mcp_exchange_handshake_and_call() {
+        use tokio::io::{AsyncWriteExt, BufReader};
+        // Client <-> mock-server over an in-memory duplex (no subprocess).
+        let (client, server) = tokio::io::duplex(8192);
+        let (client_rd, mut client_wr) = tokio::io::split(client);
+        let mut client_reader = BufReader::new(client_rd).lines();
+
+        let server_task = tokio::spawn(async move {
+            let (srd, mut swr) = tokio::io::split(server);
+            let mut lines = BufReader::new(srd).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let v: Value = match serde_json::from_str(&line) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                match v.get("id").and_then(Value::as_u64) {
+                    Some(1) => {
+                        let _ = swr
+                            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n")
+                            .await;
+                    }
+                    Some(2) => {
+                        let name = v["params"]["name"].as_str().unwrap_or("").to_string();
+                        let resp = format!(
+                            "{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"echo\":\"{name}\"}}}}\n"
+                        );
+                        let _ = swr.write_all(resp.as_bytes()).await;
+                    }
+                    _ => {} // the `initialized` notification needs no reply
+                }
+                let _ = swr.flush().await;
+            }
+        });
+
+        let result = mcp_exchange(
+            &mut client_wr,
+            &mut client_reader,
+            "do_thing",
+            &json!({ "x": 1 }),
+        )
+        .await
+        .expect("exchange");
+        assert_eq!(result["echo"], json!("do_thing"));
+        server_task.abort();
     }
 
     #[test]
