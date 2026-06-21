@@ -53,6 +53,7 @@ pub async fn tick(
     );
     crate::web::register(&mut tools);
     crate::mcp::register(&mut tools, &storage.mcp_config_path());
+    crate::wiki::register(&mut tools, &storage.wiki_dir());
     let mut fired = 0;
     for item in due {
         let conversation = format!("schedule-{}", item.id);

@@ -189,6 +189,11 @@ impl Storage {
         self.home.join("mcp").join("installed.json")
     }
 
+    /// The knowledge wiki vault (Obsidian-style markdown), separate from workspaces.
+    pub fn wiki_dir(&self) -> PathBuf {
+        self.home.join("wiki")
+    }
+
     /// Ensure a device is registered: create `devices/{id}/device.json` (with
     /// defaults) and an initial `NOTES.md` if missing, and stamp `last_seen`.
     /// v0 stores the record as JSON; the spec's device.yaml has the same fields.
