@@ -27,6 +27,8 @@ Done and on `main` since this backlog was generated:
 - **#8 trigger validation** — `schedule_create` rejects malformed triggers (`at:<unix>` / `every:<30s|5m|1h|1d|secs>` / 5-field cron) with an actionable error.
 - **#8 schedule fire loop (DONE)** — a periodic tick (`FLEETY_SCHED_TICK`, default 60s) runs due `at:`/`every:` schedules through the agent **unattended** (`RequireApproval` + `AutoDeny`: reads/reporting proceed, mutate/critical denied; mandate enforcement still later). Runs persist to a `schedule-<id>` conversation, are audited, and set `last_run`. **#8 scheduling is now complete** (CRUD + validation + firing).
 
+- **code review (self)** — a `fleety-code-review` workflow reviewed the implementation; its verify phase hit the session usage limit, so verification was done directly in the main loop. Found and fixed one real bug: **compaction could orphan a `tool` message** (kept tail starting with a tool result whose assistant tool-call was summarized away → provider 400). `ConnGate` approval, the scheduler, storage `seq`, and the tool path-escape guard were reviewed and are sound. 14 raw review candidates remain unverified (re-run the workflow in a fresh session to confirm/fix the rest).
+
 Still open below — the **heavier, architectural** items that need fresh design context: device-scoping enforcement on handles (#5), client_session tool bridge (#11), SSE streaming, connectors (SSH/HTTP/daemon), fleetyd daemon (heartbeat/autostart/on-device tools), ratatui TUI, browser/computer-use, wiki, skills/MCP runtime, updater, schedule mandate enforcement.
 
 ## Area status
