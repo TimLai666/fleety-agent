@@ -23,9 +23,11 @@ Done and on `main` since this backlog was generated:
 - **fleetyd connect** — the daemon connects on startup, registers the device, and holds the connection. (Heartbeat/reconnect/autostart/on-device tools + the `client_daemon` connector type still pending.)
 - **git_log + git_show** — completes git read tools (status/diff/log/show). Server tool set: 17 tools.
 - **#2 approval flow (end-to-end)** — `ApprovalRequested`/`Approve`/`Deny` over WebSocket; `ConnGate` drives it; `FLEETY_POLICY=require_approval` gates non-read tools; `fleety ask` prompts y/N. Verified by a WS integration test (denied write does not execute).
-- **#8 schedule CRUD** — `schedule_create`/`list`/`delete` tools persist schedules (trigger + prompt + mandate). Fire loop (triggering at the scheduled time) still pending. Server tool set: 20 tools.
+- **#8 schedule CRUD** — `schedule_create`/`list`/`delete` tools persist schedules (trigger + prompt + mandate). Server tool set: 20 tools.
+- **#8 trigger validation** — `schedule_create` rejects malformed triggers (`at:<unix>` / `every:<30s|5m|1h|1d|secs>` / 5-field cron) with an actionable error.
+- **#8 schedule fire loop (DONE)** — a periodic tick (`FLEETY_SCHED_TICK`, default 60s) runs due `at:`/`every:` schedules through the agent **unattended** (`RequireApproval` + `AutoDeny`: reads/reporting proceed, mutate/critical denied; mandate enforcement still later). Runs persist to a `schedule-<id>` conversation, are audited, and set `last_run`. **#8 scheduling is now complete** (CRUD + validation + firing).
 
-Still open below — and these are the **heavier, architectural** items that need fresh design context to do well: approval pause/wait flow (#2), device-scoping enforcement on handles (#5), client_session tool bridge (#11), SSE streaming, `/models` discovery, connectors (SSH/HTTP/daemon), fleetyd daemon, ratatui TUI, context compaction, scheduling fire-loop, browser/computer-use, wiki, skills/MCP runtime, updater.
+Still open below — the **heavier, architectural** items that need fresh design context: device-scoping enforcement on handles (#5), client_session tool bridge (#11), SSE streaming, connectors (SSH/HTTP/daemon), fleetyd daemon (heartbeat/autostart/on-device tools), ratatui TUI, browser/computer-use, wiki, skills/MCP runtime, updater, schedule mandate enforcement.
 
 ## Area status
 
