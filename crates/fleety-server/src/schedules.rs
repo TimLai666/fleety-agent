@@ -90,6 +90,8 @@ fn parse_duration_secs(s: &str) -> Result<u64> {
 pub(crate) struct DueSchedule {
     pub id: String,
     pub prompt: String,
+    /// Non-read tools this unattended run is authorized to use (the mandate).
+    pub allowed_tools: Vec<String>,
 }
 
 /// Whether a trigger should fire now given its last run. Only `at:`/`every:` are
@@ -149,8 +151,21 @@ pub(crate) fn due_schedules(dir: &Path, now: u64) -> Result<Vec<DueSchedule>> {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
+            let allowed_tools = value
+                .get("allowed_tools")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
             if !id.is_empty() {
-                due.push(DueSchedule { id, prompt });
+                due.push(DueSchedule {
+                    id,
+                    prompt,
+                    allowed_tools,
+                });
             }
         }
     }
@@ -186,13 +201,14 @@ impl Tool for ScheduleCreate {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "schedule_create".to_string(),
-            description: "Create a schedule. `trigger` is a cron expr / `at:<time>` / `every:<dur>`; `mandate` records what the unattended run is authorized to do.".to_string(),
+            description: "Create a schedule. `trigger` is a cron expr / `at:<time>` / `every:<dur>`; `mandate` describes the authorized scope; `allowed_tools` lists the non-read tools the unattended run may use (enforced at fire time).".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "trigger": { "type": "string" },
                     "prompt": { "type": "string" },
-                    "mandate": { "type": "string", "description": "authorized scope (incl. critical actions), agreed now" }
+                    "mandate": { "type": "string", "description": "human-readable authorized scope, agreed now" },
+                    "allowed_tools": { "type": "array", "items": { "type": "string" }, "description": "non-read tool names the unattended run may use; others are denied" }
                 },
                 "required": ["trigger", "prompt"]
             }),
@@ -205,12 +221,22 @@ impl Tool for ScheduleCreate {
         validate_trigger(trigger)?;
         let prompt = require_str(&args, "prompt")?;
         let mandate = args.get("mandate").and_then(Value::as_str).unwrap_or("");
+        let allowed_tools: Vec<String> = args
+            .get("allowed_tools")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
         let id = uuid::Uuid::new_v4().to_string();
         let record = json!({
             "id": id,
             "trigger": trigger,
             "prompt": prompt,
             "mandate": mandate,
+            "allowed_tools": allowed_tools,
             "enabled": true,
         });
         std::fs::create_dir_all(&self.dir)

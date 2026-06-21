@@ -1,16 +1,16 @@
 //! Schedule fire loop: periodically run due schedules unattended.
 //!
 //! Due `at:`/`every:` schedules run through the agent with an **unattended
-//! policy** (`RequireApproval` + `AutoDeny`): reads and reporting proceed, but
-//! mutate/critical tools are denied — there is no human to confirm and mandate
-//! enforcement is a later milestone. Each run is persisted to a `schedule-<id>`
-//! conversation and audited, and the schedule's `last_run` is set.
+//! policy** (`RequireApproval` + `MandateGate`): reads/reporting proceed, and a
+//! mutate/critical tool runs only if its name is in the schedule's
+//! `allowed_tools` mandate (others are denied and fed back). Each run is
+//! persisted to a `schedule-<id>` conversation and audited, and `last_run` set.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use agent_core::{
-    run_turn, AutoDeny, EventLog, LoopConfig, Message, ModelProvider, Policy, Result,
+    run_turn, EventLog, LoopConfig, MandateGate, Message, ModelProvider, Policy, Result,
 };
 
 use crate::schedules;
@@ -62,7 +62,8 @@ pub async fn tick(
         let mut messages = vec![Message::system(storage.core_memory()?)];
         messages.extend(storage.load(SCHED_DEVICE, &conversation)?);
         let mut events = EventLog::new();
-        let mut gate = AutoDeny;
+        // Mandate enforcement: only the schedule's allowed_tools may mutate.
+        let mut gate = MandateGate::new(item.allowed_tools);
         let outcome = run_turn(
             provider,
             &tools,

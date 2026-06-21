@@ -5,6 +5,8 @@
 //! before it runs; a denial is fed back to the model as a tool result instead of
 //! executing. This is how critical/irreversible actions are confirmed.
 
+use std::collections::HashSet;
+
 use async_trait::async_trait;
 use serde_json::Value;
 
@@ -78,5 +80,58 @@ impl ApprovalGate for AutoDeny {
         _risk: RiskLevel,
     ) -> Result<ApprovalDecision> {
         Ok(ApprovalDecision::Deny)
+    }
+}
+
+/// Approves only tools named in a mandate (the set of non-read tools an
+/// unattended run was authorized to use at creation time); denies everything
+/// else. Reads never reach the gate under `RequireApproval`.
+pub struct MandateGate {
+    allowed: HashSet<String>,
+}
+
+impl MandateGate {
+    pub fn new(allowed: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            allowed: allowed.into_iter().collect(),
+        }
+    }
+}
+
+#[async_trait]
+impl ApprovalGate for MandateGate {
+    async fn request(
+        &mut self,
+        tool: &str,
+        _args: &Value,
+        _risk: RiskLevel,
+    ) -> Result<ApprovalDecision> {
+        Ok(if self.allowed.contains(tool) {
+            ApprovalDecision::Approve
+        } else {
+            ApprovalDecision::Deny
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn mandate_gate_allows_only_listed_tools() {
+        let mut gate = MandateGate::new(["write_file".to_string(), "run_command".to_string()]);
+        assert_eq!(
+            gate.request("write_file", &Value::Null, RiskLevel::Mutate)
+                .await
+                .expect("ok"),
+            ApprovalDecision::Approve
+        );
+        assert_eq!(
+            gate.request("delete_everything", &Value::Null, RiskLevel::Critical)
+                .await
+                .expect("ok"),
+            ApprovalDecision::Deny
+        );
     }
 }
