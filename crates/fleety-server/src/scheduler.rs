@@ -51,6 +51,7 @@ pub async fn tick(
         &storage.skills_builtin_dir(),
         &storage.skills_installed_dir(),
     );
+    crate::web::register(&mut tools);
     let mut fired = 0;
     for item in due {
         let conversation = format!("schedule-{}", item.id);

@@ -91,6 +91,7 @@ pub async fn handle_conn(
         &storage.skills_builtin_dir(),
         &storage.skills_installed_dir(),
     );
+    crate::web::register(&mut tools);
 
     while let Some(msg) = read_client(&mut rx).await? {
         match msg {

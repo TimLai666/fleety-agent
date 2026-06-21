@@ -15,6 +15,7 @@ mod schedules;
 mod skills;
 mod storage;
 mod tools;
+mod web;
 
 use std::path::PathBuf;
 use std::sync::Arc;

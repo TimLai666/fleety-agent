@@ -207,6 +207,7 @@ dependencies = [
  "async-trait",
  "fleety-protocol",
  "futures",
+ "reqwest",
  "serde_json",
  "tokio",
  "tokio-tungstenite",
