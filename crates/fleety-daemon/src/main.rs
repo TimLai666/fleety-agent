@@ -9,6 +9,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod service;
+mod update;
 
 use agent_core::{obs, CoreError, Result};
 use futures::{SinkExt, StreamExt};
@@ -30,6 +31,12 @@ async fn main() {
         Some("uninstall") => {
             if let Err(e) = service::uninstall() {
                 tracing::error!(report = ?e.report(), "uninstall failed");
+            }
+            return;
+        }
+        Some("update") => {
+            if let Err(e) = update::update().await {
+                tracing::error!(report = ?e.report(), "update failed");
             }
             return;
         }
