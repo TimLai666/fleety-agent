@@ -67,14 +67,18 @@ Cross-conversation memory. Within a conversation the event stream is replayed on
 | `workspace_write_file` | Write a whole file (new / small files). | `device?`, `project?`, `path`, `content` | mutate |
 | `workspace_apply_patch` | Apply a multi-hunk patch. | `device?`, `project?`, `patch` | mutate |
 | `workspace_replace_lines` | Replace inclusive 1-based `start_line`..`end_line` with `content` (insert: `end_line = start_line - 1`). | `device?`, `project?`, `path`, `start_line`, `end_line`, `content` | mutate |
+| `workspace_delete_file` | Delete a file; backs up first so it can be restored. | `device?`, `project?`, `path` | mutate |
+| `workspace_move_file` | Move/rename a file (backs up the destination if it exists). | `device?`, `project?`, `from`, `to` | mutate |
+| `workspace_make_dir` | Create a directory (and missing parents). | `device?`, `project?`, `path` | mutate |
+| `workspace_rollback` | Restore a file from a backup id returned by a previous write/edit/delete/move. | `device?`, `project?`, `backup_id` | mutate |
 
-> Read before you rely; re-read before each line-range edit (line numbers shift). Mutating a non-git workspace first creates a backup / patch journal (`.fleety-backups/`, `.fleety-patches/`) so the `history_step_id` is restorable.
+> Read before you rely; re-read before each line-range edit (line numbers shift). Every mutation (write/edit/delete/move) first backs up the prior content to `.fleety-backups/` and returns a `backup` id plus a **unified diff** of the change — restore with `workspace_rollback`. Diffs work on any device, not just git repos.
 
 ## Terminal
 
 | Tool | Purpose | Key inputs | Risk |
 |---|---|---|---|
-| `terminal_run` | Run one command on the target device; returns stdout/stderr/exit code. File changes it causes are recorded as history steps. | `device?`, `project?`, `command`, `cwd?`, `timeout?` | mutate, or **critical** if the command is irreversible (wipe/mkfs/dd/HOME delete/ssh-config/key-rotate/firewall/remote-only reboot) |
+| `terminal_run` | Run one command on the target device; returns stdout/stderr/exit code. File changes it causes are recorded as history steps. Pass `track` (paths) to get a before/after unified diff of files the command changed (sed, builds, redirects). | `device?`, `project?`, `command`, `cwd?`, `timeout?`, `track?` | mutate, or **critical** if the command is irreversible (wipe/mkfs/dd/HOME delete/ssh-config/key-rotate/firewall/remote-only reboot) |
 
 > The runtime classifies obviously-destructive commands as `critical` and blocks them pending confirmation. Do not try to disguise such a command to bypass the gate.
 
@@ -83,7 +87,7 @@ Cross-conversation memory. Within a conversation the event stream is replayed on
 | Tool | Purpose | Key inputs | Risk |
 |---|---|---|---|
 | `git_status` | Working-tree status on the target device. | `device?`, `project?` | read |
-| `git_diff` | Diff (optionally staged / a path). | `device?`, `project?`, `path?`, `staged?` | read |
+| `git_diff` | Diff (optionally staged / a path); also lists untracked new files. | `device?`, `project?`, `path?`, `staged?` | read |
 | `git_log` | Commit log. | `device?`, `project?`, `limit?` | read |
 | `git_show` | Show a commit / object. | `device?`, `project?`, `ref` | read |
 

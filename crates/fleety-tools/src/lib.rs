@@ -3,9 +3,11 @@
 //!
 //! `register_workspace(registry, root, backups_dir)` adds: `read_file`,
 //! `list_dir`, `search_files` (ripgrep engine), `write_file` + `edit_file`
-//! (backup + unified diff), `run_command` (critical-command guard), and
-//! `git_status`/`git_diff`/`git_log`/`git_show`. All paths are confined to
-//! `root` with a path-escape guard; mutations back up to `backups_dir`.
+//! (backup + unified diff), `delete_file` / `move_file` / `make_dir`,
+//! `rollback` (restore a backup), `run_command` (critical-command guard; can
+//! `track` paths to diff what it changed), and `git_status`/`git_diff` (incl.
+//! untracked)/`git_log`/`git_show`. All paths are confined to `root` with a
+//! path-escape guard; mutations back up to `backups_dir`.
 #![forbid(unsafe_code)]
 #![warn(clippy::unwrap_used, clippy::expect_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
@@ -33,6 +35,19 @@ pub fn register_workspace(registry: &mut ToolRegistry, root: &Path, backups_dir:
         backups: backups_dir.to_path_buf(),
     }));
     registry.register(Box::new(RunCommand { root: r() }));
+    registry.register(Box::new(DeleteFile {
+        root: r(),
+        backups: backups_dir.to_path_buf(),
+    }));
+    registry.register(Box::new(MoveFile {
+        root: r(),
+        backups: backups_dir.to_path_buf(),
+    }));
+    registry.register(Box::new(MakeDir { root: r() }));
+    registry.register(Box::new(Rollback {
+        root: r(),
+        backups: backups_dir.to_path_buf(),
+    }));
     registry.register(Box::new(GitStatus { root: r() }));
     registry.register(Box::new(GitDiff { root: r() }));
     registry.register(Box::new(GitLog { root: r() }));
@@ -94,6 +109,36 @@ fn resolve_for_write(root: &Path, rel: &str) -> Result<PathBuf> {
         )));
     }
     Ok(resolved)
+}
+
+/// Resolve a workspace-relative path lexically (no `..`, not absolute) without
+/// requiring it to exist — for paths a tool may create or that aren't there yet.
+fn resolve_lenient(root: &Path, rel: &str) -> Result<PathBuf> {
+    if rel.is_empty() || Path::new(rel).is_absolute() || rel.split(['/', '\\']).any(|c| c == "..") {
+        return Err(CoreError::Message(format!(
+            "path '{rel}' must be a relative path inside the workspace (no '..')"
+        )));
+    }
+    let canon_root = root
+        .canonicalize()
+        .map_err(|e| CoreError::Message(format!("root unavailable: {e}")))?;
+    Ok(canon_root.join(rel))
+}
+
+/// Find the first file under `dir` (recursively); used to locate a backup's content.
+fn first_file(dir: &Path) -> Option<PathBuf> {
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.is_file() {
+            return Some(path);
+        }
+        if path.is_dir() {
+            if let Some(found) = first_file(&path) {
+                return Some(found);
+            }
+        }
+    }
+    None
 }
 
 /// Copy an existing file into the backups store and return a `{id, path}` handle.
@@ -475,12 +520,13 @@ impl Tool for RunCommand {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "run_command".to_string(),
-            description: "Run a shell command in the workspace and capture stdout/stderr/exit code. Clearly destructive commands are refused.".to_string(),
+            description: "Run a shell command in the workspace and capture stdout/stderr/exit code. Clearly destructive commands are refused. Pass `track` (paths) to get a unified diff of what those files looked like before vs after — useful when a command (sed, a build, etc.) changes files.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "command": { "type": "string" },
-                    "cwd": { "type": "string", "description": "workspace-relative working dir (default workspace root)" }
+                    "cwd": { "type": "string", "description": "workspace-relative working dir (default workspace root)" },
+                    "track": { "type": "array", "items": { "type": "string" }, "description": "workspace-relative paths to diff (before vs after the command)" }
                 },
                 "required": ["command"]
             }),
@@ -499,6 +545,24 @@ impl Tool for RunCommand {
             Some(rel) => resolve_in_root(&self.root, rel)?,
             None => self.root.clone(),
         };
+
+        // Snapshot tracked paths so we can diff what the command changed.
+        let tracked: Vec<String> = args
+            .get("track")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut before: Vec<(String, PathBuf, String)> = Vec::new();
+        for rel in &tracked {
+            let path = resolve_lenient(&self.root, rel)?;
+            let content = std::fs::read_to_string(&path).unwrap_or_default();
+            before.push((rel.clone(), path, content));
+        }
+
         let (shell, flag) = if cfg!(windows) {
             ("cmd", "/C")
         } else {
@@ -510,11 +574,27 @@ impl Tool for RunCommand {
             .current_dir(&cwd)
             .output()
             .map_err(|e| CoreError::Message(format!("cannot run command: {e}")))?;
-        Ok(json!({
+
+        let mut result = json!({
             "exit_code": output.status.code(),
             "stdout": String::from_utf8_lossy(&output.stdout),
             "stderr": String::from_utf8_lossy(&output.stderr),
-        }))
+        });
+        if !before.is_empty() {
+            let diffs: Vec<Value> = before
+                .iter()
+                .map(|(rel, path, old)| {
+                    let new = std::fs::read_to_string(path).unwrap_or_default();
+                    json!({
+                        "path": rel,
+                        "changed": *old != new,
+                        "diff": unified_diff(old, &new, rel),
+                    })
+                })
+                .collect();
+            result["diffs"] = json!(diffs);
+        }
+        Ok(result)
     }
 }
 
@@ -547,14 +627,22 @@ impl Tool for GitDiff {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "git_diff".to_string(),
-            description: "Show the unstaged `git diff` for the workspace.".to_string(),
+            description: "Show the unstaged `git diff` for the workspace, plus any untracked new files (changes from any source — edits, run_command, external tools — show here).".to_string(),
             parameters: json!({ "type": "object", "properties": {} }),
             risk: RiskLevel::Read,
         }
     }
 
     async fn call(&self, _args: Value) -> Result<Value> {
-        Ok(json!({ "diff": run_git(&self.root, &["diff"])? }))
+        let diff = run_git(&self.root, &["diff"])?;
+        let untracked: Vec<String> =
+            run_git(&self.root, &["ls-files", "--others", "--exclude-standard"])
+                .unwrap_or_default()
+                .lines()
+                .map(|l| l.to_string())
+                .filter(|l| !l.is_empty())
+                .collect();
+        Ok(json!({ "diff": diff, "untracked": untracked }))
     }
 }
 
@@ -603,6 +691,156 @@ impl Tool for GitShow {
     async fn call(&self, args: Value) -> Result<Value> {
         let reference = args.get("ref").and_then(Value::as_str).unwrap_or("HEAD");
         Ok(json!({ "show": run_git(&self.root, &["show", "--stat", reference])? }))
+    }
+}
+
+struct DeleteFile {
+    root: PathBuf,
+    backups: PathBuf,
+}
+
+#[async_trait]
+impl Tool for DeleteFile {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "delete_file".to_string(),
+            description: "Delete a file in the workspace. The content is backed up first, so the delete can be undone with rollback.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" } },
+                "required": ["path"]
+            }),
+            risk: RiskLevel::Mutate,
+        }
+    }
+
+    async fn call(&self, args: Value) -> Result<Value> {
+        let path = require_str(&args, "path")?;
+        let resolved = resolve_in_root(&self.root, path)?;
+        if resolved.is_dir() {
+            return Err(CoreError::Message(format!(
+                "'{path}' is a directory; use run_command for directory removal"
+            )));
+        }
+        let backup = backup_existing(&self.backups, path, &resolved)?;
+        std::fs::remove_file(&resolved)
+            .map_err(|e| CoreError::Message(format!("cannot delete '{path}': {e}")))?;
+        Ok(json!({ "path": path, "deleted": true, "backup": backup }))
+    }
+}
+
+struct MoveFile {
+    root: PathBuf,
+    backups: PathBuf,
+}
+
+#[async_trait]
+impl Tool for MoveFile {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "move_file".to_string(),
+            description: "Move/rename a file within the workspace. If the destination exists it is backed up first.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "from": { "type": "string" },
+                    "to": { "type": "string" }
+                },
+                "required": ["from", "to"]
+            }),
+            risk: RiskLevel::Mutate,
+        }
+    }
+
+    async fn call(&self, args: Value) -> Result<Value> {
+        let from = require_str(&args, "from")?;
+        let to = require_str(&args, "to")?;
+        let src = resolve_in_root(&self.root, from)?;
+        let dest = resolve_lenient(&self.root, to)?;
+        let mut backup = Value::Null;
+        if dest.exists() {
+            backup = backup_existing(&self.backups, to, &dest)?;
+        }
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| CoreError::Message(format!("cannot create '{to}' parent: {e}")))?;
+        }
+        std::fs::rename(&src, &dest)
+            .map_err(|e| CoreError::Message(format!("cannot move '{from}' -> '{to}': {e}")))?;
+        Ok(json!({ "from": from, "to": to, "moved": true, "backup": backup }))
+    }
+}
+
+struct MakeDir {
+    root: PathBuf,
+}
+
+#[async_trait]
+impl Tool for MakeDir {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "make_dir".to_string(),
+            description: "Create a directory (and any missing parents) within the workspace."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" } },
+                "required": ["path"]
+            }),
+            risk: RiskLevel::Mutate,
+        }
+    }
+
+    async fn call(&self, args: Value) -> Result<Value> {
+        let path = require_str(&args, "path")?;
+        let resolved = resolve_lenient(&self.root, path)?;
+        std::fs::create_dir_all(&resolved)
+            .map_err(|e| CoreError::Message(format!("cannot create dir '{path}': {e}")))?;
+        Ok(json!({ "path": path, "created": true }))
+    }
+}
+
+struct Rollback {
+    root: PathBuf,
+    backups: PathBuf,
+}
+
+#[async_trait]
+impl Tool for Rollback {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "rollback".to_string(),
+            description: "Restore a file from a backup produced by write_file/edit_file/delete_file/move_file (pass the backup `id`).".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "backup_id": { "type": "string" } },
+                "required": ["backup_id"]
+            }),
+            risk: RiskLevel::Mutate,
+        }
+    }
+
+    async fn call(&self, args: Value) -> Result<Value> {
+        let id = require_str(&args, "backup_id")?;
+        if id.contains('/') || id.contains('\\') || id.contains("..") {
+            return Err(CoreError::Message(format!("invalid backup id '{id}'")));
+        }
+        let backup_root = self.backups.join(id);
+        let backup_file = first_file(&backup_root)
+            .ok_or_else(|| CoreError::Message(format!("no backup '{id}'")))?;
+        let rel = backup_file
+            .strip_prefix(&backup_root)
+            .map_err(|e| CoreError::Message(format!("corrupt backup '{id}': {e}")))?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let dest = resolve_lenient(&self.root, &rel)?;
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| CoreError::Message(format!("cannot recreate '{rel}' parent: {e}")))?;
+        }
+        std::fs::copy(&backup_file, &dest)
+            .map_err(|e| CoreError::Message(format!("cannot restore '{rel}': {e}")))?;
+        Ok(json!({ "restored": rel, "backup_id": id }))
     }
 }
 
@@ -664,6 +902,76 @@ mod tests {
             .call("read_file", json!({ "path": "../escape" }))
             .await
             .is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn track_diff_delete_rollback_move_mkdir() {
+        let root = temp();
+        let backups = root.join(".bak");
+        std::fs::write(root.join("t.txt"), "one\ntwo\n").expect("seed");
+        let mut reg = ToolRegistry::new();
+        register_workspace(&mut reg, &root, &backups);
+
+        // run_command with track -> diff of what the command changed
+        let shell_append = if cfg!(windows) {
+            "echo three>> t.txt"
+        } else {
+            "printf 'three\\n' >> t.txt"
+        };
+        let ran = reg
+            .call(
+                "run_command",
+                json!({ "command": shell_append, "track": ["t.txt"] }),
+            )
+            .await
+            .expect("run");
+        assert_eq!(ran["diffs"][0]["changed"], json!(true));
+        assert!(ran["diffs"][0]["diff"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("+three"));
+
+        // make_dir + delete_file (backed up) + rollback restores it
+        reg.call("make_dir", json!({ "path": "sub/deep" }))
+            .await
+            .expect("mkdir");
+        assert!(root.join("sub/deep").is_dir());
+
+        std::fs::write(root.join("sub/d.txt"), "keepme").expect("seed2");
+        let del = reg
+            .call("delete_file", json!({ "path": "sub/d.txt" }))
+            .await
+            .expect("delete");
+        assert!(!root.join("sub/d.txt").exists());
+        let id = del["backup"]["id"].as_str().expect("backup id").to_string();
+        reg.call("rollback", json!({ "backup_id": id }))
+            .await
+            .expect("rollback");
+        assert_eq!(
+            std::fs::read_to_string(root.join("sub/d.txt")).expect("read"),
+            "keepme"
+        );
+
+        // move_file
+        reg.call(
+            "move_file",
+            json!({ "from": "sub/d.txt", "to": "sub/e.txt" }),
+        )
+        .await
+        .expect("move");
+        assert!(!root.join("sub/d.txt").exists() && root.join("sub/e.txt").exists());
+
+        // guards: no escaping, no absolute, no ".."
+        assert!(reg
+            .call("make_dir", json!({ "path": "../evil" }))
+            .await
+            .is_err());
+        assert!(reg
+            .call("rollback", json!({ "backup_id": "../x" }))
+            .await
+            .is_err());
+
         let _ = std::fs::remove_dir_all(&root);
     }
 

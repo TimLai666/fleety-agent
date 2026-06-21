@@ -78,8 +78,11 @@ back as a git submodule.
 
 ## What it can do
 
-The agent exposes ~38 tools: workspace files + git (`read_file`, `list_dir`,
-`search_files`, `write_file`, `edit_file`, `run_command`, `git_*`), memory and
+The agent exposes ~42 tools: workspace files + git (`read_file`, `list_dir`,
+`search_files`, `write_file`, `edit_file`, `delete_file`, `move_file`, `make_dir`,
+`rollback`, `run_command`, `git_*`) — mutations back up + return a unified diff
+(any device, not just git repos), `run_command` can `track` paths to diff what a
+command changed, and `rollback` restores from a backup — plus memory and
 audit history, a knowledge wiki, HTTP (`fetch_url` / `http_request`), self-managed
 scheduling (`schedule_*` with a fire loop + per-schedule mandate), a skills + MCP
 runtime, and **cross-device execution** — run tools on another connected device
