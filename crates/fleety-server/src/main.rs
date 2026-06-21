@@ -95,6 +95,7 @@ async fn main() {
     // Cross-device routing state, shared across all connections.
     let hub = bridge::new_hub();
     let pending = bridge::new_pending();
+    let handles = bridge::new_handles();
 
     // Schedule fire loop (unattended): checks for due schedules periodically.
     let tick_secs = std::env::var("FLEETY_SCHED_TICK")
@@ -130,11 +131,14 @@ async fn main() {
         let workspace = Arc::clone(&workspace);
         let hub = Arc::clone(&hub);
         let pending = Arc::clone(&pending);
+        let handles = Arc::clone(&handles);
         // Each connection runs in its own task: an error or panic here is
         // isolated and never brings the server down.
         tokio::spawn(async move {
-            match conn::handle_conn(stream, storage, provider, workspace, policy, hub, pending)
-                .await
+            match conn::handle_conn(
+                stream, storage, provider, workspace, policy, hub, pending, handles,
+            )
+            .await
             {
                 Ok(()) => {}
                 Err(e) => tracing::warn!(%peer, report = ?e.report(), "connection error"),

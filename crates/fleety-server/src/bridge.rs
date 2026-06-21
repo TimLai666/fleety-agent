@@ -22,6 +22,10 @@ use fleety_protocol::ServerMsg;
 pub type Hub = Arc<Mutex<HashMap<String, mpsc::UnboundedSender<WsMessage>>>>;
 /// In-flight on-device calls: `call_id -> reply channel` (Ok(value) / Err(msg)).
 pub type Pending = Arc<Mutex<HashMap<String, oneshot::Sender<std::result::Result<Value, String>>>>>;
+/// Stateful tool handles bound to a device: `handle_id -> owning device_id`.
+/// Enforces the device-scoping invariant — a handle made on one device can't be
+/// used against another.
+pub type Handles = Arc<Mutex<HashMap<String, String>>>;
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -33,14 +37,36 @@ pub fn new_pending() -> Pending {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
+pub fn new_handles() -> Handles {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+
+/// Reject using a handle bound to a different device (actionable: owning device
+/// + two remediation paths).
+fn check_handle(handles: &HashMap<String, String>, handle: &str, device: &str) -> Result<()> {
+    if let Some(owner) = handles.get(handle) {
+        if owner != device {
+            return Err(CoreError::Message(format!(
+                "handle '{handle}' belongs to device '{owner}', not '{device}'. Either target device '{owner}' for this handle, or open a fresh handle on '{device}'."
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Register the `device_exec` routing tool.
-pub fn register(registry: &mut ToolRegistry, hub: Hub, pending: Pending) {
-    registry.register(Box::new(DeviceExec { hub, pending }));
+pub fn register(registry: &mut ToolRegistry, hub: Hub, pending: Pending, handles: Handles) {
+    registry.register(Box::new(DeviceExec {
+        hub,
+        pending,
+        handles,
+    }));
 }
 
 struct DeviceExec {
     hub: Hub,
     pending: Pending,
+    handles: Handles,
 }
 
 #[async_trait]
@@ -54,7 +80,8 @@ impl Tool for DeviceExec {
                 "properties": {
                     "device": { "type": "string", "description": "target device_id (see device_list)" },
                     "tool": { "type": "string" },
-                    "args": { "type": "object" }
+                    "args": { "type": "object" },
+                    "handle": { "type": "string", "description": "a stateful handle from a prior call; must belong to this device" }
                 },
                 "required": ["device", "tool"]
             }),
@@ -70,6 +97,11 @@ impl Tool for DeviceExec {
             CoreError::Message("missing required string argument 'tool'".to_string())
         })?;
         let tool_args = args.get("args").cloned().unwrap_or_else(|| json!({}));
+
+        // Device-scoping: a supplied handle must belong to the target device.
+        if let Some(handle) = args.get("handle").and_then(Value::as_str) {
+            check_handle(&*self.handles.lock().await, handle, device)?;
+        }
 
         let call_id = uuid::Uuid::new_v4().to_string();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -95,7 +127,16 @@ impl Tool for DeviceExec {
         }
 
         match tokio::time::timeout(CALL_TIMEOUT, reply_rx).await {
-            Ok(Ok(Ok(value))) => Ok(value),
+            Ok(Ok(Ok(value))) => {
+                // Bind any handle the device returned to this device (scoping).
+                if let Some(handle) = value.get("handle").and_then(Value::as_str) {
+                    self.handles
+                        .lock()
+                        .await
+                        .insert(handle.to_string(), device.to_string());
+                }
+                Ok(value)
+            }
             Ok(Ok(Err(message))) => Err(CoreError::Provider(format!(
                 "device '{device}' tool failed: {message}"
             ))),
@@ -121,5 +162,22 @@ pub async fn dispatch_result(
 ) {
     if let Some(tx) = pending.lock().await.remove(call_id) {
         let _ = tx.send(result);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn handle_scoping_rejects_cross_device() {
+        let mut map = HashMap::new();
+        map.insert("sess1".to_string(), "pi".to_string());
+        // same device: ok; unknown handle: ok (not yet bound).
+        assert!(check_handle(&map, "sess1", "pi").is_ok());
+        assert!(check_handle(&map, "other", "laptop").is_ok());
+        // cross-device: rejected, naming the owner.
+        let err = check_handle(&map, "sess1", "laptop").expect_err("cross-device");
+        assert!(err.report().message.contains("pi"));
     }
 }

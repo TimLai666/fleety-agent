@@ -18,7 +18,7 @@ use agent_core::{
 };
 use fleety_protocol::{ClientMsg, ServerMsg, WireError, PROTOCOL_VERSION};
 
-use crate::bridge::{self, Hub, Pending};
+use crate::bridge::{self, Handles, Hub, Pending};
 use crate::storage::Storage;
 
 /// Outbound frame sender (drained by the connection's writer task).
@@ -37,6 +37,7 @@ pub async fn handle_conn(
     policy: Policy,
     hub: Hub,
     pending: Pending,
+    handles: Handles,
 ) -> Result<()> {
     let ws = tokio_tungstenite::accept_async(stream)
         .await
@@ -96,6 +97,7 @@ pub async fn handle_conn(
         policy,
         &hub,
         &pending,
+        &handles,
         &device_id,
     )
     .await;
@@ -118,6 +120,7 @@ async fn serve(
     policy: Policy,
     hub: &Hub,
     pending: &Pending,
+    handles: &Handles,
     device_id: &str,
 ) -> Result<()> {
     let session_id = uuid::Uuid::new_v4().to_string();
@@ -150,7 +153,12 @@ async fn serve(
     crate::wiki::register(&mut tools, &storage.wiki_dir());
     crate::ssh::register(&mut tools);
     crate::browser::register(&mut tools);
-    bridge::register(&mut tools, Arc::clone(hub), Arc::clone(pending));
+    bridge::register(
+        &mut tools,
+        Arc::clone(hub),
+        Arc::clone(pending),
+        Arc::clone(handles),
+    );
 
     while let Some(msg) = read_client(rx).await? {
         match msg {
@@ -438,6 +446,7 @@ mod tests {
                     Policy::RequireApproval,
                     bridge::new_hub(),
                     bridge::new_pending(),
+                    bridge::new_handles(),
                 )
                 .await;
             }
@@ -531,6 +540,7 @@ mod tests {
         let workspace = Arc::new(ws_root.clone());
         let hub = bridge::new_hub();
         let pending = bridge::new_pending();
+        let handles = bridge::new_handles();
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -542,18 +552,21 @@ mod tests {
             let workspace = Arc::clone(&workspace);
             let hub = Arc::clone(&hub);
             let pending = Arc::clone(&pending);
+            let handles = Arc::clone(&handles);
             tokio::spawn(async move {
                 for _ in 0..2 {
                     if let Ok((stream, _)) = listener.accept().await {
-                        let (s, p, w, h, pe) = (
+                        let (s, p, w, h, pe, hd) = (
                             Arc::clone(&storage),
                             Arc::clone(&provider),
                             Arc::clone(&workspace),
                             Arc::clone(&hub),
                             Arc::clone(&pending),
+                            Arc::clone(&handles),
                         );
                         tokio::spawn(async move {
-                            let _ = handle_conn(stream, s, p, w, Policy::FullAccess, h, pe).await;
+                            let _ =
+                                handle_conn(stream, s, p, w, Policy::FullAccess, h, pe, hd).await;
                         });
                     }
                 }
