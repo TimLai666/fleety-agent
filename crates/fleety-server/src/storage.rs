@@ -141,6 +141,16 @@ impl Storage {
         self.home.join("fleet").join("schedules")
     }
 
+    /// Built-in skills (shipped with the runtime); read-only, replaced on update.
+    pub fn skills_builtin_dir(&self) -> PathBuf {
+        self.home.join("skills").join("builtin")
+    }
+
+    /// User-installed skills; preserved across updates. Overrides built-ins by name.
+    pub fn skills_installed_dir(&self) -> PathBuf {
+        self.home.join("skills").join("installed")
+    }
+
     /// Ensure a device is registered: create `devices/{id}/device.json` (with
     /// defaults) and an initial `NOTES.md` if missing, and stamp `last_seen`.
     /// v0 stores the record as JSON; the spec's device.yaml has the same fields.

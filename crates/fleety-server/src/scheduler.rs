@@ -38,13 +38,18 @@ pub async fn tick(
     if due.is_empty() {
         return Ok(0);
     }
-    let tools = crate::tools::build_registry(
+    let mut tools = crate::tools::build_registry(
         workspace,
         &storage.backups_dir(),
         &storage.memory_dir(),
         &storage.history_path(SCHED_DEVICE),
         &storage.devices_dir(),
         &storage.schedules_dir(),
+    );
+    crate::skills::register(
+        &mut tools,
+        &storage.skills_builtin_dir(),
+        &storage.skills_installed_dir(),
     );
     let mut fired = 0;
     for item in due {

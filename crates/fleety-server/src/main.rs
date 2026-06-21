@@ -12,6 +12,7 @@ mod conn;
 mod echo;
 mod scheduler;
 mod schedules;
+mod skills;
 mod storage;
 mod tools;
 

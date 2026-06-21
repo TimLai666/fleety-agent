@@ -78,13 +78,18 @@ pub async fn handle_conn(
     )
     .await?;
 
-    let tools = crate::tools::build_registry(
+    let mut tools = crate::tools::build_registry(
         &workspace,
         &storage.backups_dir(),
         &storage.memory_dir(),
         &storage.history_path(&device_id),
         &storage.devices_dir(),
         &storage.schedules_dir(),
+    );
+    crate::skills::register(
+        &mut tools,
+        &storage.skills_builtin_dir(),
+        &storage.skills_installed_dir(),
     );
 
     while let Some(msg) = read_client(&mut rx).await? {
