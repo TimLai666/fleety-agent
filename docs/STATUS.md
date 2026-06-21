@@ -40,12 +40,15 @@ Done and on `main` since this backlog was generated:
 - **fetch_url + http_request** — SSRF-guarded HTTP: `fetch_url` (read-only GET) and `http_request` (GET/POST/PUT/PATCH/DELETE/HEAD + headers + body). Only http/https; loopback/private hosts blocked unless `FLEETY_ALLOW_PRIVATE_NET=1`; redirects not auto-followed; body size-capped. This is the node model's HTTP-connector capability (connect to platforms/APIs over HTTP). Server tools: 33.
 - **code review + fixes (workflow)** — the `fleety-code-review` workflow (adversarial review → verify) ran across the crates: **17 raw → 7 confirmed**. **All 7 fixed** with regression tests: (a) path traversal via unvalidated `device_id`/`conversation_id` in storage (also covers the scheduler's `schedule-<id>` conversation); (b) `search_files` followed file symlinks out of the workspace; (c) `write_file`/`edit_file` could write through a symlink leaf; (d) compaction could orphan a `tool` message / summarize away all recent messages. (e) seq-assignment TOCTOU in `Storage::append` — fixed with an `append_lock` held across count-then-write. **All 7 confirmed findings are fixed.**
 
-Still open — the **heavier, external/UI-bound** items needing their own integration environment: device-scoping enforcement on handles (#5, needs multi-device handles), client_session tool bridge (#11), SSE incremental token display (consumption done; needs protocol deltas + TUI), only **polish/hardening refinements** now — all the originally-listed architectural items (SSH, browser, computer-use, TUI, device-scoping, on-device bridge) are implemented:
-- **SSE incremental token display in the TUI** — the server delivers whole assistant messages; true token-by-token streaming to the TUI would add protocol delta frames + partial-frame rendering (SSE *consumption* from the model is already done).
-- **persistent browser/SSH sessions** — the browser/ssh tools connect per call; a long-lived session handle (which would exercise more of the device-scoping binding) is an enhancement.
-- **live-path hardening** — the live MCP spawn / SSH / CDP / updater swap paths are logic-tested + manually exercised (the codebase posture); a real multi-device/Chrome/SSH integration suite would add belt-and-suspenders coverage.
+Still open — all the originally-listed architectural items (SSH, browser, computer-use, TUI, device-scoping, on-device bridge, scheduling, skills/MCP, wiki, updater) are implemented. What remains is **one real gap plus refinements**:
 
-The full Fleety v0 spec surface is implemented and verified (60+ tests, CI green); these remaining items are refinements, not missing architecture.
+- **Authentication / enrollment (pairing codes + tokens) — the real gap.** WebSocket connections are currently *unauthenticated*: any client that can reach the port can act as any `device_id`. The spec's pairing-code enrollment + per-device tokens are not implemented. Until they land, deploy only behind a trusted network / reverse proxy with TLS + auth.
+- **critical-command guard** — a deliberately permissive string heuristic, not the semantic classifier the spec (§9) envisions; some irreversible commands may slip past, some safe ones may be over-flagged.
+- **SSE incremental token display in the TUI** — the server delivers whole assistant messages; token-by-token streaming would add protocol delta frames (model-side SSE *consumption* is already done).
+- **persistent browser/SSH sessions** — the browser/ssh tools connect per call; a long-lived session handle is an enhancement.
+- **live-path hardening** — the live MCP spawn / SSH / CDP / updater swap paths are logic-tested + manually exercised; a real multi-device / Chrome / SSH integration suite would add coverage.
+
+The v0 tool + runtime surface is implemented and verified (60+ tests, CI green); connection auth is the notable remaining *feature*, the rest are refinements.
 
 ## Area status
 
