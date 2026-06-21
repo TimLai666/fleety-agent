@@ -26,6 +26,7 @@ pub fn build_registry(
 ) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     fleety_tools::register_workspace(&mut registry, workspace, backups_dir);
+    fleety_tools::register_insyra(&mut registry, workspace);
     registry.register(Box::new(MemoryRead {
         dir: memory_dir.to_path_buf(),
     }));

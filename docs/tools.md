@@ -99,6 +99,14 @@ Cross-conversation memory. Within a conversation the event stream is replayed on
 | `project_create` | Create an empty persistent managed workspace. | `device?`, `name` | mutate |
 | `project_clone` | `git clone` into a persistent managed workspace. | `device?`, `url`, `name?` | mutate |
 
+## Data analysis (Insyra DSL)
+
+| Tool | Purpose | Key inputs | Risk |
+|---|---|---|---|
+| `insyra_exec` | Run the Insyra `.isr` DSL — load CSV/Parquet/Excel/SQL, transform (filter/groupby/scale/encode), stats (mean/describe/ttest/anova/regression/kmeans), plot. Stateful per `session`; `save <var> <file>` writes results into the workspace. | `device?`, `command` \| `script`, `session?`, `reset?` | mutate |
+
+> Backed by the `fleety-insyra` sidecar (a Go process wrapping Insyra's `engine/dsl`), kept alive per workspace; DSL sessions keep their variables/data across calls, and named environments persist on disk under `<root>/.insyra`. Load the `use-insyra-cli` skill for the full DSL command reference.
+
 ## Skills
 
 | Tool | Purpose | Key inputs | Risk |

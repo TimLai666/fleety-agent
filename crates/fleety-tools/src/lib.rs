@@ -20,6 +20,9 @@ use serde_json::{json, Value};
 
 use agent_core::{CoreError, Result, RiskLevel, Tool, ToolRegistry, ToolSpec};
 
+mod insyra;
+pub use insyra::register_insyra;
+
 /// Register the workspace tools rooted at `root`; mutations back up to `backups_dir`.
 pub fn register_workspace(registry: &mut ToolRegistry, root: &Path, backups_dir: &Path) {
     let r = || root.to_path_buf();

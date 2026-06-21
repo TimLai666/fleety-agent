@@ -76,6 +76,10 @@ Dependency rule: everything may depend on `agent-core`; `agent-core` depends on
 nothing Fleety-specific, so it can later be extracted to its own repo and mounted
 back as a git submodule.
 
+Sidecars live under [`sidecars/`](sidecars): [`fleety-insyra`](sidecars/fleety-insyra)
+is a small Go process wrapping the [Insyra](https://github.com/HazelnutParadise/insyra)
+data-analysis DSL, driven by the `insyra_exec` tool over stdin/stdout JSON.
+
 ## What it can do
 
 The agent exposes ~42 tools: workspace files + git (`read_file`, `list_dir`,
@@ -83,7 +87,9 @@ The agent exposes ~42 tools: workspace files + git (`read_file`, `list_dir`,
 `rollback`, `run_command`, `git_*`) — mutations back up + return a unified diff
 (any device, not just git repos), `run_command` can `track` paths to diff what a
 command changed, and `rollback` restores from a backup — plus memory and
-audit history, a knowledge wiki, HTTP (`fetch_url` / `http_request`), self-managed
+audit history, **data analysis** via the Insyra DSL (`insyra_exec` — stateful
+`.isr` sessions backed by the `fleety-insyra` Go sidecar), a knowledge wiki,
+HTTP (`fetch_url` / `http_request`), self-managed
 scheduling (`schedule_*` with a fire loop + per-schedule mandate), a skills + MCP
 runtime, and **cross-device execution** — run tools on another connected device
 (`device_exec`, via the daemon), over SSH (`ssh_exec`), or drive a Chrome over the

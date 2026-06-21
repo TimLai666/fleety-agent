@@ -23,6 +23,7 @@ pub fn build_local_registry(root: &Path) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     let backups = root.join(".fleety-backups");
     fleety_tools::register_workspace(&mut registry, root, &backups);
+    fleety_tools::register_insyra(&mut registry, root);
     registry
 }
 
