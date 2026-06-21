@@ -186,7 +186,14 @@ async fn compact_if_needed(
     if messages.len() <= keep_head + config.recent_keep_messages + 1 {
         return Ok(());
     }
-    let split = messages.len() - config.recent_keep_messages;
+    let mut split = messages.len() - config.recent_keep_messages;
+    // Never let the kept tail begin with an orphaned `tool` message: its
+    // assistant tool-call would have been summarized away, and providers reject a
+    // `tool` message with no preceding matching `assistant` tool_calls. Advance
+    // the split (summarize those tool results too) to a safe boundary.
+    while split < messages.len() && messages[split].role == Role::Tool {
+        split += 1;
+    }
     let middle_text = messages[keep_head..split]
         .iter()
         .map(render_message)
@@ -456,6 +463,60 @@ mod tests {
                 .map(|c| c.contains("Summary of earlier conversation"))
                 .unwrap_or(false)
         }));
+    }
+
+    #[tokio::test]
+    async fn compaction_does_not_orphan_tool_messages() {
+        // split = len(7) - recent_keep(2) = 5 -> messages[5] is a tool result
+        // whose assistant tool-call would land in the summary. The guard must
+        // advance the split so no orphaned tool message survives.
+        let provider = MockProvider::new(vec![ModelResponse {
+            message: Message::assistant("SUMMARY"),
+        }]);
+        let assistant_tc = |id: &str| Message {
+            role: Role::Assistant,
+            content: Some("calling".to_string()),
+            tool_calls: vec![ToolCall {
+                id: id.to_string(),
+                name: "echo".to_string(),
+                arguments: json!({}),
+            }],
+            tool_call_id: None,
+        };
+        let mut messages = vec![
+            Message::system("sys padding to exceed the tiny threshold"),
+            Message::user("hello there padding padding"),
+            assistant_tc("c1"),
+            Message::tool_result("c1", "result one padding"),
+            assistant_tc("c2"),
+            Message::tool_result("c2", "result two padding"),
+            Message::assistant("final answer padding"),
+        ];
+        let config = LoopConfig {
+            compact_threshold_chars: 10,
+            recent_keep_messages: 2,
+            ..LoopConfig::default()
+        };
+
+        compact_if_needed(&provider, &mut messages, &config)
+            .await
+            .expect("compact");
+
+        // Every surviving `tool` message must still be preceded by its
+        // assistant tool-call (no orphans).
+        for (i, m) in messages.iter().enumerate() {
+            if m.role == Role::Tool {
+                let id = m.tool_call_id.clone().expect("tool has id");
+                let has_owner = messages[..i]
+                    .iter()
+                    .any(|p| p.role == Role::Assistant && p.tool_calls.iter().any(|c| c.id == id));
+                assert!(has_owner, "orphaned tool message survived compaction");
+            }
+        }
+        assert_eq!(
+            messages.last().and_then(|m| m.content.as_deref()),
+            Some("final answer padding")
+        );
     }
 
     struct DenyGate;
