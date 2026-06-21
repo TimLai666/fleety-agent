@@ -4,6 +4,9 @@
 //! conversation round-trip, and prints the reply. Interactive TUI comes later.
 #![forbid(unsafe_code)]
 #![warn(clippy::unwrap_used, clippy::expect_used)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
+mod tui;
 
 use std::path::PathBuf;
 
@@ -63,10 +66,105 @@ async fn main() {
                 eprintln!("error: {}", e.report().message);
             }
         }
+        Some("tui") => {
+            if let Err(e) = run_tui().await {
+                eprintln!("error: {}", e.report().message);
+            }
+        }
         _ => {
-            println!("fleety {} — try: fleety ask \"hello\"", agent_core::VERSION);
+            println!(
+                "fleety {} — try: fleety ask \"hello\"  |  fleety tui",
+                agent_core::VERSION
+            );
         }
     }
+}
+
+/// Interactive TUI: connect, then loop over key events and server frames.
+async fn run_tui() -> Result<()> {
+    use ratatui::crossterm::event::{Event, KeyEventKind};
+
+    let url = agent_url();
+    let (ws, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .map_err(|e| CoreError::Provider(format!("cannot connect to {url}: {e}")))?;
+    let (mut tx, mut rx) = ws.split();
+    send(
+        &mut tx,
+        &ClientMsg::Hello {
+            device_id: device_id(),
+            protocol: PROTOCOL_VERSION,
+        },
+    )
+    .await?;
+
+    // Blocking key reads happen on a thread and arrive over a channel.
+    let (key_tx, mut key_rx) = tokio::sync::mpsc::unbounded_channel();
+    std::thread::spawn(move || loop {
+        match ratatui::crossterm::event::read() {
+            Ok(Event::Key(k)) if k.kind != KeyEventKind::Release => {
+                if key_tx.send(k).is_err() {
+                    break;
+                }
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    });
+
+    let mut terminal = ratatui::init();
+    let mut app = tui::App::new(format!("connected to {url}"));
+    let result = loop {
+        if let Err(e) = terminal.draw(|f| tui::render(f, &app)) {
+            break Err(CoreError::Message(format!("draw failed: {e}")));
+        }
+        if app.should_quit {
+            break Ok(());
+        }
+        tokio::select! {
+            key = key_rx.recv() => match key {
+                Some(k) => match tui::on_key(&mut app, k) {
+                    tui::Action::Send(text) => {
+                        app.status = "sent; waiting…".to_string();
+                        if let Err(e) = send(&mut tx, &ClientMsg::UserMessage {
+                            conversation_id: None,
+                            text,
+                            origin: OriginContext::default(),
+                        }).await {
+                            app.status = format!("send failed: {}", e.report().message);
+                        }
+                    }
+                    tui::Action::Quit => app.should_quit = true,
+                    tui::Action::None => {}
+                },
+                None => app.should_quit = true,
+            },
+            frame = rx.next() => match frame {
+                Some(Ok(f)) if f.is_text() => {
+                    if let Ok(text) = f.to_text() {
+                        match serde_json::from_str::<ServerMsg>(text) {
+                            Ok(ServerMsg::Assistant { text, .. }) => {
+                                app.push("fleety", text);
+                                app.status = "ready".to_string();
+                            }
+                            Ok(ServerMsg::Error { error }) => {
+                                app.status = format!("agent error: {}", error.message);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Some(Ok(_)) => {}
+                _ => {
+                    app.status = "disconnected".to_string();
+                    app.should_quit = true;
+                }
+            },
+        }
+    };
+    ratatui::restore();
+    let _ = tx.close().await;
+    result
 }
 
 fn fleety_dir() -> Option<PathBuf> {
