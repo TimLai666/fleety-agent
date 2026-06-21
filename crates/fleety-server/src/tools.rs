@@ -109,7 +109,19 @@ fn resolve_for_write(root: &Path, rel: &str) -> Result<PathBuf> {
     let file_name = target
         .file_name()
         .ok_or_else(|| CoreError::Message(format!("path '{rel}' has no file name")))?;
-    Ok(canon_parent.join(file_name))
+    let resolved = canon_parent.join(file_name);
+    // Refuse to write through a symlink: it could redirect the write outside the
+    // workspace (resolve only canonicalizes the parent, not the leaf).
+    if resolved
+        .symlink_metadata()
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err(CoreError::Message(format!(
+            "refusing to write through symlink '{rel}'"
+        )));
+    }
+    Ok(resolved)
 }
 
 /// Copy an existing file into the backups store (outside the workspace) and
@@ -181,6 +193,11 @@ fn search_dir(dir: &Path, root: &Path, query: &str, max: usize, out: &mut Vec<Va
             return;
         }
         let path = entry.path();
+        // Skip symlinks: following them (file or dir) can read outside the
+        // workspace boundary that resolve_in_root otherwise enforces.
+        if entry.file_type().map(|t| t.is_symlink()).unwrap_or(false) {
+            continue;
+        }
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
         if is_dir {
             let name = entry.file_name();

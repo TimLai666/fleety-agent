@@ -53,6 +53,21 @@ fn read_events(path: &Path) -> Result<Vec<StoredEvent>> {
     Ok(events)
 }
 
+/// Reject id components that could escape the store via path traversal.
+fn validate_id(kind: &str, id: &str) -> Result<()> {
+    if id.is_empty()
+        || id.contains('/')
+        || id.contains('\\')
+        || id.contains("..")
+        || id.contains('\0')
+    {
+        return Err(CoreError::Message(format!(
+            "invalid {kind} '{id}': must not be empty or contain path separators or '..'"
+        )));
+    }
+    Ok(())
+}
+
 /// Filesystem-backed conversation store rooted at the Agent home.
 pub struct Storage {
     home: PathBuf,
@@ -75,6 +90,8 @@ impl Storage {
     /// Append a message to a conversation's event stream; returns its `seq`
     /// (monotonic per conversation, the basis for resume/replay).
     pub fn append(&self, device_id: &str, conversation_id: &str, message: &Message) -> Result<u64> {
+        validate_id("device_id", device_id)?;
+        validate_id("conversation_id", conversation_id)?;
         let path = self.conversation_path(device_id, conversation_id);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| {
@@ -97,6 +114,8 @@ impl Storage {
 
     /// Load a conversation's messages (empty if it does not exist yet).
     pub fn load(&self, device_id: &str, conversation_id: &str) -> Result<Vec<Message>> {
+        validate_id("device_id", device_id)?;
+        validate_id("conversation_id", conversation_id)?;
         let events = read_events(&self.conversation_path(device_id, conversation_id))?;
         Ok(events.into_iter().map(|e| e.message).collect())
     }
@@ -108,6 +127,8 @@ impl Storage {
         conversation_id: &str,
         after_seq: u64,
     ) -> Result<Vec<StoredEvent>> {
+        validate_id("device_id", device_id)?;
+        validate_id("conversation_id", conversation_id)?;
         let events = read_events(&self.conversation_path(device_id, conversation_id))?;
         Ok(events.into_iter().filter(|e| e.seq > after_seq).collect())
     }
@@ -155,6 +176,7 @@ impl Storage {
     /// defaults) and an initial `NOTES.md` if missing, and stamp `last_seen`.
     /// v0 stores the record as JSON; the spec's device.yaml has the same fields.
     pub fn ensure_device(&self, device_id: &str, connector_type: &str) -> Result<()> {
+        validate_id("device_id", device_id)?;
         let dir = self.devices_dir().join(device_id);
         fs::create_dir_all(&dir)
             .map_err(|e| CoreError::Message(format!("cannot create device dir: {e}")))?;
@@ -227,6 +249,7 @@ impl Storage {
 
     /// Append an event to a device's audit log (`history.jsonl`).
     pub fn append_history(&self, device_id: &str, event: &Event) -> Result<()> {
+        validate_id("device_id", device_id)?;
         let path = self.history_path(device_id);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| {
@@ -293,6 +316,22 @@ mod tests {
             .load_after("dev", "none", 0)
             .expect("after")
             .is_empty());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn rejects_path_traversal_ids() {
+        let home = temp_home();
+        let storage = Storage::new(home.clone());
+        assert!(storage.append("../evil", "c", &Message::user("x")).is_err());
+        assert!(storage
+            .append("dev", "../../evil", &Message::user("x"))
+            .is_err());
+        assert!(storage.append("a/b", "c", &Message::user("x")).is_err());
+        assert!(storage.load("..", "c").is_err());
+        assert!(storage.ensure_device("../x", "client_session").is_err());
+        // A normal id still works.
+        assert!(storage.append("dev", "conv", &Message::user("ok")).is_ok());
         let _ = std::fs::remove_dir_all(&home);
     }
 }

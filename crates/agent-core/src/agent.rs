@@ -187,12 +187,12 @@ async fn compact_if_needed(
         return Ok(());
     }
     let mut split = messages.len() - config.recent_keep_messages;
-    // Never let the kept tail begin with an orphaned `tool` message: its
-    // assistant tool-call would have been summarized away, and providers reject a
-    // `tool` message with no preceding matching `assistant` tool_calls. Advance
-    // the split (summarize those tool results too) to a safe boundary.
-    while split < messages.len() && messages[split].role == Role::Tool {
-        split += 1;
+    // Don't let the kept tail begin with an orphaned `tool` message (its
+    // assistant tool-call would be summarized away — providers reject that). Back
+    // up to the owning assistant so its tool_call and results stay together; this
+    // also guarantees we never keep zero recent messages.
+    while split > keep_head && messages[split].role == Role::Tool {
+        split -= 1;
     }
     let middle_text = messages[keep_head..split]
         .iter()
@@ -517,6 +517,61 @@ mod tests {
             messages.last().and_then(|m| m.content.as_deref()),
             Some("final answer padding")
         );
+    }
+
+    #[tokio::test]
+    async fn compaction_keeps_recent_when_tail_is_all_tools() {
+        // recent_keep=2 and the tail is [tool, tool]; backing up to the owning
+        // assistant must keep that block verbatim (not summarize everything).
+        let provider = MockProvider::new(vec![ModelResponse {
+            message: Message::assistant("SUMMARY"),
+        }]);
+        let mut messages = vec![
+            Message::system("sys padding to exceed the tiny threshold"),
+            Message::user("hello there padding padding"),
+            Message {
+                role: Role::Assistant,
+                content: Some("calling".to_string()),
+                tool_calls: vec![
+                    ToolCall {
+                        id: "c1".into(),
+                        name: "echo".into(),
+                        arguments: json!({}),
+                    },
+                    ToolCall {
+                        id: "c2".into(),
+                        name: "echo".into(),
+                        arguments: json!({}),
+                    },
+                ],
+                tool_call_id: None,
+            },
+            Message::tool_result("c1", "result one"),
+            Message::tool_result("c2", "result two"),
+        ];
+        let config = LoopConfig {
+            compact_threshold_chars: 10,
+            recent_keep_messages: 2,
+            ..LoopConfig::default()
+        };
+
+        compact_if_needed(&provider, &mut messages, &config)
+            .await
+            .expect("compact");
+
+        // The owning assistant block survived verbatim (recent not all summarized).
+        assert!(messages
+            .iter()
+            .any(|m| m.content.as_deref() == Some("calling")));
+        // No orphaned tool messages.
+        for (i, m) in messages.iter().enumerate() {
+            if m.role == Role::Tool {
+                let id = m.tool_call_id.clone().expect("tool id");
+                assert!(messages[..i]
+                    .iter()
+                    .any(|p| p.role == Role::Assistant && p.tool_calls.iter().any(|c| c.id == id)));
+            }
+        }
     }
 
     struct DenyGate;
