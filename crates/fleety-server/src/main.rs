@@ -16,6 +16,7 @@ mod echo;
 mod mcp;
 mod scheduler;
 mod schedules;
+mod sites;
 mod skills;
 mod ssh;
 mod storage;

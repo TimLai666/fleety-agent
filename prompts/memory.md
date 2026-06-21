@@ -50,6 +50,8 @@ A device record carries more than one way to reach it and where it physically li
 - **`mobility`** — `stationary` (fixed in one place: desktop, NAS, Pi, router, smart plug, fan), `mobile` (travels with a person: laptop, phone), or `unknown`.
 - **`site`** — the named place a device is at (`home`, `office`, `lab`). A stationary device has a fixed `site`; a mobile device has a *current, changeable* `site` that may be `away` or `unknown`.
 
+**Maintain a site registry, not just per-device fields.** Sites are first-class records you keep current: `site_set` to create/update a place (id + name + description), `site_list` to see all places, `site_show` to see a place and the devices located there, `device_set_site` to put a device at a registered site. When you learn that some devices are at one location and others elsewhere, record the sites and assign each device — then you can reason about "what's at the office" vs "what's at home" instead of guessing from device names.
+
 **Reachability is not presence.** Because a device can be reached from anywhere through its connectors, the fact that you *can* reach it tells you nothing about where the user physically is. To reason about physical presence, use co-location signals, never reachability:
 
 - Two devices are **co-located** when they share a **local network** (same LAN / subnet / gateway), verifiable from facts — not when one reaches the other through a relay or the internet.

@@ -169,6 +169,11 @@ impl Storage {
         self.home.join("fleet").join("devices")
     }
 
+    /// Directory holding site (場域 / location) records.
+    pub fn sites_dir(&self) -> PathBuf {
+        self.home.join("fleet").join("sites")
+    }
+
     /// Directory holding the agent's schedules.
     pub fn schedules_dir(&self) -> PathBuf {
         self.home.join("fleet").join("schedules")
