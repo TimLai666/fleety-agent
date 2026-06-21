@@ -28,6 +28,64 @@ fn require_str<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
         .ok_or_else(|| CoreError::Message(format!("missing required string argument '{key}'")))
 }
 
+/// Validate a schedule trigger: `at:<unix_secs>`, `every:<dur>` (e.g. `30s`,
+/// `5m`, `2h`, `1d`, or bare seconds), or a 5-field cron expression. The fire
+/// loop (a later milestone) consumes the same grammar.
+fn validate_trigger(spec: &str) -> Result<()> {
+    let spec = spec.trim();
+    if let Some(rest) = spec.strip_prefix("at:") {
+        return parse_unix(rest).map(|_| ());
+    }
+    if let Some(rest) = spec.strip_prefix("every:") {
+        return parse_duration_secs(rest).map(|_| ());
+    }
+    if spec.split_whitespace().count() == 5 {
+        return Ok(()); // cron expression
+    }
+    Err(CoreError::Message(format!(
+        "invalid trigger '{spec}'; use 'at:<unix_secs>', 'every:<dur, e.g. 30s/5m/1h/1d>', or a 5-field cron expression"
+    )))
+}
+
+fn parse_unix(s: &str) -> Result<u64> {
+    s.trim()
+        .parse::<u64>()
+        .map_err(|_| CoreError::Message(format!("invalid 'at:' time '{s}' (want unix seconds)")))
+}
+
+fn parse_duration_secs(s: &str) -> Result<u64> {
+    let s = s.trim();
+    if let Ok(n) = s.parse::<u64>() {
+        return if n > 0 {
+            Ok(n)
+        } else {
+            Err(CoreError::Message(
+                "'every:' interval must be > 0".to_string(),
+            ))
+        };
+    }
+    let split = s.len().saturating_sub(1);
+    let (num, unit) = s.split_at(split);
+    let n: u64 = num
+        .parse()
+        .map_err(|_| CoreError::Message(format!("invalid duration '{s}' (e.g. 30s/5m/1h/1d)")))?;
+    let mult = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86400,
+        _ => {
+            return Err(CoreError::Message(format!(
+                "invalid duration unit in '{s}' (use s/m/h/d)"
+            )))
+        }
+    };
+    if n == 0 {
+        return Err(CoreError::Message("duration must be > 0".to_string()));
+    }
+    Ok(n * mult)
+}
+
 struct ScheduleCreate {
     dir: PathBuf,
 }
@@ -53,6 +111,7 @@ impl Tool for ScheduleCreate {
 
     async fn call(&self, args: Value) -> Result<Value> {
         let trigger = require_str(&args, "trigger")?;
+        validate_trigger(trigger)?;
         let prompt = require_str(&args, "prompt")?;
         let mandate = args.get("mandate").and_then(Value::as_str).unwrap_or("");
         let id = uuid::Uuid::new_v4().to_string();
@@ -189,6 +248,36 @@ mod tests {
             .await;
         assert!(missing.is_err());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn trigger_validation() {
+        assert!(validate_trigger("at:1700000000").is_ok());
+        assert!(validate_trigger("every:30s").is_ok());
+        assert!(validate_trigger("every:5m").is_ok());
+        assert!(validate_trigger("every:1h").is_ok());
+        assert!(validate_trigger("every:1d").is_ok());
+        assert!(validate_trigger("every:90").is_ok());
+        assert!(validate_trigger("0 9 * * 1").is_ok()); // cron
+        assert!(validate_trigger("at:notanumber").is_err());
+        assert!(validate_trigger("every:0").is_err());
+        assert!(validate_trigger("every:5x").is_err());
+        assert!(validate_trigger("garbage").is_err());
+    }
+
+    #[tokio::test]
+    async fn create_rejects_bad_trigger() {
+        let dir = temp_dir();
+        let mut registry = ToolRegistry::new();
+        register(&mut registry, &dir);
+        let bad = registry
+            .call(
+                "schedule_create",
+                json!({ "trigger": "garbage", "prompt": "x" }),
+            )
+            .await;
+        assert!(bad.is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
