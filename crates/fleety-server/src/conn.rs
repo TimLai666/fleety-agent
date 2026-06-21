@@ -92,6 +92,7 @@ pub async fn handle_conn(
         &storage.skills_installed_dir(),
     );
     crate::web::register(&mut tools);
+    crate::mcp::register(&mut tools, &storage.mcp_config_path());
 
     while let Some(msg) = read_client(&mut rx).await? {
         match msg {

@@ -1,0 +1,434 @@
+//! MCP runtime: configure external MCP servers and call their tools.
+//!
+//! `mcp_add`/`mcp_list`/`mcp_remove` persist a JSON list of servers; `mcp_call`
+//! spawns a server over stdio and speaks newline-delimited JSON-RPC
+//! (initialize → tools/call). The JSON-RPC framing is unit-tested; the live
+//! spawn follows the codebase's verification posture (logic tested, live I/O
+//! exercised manually, like the OpenAI provider).
+
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::Command;
+
+use agent_core::{CoreError, Result, RiskLevel, Tool, ToolRegistry, ToolSpec};
+
+const CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Register the MCP tools, persisting config at `config_path`.
+pub fn register(registry: &mut ToolRegistry, config_path: &Path) {
+    registry.register(Box::new(McpList {
+        config: config_path.to_path_buf(),
+    }));
+    registry.register(Box::new(McpAdd {
+        config: config_path.to_path_buf(),
+    }));
+    registry.register(Box::new(McpRemove {
+        config: config_path.to_path_buf(),
+    }));
+    registry.register(Box::new(McpCall {
+        config: config_path.to_path_buf(),
+    }));
+}
+
+fn require_str<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
+    args.get(key)
+        .and_then(Value::as_str)
+        .ok_or_else(|| CoreError::Message(format!("missing required string argument '{key}'")))
+}
+
+#[derive(Clone)]
+struct ServerCfg {
+    name: String,
+    command: String,
+    args: Vec<String>,
+}
+
+fn load_servers(config: &Path) -> Result<Vec<ServerCfg>> {
+    let text = match std::fs::read_to_string(config) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(CoreError::Message(format!("cannot read mcp config: {e}"))),
+    };
+    let value: Value = serde_json::from_str(&text)
+        .map_err(|e| CoreError::Message(format!("corrupt mcp config: {e}")))?;
+    let mut out = Vec::new();
+    if let Some(arr) = value.get("servers").and_then(Value::as_array) {
+        for s in arr {
+            let name = s
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let command = s
+                .get("command")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let args = s
+                .get("args")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !name.is_empty() && !command.is_empty() {
+                out.push(ServerCfg {
+                    name,
+                    command,
+                    args,
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn save_servers(config: &Path, servers: &[ServerCfg]) -> Result<()> {
+    if let Some(parent) = config.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| CoreError::Message(format!("cannot create mcp dir: {e}")))?;
+    }
+    let arr: Vec<Value> = servers
+        .iter()
+        .map(|s| json!({ "name": s.name, "command": s.command, "args": s.args }))
+        .collect();
+    let body = serde_json::to_string_pretty(&json!({ "servers": arr }))
+        .map_err(|e| CoreError::Message(format!("serialize mcp config: {e}")))?;
+    std::fs::write(config, body)
+        .map_err(|e| CoreError::Message(format!("write mcp config: {e}")))?;
+    Ok(())
+}
+
+// --- JSON-RPC framing (pure, unit-tested) ---
+
+fn jsonrpc_request(id: u64, method: &str, params: Value) -> String {
+    json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }).to_string()
+}
+
+fn jsonrpc_notification(method: &str, params: Value) -> String {
+    json!({ "jsonrpc": "2.0", "method": method, "params": params }).to_string()
+}
+
+/// Parse a JSON-RPC line: `Some(Ok(result))` / `Some(Err)` if it is the response
+/// for `id`, or `None` if it is an unrelated message (notification / other id).
+fn parse_response_for(line: &str, id: u64) -> Option<Result<Value>> {
+    let v: Value = serde_json::from_str(line).ok()?;
+    if v.get("id").and_then(Value::as_u64) != Some(id) {
+        return None;
+    }
+    if let Some(err) = v.get("error") {
+        let msg = err
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown error");
+        return Some(Err(CoreError::Provider(format!("mcp error: {msg}"))));
+    }
+    Some(Ok(v.get("result").cloned().unwrap_or(Value::Null)))
+}
+
+async fn write_line<W: AsyncWriteExt + Unpin>(w: &mut W, line: &str) -> Result<()> {
+    w.write_all(line.as_bytes())
+        .await
+        .map_err(|e| CoreError::Provider(format!("mcp write failed: {e}")))?;
+    w.write_all(b"\n")
+        .await
+        .map_err(|e| CoreError::Provider(format!("mcp write failed: {e}")))?;
+    w.flush()
+        .await
+        .map_err(|e| CoreError::Provider(format!("mcp flush failed: {e}")))?;
+    Ok(())
+}
+
+async fn read_response<R: AsyncBufReadExt + Unpin>(
+    reader: &mut tokio::io::Lines<R>,
+    id: u64,
+) -> Result<Value> {
+    loop {
+        match reader
+            .next_line()
+            .await
+            .map_err(|e| CoreError::Provider(format!("mcp read failed: {e}")))?
+        {
+            Some(line) => {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                if let Some(res) = parse_response_for(&line, id) {
+                    return res;
+                }
+            }
+            None => {
+                return Err(CoreError::Provider(
+                    "mcp server closed before responding".to_string(),
+                ))
+            }
+        }
+    }
+}
+
+struct McpList {
+    config: PathBuf,
+}
+
+#[async_trait]
+impl Tool for McpList {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "mcp_list".to_string(),
+            description: "List configured external MCP servers.".to_string(),
+            parameters: json!({ "type": "object", "properties": {} }),
+            risk: RiskLevel::Read,
+        }
+    }
+
+    async fn call(&self, _args: Value) -> Result<Value> {
+        let servers: Vec<Value> = load_servers(&self.config)?
+            .into_iter()
+            .map(|s| json!({ "name": s.name, "command": s.command, "args": s.args }))
+            .collect();
+        Ok(json!({ "servers": servers }))
+    }
+}
+
+struct McpAdd {
+    config: PathBuf,
+}
+
+#[async_trait]
+impl Tool for McpAdd {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "mcp_add".to_string(),
+            description: "Add (or replace) an external MCP server by name.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "command": { "type": "string" },
+                    "args": { "type": "array", "items": { "type": "string" } }
+                },
+                "required": ["name", "command"]
+            }),
+            risk: RiskLevel::Mutate,
+        }
+    }
+
+    async fn call(&self, args: Value) -> Result<Value> {
+        let name = require_str(&args, "name")?.to_string();
+        let command = require_str(&args, "command")?.to_string();
+        let server_args = args
+            .get("args")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut servers = load_servers(&self.config)?;
+        servers.retain(|s| s.name != name);
+        servers.push(ServerCfg {
+            name: name.clone(),
+            command,
+            args: server_args,
+        });
+        save_servers(&self.config, &servers)?;
+        Ok(json!({ "name": name, "added": true }))
+    }
+}
+
+struct McpRemove {
+    config: PathBuf,
+}
+
+#[async_trait]
+impl Tool for McpRemove {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "mcp_remove".to_string(),
+            description: "Remove a configured MCP server by name.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "name": { "type": "string" } },
+                "required": ["name"]
+            }),
+            risk: RiskLevel::Mutate,
+        }
+    }
+
+    async fn call(&self, args: Value) -> Result<Value> {
+        let name = require_str(&args, "name")?;
+        let mut servers = load_servers(&self.config)?;
+        let before = servers.len();
+        servers.retain(|s| s.name != name);
+        if servers.len() == before {
+            return Err(CoreError::Message(format!("no such mcp server '{name}'")));
+        }
+        save_servers(&self.config, &servers)?;
+        Ok(json!({ "name": name, "removed": true }))
+    }
+}
+
+struct McpCall {
+    config: PathBuf,
+}
+
+#[async_trait]
+impl Tool for McpCall {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "mcp_call".to_string(),
+            description: "Call a tool on a configured MCP server (spawns it over stdio JSON-RPC)."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "server": { "type": "string" },
+                    "tool": { "type": "string" },
+                    "arguments": { "type": "object" }
+                },
+                "required": ["server", "tool"]
+            }),
+            risk: RiskLevel::Mutate,
+        }
+    }
+
+    async fn call(&self, args: Value) -> Result<Value> {
+        let server_name = require_str(&args, "server")?;
+        let tool = require_str(&args, "tool")?.to_string();
+        let arguments = args.get("arguments").cloned().unwrap_or_else(|| json!({}));
+
+        let server = load_servers(&self.config)?
+            .into_iter()
+            .find(|s| s.name == server_name)
+            .ok_or_else(|| CoreError::ToolNotFound(format!("mcp server '{server_name}'")))?;
+
+        let mut child = Command::new(&server.command)
+            .args(&server.args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| {
+                CoreError::Message(format!("cannot spawn mcp server '{server_name}': {e}"))
+            })?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| CoreError::Message("mcp server has no stdin".to_string()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| CoreError::Message("mcp server has no stdout".to_string()))?;
+        let mut reader = BufReader::new(stdout).lines();
+
+        let exchange = async {
+            let init = jsonrpc_request(
+                1,
+                "initialize",
+                json!({
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": { "name": "fleety", "version": env!("CARGO_PKG_VERSION") }
+                }),
+            );
+            write_line(&mut stdin, &init).await?;
+            read_response(&mut reader, 1).await?;
+            write_line(
+                &mut stdin,
+                &jsonrpc_notification("notifications/initialized", json!({})),
+            )
+            .await?;
+            let call = jsonrpc_request(
+                2,
+                "tools/call",
+                json!({ "name": tool, "arguments": arguments }),
+            );
+            write_line(&mut stdin, &call).await?;
+            read_response(&mut reader, 2).await
+        };
+
+        let result = tokio::time::timeout(CALL_TIMEOUT, exchange).await;
+        let _ = child.start_kill();
+        match result {
+            Ok(inner) => inner,
+            Err(_) => Err(CoreError::Provider(format!(
+                "mcp server '{server_name}' timed out after {}s",
+                CALL_TIMEOUT.as_secs()
+            ))),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_config() -> PathBuf {
+        std::env::temp_dir()
+            .join(format!("fleety-mcp-{}", uuid::Uuid::new_v4()))
+            .join("installed.json")
+    }
+
+    #[test]
+    fn jsonrpc_framing() {
+        let req = jsonrpc_request(2, "tools/call", json!({ "name": "x" }));
+        let v: Value = serde_json::from_str(&req).expect("json");
+        assert_eq!(v["jsonrpc"], json!("2.0"));
+        assert_eq!(v["id"], json!(2));
+        assert_eq!(v["method"], json!("tools/call"));
+
+        // matching id -> result
+        let line = r#"{"jsonrpc":"2.0","id":2,"result":{"ok":true}}"#;
+        assert_eq!(
+            parse_response_for(line, 2).expect("some").expect("ok"),
+            json!({ "ok": true })
+        );
+        // error
+        let err = r#"{"jsonrpc":"2.0","id":2,"error":{"message":"boom"}}"#;
+        assert!(parse_response_for(err, 2).expect("some").is_err());
+        // wrong id / notification -> None
+        assert!(parse_response_for(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#, 2).is_none());
+        assert!(parse_response_for(r#"{"jsonrpc":"2.0","method":"note"}"#, 2).is_none());
+    }
+
+    #[tokio::test]
+    async fn config_crud() {
+        let config = temp_config();
+        let mut registry = ToolRegistry::new();
+        register(&mut registry, &config);
+
+        registry
+            .call(
+                "mcp_add",
+                json!({ "name": "files", "command": "node", "args": ["server.js"] }),
+            )
+            .await
+            .expect("add");
+        let listed = registry.call("mcp_list", json!({})).await.expect("list");
+        assert_eq!(listed["servers"].as_array().map(Vec::len).unwrap_or(0), 1);
+        assert_eq!(listed["servers"][0]["command"], json!("node"));
+
+        registry
+            .call("mcp_remove", json!({ "name": "files" }))
+            .await
+            .expect("remove");
+        let after = registry.call("mcp_list", json!({})).await.expect("list2");
+        assert_eq!(after["servers"].as_array().map(Vec::len).unwrap_or(0), 0);
+        assert!(registry
+            .call("mcp_remove", json!({ "name": "nope" }))
+            .await
+            .is_err());
+
+        if let Some(dir) = config.parent() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}

@@ -15,7 +15,7 @@ publish = false
 agent-core = { path = "crates/agent-core" }
 fleety-protocol = { path = "crates/fleety-protocol" }
 # external
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "net", "io-util", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "net", "io-util", "sync", "process"] }
 thiserror = "1.0"
 anyhow = "1.0"
 tracing = "0.1"

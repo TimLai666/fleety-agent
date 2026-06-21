@@ -184,6 +184,11 @@ impl Storage {
         self.home.join("skills").join("installed")
     }
 
+    /// Path to the user-installed MCP server config (JSON).
+    pub fn mcp_config_path(&self) -> PathBuf {
+        self.home.join("mcp").join("installed.json")
+    }
+
     /// Ensure a device is registered: create `devices/{id}/device.json` (with
     /// defaults) and an initial `NOTES.md` if missing, and stamp `last_seen`.
     /// v0 stores the record as JSON; the spec's device.yaml has the same fields.

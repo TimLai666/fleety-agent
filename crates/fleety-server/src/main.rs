@@ -10,6 +10,7 @@
 
 mod conn;
 mod echo;
+mod mcp;
 mod scheduler;
 mod schedules;
 mod skills;
