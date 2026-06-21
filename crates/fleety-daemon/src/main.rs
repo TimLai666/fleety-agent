@@ -8,6 +8,7 @@
 #![warn(clippy::unwrap_used, clippy::expect_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+mod ondevice;
 mod service;
 mod update;
 
@@ -15,7 +16,7 @@ use agent_core::{obs, CoreError, Result};
 use futures::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-use fleety_protocol::{ClientMsg, ServerMsg, PROTOCOL_VERSION};
+use fleety_protocol::{ClientMsg, ServerMsg, WireError, PROTOCOL_VERSION};
 
 #[tokio::main]
 async fn main() {
@@ -75,18 +76,57 @@ async fn run() -> Result<()> {
         .await
         .map_err(|e| CoreError::Provider(format!("send hello failed: {e}")))?;
 
+    let registry = ondevice::build_local_registry(&ondevice::device_root());
     tracing::info!(%url, "connected; holding connection");
     while let Some(frame) = rx.next().await {
         let frame =
             frame.map_err(|e| CoreError::Provider(format!("websocket read failed: {e}")))?;
-        if frame.is_text() {
-            if let Ok(text) = frame.to_text() {
-                if let Ok(ServerMsg::Welcome { session_id, .. }) = serde_json::from_str(text) {
-                    tracing::info!(%session_id, "registered with agent");
-                }
-            }
-        } else if frame.is_close() {
+        if frame.is_close() {
             break;
+        }
+        if !frame.is_text() {
+            continue;
+        }
+        let Ok(text) = frame.to_text() else { continue };
+        let Ok(msg) = serde_json::from_str::<ServerMsg>(text) else {
+            continue;
+        };
+        match msg {
+            ServerMsg::Welcome { session_id, .. } => {
+                tracing::info!(%session_id, "registered with agent");
+            }
+            ServerMsg::RunTool {
+                call_id,
+                tool,
+                args_json,
+            } => {
+                let args: serde_json::Value =
+                    serde_json::from_str(&args_json).unwrap_or_else(|_| serde_json::json!({}));
+                tracing::info!(%tool, "running on-device tool");
+                let reply = match registry.call(&tool, args).await {
+                    Ok(value) => ClientMsg::ToolResult {
+                        call_id,
+                        result_json: value.to_string(),
+                    },
+                    Err(e) => {
+                        let r = e.report();
+                        ClientMsg::ToolError {
+                            call_id,
+                            error: WireError {
+                                kind: r.kind,
+                                message: r.message,
+                                remediation: r.remediation,
+                            },
+                        }
+                    }
+                };
+                let out = serde_json::to_string(&reply)
+                    .map_err(|e| CoreError::Message(format!("serialize reply: {e}")))?;
+                tx.send(WsMessage::Text(out))
+                    .await
+                    .map_err(|e| CoreError::Provider(format!("send reply failed: {e}")))?;
+            }
+            _ => {}
         }
     }
     tracing::info!("fleetyd disconnected");

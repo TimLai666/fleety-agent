@@ -213,7 +213,9 @@ async fn ask(text: String) -> Result<()> {
                 };
                 send(&mut tx, &decision).await?;
             }
-            Some(ServerMsg::Welcome { .. }) | Some(ServerMsg::Replay { .. }) => {}
+            Some(ServerMsg::Welcome { .. })
+            | Some(ServerMsg::Replay { .. })
+            | Some(ServerMsg::RunTool { .. }) => {}
         }
     }
     // Close the connection gracefully so the server sees a clean disconnect.

@@ -1,6 +1,6 @@
 //! Per-connection handling: WebSocket handshake, session, and the turn loop.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use futures::stream::{SplitSink, SplitStream};
@@ -10,24 +10,33 @@ use tokio_tungstenite::tungstenite::error::ProtocolError;
 use tokio_tungstenite::tungstenite::{Error as WsErr, Message as WsMessage};
 use tokio_tungstenite::WebSocketStream;
 
+use tokio::sync::mpsc;
+
 use agent_core::{
     run_turn, ApprovalDecision, ApprovalGate, CoreError, EventLog, LoopConfig, Message,
     ModelProvider, Policy, Result, RiskLevel, Role,
 };
 use fleety_protocol::{ClientMsg, ServerMsg, WireError, PROTOCOL_VERSION};
 
+use crate::bridge::{self, Hub, Pending};
 use crate::storage::Storage;
+
+/// Outbound frame sender (drained by the connection's writer task).
+type Out = mpsc::UnboundedSender<WsMessage>;
 
 type Tx = SplitSink<WebSocketStream<TcpStream>, WsMessage>;
 type Rx = SplitStream<WebSocketStream<TcpStream>>;
 
 /// Handle one client connection to completion.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_conn(
     stream: TcpStream,
     storage: Arc<Storage>,
     provider: Arc<dyn ModelProvider>,
     workspace: Arc<PathBuf>,
     policy: Policy,
+    hub: Hub,
+    pending: Pending,
 ) -> Result<()> {
     let ws = tokio_tungstenite::accept_async(stream)
         .await
@@ -65,24 +74,69 @@ pub async fn handle_conn(
     // Register / refresh this device in the registry.
     storage.ensure_device(&device_id, "client_session")?;
 
+    // A single writer task owns the sink; everything else (this handler, the
+    // approval gate, and other connections routing RunTool here) sends frames
+    // through `out`, registered in the hub under this device_id.
+    let (out, mut out_rx) = mpsc::unbounded_channel::<WsMessage>();
+    let writer = tokio::spawn(async move {
+        while let Some(frame) = out_rx.recv().await {
+            if tx.send(frame).await.is_err() {
+                break;
+            }
+        }
+    });
+    hub.lock().await.insert(device_id.clone(), out.clone());
+
+    let result = serve(
+        &mut rx,
+        &out,
+        &storage,
+        provider.as_ref(),
+        &workspace,
+        policy,
+        &hub,
+        &pending,
+        &device_id,
+    )
+    .await;
+
+    hub.lock().await.remove(&device_id);
+    writer.abort();
+    tracing::info!(%device_id, "client disconnected");
+    result
+}
+
+/// The session loop, factored out so `handle_conn` can always clean up the hub
+/// entry and writer task afterward.
+#[allow(clippy::too_many_arguments)]
+async fn serve(
+    rx: &mut Rx,
+    out: &Out,
+    storage: &Storage,
+    provider: &dyn ModelProvider,
+    workspace: &Path,
+    policy: Policy,
+    hub: &Hub,
+    pending: &Pending,
+    device_id: &str,
+) -> Result<()> {
     let session_id = uuid::Uuid::new_v4().to_string();
     let default_conversation = uuid::Uuid::new_v4().to_string();
     tracing::info!(%device_id, %session_id, "client connected");
-    send(
-        &mut tx,
+    emit(
+        out,
         &ServerMsg::Welcome {
             session_id,
             conversation_id: default_conversation.clone(),
             protocol: PROTOCOL_VERSION,
         },
-    )
-    .await?;
+    )?;
 
     let mut tools = crate::tools::build_registry(
-        &workspace,
+        workspace,
         &storage.backups_dir(),
         &storage.memory_dir(),
-        &storage.history_path(&device_id),
+        &storage.history_path(device_id),
         &storage.devices_dir(),
         &storage.schedules_dir(),
     );
@@ -94,8 +148,9 @@ pub async fn handle_conn(
     crate::web::register(&mut tools);
     crate::mcp::register(&mut tools, &storage.mcp_config_path());
     crate::wiki::register(&mut tools, &storage.wiki_dir());
+    bridge::register(&mut tools, Arc::clone(hub), Arc::clone(pending));
 
-    while let Some(msg) = read_client(&mut rx).await? {
+    while let Some(msg) = read_client(rx).await? {
         match msg {
             ClientMsg::UserMessage {
                 conversation_id,
@@ -106,19 +161,19 @@ pub async fn handle_conn(
                 tracing::info!(%device_id, conversation = %conversation, ?origin, "user message");
 
                 // Persist the user message, then run the turn over the history.
-                storage.append(&device_id, &conversation, &Message::user(text))?;
+                storage.append(device_id, &conversation, &Message::user(text))?;
                 // Inject agent-level core memory (ME/USER/TODO) as the system
                 // preamble each turn; it is ephemeral, not persisted to the convo.
                 let mut messages = vec![Message::system(storage.core_memory()?)];
-                messages.extend(storage.load(&device_id, &conversation)?);
+                messages.extend(storage.load(device_id, &conversation)?);
                 let mut events = EventLog::new();
                 let outcome = {
                     let mut gate = ConnGate {
-                        tx: &mut tx,
-                        rx: &mut rx,
+                        out: out.clone(),
+                        rx,
                     };
                     run_turn(
-                        provider.as_ref(),
+                        provider,
                         &tools,
                         &mut messages,
                         &mut events,
@@ -131,38 +186,33 @@ pub async fn handle_conn(
 
                 // Audit: persist the turn's events (tool calls, results, replies).
                 for event in events.events() {
-                    storage.append_history(&device_id, event)?;
+                    storage.append_history(device_id, event)?;
                 }
 
                 let reply = outcome.output;
-                let seq = storage.append(
-                    &device_id,
-                    &conversation,
-                    &Message::assistant(reply.clone()),
-                )?;
-                send(
-                    &mut tx,
+                let seq =
+                    storage.append(device_id, &conversation, &Message::assistant(reply.clone()))?;
+                emit(
+                    out,
                     &ServerMsg::Assistant {
                         conversation_id: conversation.clone(),
                         text: reply,
                         seq,
                     },
-                )
-                .await?;
-                send(
-                    &mut tx,
+                )?;
+                emit(
+                    out,
                     &ServerMsg::Done {
                         conversation_id: conversation,
                     },
-                )
-                .await?;
+                )?;
             }
             ClientMsg::Resume {
                 conversation_id,
                 after_seq,
             } => {
                 tracing::info!(%device_id, conversation = %conversation_id, after_seq, "resume");
-                let missed = storage.load_after(&device_id, &conversation_id, after_seq)?;
+                let missed = storage.load_after(device_id, &conversation_id, after_seq)?;
                 for stored in missed {
                     let role = match stored.message.role {
                         Role::User => "user",
@@ -170,18 +220,29 @@ pub async fn handle_conn(
                         Role::System => "system",
                         Role::Tool => "tool",
                     };
-                    send(
-                        &mut tx,
+                    emit(
+                        out,
                         &ServerMsg::Replay {
                             conversation_id: conversation_id.clone(),
                             seq: stored.seq,
                             role: role.to_string(),
                             content: stored.message.content.clone().unwrap_or_default(),
                         },
-                    )
-                    .await?;
+                    )?;
                 }
-                send(&mut tx, &ServerMsg::Done { conversation_id }).await?;
+                emit(out, &ServerMsg::Done { conversation_id })?;
+            }
+            ClientMsg::ToolResult {
+                call_id,
+                result_json,
+            } => {
+                // A daemon's reply to a RunTool we dispatched: route to the waiter.
+                let value = serde_json::from_str::<serde_json::Value>(&result_json)
+                    .unwrap_or(serde_json::Value::Null);
+                bridge::dispatch_result(pending, &call_id, Ok(value)).await;
+            }
+            ClientMsg::ToolError { call_id, error } => {
+                bridge::dispatch_result(pending, &call_id, Err(error.message)).await;
             }
             ClientMsg::Approve { .. } | ClientMsg::Deny { .. } => {
                 // Only meaningful as a reply during an approval; ignore otherwise.
@@ -192,8 +253,15 @@ pub async fn handle_conn(
         }
     }
 
-    tracing::info!(%device_id, "client disconnected");
     Ok(())
+}
+
+/// Send a frame to this connection's writer task.
+fn emit(out: &Out, msg: &ServerMsg) -> Result<()> {
+    let json = serde_json::to_string(msg)
+        .map_err(|e| CoreError::Message(format!("serialize server frame: {e}")))?;
+    out.send(WsMessage::Text(json))
+        .map_err(|_| CoreError::Provider("connection writer closed".to_string()))
 }
 
 async fn send(tx: &mut Tx, msg: &ServerMsg) -> Result<()> {
@@ -233,7 +301,7 @@ fn is_disconnect(e: &WsErr) -> bool {
 /// for an Approve/Deny reply. Sequential within the connection, so it can read
 /// the reply directly from `rx`.
 struct ConnGate<'a> {
-    tx: &'a mut Tx,
+    out: Out,
     rx: &'a mut Rx,
 }
 
@@ -247,16 +315,15 @@ impl ApprovalGate for ConnGate<'_> {
     ) -> Result<ApprovalDecision> {
         let approval_id = uuid::Uuid::new_v4().to_string();
         let summary: String = args.to_string().chars().take(300).collect();
-        send(
-            self.tx,
+        emit(
+            &self.out,
             &ServerMsg::ApprovalRequested {
                 approval_id: approval_id.clone(),
                 tool: tool.to_string(),
                 summary,
                 risk: format!("{risk:?}").to_lowercase(),
             },
-        )
-        .await?;
+        )?;
         loop {
             match read_client(self.rx).await? {
                 Some(ClientMsg::Approve { approval_id: id }) if id == approval_id => {
@@ -367,6 +434,8 @@ mod tests {
                     provider,
                     workspace,
                     Policy::RequireApproval,
+                    bridge::new_hub(),
+                    bridge::new_pending(),
                 )
                 .await;
             }
@@ -427,6 +496,146 @@ mod tests {
             "denied write must not happen"
         );
 
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn device_exec_routes_to_daemon_and_returns() {
+        // The user's agent calls device_exec -> server routes RunTool to the "pi"
+        // daemon connection -> daemon replies -> the result returns to the agent
+        // loop and is audited. Exercises the full three-party bridge.
+        let provider: Arc<dyn ModelProvider> = Arc::new(MockProvider::new(vec![
+            ModelResponse {
+                message: Message {
+                    role: CoreRole::Assistant,
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "c1".to_string(),
+                        name: "device_exec".to_string(),
+                        arguments: serde_json::json!({ "device": "pi", "tool": "read_file", "args": { "path": "x" } }),
+                    }],
+                    tool_call_id: None,
+                },
+            },
+            ModelResponse {
+                message: Message::assistant("done"),
+            },
+        ]));
+
+        let home = std::env::temp_dir().join(format!("fleety-bridge-{}", uuid::Uuid::new_v4()));
+        let ws_root = home.join("ws");
+        std::fs::create_dir_all(&ws_root).expect("mk ws");
+        let storage = Arc::new(Storage::new(home.clone()));
+        let workspace = Arc::new(ws_root.clone());
+        let hub = bridge::new_hub();
+        let pending = bridge::new_pending();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        {
+            let storage = Arc::clone(&storage);
+            let provider = Arc::clone(&provider);
+            let workspace = Arc::clone(&workspace);
+            let hub = Arc::clone(&hub);
+            let pending = Arc::clone(&pending);
+            tokio::spawn(async move {
+                for _ in 0..2 {
+                    if let Ok((stream, _)) = listener.accept().await {
+                        let (s, p, w, h, pe) = (
+                            Arc::clone(&storage),
+                            Arc::clone(&provider),
+                            Arc::clone(&workspace),
+                            Arc::clone(&hub),
+                            Arc::clone(&pending),
+                        );
+                        tokio::spawn(async move {
+                            let _ = handle_conn(stream, s, p, w, Policy::FullAccess, h, pe).await;
+                        });
+                    }
+                }
+            });
+        }
+
+        let url = format!("ws://{addr}");
+
+        // Fake daemon "pi": replies to any RunTool with a marker result.
+        let (dws, _) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("daemon connect");
+        let (mut dtx, mut drx) = dws.split();
+        send_client(
+            &mut dtx,
+            &ClientMsg::Hello {
+                device_id: "pi".into(),
+                protocol: PROTOCOL_VERSION,
+            },
+        )
+        .await;
+        assert!(matches!(
+            recv_server(&mut drx).await,
+            Some(ServerMsg::Welcome { .. })
+        ));
+        let daemon = tokio::spawn(async move {
+            while let Some(msg) = recv_server(&mut drx).await {
+                if let ServerMsg::RunTool { call_id, tool, .. } = msg {
+                    let reply = ClientMsg::ToolResult {
+                        call_id,
+                        result_json: serde_json::json!({ "device_said": tool }).to_string(),
+                    };
+                    send_client(&mut dtx, &reply).await;
+                }
+            }
+        });
+
+        // User: connect and trigger the turn that calls device_exec on "pi".
+        let (uws, _) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("user connect");
+        let (mut utx, mut urx) = uws.split();
+        send_client(
+            &mut utx,
+            &ClientMsg::Hello {
+                device_id: "user".into(),
+                protocol: PROTOCOL_VERSION,
+            },
+        )
+        .await;
+        assert!(matches!(
+            recv_server(&mut urx).await,
+            Some(ServerMsg::Welcome { .. })
+        ));
+        send_client(
+            &mut utx,
+            &ClientMsg::UserMessage {
+                conversation_id: None,
+                text: "run on pi".into(),
+                origin: Default::default(),
+            },
+        )
+        .await;
+
+        let mut done = false;
+        for _ in 0..10 {
+            match recv_server(&mut urx).await {
+                Some(ServerMsg::Done { .. }) | None => {
+                    done = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(done, "user turn should complete");
+
+        // The daemon's result was returned to the agent and audited.
+        let hist = std::fs::read_to_string(storage.history_path("user")).unwrap_or_default();
+        assert!(
+            hist.contains("device_said"),
+            "daemon result should be recorded; history was: {hist}"
+        );
+
+        daemon.abort();
         let _ = std::fs::remove_dir_all(&home);
     }
 }

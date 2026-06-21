@@ -1,0 +1,125 @@
+//! Cross-device tool routing (the `client_session` bridge).
+//!
+//! Each connection registers an outbound sender in the [`Hub`] keyed by its
+//! `device_id`. The `device_exec` tool sends a `RunTool` frame to a target
+//! device's connection and awaits the daemon's `ToolResult`/`ToolError`,
+//! correlated by `call_id` through [`Pending`]. This lets the agent operate any
+//! connected device, not just the server's own workspace.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use serde_json::{json, Value};
+use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+use agent_core::{CoreError, Result, RiskLevel, Tool, ToolRegistry, ToolSpec};
+use fleety_protocol::ServerMsg;
+
+/// Active device connections: `device_id -> outbound frame sender`.
+pub type Hub = Arc<Mutex<HashMap<String, mpsc::UnboundedSender<WsMessage>>>>;
+/// In-flight on-device calls: `call_id -> reply channel` (Ok(value) / Err(msg)).
+pub type Pending = Arc<Mutex<HashMap<String, oneshot::Sender<std::result::Result<Value, String>>>>>;
+
+const CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+pub fn new_hub() -> Hub {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+
+pub fn new_pending() -> Pending {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+
+/// Register the `device_exec` routing tool.
+pub fn register(registry: &mut ToolRegistry, hub: Hub, pending: Pending) {
+    registry.register(Box::new(DeviceExec { hub, pending }));
+}
+
+struct DeviceExec {
+    hub: Hub,
+    pending: Pending,
+}
+
+#[async_trait]
+impl Tool for DeviceExec {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "device_exec".to_string(),
+            description: "Run a tool on another connected device by id (routes to that device's daemon). On-device tools: read_file, list_dir, write_file, run_command.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "device": { "type": "string", "description": "target device_id (see device_list)" },
+                    "tool": { "type": "string" },
+                    "args": { "type": "object" }
+                },
+                "required": ["device", "tool"]
+            }),
+            risk: RiskLevel::Mutate,
+        }
+    }
+
+    async fn call(&self, args: Value) -> Result<Value> {
+        let device = args.get("device").and_then(Value::as_str).ok_or_else(|| {
+            CoreError::Message("missing required string argument 'device'".to_string())
+        })?;
+        let tool = args.get("tool").and_then(Value::as_str).ok_or_else(|| {
+            CoreError::Message("missing required string argument 'tool'".to_string())
+        })?;
+        let tool_args = args.get("args").cloned().unwrap_or_else(|| json!({}));
+
+        let call_id = uuid::Uuid::new_v4().to_string();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.pending.lock().await.insert(call_id.clone(), reply_tx);
+
+        let frame = ServerMsg::RunTool {
+            call_id: call_id.clone(),
+            tool: tool.to_string(),
+            args_json: tool_args.to_string(),
+        };
+        let text = serde_json::to_string(&frame)
+            .map_err(|e| CoreError::Message(format!("serialize RunTool: {e}")))?;
+        {
+            let hub = self.hub.lock().await;
+            let sender = hub.get(device).ok_or_else(|| {
+                CoreError::Message(format!(
+                    "device '{device}' is not connected; use device_list to see connected devices"
+                ))
+            })?;
+            sender
+                .send(WsMessage::Text(text))
+                .map_err(|_| CoreError::Provider(format!("device '{device}' connection closed")))?;
+        }
+
+        match tokio::time::timeout(CALL_TIMEOUT, reply_rx).await {
+            Ok(Ok(Ok(value))) => Ok(value),
+            Ok(Ok(Err(message))) => Err(CoreError::Provider(format!(
+                "device '{device}' tool failed: {message}"
+            ))),
+            Ok(Err(_)) => Err(CoreError::Provider(format!(
+                "device '{device}' reply channel dropped (disconnected?)"
+            ))),
+            Err(_) => {
+                self.pending.lock().await.remove(&call_id);
+                Err(CoreError::Provider(format!(
+                    "device '{device}' tool '{tool}' timed out after {}s",
+                    CALL_TIMEOUT.as_secs()
+                )))
+            }
+        }
+    }
+}
+
+/// Dispatch a daemon's tool reply to the waiting `device_exec` call.
+pub async fn dispatch_result(
+    pending: &Pending,
+    call_id: &str,
+    result: std::result::Result<Value, String>,
+) {
+    if let Some(tx) = pending.lock().await.remove(call_id) {
+        let _ = tx.send(result);
+    }
+}

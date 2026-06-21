@@ -8,6 +8,7 @@
 #![warn(clippy::unwrap_used, clippy::expect_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+mod bridge;
 mod conn;
 mod echo;
 mod mcp;
@@ -89,6 +90,10 @@ async fn main() {
     let workspace = Arc::new(workspace_root());
     tracing::info!(workspace = %workspace.display(), "workspace for tools");
 
+    // Cross-device routing state, shared across all connections.
+    let hub = bridge::new_hub();
+    let pending = bridge::new_pending();
+
     // Schedule fire loop (unattended): checks for due schedules periodically.
     let tick_secs = std::env::var("FLEETY_SCHED_TICK")
         .ok()
@@ -121,10 +126,14 @@ async fn main() {
         let storage = Arc::clone(&storage);
         let provider = Arc::clone(&provider);
         let workspace = Arc::clone(&workspace);
+        let hub = Arc::clone(&hub);
+        let pending = Arc::clone(&pending);
         // Each connection runs in its own task: an error or panic here is
         // isolated and never brings the server down.
         tokio::spawn(async move {
-            match conn::handle_conn(stream, storage, provider, workspace, policy).await {
+            match conn::handle_conn(stream, storage, provider, workspace, policy, hub, pending)
+                .await
+            {
                 Ok(()) => {}
                 Err(e) => tracing::warn!(%peer, report = ?e.report(), "connection error"),
             }
