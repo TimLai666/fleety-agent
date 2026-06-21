@@ -39,9 +39,17 @@ fn collect(builtin: &Path, installed: &Path) -> BTreeMap<String, SkillInfo> {
             continue;
         };
         for entry in entries.flatten() {
+            // Skip symlinked skill dirs (could point outside the skills store).
+            if entry.file_type().map(|t| t.is_symlink()).unwrap_or(false) {
+                continue;
+            }
             let path = entry.path();
             let skill_md = path.join("SKILL.md");
-            if path.is_dir() && skill_md.is_file() {
+            let md_is_symlink = skill_md
+                .symlink_metadata()
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false);
+            if path.is_dir() && skill_md.is_file() && !md_is_symlink {
                 let name = entry.file_name().to_string_lossy().to_string();
                 map.insert(
                     name,

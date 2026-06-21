@@ -60,9 +60,10 @@ fn validate_id(kind: &str, id: &str) -> Result<()> {
         || id.contains('\\')
         || id.contains("..")
         || id.contains('\0')
+        || id.contains(':')
     {
         return Err(CoreError::Message(format!(
-            "invalid {kind} '{id}': must not be empty or contain path separators or '..'"
+            "invalid {kind} '{id}': must not be empty or contain path separators, ':' or '..'"
         )));
     }
     Ok(())

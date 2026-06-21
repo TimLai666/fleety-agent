@@ -15,29 +15,48 @@ pub fn register(registry: &mut ToolRegistry) {
     registry.register(Box::new(FetchUrl));
 }
 
-/// Whether a host is loopback / private / link-local (blocked by default).
-fn is_blocked_host(host: &str) -> bool {
-    let h = host.trim_matches(['[', ']']).to_ascii_lowercase();
-    if h == "localhost" || h.ends_with(".localhost") || h == "::1" || h == "0.0.0.0" {
-        return true;
-    }
-    if h.starts_with("127.")
-        || h.starts_with("10.")
-        || h.starts_with("192.168.")
-        || h.starts_with("169.254.")
-    {
-        return true;
-    }
-    // fc00::/7 unique-local IPv6
-    if h.starts_with("fc") || h.starts_with("fd") {
-        return true;
-    }
-    // 172.16.0.0/12
-    if let Some(second) = h.strip_prefix("172.").and_then(|r| r.split('.').next()) {
-        if let Ok(octet) = second.parse::<u8>() {
-            if (16..=31).contains(&octet) {
+/// Whether a parsed IP is loopback / private / link-local / unspecified.
+fn ip_blocked(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+        }
+        IpAddr::V6(v6) => {
+            if v6.is_loopback() || v6.is_unspecified() {
                 return true;
             }
+            // IPv4-mapped/compatible (e.g. ::ffff:127.0.0.1) -> check as IPv4.
+            if let Some(v4) = v6.to_ipv4() {
+                return v4.is_loopback()
+                    || v4.is_private()
+                    || v4.is_link_local()
+                    || v4.is_unspecified();
+            }
+            let seg0 = v6.segments()[0];
+            (seg0 & 0xfe00) == 0xfc00 // fc00::/7 unique-local
+                || (seg0 & 0xffc0) == 0xfe80 // fe80::/10 link-local
+        }
+    }
+}
+
+/// Whether a host is loopback / private / link-local (blocked by default).
+fn is_blocked_host(host: &str) -> bool {
+    let h = host
+        .trim_matches(['[', ']'])
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if h == "localhost" || h.ends_with(".localhost") {
+        return true;
+    }
+    // Robust check: if the host is a literal IP (incl. IPv4-mapped IPv6), classify it.
+    if let Ok(ip) = h.parse::<std::net::IpAddr>() {
+        if ip_blocked(ip) {
+            return true;
         }
     }
     false
@@ -142,6 +161,10 @@ mod tests {
             "172.31.255.255",
             "::1",
             "fd00::1",
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+            "0.0.0.0",
+            "127.0.0.1.",
         ] {
             assert!(is_blocked_host(h), "{h} should be blocked");
         }
