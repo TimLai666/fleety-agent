@@ -1,10 +1,14 @@
 //! fleetyd — the Fleety device background service.
 //!
 //! Connects to the Agent on startup (registering this device) and holds the
-//! connection open. Heartbeat, reconnect/backoff, autostart, and on-device tool
+//! connection open. `fleetyd install`/`uninstall` set up OS autostart. Heartbeat
+//! is handled by WebSocket control frames; reconnect/backoff and on-device tool
 //! execution are later milestones.
 #![forbid(unsafe_code)]
 #![warn(clippy::unwrap_used, clippy::expect_used)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
+mod service;
 
 use agent_core::{obs, CoreError, Result};
 use futures::{SinkExt, StreamExt};
@@ -15,6 +19,22 @@ use fleety_protocol::{ClientMsg, ServerMsg, PROTOCOL_VERSION};
 #[tokio::main]
 async fn main() {
     obs::init();
+    // Subcommands: `install` / `uninstall` configure OS autostart, then exit.
+    match std::env::args().nth(1).as_deref() {
+        Some("install") => {
+            if let Err(e) = service::install() {
+                tracing::error!(report = ?e.report(), "install failed");
+            }
+            return;
+        }
+        Some("uninstall") => {
+            if let Err(e) = service::uninstall() {
+                tracing::error!(report = ?e.report(), "uninstall failed");
+            }
+            return;
+        }
+        _ => {}
+    }
     tracing::info!(version = agent_core::VERSION, "fleetyd starting");
     if let Err(e) = run().await {
         tracing::error!(report = ?e.report(), "fleetyd exited with error");
