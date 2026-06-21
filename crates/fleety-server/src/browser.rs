@@ -6,19 +6,42 @@
 //! prefer screenshots and use sparingly. The CDP framing / page discovery is
 //! unit-tested; the live connection follows the logic-tested/live-manual posture.
 
+use std::collections::HashMap;
+use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use tokio::net::TcpStream;
+use tokio::sync::Mutex as AsyncMutex;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use agent_core::{CoreError, Result, RiskLevel, Tool, ToolRegistry, ToolSpec};
 
 const CDP_TIMEOUT: Duration = Duration::from_secs(30);
 
+type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// A persistent CDP session: an open Chrome DevTools websocket + its id counter.
+struct Session {
+    ws: AsyncMutex<WsStream>,
+    next_id: AtomicU64,
+}
+
+/// Process-wide registry of open browser sessions (`browser_open`/`browser_close`).
+fn sessions() -> &'static Mutex<HashMap<String, Arc<Session>>> {
+    static SESSIONS: OnceLock<Mutex<HashMap<String, Arc<Session>>>> = OnceLock::new();
+    SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// Register the browser tools.
 pub fn register(registry: &mut ToolRegistry) {
+    registry.register(Box::new(BrowserOpen));
+    registry.register(Box::new(BrowserClose));
     registry.register(Box::new(BrowserNavigate));
     registry.register(Box::new(BrowserEval));
     registry.register(Box::new(BrowserScreenshot));
@@ -77,25 +100,38 @@ fn parse_cdp_result(text: &str, id: u64) -> Option<Result<Value>> {
     Some(Ok(value.get("result").cloned().unwrap_or(Value::Null)))
 }
 
-/// Run one CDP command against the Chrome at `http_base`.
-async fn cdp(http_base: &str, method: &str, params: Value) -> Result<Value> {
+async fn with_timeout<F: Future<Output = Result<Value>>>(method: &str, fut: F) -> Result<Value> {
+    match tokio::time::timeout(CDP_TIMEOUT, fut).await {
+        Ok(inner) => inner,
+        Err(_) => Err(CoreError::Provider(format!(
+            "CDP '{method}' timed out after {}s",
+            CDP_TIMEOUT.as_secs()
+        ))),
+    }
+}
+
+/// Discover a debuggable page's websocket URL from `{http_base}/json`.
+async fn discover_ws(http_base: &str) -> Result<String> {
     let list = reqwest::get(format!("{http_base}/json"))
         .await
         .map_err(|e| CoreError::Provider(format!("cannot reach Chrome at {http_base}: {e}")))?
         .text()
         .await
         .map_err(|e| CoreError::Provider(format!("reading Chrome /json failed: {e}")))?;
-    let ws_url = parse_ws_url(&list)?;
+    parse_ws_url(&list)
+}
 
+/// Run one CDP command on a fresh connection (no persistent session).
+async fn cdp(http_base: &str, method: &str, params: Value) -> Result<Value> {
+    let ws_url = discover_ws(http_base).await?;
     let exchange = async {
-        let (ws, _) = tokio_tungstenite::connect_async(&ws_url)
+        let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
             .await
             .map_err(|e| CoreError::Provider(format!("CDP websocket connect failed: {e}")))?;
-        let (mut tx, mut rx) = ws.split();
-        tx.send(WsMessage::Text(cdp_command(1, method, &params)))
+        ws.send(WsMessage::Text(cdp_command(1, method, &params)))
             .await
             .map_err(|e| CoreError::Provider(format!("CDP send failed: {e}")))?;
-        while let Some(frame) = rx.next().await {
+        while let Some(frame) = ws.next().await {
             let frame = frame.map_err(|e| CoreError::Provider(format!("CDP read failed: {e}")))?;
             if let Ok(text) = frame.to_text() {
                 if let Some(result) = parse_cdp_result(text, 1) {
@@ -107,13 +143,44 @@ async fn cdp(http_base: &str, method: &str, params: Value) -> Result<Value> {
             "CDP connection closed before responding".to_string(),
         ))
     };
+    with_timeout(method, exchange).await
+}
 
-    match tokio::time::timeout(CDP_TIMEOUT, exchange).await {
-        Ok(inner) => inner,
-        Err(_) => Err(CoreError::Provider(format!(
-            "CDP '{method}' timed out after {}s",
-            CDP_TIMEOUT.as_secs()
-        ))),
+/// Run one CDP command over an existing persistent session.
+async fn cdp_session(session_id: &str, method: &str, params: Value) -> Result<Value> {
+    let sess = sessions()
+        .lock()
+        .map_err(|_| CoreError::Message("browser sessions lock poisoned".to_string()))?
+        .get(session_id)
+        .cloned()
+        .ok_or_else(|| CoreError::Message(format!("no such browser session '{session_id}'")))?;
+    let id = sess.next_id.fetch_add(1, Ordering::Relaxed);
+    let exchange = async {
+        let mut ws = sess.ws.lock().await;
+        ws.send(WsMessage::Text(cdp_command(id, method, &params)))
+            .await
+            .map_err(|e| CoreError::Provider(format!("CDP send failed: {e}")))?;
+        while let Some(frame) = ws.next().await {
+            let frame = frame.map_err(|e| CoreError::Provider(format!("CDP read failed: {e}")))?;
+            if let Ok(text) = frame.to_text() {
+                if let Some(result) = parse_cdp_result(text, id) {
+                    return result;
+                }
+            }
+        }
+        Err(CoreError::Provider(
+            "CDP session closed before responding".to_string(),
+        ))
+    };
+    with_timeout(method, exchange).await
+}
+
+/// Route a CDP command to a persistent `session` if given, else a fresh connection.
+async fn dispatch(args: &Value, method: &str, params: Value) -> Result<Value> {
+    if let Some(session) = args.get("session").and_then(Value::as_str) {
+        cdp_session(session, method, params).await
+    } else {
+        cdp(&chrome_base(args), method, params).await
     }
 }
 
@@ -131,6 +198,7 @@ impl Tool for BrowserNavigate {
                 "type": "object",
                 "properties": {
                     "url": { "type": "string" },
+                    "session": { "type": "string", "description": "reuse a browser_open session" },
                     "chrome": { "type": "string", "description": "Chrome devtools http base, default http://127.0.0.1:9222" }
                 },
                 "required": ["url"]
@@ -143,7 +211,7 @@ impl Tool for BrowserNavigate {
         let url = args.get("url").and_then(Value::as_str).ok_or_else(|| {
             CoreError::Message("missing required string argument 'url'".to_string())
         })?;
-        cdp(&chrome_base(&args), "Page.navigate", json!({ "url": url })).await
+        dispatch(&args, "Page.navigate", json!({ "url": url })).await
     }
 }
 
@@ -159,6 +227,7 @@ impl Tool for BrowserEval {
                 "type": "object",
                 "properties": {
                     "expression": { "type": "string" },
+                    "session": { "type": "string", "description": "reuse a browser_open session" },
                     "chrome": { "type": "string" }
                 },
                 "required": ["expression"]
@@ -174,8 +243,8 @@ impl Tool for BrowserEval {
             .ok_or_else(|| {
                 CoreError::Message("missing required string argument 'expression'".to_string())
             })?;
-        cdp(
-            &chrome_base(&args),
+        dispatch(
+            &args,
             "Runtime.evaluate",
             json!({ "expression": expression, "returnByValue": true }),
         )
@@ -193,14 +262,80 @@ impl Tool for BrowserScreenshot {
             description: "Capture a screenshot of the connected Chrome page (base64 PNG via CDP). The low-impact way to observe a device's screen.".to_string(),
             parameters: json!({
                 "type": "object",
-                "properties": { "chrome": { "type": "string" } }
+                "properties": {
+                    "session": { "type": "string", "description": "reuse a browser_open session" },
+                    "chrome": { "type": "string" }
+                }
             }),
             risk: RiskLevel::Read,
         }
     }
 
     async fn call(&self, args: Value) -> Result<Value> {
-        cdp(&chrome_base(&args), "Page.captureScreenshot", json!({})).await
+        dispatch(&args, "Page.captureScreenshot", json!({})).await
+    }
+}
+
+struct BrowserOpen;
+
+#[async_trait]
+impl Tool for BrowserOpen {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "browser_open".to_string(),
+            description: "Open a persistent browser (CDP) session and return its handle; pass `session` to browser_navigate/eval/screenshot to reuse the connection.".to_string(),
+            parameters: json!({ "type": "object", "properties": { "chrome": { "type": "string" } } }),
+            risk: RiskLevel::Mutate,
+        }
+    }
+
+    async fn call(&self, args: Value) -> Result<Value> {
+        let ws_url = discover_ws(&chrome_base(&args)).await?;
+        let (ws, _) = tokio_tungstenite::connect_async(&ws_url)
+            .await
+            .map_err(|e| CoreError::Provider(format!("CDP websocket connect failed: {e}")))?;
+        let id = format!("br-{}", uuid::Uuid::new_v4().simple());
+        sessions()
+            .lock()
+            .map_err(|_| CoreError::Message("browser sessions lock poisoned".to_string()))?
+            .insert(
+                id.clone(),
+                Arc::new(Session {
+                    ws: AsyncMutex::new(ws),
+                    next_id: AtomicU64::new(1),
+                }),
+            );
+        Ok(json!({ "session": id }))
+    }
+}
+
+struct BrowserClose;
+
+#[async_trait]
+impl Tool for BrowserClose {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "browser_close".to_string(),
+            description: "Close a persistent browser session opened with browser_open.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "session": { "type": "string" } },
+                "required": ["session"]
+            }),
+            risk: RiskLevel::Mutate,
+        }
+    }
+
+    async fn call(&self, args: Value) -> Result<Value> {
+        let session = args.get("session").and_then(Value::as_str).ok_or_else(|| {
+            CoreError::Message("missing required string argument 'session'".to_string())
+        })?;
+        let closed = sessions()
+            .lock()
+            .map_err(|_| CoreError::Message("browser sessions lock poisoned".to_string()))?
+            .remove(session)
+            .is_some();
+        Ok(json!({ "session": session, "closed": closed }))
     }
 }
 
@@ -222,6 +357,26 @@ mod tests {
 
         assert!(parse_ws_url("[]").is_err());
         assert!(parse_ws_url("not json").is_err());
+    }
+
+    #[tokio::test]
+    async fn unknown_session_errors_and_close_is_idempotent() {
+        let mut registry = ToolRegistry::new();
+        register(&mut registry);
+        // Using a bogus session handle is rejected (no network involved).
+        assert!(registry
+            .call(
+                "browser_navigate",
+                json!({ "url": "https://example.com", "session": "nope" })
+            )
+            .await
+            .is_err());
+        // Closing an unknown session is a no-op, not an error.
+        let r = registry
+            .call("browser_close", json!({ "session": "nope" }))
+            .await
+            .expect("close");
+        assert_eq!(r["closed"], json!(false));
     }
 
     #[test]

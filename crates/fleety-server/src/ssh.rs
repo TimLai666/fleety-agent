@@ -24,12 +24,15 @@ fn require_str<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
 }
 
 /// Build the `ssh` argument vector (everything after the program name).
+/// When `control_dir` is set, enable connection multiplexing (ControlMaster) so
+/// repeated calls to the same host reuse one persistent connection.
 fn build_ssh_args(
     host: &str,
     command: &str,
     user: Option<&str>,
     port: Option<u64>,
     identity: Option<&str>,
+    control_dir: Option<&str>,
 ) -> Vec<String> {
     let mut args = vec![
         "-o".to_string(),
@@ -37,6 +40,14 @@ fn build_ssh_args(
         "-o".to_string(),
         "StrictHostKeyChecking=accept-new".to_string(),
     ];
+    if let Some(dir) = control_dir {
+        args.push("-o".to_string());
+        args.push("ControlMaster=auto".to_string());
+        args.push("-o".to_string());
+        args.push(format!("ControlPath={dir}/%C"));
+        args.push("-o".to_string());
+        args.push("ControlPersist=60".to_string());
+    }
     if let Some(p) = port {
         args.push("-p".to_string());
         args.push(p.to_string());
@@ -89,7 +100,17 @@ impl Tool for SshExec {
         let port = args.get("port").and_then(Value::as_u64);
         let identity = args.get("identity").and_then(Value::as_str);
 
-        let ssh_args = build_ssh_args(host, command, user, port, identity);
+        // Persistent connection multiplexing via ControlMaster (Unix only; the
+        // Windows OpenSSH client doesn't support it). Repeated calls to the same
+        // host then reuse one connection.
+        let control_dir = if cfg!(unix) {
+            let dir = std::env::temp_dir().join("fleety-ssh");
+            let _ = std::fs::create_dir_all(&dir);
+            Some(dir.to_string_lossy().to_string())
+        } else {
+            None
+        };
+        let ssh_args = build_ssh_args(host, command, user, port, identity, control_dir.as_deref());
         let output = Command::new("ssh").args(&ssh_args).output().map_err(|e| {
             CoreError::Message(format!(
                 "cannot run ssh (is the ssh client installed?): {e}"
@@ -115,6 +136,7 @@ mod tests {
             Some("admin"),
             Some(2222),
             Some("~/.ssh/id"),
+            Some("/tmp/fleety-ssh"),
         );
         assert!(args.contains(&"admin@pi.local".to_string()));
         assert!(args.contains(&"uptime".to_string()));
@@ -125,11 +147,17 @@ mod tests {
             .windows(2)
             .any(|w| w == ["-i".to_string(), "~/.ssh/id".to_string()]));
         assert!(args.contains(&"BatchMode=yes".to_string()));
+        // Multiplexing options present when a control dir is given.
+        assert!(args.contains(&"ControlMaster=auto".to_string()));
+        assert!(args
+            .iter()
+            .any(|a| a.starts_with("ControlPath=/tmp/fleety-ssh/")));
 
-        let plain = build_ssh_args("host", "ls", None, None, None);
+        let plain = build_ssh_args("host", "ls", None, None, None, None);
         assert_eq!(plain.last(), Some(&"ls".to_string()));
         assert!(plain.contains(&"host".to_string()));
         assert!(!plain.contains(&"-p".to_string()));
+        assert!(!plain.contains(&"ControlMaster=auto".to_string()));
     }
 
     #[tokio::test]
