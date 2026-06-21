@@ -9,6 +9,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod bridge;
+mod browser;
 mod conn;
 mod echo;
 mod mcp;
