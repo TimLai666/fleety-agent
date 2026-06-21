@@ -38,7 +38,28 @@ Override the install location with `FLEETY_INSTALL_DIR`. The one-liners pull fro
 the newest [GitHub Release](https://github.com/TimLai666/fleety-agent/releases) —
 maintainers cut one by pushing a tag (`git tag v0.1.0 && git push origin v0.1.0`),
 which triggers [`.github/workflows/release.yml`](.github/workflows/release.yml) to
-build and attach the per-platform binaries.
+build and attach the per-platform binaries (`fleety`, `fleety-server`, `fleetyd`).
+
+## Deploy the server
+
+**Docker (recommended)** — build and run in one command:
+
+```sh
+docker compose up -d --build
+```
+
+Listens on `:8787`, persists state in the `fleety-data` volume, and operates on
+`./workspace`. Configure a model and policy via env — see
+[`docker-compose.yml`](docker-compose.yml).
+
+**Without Docker** — one-line install of the `fleety-server` binary:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/TimLai666/fleety-agent/main/scripts/install-server.sh | sh
+```
+
+It installs `fleety-server` onto your PATH and prints how to run it plus a
+ready-to-use systemd unit for autostart.
 
 ## Workspace
 

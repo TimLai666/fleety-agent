@@ -38,16 +38,26 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - name: Build fleety
-        run: cargo build --release --locked --target ${{ matrix.target }} --bin fleety
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin fleety --bin fleety-server --bin fleetyd
       - name: Package (tar.gz)
         if: matrix.archive == 'tar.gz'
-        run: tar -C target/${{ matrix.target }}/release -czf fleety-${{ matrix.target }}.tar.gz fleety
+        run: |
+          cd target/${{ matrix.target }}/release
+          for b in fleety fleety-server fleetyd; do
+            tar -czf "$GITHUB_WORKSPACE/$b-${{ matrix.target }}.tar.gz" "$b"
+          done
       - name: Package (zip)
         if: matrix.archive == 'zip'
         shell: pwsh
-        run: Compress-Archive -Path target/${{ matrix.target }}/release/fleety.exe -DestinationPath fleety-${{ matrix.target }}.zip
+        run: |
+          foreach ($b in 'fleety', 'fleety-server', 'fleetyd') {
+            Compress-Archive -Path "target/${{ matrix.target }}/release/$b.exe" -DestinationPath "$b-${{ matrix.target }}.zip"
+          }
       - name: Attach to release
         uses: softprops/action-gh-release@v2
         with:
-          files: fleety-${{ matrix.target }}.${{ matrix.archive }}
+          files: |
+            fleety-${{ matrix.target }}.${{ matrix.archive }}
+            fleety-server-${{ matrix.target }}.${{ matrix.archive }}
+            fleetyd-${{ matrix.target }}.${{ matrix.archive }}
