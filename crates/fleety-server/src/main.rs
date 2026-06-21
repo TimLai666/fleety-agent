@@ -10,6 +10,7 @@
 
 mod conn;
 mod echo;
+mod scheduler;
 mod schedules;
 mod storage;
 mod tools;
@@ -82,6 +83,18 @@ async fn main() {
     let policy = policy_from_env();
     let workspace = Arc::new(workspace_root());
     tracing::info!(workspace = %workspace.display(), "workspace for tools");
+
+    // Schedule fire loop (unattended): checks for due schedules periodically.
+    let tick_secs = std::env::var("FLEETY_SCHED_TICK")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(60);
+    scheduler::spawn(
+        Arc::clone(&storage),
+        Arc::clone(&provider),
+        Arc::clone(&workspace),
+        tick_secs,
+    );
 
     let listener = match TcpListener::bind(&addr).await {
         Ok(listener) => listener,

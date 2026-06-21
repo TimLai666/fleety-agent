@@ -86,6 +86,97 @@ fn parse_duration_secs(s: &str) -> Result<u64> {
     Ok(n * mult)
 }
 
+/// A schedule that is due to fire now.
+pub(crate) struct DueSchedule {
+    pub id: String,
+    pub prompt: String,
+}
+
+/// Whether a trigger should fire now given its last run. Only `at:`/`every:` are
+/// fired by the loop; cron is validated on create but not yet fired.
+pub(crate) fn trigger_due(spec: &str, last_run: Option<u64>, now: u64) -> bool {
+    let spec = spec.trim();
+    if let Some(rest) = spec.strip_prefix("at:") {
+        return matches!(parse_unix(rest), Ok(t) if last_run.is_none() && now >= t);
+    }
+    if let Some(rest) = spec.strip_prefix("every:") {
+        return match parse_duration_secs(rest) {
+            Ok(secs) => match last_run {
+                None => true,
+                Some(l) => now >= l.saturating_add(secs),
+            },
+            Err(_) => false,
+        };
+    }
+    false
+}
+
+/// Schedules that are due to fire at `now` (enabled, `at:`/`every:`).
+pub(crate) fn due_schedules(dir: &Path, now: u64) -> Result<Vec<DueSchedule>> {
+    let mut due = Vec::new();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(due),
+        Err(e) => return Err(CoreError::Message(format!("cannot list schedules: {e}"))),
+    };
+    for entry in entries.flatten() {
+        if entry.path().extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        if !value
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        let trigger = value.get("trigger").and_then(Value::as_str).unwrap_or("");
+        let last_run = value.get("last_run").and_then(Value::as_u64);
+        if trigger_due(trigger, last_run, now) {
+            let id = value
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let prompt = value
+                .get("prompt")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            if !id.is_empty() {
+                due.push(DueSchedule { id, prompt });
+            }
+        }
+    }
+    Ok(due)
+}
+
+/// Record that a schedule fired at `now` (sets `last_run`).
+pub(crate) fn mark_fired(dir: &Path, id: &str, now: u64) -> Result<()> {
+    if id.contains('/') || id.contains('\\') || id.contains("..") {
+        return Err(CoreError::Message(format!("invalid schedule id '{id}'")));
+    }
+    let path = dir.join(format!("{id}.json"));
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| CoreError::Message(format!("cannot read schedule '{id}': {e}")))?;
+    let mut value: Value = serde_json::from_str(&text)
+        .map_err(|e| CoreError::Message(format!("corrupt schedule '{id}': {e}")))?;
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("last_run".to_string(), json!(now));
+    }
+    let pretty = serde_json::to_string_pretty(&value)
+        .map_err(|e| CoreError::Message(format!("serialize schedule: {e}")))?;
+    std::fs::write(&path, pretty)
+        .map_err(|e| CoreError::Message(format!("write schedule: {e}")))?;
+    Ok(())
+}
+
 struct ScheduleCreate {
     dir: PathBuf,
 }
@@ -278,6 +369,42 @@ mod tests {
             )
             .await;
         assert!(bad.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn trigger_due_logic() {
+        assert!(!trigger_due("at:100", None, 50));
+        assert!(trigger_due("at:100", None, 100));
+        assert!(!trigger_due("at:100", Some(100), 200));
+        assert!(trigger_due("every:60", None, 0));
+        assert!(!trigger_due("every:60", Some(100), 130));
+        assert!(trigger_due("every:60", Some(100), 160));
+        assert!(trigger_due("every:1m", Some(100), 160));
+        assert!(!trigger_due("0 9 * * 1", None, 999999));
+    }
+
+    #[tokio::test]
+    async fn due_and_mark_fired_roundtrip() {
+        let dir = temp_dir();
+        let mut registry = ToolRegistry::new();
+        register(&mut registry, &dir);
+        let created = registry
+            .call(
+                "schedule_create",
+                json!({ "trigger": "at:1000", "prompt": "go" }),
+            )
+            .await
+            .expect("create");
+        let id = created["id"].as_str().expect("id").to_string();
+
+        let due = due_schedules(&dir, 2000).expect("due");
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].prompt, "go");
+
+        mark_fired(&dir, &id, 2000).expect("mark");
+        assert!(due_schedules(&dir, 3000).expect("due2").is_empty());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -63,3 +63,20 @@ impl ApprovalGate for AutoApprove {
         Ok(ApprovalDecision::Approve)
     }
 }
+
+/// Always denies; used for unattended runs (e.g. scheduled jobs) where no human
+/// can confirm. Under `RequireApproval` this lets reads proceed but feeds back a
+/// denial for any mutate/critical tool instead of executing it.
+pub struct AutoDeny;
+
+#[async_trait]
+impl ApprovalGate for AutoDeny {
+    async fn request(
+        &mut self,
+        _tool: &str,
+        _args: &Value,
+        _risk: RiskLevel,
+    ) -> Result<ApprovalDecision> {
+        Ok(ApprovalDecision::Deny)
+    }
+}
