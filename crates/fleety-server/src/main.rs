@@ -127,6 +127,19 @@ async fn main() {
         tick_secs,
     );
 
+    // Eagerly finish any interactive turn interrupted by a crash/redeploy, so it
+    // doesn't wait for the user to reconnect. Runs in the background.
+    tokio::spawn(conn::recover_all_interactive(
+        Arc::clone(&storage),
+        Arc::clone(&provider),
+        Arc::clone(&workspace),
+        policy,
+        Arc::clone(&hub),
+        Arc::clone(&pending),
+        Arc::clone(&handles),
+        Arc::clone(&auth),
+    ));
+
     let listener = match TcpListener::bind(&addr).await {
         Ok(listener) => listener,
         Err(e) => {

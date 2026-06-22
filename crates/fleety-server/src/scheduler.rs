@@ -17,7 +17,7 @@ use agent_core::{
 use crate::schedules;
 use crate::storage::Storage;
 
-const SCHED_DEVICE: &str = "scheduler";
+pub(crate) const SCHED_DEVICE: &str = "scheduler";
 
 /// Current unix time in seconds.
 pub fn now_secs() -> u64 {

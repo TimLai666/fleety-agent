@@ -13,8 +13,8 @@ use tokio_tungstenite::WebSocketStream;
 use tokio::sync::mpsc;
 
 use agent_core::{
-    reconstruct_messages, run_turn_streaming, ApprovalDecision, ApprovalGate, CoreError,
-    LoopConfig, Message, ModelProvider, Policy, Result, RiskLevel, Role, ToolRegistry,
+    reconstruct_messages, run_turn, run_turn_streaming, ApprovalDecision, ApprovalGate, AutoDeny,
+    CoreError, LoopConfig, Message, ModelProvider, Policy, Result, RiskLevel, Role, ToolRegistry,
 };
 use fleety_protocol::{ClientMsg, ServerMsg, WireError, PROTOCOL_VERSION};
 
@@ -157,32 +157,7 @@ async fn serve(
         },
     )?;
 
-    let mut tools = crate::tools::build_registry(
-        workspace,
-        &storage.backups_dir(),
-        &storage.memory_dir(),
-        &storage.history_path(device_id),
-        &storage.devices_dir(),
-        &storage.schedules_dir(),
-    );
-    crate::skills::register(
-        &mut tools,
-        &storage.skills_builtin_dir(),
-        &storage.skills_installed_dir(),
-    );
-    crate::web::register(&mut tools);
-    crate::mcp::register(&mut tools, &storage.mcp_config_path());
-    crate::wiki::register(&mut tools, &storage.wiki_dir());
-    crate::ssh::register(&mut tools);
-    crate::browser::register(&mut tools);
-    crate::sites::register(&mut tools, &storage.sites_dir(), &storage.devices_dir());
-    auth::register(&mut tools, Arc::clone(auth));
-    bridge::register(
-        &mut tools,
-        Arc::clone(hub),
-        Arc::clone(pending),
-        Arc::clone(handles),
-    );
+    let tools = build_full_registry(storage, workspace, device_id, hub, pending, handles, auth);
 
     while let Some(msg) = read_client(rx).await? {
         match msg {
@@ -412,6 +387,145 @@ fn is_disconnect(e: &WsErr) -> bool {
         ))
 }
 
+/// Build the full interactive tool registry for `device_id`: workspace tools
+/// (+ insyra), memory/history/device/sites/schedules, skills, web, mcp, wiki,
+/// ssh, browser, auth, and the cross-device bridge. Shared by live connections
+/// and startup recovery so a recovered turn has the same capabilities.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_full_registry(
+    storage: &Storage,
+    workspace: &Path,
+    device_id: &str,
+    hub: &Hub,
+    pending: &Pending,
+    handles: &Handles,
+    auth: &Arc<AuthStore>,
+) -> ToolRegistry {
+    let mut tools = crate::tools::build_registry(
+        workspace,
+        &storage.backups_dir(),
+        &storage.memory_dir(),
+        &storage.history_path(device_id),
+        &storage.devices_dir(),
+        &storage.schedules_dir(),
+    );
+    crate::skills::register(
+        &mut tools,
+        &storage.skills_builtin_dir(),
+        &storage.skills_installed_dir(),
+    );
+    crate::web::register(&mut tools);
+    crate::mcp::register(&mut tools, &storage.mcp_config_path());
+    crate::wiki::register(&mut tools, &storage.wiki_dir());
+    crate::ssh::register(&mut tools);
+    crate::browser::register(&mut tools);
+    crate::sites::register(&mut tools, &storage.sites_dir(), &storage.devices_dir());
+    auth::register(&mut tools, Arc::clone(auth));
+    bridge::register(
+        &mut tools,
+        Arc::clone(hub),
+        Arc::clone(pending),
+        Arc::clone(handles),
+    );
+    tools
+}
+
+/// At startup, finish interactive turns left interrupted by a crash/redeploy so
+/// they don't wait for the user to reconnect. Scheduler turns are skipped (the
+/// scheduler tick recovers those). There is no client to stream to or ask for
+/// approval: the reply is persisted to the conversation stream and the journal
+/// cleared, so the next reconnect's `Resume` delivers it; gated tools in the
+/// continuation are denied (`AutoDeny`) — under full access the turn just
+/// completes. Each turn is isolated; a failure leaves its journal for a retry.
+///
+/// (Best-effort: a client reconnecting to the *same* conversation during this
+/// pass could in principle also drive it; the window is tiny and the interrupted
+/// tool is never re-run. A per-conversation lock would close it fully.)
+#[allow(clippy::too_many_arguments)]
+pub async fn recover_all_interactive(
+    storage: Arc<Storage>,
+    provider: Arc<dyn ModelProvider>,
+    workspace: Arc<PathBuf>,
+    policy: Policy,
+    hub: Hub,
+    pending: Pending,
+    handles: Handles,
+    auth: Arc<AuthStore>,
+) {
+    let incomplete = match storage.list_incomplete_turns() {
+        Ok(turns) => turns,
+        Err(e) => {
+            tracing::warn!(report = ?e.report(), "cannot scan for interrupted turns");
+            return;
+        }
+    };
+    for (device_id, conversation) in incomplete {
+        if device_id == crate::scheduler::SCHED_DEVICE {
+            continue; // recovered by the scheduler tick, with its mandate
+        }
+        if let Err(e) = recover_one_interactive(
+            &storage,
+            provider.as_ref(),
+            &workspace,
+            policy,
+            &hub,
+            &pending,
+            &handles,
+            &auth,
+            &device_id,
+            &conversation,
+        )
+        .await
+        {
+            tracing::warn!(%device_id, %conversation, report = ?e.report(), "could not recover interactive turn at startup");
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn recover_one_interactive(
+    storage: &Arc<Storage>,
+    provider: &dyn ModelProvider,
+    workspace: &Path,
+    policy: Policy,
+    hub: &Hub,
+    pending: &Pending,
+    handles: &Handles,
+    auth: &Arc<AuthStore>,
+    device_id: &str,
+    conversation: &str,
+) -> Result<()> {
+    let events = storage.journal_events(device_id, conversation)?;
+    if events.is_empty() {
+        storage.journal_end(device_id, conversation)?;
+        return Ok(());
+    }
+    tracing::info!(%device_id, %conversation, events = events.len(), "recovering interrupted interactive turn at startup");
+    let tools = build_full_registry(storage, workspace, device_id, hub, pending, handles, auth);
+    let config = LoopConfig::default();
+    let mut messages = vec![Message::system(storage.core_memory()?)];
+    messages.extend(storage.load(device_id, conversation)?);
+    messages.extend(reconstruct_messages(&events, config.max_tool_result_chars));
+    let mut log = storage.journaling_log(device_id, conversation);
+    let mut gate = AutoDeny;
+    let outcome = run_turn(
+        provider,
+        &tools,
+        &mut messages,
+        &mut log,
+        &config,
+        policy,
+        &mut gate,
+    )
+    .await?;
+    for event in log.events() {
+        storage.append_history(device_id, event)?;
+    }
+    storage.append(device_id, conversation, &Message::assistant(outcome.output))?;
+    storage.journal_end(device_id, conversation)?;
+    Ok(())
+}
+
 /// Finish a turn left interrupted by a crash/redeploy: reconstruct its messages
 /// from the journal (the in-flight tool is flagged interrupted, never re-run),
 /// continue the loop to a final answer, persist it, and clear the journal. A
@@ -565,10 +679,69 @@ async fn read_client(rx: &mut Rx) -> Result<Option<ClientMsg>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_core::{MockProvider, ModelResponse, Role as CoreRole, ToolCall};
+    use agent_core::{Event, MockProvider, ModelResponse, Role as CoreRole, ToolCall};
     use tokio_tungstenite::MaybeTlsStream;
 
     type ClientWs = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+    #[tokio::test]
+    async fn startup_recovers_interrupted_interactive_turn() {
+        use crate::auth::AuthStore;
+        use crate::echo::EchoProvider;
+        use serde_json::json;
+
+        let home = std::env::temp_dir().join(format!("fleety-erec-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&home).expect("mk home");
+        let storage = Arc::new(Storage::new(home.clone()));
+        let workspace = Arc::new(home.clone());
+
+        // Seed a non-scheduler conversation interrupted mid-turn (no tool result).
+        let user = Message::user("status");
+        storage.append("dev", "c1", &user).expect("append");
+        storage.journal_begin("dev", "c1", &user).expect("begin");
+        let mut assistant = Message::assistant("");
+        assistant.tool_calls = vec![ToolCall {
+            id: "t1".into(),
+            name: "run_command".into(),
+            arguments: json!({ "command": "echo hi" }),
+        }];
+        storage
+            .journal_event("dev", "c1", &Event::Assistant(assistant))
+            .expect("ev1");
+        storage
+            .journal_event(
+                "dev",
+                "c1",
+                &Event::ToolCall(ToolCall {
+                    id: "t1".into(),
+                    name: "run_command".into(),
+                    arguments: json!({ "command": "echo hi" }),
+                }),
+            )
+            .expect("ev2");
+
+        // Startup recovery, no client connected.
+        let auth = Arc::new(AuthStore::load(storage.auth_path(), None, false));
+        recover_all_interactive(
+            Arc::clone(&storage),
+            Arc::new(EchoProvider),
+            workspace,
+            Policy::FullAccess,
+            bridge::new_hub(),
+            bridge::new_pending(),
+            bridge::new_handles(),
+            auth,
+        )
+        .await;
+
+        // The interrupted turn is finished (journal cleared, reply persisted)
+        // without re-running the interrupted run_command.
+        assert!(storage.list_incomplete_turns().expect("list").is_empty());
+        let msgs = storage.load("dev", "c1").expect("load");
+        assert!(msgs.iter().any(|m| m.role == CoreRole::Assistant));
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
 
     async fn recv_server(rx: &mut futures::stream::SplitStream<ClientWs>) -> Option<ServerMsg> {
         while let Some(Ok(frame)) = rx.next().await {
