@@ -158,7 +158,7 @@ impl Tool for InsyraExec {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "insyra_exec".to_string(),
-            description: "Data analysis via the Insyra DSL (.isr): load CSV/Parquet/Excel/SQL, transform (filter/groupby/scale/encode), run stats (mean/describe/ttest/anova/regression/kmeans), and plot. State persists within a `session` (variables + loaded data) across calls. Pass `script` for a multi-line .isr program or `command` for one line; `save <var> <file>` writes results into the workspace (read them back with read_file). Set `reset` to clear a session. Common DSL: newdl/load/read, filter/groupby/scale/encode, mean/median/describe/rank, ttest/ztest/anova/chisq/regression/kmeans, show/save/plot.".to_string(),
+            description: "Data analysis via the Insyra DSL (.isr): load CSV/Parquet/Excel/SQL, transform (filter/groupby/scale/encode), run stats (mean/describe/ttest/anova/regression/kmeans), and plot. State persists within a `session` (variables + loaded data) across calls. Pass `script` for a multi-line .isr program or `command` for one line; `save <var> <file>` writes results into the workspace (read them back with read_file). Set `reset` to clear a session. Common DSL: newdl/load/read, filter/groupby/scale/encode, mean/median/describe/rank, ttest/ztest/anova/chisq/regression/kmeans, show/save/plot. Load the `use-insyra-cli` skill for the full DSL reference.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

@@ -11,6 +11,7 @@
 mod auth;
 mod bridge;
 mod browser;
+mod builtin_skills;
 mod conn;
 mod echo;
 mod mcp;
@@ -89,6 +90,11 @@ async fn main() {
     tracing::info!(version = agent_core::VERSION, %addr, home = %home.display(), "fleety-server starting");
 
     let storage = Arc::new(Storage::new(home));
+    // Seed built-in skills shipped in the binary (best-effort; a failure here
+    // must not stop the server from serving).
+    if let Err(e) = builtin_skills::seed(&storage.skills_builtin_dir()) {
+        tracing::warn!(error = %e, "could not seed built-in skills");
+    }
     let provider = build_provider();
     let policy = policy_from_env();
     let workspace = Arc::new(workspace_root());

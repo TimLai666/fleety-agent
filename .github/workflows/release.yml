@@ -41,22 +41,34 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: stable
-      - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }} --bin fleety --bin fleety-server --bin fleetyd
-      # The fleety-insyra sidecar embeds Insyra; ship the latest at release time.
-      # A breaking Insyra change surfaces here as a build/test failure (fix the
-      # sidecar, don't pin around it). Each runner's arch matches its target, so
-      # a native `go build` produces the right binary.
-      - name: Build insyra sidecar (latest Insyra)
+      # Ship the latest Insyra at release time: bump the sidecar's dependency,
+      # then refresh the vendored use-insyra-cli skill to the SAME version so the
+      # DSL reference the agent reads matches the engine it drives. A breaking
+      # Insyra change surfaces here as a build/test failure (fix the sidecar,
+      # don't pin around it). Must run before the cargo build, which embeds the
+      # skill into fleety-server via include_str!.
+      - name: Update Insyra + skill to latest
         shell: bash
         run: |
           cd sidecars/fleety-insyra
           go get -u github.com/HazelnutParadise/insyra@latest
           go mod tidy
           go test ./...
+          v=$(go list -m -f '{{.Version}}' github.com/HazelnutParadise/insyra)
+          echo "Insyra $v"
+          skill="$GITHUB_WORKSPACE/crates/fleety-server/builtin-skills/use-insyra-cli/SKILL.upstream.md"
+          base="https://raw.githubusercontent.com/HazelnutParadise/insyra"
+          curl -fsSL "$base/$v/skills/use-insyra-cli/SKILL.md" -o "$skill" \
+            || curl -fsSL "$base/main/skills/use-insyra-cli/SKILL.md" -o "$skill"
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin fleety --bin fleety-server --bin fleetyd
+      # Each runner's arch matches its target, so a native `go build` is correct.
+      - name: Build insyra sidecar
+        shell: bash
+        run: |
           out="$GITHUB_WORKSPACE/target/${{ matrix.target }}/release/fleety-insyra"
           [ "${{ matrix.archive }}" = "zip" ] && out="$out.exe"
-          go build -trimpath -o "$out" .
+          (cd sidecars/fleety-insyra && go build -trimpath -o "$out" .)
       - name: Package (tar.gz)
         if: matrix.archive == 'tar.gz'
         run: |
