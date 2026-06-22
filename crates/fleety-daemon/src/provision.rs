@@ -113,15 +113,13 @@ mod tests {
         }
     }
 
+    // One test (not two) so the shared FLEETY_INSYRA_URL env var can't race
+    // between tests running on parallel threads.
     #[test]
-    fn url_env_override_wins() {
+    fn url_override_then_default() {
         std::env::set_var("FLEETY_INSYRA_URL", "https://example.test/sidecar");
         assert_eq!(sidecar_url().unwrap(), "https://example.test/sidecar");
-        std::env::remove_var("FLEETY_INSYRA_URL");
-    }
 
-    #[test]
-    fn url_defaults_to_release_asset() {
         std::env::remove_var("FLEETY_INSYRA_URL");
         if let Some(target) = target_triple() {
             let url = sidecar_url().expect("url");

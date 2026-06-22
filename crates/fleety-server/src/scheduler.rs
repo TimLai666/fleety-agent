@@ -10,7 +10,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use agent_core::{
-    run_turn, EventLog, LoopConfig, MandateGate, Message, ModelProvider, Policy, Result,
+    reconstruct_messages, run_turn, LoopConfig, MandateGate, Message, ModelProvider, Policy,
+    Result, ToolRegistry,
 };
 
 use crate::schedules;
@@ -29,13 +30,20 @@ pub fn now_secs() -> u64 {
 
 /// Run all schedules due at `now`. Returns how many fired.
 pub async fn tick(
-    storage: &Storage,
+    storage: &Arc<Storage>,
     provider: &dyn ModelProvider,
     workspace: &Path,
     now: u64,
 ) -> Result<usize> {
     let due = schedules::due_schedules(&storage.schedules_dir(), now)?;
-    if due.is_empty() {
+    // Schedule turns interrupted by a crash, to finish before firing new ones.
+    let incomplete: Vec<String> = storage
+        .list_incomplete_turns()?
+        .into_iter()
+        .filter(|(device, _)| device == SCHED_DEVICE)
+        .map(|(_, conversation)| conversation)
+        .collect();
+    if due.is_empty() && incomplete.is_empty() {
         return Ok(0);
     }
     let mut tools = crate::tools::build_registry(
@@ -57,14 +65,24 @@ pub async fn tick(
     crate::ssh::register(&mut tools);
     crate::browser::register(&mut tools);
     crate::sites::register(&mut tools, &storage.sites_dir(), &storage.devices_dir());
+    // Finish interrupted scheduled turns first (best-effort, each isolated).
+    for conversation in incomplete {
+        if let Err(e) = recover_schedule_turn(storage, provider, &tools, &conversation).await {
+            tracing::warn!(conversation = %conversation, report = ?e.report(), "could not recover scheduled turn");
+        }
+    }
+
     let mut fired = 0;
     for item in due {
         let conversation = format!("schedule-{}", item.id);
         tracing::info!(schedule = %item.id, "firing schedule");
-        storage.append(SCHED_DEVICE, &conversation, &Message::user(item.prompt))?;
+        let user_msg = Message::user(item.prompt);
+        storage.append(SCHED_DEVICE, &conversation, &user_msg)?;
+        storage.journal_begin(SCHED_DEVICE, &conversation, &user_msg)?;
         let mut messages = vec![Message::system(storage.core_memory()?)];
         messages.extend(storage.load(SCHED_DEVICE, &conversation)?);
-        let mut events = EventLog::new();
+        // Journal each event so a crash mid-run is recoverable on the next tick.
+        let mut events = storage.journaling_log(SCHED_DEVICE, &conversation);
         // Mandate enforcement: only the schedule's allowed_tools may mutate.
         let mut gate = MandateGate::new(item.allowed_tools);
         let outcome = run_turn(
@@ -85,10 +103,79 @@ pub async fn tick(
             &conversation,
             &Message::assistant(outcome.output),
         )?;
+        storage.journal_end(SCHED_DEVICE, &conversation)?;
         schedules::mark_fired(&storage.schedules_dir(), &item.id, now)?;
         fired += 1;
     }
     Ok(fired)
+}
+
+/// Finish a scheduled turn interrupted by a crash: reconstruct from the journal
+/// (the in-flight tool is flagged interrupted, never re-run), re-apply the
+/// schedule's mandate, run to completion, and clear the journal.
+async fn recover_schedule_turn(
+    storage: &Arc<Storage>,
+    provider: &dyn ModelProvider,
+    tools: &ToolRegistry,
+    conversation: &str,
+) -> Result<()> {
+    let events = storage.journal_events(SCHED_DEVICE, conversation)?;
+    if events.is_empty() {
+        storage.journal_end(SCHED_DEVICE, conversation)?;
+        return Ok(());
+    }
+    tracing::info!(%conversation, events = events.len(), "recovering interrupted scheduled turn");
+    let config = LoopConfig::default();
+    let mut messages = vec![Message::system(storage.core_memory()?)];
+    messages.extend(storage.load(SCHED_DEVICE, conversation)?);
+    messages.extend(reconstruct_messages(&events, config.max_tool_result_chars));
+    let mut log = storage.journaling_log(SCHED_DEVICE, conversation);
+    let mut gate = MandateGate::new(schedule_allowed_tools(storage, conversation));
+    let outcome = run_turn(
+        provider,
+        tools,
+        &mut messages,
+        &mut log,
+        &config,
+        Policy::RequireApproval,
+        &mut gate,
+    )
+    .await?;
+    for event in log.events() {
+        storage.append_history(SCHED_DEVICE, event)?;
+    }
+    storage.append(
+        SCHED_DEVICE,
+        conversation,
+        &Message::assistant(outcome.output),
+    )?;
+    storage.journal_end(SCHED_DEVICE, conversation)?;
+    Ok(())
+}
+
+/// Restore a schedule's mandate (`allowed_tools`) by id from a `schedule-<id>`
+/// conversation. Empty (no mutates allowed) if the schedule is gone — the safe
+/// default for recovering an unattended turn.
+fn schedule_allowed_tools(storage: &Storage, conversation: &str) -> Vec<String> {
+    let Some(id) = conversation.strip_prefix("schedule-") else {
+        return Vec::new();
+    };
+    let path = storage.schedules_dir().join(format!("{id}.json"));
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Vec::new();
+    };
+    value
+        .get("allowed_tools")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Spawn the periodic fire loop. A failing tick is logged and isolated; it never
@@ -116,12 +203,68 @@ pub fn spawn(
 mod tests {
     use super::*;
     use crate::echo::EchoProvider;
+    use agent_core::{Event, Role, ToolCall};
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn tick_recovers_interrupted_scheduled_turn() {
+        let home = std::env::temp_dir().join(format!("fleety-recover-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&home).expect("mk home");
+        let storage = Arc::new(Storage::new(home.clone()));
+        let workspace = home.clone();
+
+        // Simulate a crash mid-turn: a user message persisted, a journal opened,
+        // an assistant step with a tool call recorded — but no tool result.
+        let conv = "schedule-s1";
+        let user = Message::user("status report");
+        storage
+            .append(SCHED_DEVICE, conv, &user)
+            .expect("append user");
+        storage
+            .journal_begin(SCHED_DEVICE, conv, &user)
+            .expect("begin");
+        let mut assistant = Message::assistant("");
+        assistant.tool_calls = vec![ToolCall {
+            id: "t1".into(),
+            name: "run_command".into(),
+            arguments: json!({ "command": "echo hi" }),
+        }];
+        storage
+            .journal_event(SCHED_DEVICE, conv, &Event::Assistant(assistant))
+            .expect("journal assistant");
+        storage
+            .journal_event(
+                SCHED_DEVICE,
+                conv,
+                &Event::ToolCall(ToolCall {
+                    id: "t1".into(),
+                    name: "run_command".into(),
+                    arguments: json!({ "command": "echo hi" }),
+                }),
+            )
+            .expect("journal toolcall");
+        // crash here: t1 has no result.
+
+        // A tick with nothing due still recovers the interrupted turn.
+        let fired = tick(&storage, &EchoProvider, &workspace, 0)
+            .await
+            .expect("tick");
+        assert_eq!(fired, 0);
+
+        // The journal is cleared and a final assistant reply was persisted —
+        // without re-running the interrupted `run_command`.
+        assert!(storage.list_incomplete_turns().expect("list").is_empty());
+        let msgs = storage.load(SCHED_DEVICE, conv).expect("load");
+        assert!(msgs.iter().any(|m| m.role == Role::Assistant));
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
 
     #[tokio::test]
     async fn tick_fires_due_at_schedule_once() {
         let home = std::env::temp_dir().join(format!("fleety-tick-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&home).expect("mk home");
-        let storage = Storage::new(home.clone());
+        let storage = Arc::new(Storage::new(home.clone()));
         let workspace = home.clone(); // any real dir serves as the tool root
 
         let sdir = storage.schedules_dir();

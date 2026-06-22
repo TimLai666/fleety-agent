@@ -13,8 +13,8 @@ use tokio_tungstenite::WebSocketStream;
 use tokio::sync::mpsc;
 
 use agent_core::{
-    run_turn_streaming, ApprovalDecision, ApprovalGate, CoreError, EventLog, LoopConfig, Message,
-    ModelProvider, Policy, Result, RiskLevel, Role,
+    reconstruct_messages, run_turn_streaming, ApprovalDecision, ApprovalGate, CoreError,
+    LoopConfig, Message, ModelProvider, Policy, Result, RiskLevel, Role, ToolRegistry,
 };
 use fleety_protocol::{ClientMsg, ServerMsg, WireError, PROTOCOL_VERSION};
 
@@ -133,7 +133,7 @@ pub async fn handle_conn(
 async fn serve(
     rx: &mut Rx,
     out: &Out,
-    storage: &Storage,
+    storage: &Arc<Storage>,
     provider: &dyn ModelProvider,
     workspace: &Path,
     policy: Policy,
@@ -194,13 +194,36 @@ async fn serve(
                 let conversation = conversation_id.unwrap_or_else(|| default_conversation.clone());
                 tracing::info!(%device_id, conversation = %conversation, ?origin, "user message");
 
-                // Persist the user message, then run the turn over the history.
-                storage.append(device_id, &conversation, &Message::user(text))?;
+                // First finish any turn left interrupted by a crash/redeploy, so
+                // it isn't lost and doesn't interleave with this message. Best
+                // effort: on failure the journal stays for a later retry.
+                if let Err(e) = recover_incomplete_turn(
+                    rx,
+                    out,
+                    storage,
+                    provider,
+                    &tools,
+                    policy,
+                    device_id,
+                    &conversation,
+                )
+                .await
+                {
+                    tracing::warn!(%device_id, conversation = %conversation, report = ?e.report(), "could not recover interrupted turn");
+                }
+
+                // Persist the user message and open a durable turn journal, then
+                // run the turn over the history.
+                let user_msg = Message::user(text);
+                storage.append(device_id, &conversation, &user_msg)?;
+                storage.journal_begin(device_id, &conversation, &user_msg)?;
                 // Inject agent-level core memory (ME/USER/TODO) as the system
                 // preamble each turn; it is ephemeral, not persisted to the convo.
                 let mut messages = vec![Message::system(storage.core_memory()?)];
                 messages.extend(storage.load(device_id, &conversation)?);
-                let mut events = EventLog::new();
+                // Journal every loop event the instant it happens, so a crash
+                // mid-turn is recoverable.
+                let mut events = storage.journaling_log(device_id, &conversation);
                 // Stream content chunks to the client for token-by-token display;
                 // the full reply still arrives as `Assistant` below.
                 let delta_out = out.clone();
@@ -240,6 +263,8 @@ async fn serve(
                 let reply = outcome.output;
                 let seq =
                     storage.append(device_id, &conversation, &Message::assistant(reply.clone()))?;
+                // Turn done: clear the journal (the reply now lives in the stream).
+                storage.journal_end(device_id, &conversation)?;
                 emit(
                     out,
                     &ServerMsg::Assistant {
@@ -260,6 +285,22 @@ async fn serve(
                 after_seq,
             } => {
                 tracing::info!(%device_id, conversation = %conversation_id, after_seq, "resume");
+                // Finish any interrupted turn before replaying, so the catch-up
+                // includes its result.
+                if let Err(e) = recover_incomplete_turn(
+                    rx,
+                    out,
+                    storage,
+                    provider,
+                    &tools,
+                    policy,
+                    device_id,
+                    &conversation_id,
+                )
+                .await
+                {
+                    tracing::warn!(%device_id, conversation = %conversation_id, report = ?e.report(), "could not recover interrupted turn");
+                }
                 let missed = storage.load_after(device_id, &conversation_id, after_seq)?;
                 for stored in missed {
                     let role = match stored.message.role {
@@ -369,6 +410,89 @@ fn is_disconnect(e: &WsErr) -> bool {
             io.kind(),
             ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted | ErrorKind::BrokenPipe | ErrorKind::UnexpectedEof
         ))
+}
+
+/// Finish a turn left interrupted by a crash/redeploy: reconstruct its messages
+/// from the journal (the in-flight tool is flagged interrupted, never re-run),
+/// continue the loop to a final answer, persist it, and clear the journal. A
+/// no-op when there is no journal. The continuation is itself journaled, so a
+/// second crash is still recoverable.
+#[allow(clippy::too_many_arguments)]
+async fn recover_incomplete_turn(
+    rx: &mut Rx,
+    out: &Out,
+    storage: &Arc<Storage>,
+    provider: &dyn ModelProvider,
+    tools: &ToolRegistry,
+    policy: Policy,
+    device_id: &str,
+    conversation: &str,
+) -> Result<()> {
+    let events = storage.journal_events(device_id, conversation)?;
+    if events.is_empty() {
+        // No journal, or an empty/stale one — nothing to finish.
+        storage.journal_end(device_id, conversation)?;
+        return Ok(());
+    }
+    tracing::info!(%device_id, %conversation, events = events.len(), "recovering interrupted turn");
+
+    let config = LoopConfig::default();
+    let mut messages = vec![Message::system(storage.core_memory()?)];
+    messages.extend(storage.load(device_id, conversation)?);
+    messages.extend(reconstruct_messages(&events, config.max_tool_result_chars));
+
+    let delta_out = out.clone();
+    let delta_conv = conversation.to_string();
+    let mut on_delta: Box<dyn FnMut(&str) + Send> = Box::new(move |chunk: &str| {
+        let frame = ServerMsg::AssistantDelta {
+            conversation_id: delta_conv.clone(),
+            chunk: chunk.to_string(),
+        };
+        if let Ok(json) = serde_json::to_string(&frame) {
+            let _ = delta_out.send(WsMessage::Text(json));
+        }
+    });
+
+    let mut log = storage.journaling_log(device_id, conversation);
+    let outcome = {
+        let mut gate = ConnGate {
+            out: out.clone(),
+            rx,
+        };
+        run_turn_streaming(
+            provider,
+            tools,
+            &mut messages,
+            &mut log,
+            &config,
+            policy,
+            &mut gate,
+            on_delta.as_mut(),
+        )
+        .await?
+    };
+
+    for event in log.events() {
+        storage.append_history(device_id, event)?;
+    }
+    let reply = outcome.output;
+    let seq = storage.append(device_id, conversation, &Message::assistant(reply.clone()))?;
+    storage.journal_end(device_id, conversation)?;
+    emit(
+        out,
+        &ServerMsg::Assistant {
+            conversation_id: conversation.to_string(),
+            text: reply,
+            seq,
+        },
+    )?;
+    emit(
+        out,
+        &ServerMsg::Done {
+            conversation_id: conversation.to_string(),
+        },
+    )?;
+    Ok(())
 }
 
 /// Approval gate that asks the connected client over the WebSocket and waits

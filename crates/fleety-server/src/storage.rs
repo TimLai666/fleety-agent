@@ -5,9 +5,10 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use agent_core::{CoreError, Event, Message, Result};
+use agent_core::{CoreError, Event, EventLog, Message, Result};
 use serde_json::Value;
 
 const DEFAULT_ME: &str = "Your name is Fleety. You are a cross-device, full-access agent that helps the user operate their devices. You act autonomously, keep an audit trail, and can roll back; you confirm only genuinely irreversible actions.";
@@ -299,6 +300,153 @@ impl Storage {
             .map_err(|e| CoreError::Message(format!("write audit failed: {e}")))?;
         Ok(())
     }
+
+    /// Path to a conversation's in-flight turn journal (durable record of the
+    /// current turn's events, removed once the turn completes).
+    fn journal_path(&self, device_id: &str, conversation_id: &str) -> PathBuf {
+        self.home
+            .join("fleet")
+            .join("devices")
+            .join(device_id)
+            .join("conversations")
+            .join(format!("{conversation_id}.journal.jsonl"))
+    }
+
+    /// Begin a turn journal: (re)create the file with the starting user message.
+    pub fn journal_begin(
+        &self,
+        device_id: &str,
+        conversation_id: &str,
+        user: &Message,
+    ) -> Result<()> {
+        validate_id("device_id", device_id)?;
+        validate_id("conversation_id", conversation_id)?;
+        let path = self.journal_path(device_id, conversation_id);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| {
+                CoreError::Message(format!("cannot create {}: {e}", parent.display()))
+            })?;
+        }
+        let record = serde_json::json!({ "kind": "start", "message": user });
+        let line = serde_json::to_string(&record)
+            .map_err(|e| CoreError::Message(format!("serialize journal start: {e}")))?;
+        // Truncating create: a fresh journal per turn.
+        fs::write(&path, format!("{line}\n"))
+            .map_err(|e| CoreError::Message(format!("write {} failed: {e}", path.display())))?;
+        Ok(())
+    }
+
+    /// Append one loop event to the current turn journal (called as it happens).
+    pub fn journal_event(
+        &self,
+        device_id: &str,
+        conversation_id: &str,
+        event: &Event,
+    ) -> Result<()> {
+        validate_id("device_id", device_id)?;
+        validate_id("conversation_id", conversation_id)?;
+        let path = self.journal_path(device_id, conversation_id);
+        let record = serde_json::json!({ "kind": "event", "event": event });
+        let line = serde_json::to_string(&record)
+            .map_err(|e| CoreError::Message(format!("serialize journal event: {e}")))?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| CoreError::Message(format!("cannot open {}: {e}", path.display())))?;
+        writeln!(file, "{line}")
+            .map_err(|e| CoreError::Message(format!("write journal failed: {e}")))?;
+        Ok(())
+    }
+
+    /// Finish a turn: remove its journal (the result now lives in the stream).
+    pub fn journal_end(&self, device_id: &str, conversation_id: &str) -> Result<()> {
+        validate_id("device_id", device_id)?;
+        validate_id("conversation_id", conversation_id)?;
+        let path = self.journal_path(device_id, conversation_id);
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(CoreError::Message(format!(
+                "cannot remove {}: {e}",
+                path.display()
+            ))),
+        }
+    }
+
+    /// Read the journaled loop events for an interrupted turn (empty if none).
+    pub fn journal_events(&self, device_id: &str, conversation_id: &str) -> Result<Vec<Event>> {
+        validate_id("device_id", device_id)?;
+        validate_id("conversation_id", conversation_id)?;
+        let path = self.journal_path(device_id, conversation_id);
+        let file = match File::open(&path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => {
+                return Err(CoreError::Message(format!(
+                    "cannot read {}: {e}",
+                    path.display()
+                )))
+            }
+        };
+        let mut events = Vec::new();
+        for line in BufReader::new(file).lines() {
+            let line = line.map_err(|e| CoreError::Message(format!("read journal line: {e}")))?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value: Value = serde_json::from_str(&line)
+                .map_err(|e| CoreError::Message(format!("corrupt journal line: {e}")))?;
+            if value.get("kind").and_then(Value::as_str) != Some("event") {
+                continue;
+            }
+            let event: Event =
+                serde_json::from_value(value.get("event").cloned().unwrap_or(Value::Null))
+                    .map_err(|e| CoreError::Message(format!("corrupt journal event: {e}")))?;
+            events.push(event);
+        }
+        Ok(events)
+    }
+
+    /// An [`EventLog`] that journals each event to a conversation's turn journal
+    /// the instant it happens, so a crash mid-turn is recoverable. Requires an
+    /// `Arc<Storage>` so the sink can outlive the call.
+    pub fn journaling_log(self: &Arc<Self>, device_id: &str, conversation_id: &str) -> EventLog {
+        let storage = Arc::clone(self);
+        let device = device_id.to_string();
+        let conv = conversation_id.to_string();
+        EventLog::with_sink(Box::new(move |event: &Event| {
+            if let Err(e) = storage.journal_event(&device, &conv, event) {
+                tracing::warn!(report = ?e.report(), "could not journal turn event");
+            }
+        }))
+    }
+
+    /// List `(device_id, conversation_id)` pairs that have an unfinished turn
+    /// journal — used to recover interrupted turns.
+    pub fn list_incomplete_turns(&self) -> Result<Vec<(String, String)>> {
+        let mut out = Vec::new();
+        let devices = self.devices_dir();
+        let device_entries = match fs::read_dir(&devices) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(e) => return Err(CoreError::Message(format!("cannot list devices: {e}"))),
+        };
+        for device in device_entries.flatten() {
+            let device_id = device.file_name().to_string_lossy().to_string();
+            let convs = device.path().join("conversations");
+            let Ok(conv_entries) = fs::read_dir(&convs) else {
+                continue;
+            };
+            for entry in conv_entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if let Some(conv) = name.strip_suffix(".journal.jsonl") {
+                    out.push((device_id.clone(), conv.to_string()));
+                }
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -348,6 +496,46 @@ mod tests {
             .load_after("dev", "none", 0)
             .expect("after")
             .is_empty());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn turn_journal_records_events_and_lists_incomplete() {
+        use agent_core::{Event, Message};
+        let home = temp_home();
+        let storage = Storage::new(home.clone());
+
+        storage
+            .journal_begin("dev", "conv", &Message::user("hi"))
+            .expect("begin");
+        storage
+            .journal_event(
+                "dev",
+                "conv",
+                &Event::ToolResult {
+                    id: "a".into(),
+                    result: serde_json::json!({ "ok": true }),
+                },
+            )
+            .expect("event");
+
+        // The incomplete turn is discoverable and its events readable.
+        let incomplete = storage.list_incomplete_turns().expect("list");
+        assert_eq!(incomplete, vec![("dev".to_string(), "conv".to_string())]);
+        let events = storage.journal_events("dev", "conv").expect("events");
+        assert_eq!(events.len(), 1);
+
+        // After ending, nothing remains.
+        storage.journal_end("dev", "conv").expect("end");
+        assert!(storage.list_incomplete_turns().expect("list2").is_empty());
+        assert!(storage
+            .journal_events("dev", "conv")
+            .expect("ev2")
+            .is_empty());
+        storage
+            .journal_end("dev", "conv")
+            .expect("end is idempotent");
+
         let _ = std::fs::remove_dir_all(&home);
     }
 

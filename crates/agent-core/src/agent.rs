@@ -153,7 +153,7 @@ pub async fn run_turn_streaming(
 
 /// Truncate `text` to at most `max_chars`, appending a marker noting how much was
 /// omitted. The full text lives in the event log, so this is reversible.
-fn budget_text(text: &str, max_chars: usize) -> String {
+pub(crate) fn budget_text(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
         return text.to_string();
     }
