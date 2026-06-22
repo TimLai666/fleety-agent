@@ -9,6 +9,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod ondevice;
+mod provision;
 mod service;
 mod update;
 
@@ -27,6 +28,10 @@ async fn main() {
             if let Err(e) = service::install() {
                 tracing::error!(report = ?e.report(), "install failed");
             }
+            // Provision the data-analysis sidecar (best-effort).
+            if let Err(e) = provision::ensure_insyra(false).await {
+                tracing::warn!(report = ?e.report(), "could not provision fleety-insyra sidecar");
+            }
             return;
         }
         Some("uninstall") => {
@@ -38,6 +43,10 @@ async fn main() {
         Some("update") => {
             if let Err(e) = update::update().await {
                 tracing::error!(report = ?e.report(), "update failed");
+            }
+            // Refresh the data-analysis sidecar alongside fleetyd (best-effort).
+            if let Err(e) = provision::ensure_insyra(true).await {
+                tracing::warn!(report = ?e.report(), "could not refresh fleety-insyra sidecar");
             }
             return;
         }

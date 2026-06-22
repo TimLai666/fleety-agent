@@ -105,7 +105,7 @@ Cross-conversation memory. Within a conversation the event stream is replayed on
 |---|---|---|---|
 | `insyra_exec` | Run the Insyra `.isr` DSL — load CSV/Parquet/Excel/SQL, transform (filter/groupby/scale/encode), stats (mean/describe/ttest/anova/regression/kmeans), plot. Stateful per `session`; `save <var> <file>` writes results into the workspace. | `device?`, `command` \| `script`, `session?`, `reset?` | mutate |
 
-> Backed by the `fleety-insyra` sidecar (a Go process wrapping Insyra's `engine/dsl`), kept alive per workspace; DSL sessions keep their variables/data across calls, and named environments persist on disk under `<root>/.insyra`. Load the built-in `use-insyra-cli` skill (vendored from upstream, refreshed to the shipped Insyra version at release) for the full `.isr` DSL command reference.
+> Backed by the `fleety-insyra` sidecar (a Go process wrapping Insyra's `engine/dsl`), kept alive per workspace; DSL sessions keep their variables/data across calls, and named environments persist on disk under `<root>/.insyra`. Load the built-in `use-insyra-cli` skill (vendored from upstream, refreshed to the shipped Insyra version at release) for the full `.isr` DSL command reference. The sidecar ships with the server (install script + Docker image) and is provisioned onto devices by `fleetyd install`/`update`; the binary is resolved via `FLEETY_INSYRA_BIN`, then beside the executable, then `PATH`.
 
 ## Skills
 

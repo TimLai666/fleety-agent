@@ -63,24 +63,26 @@ jobs:
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }} --bin fleety --bin fleety-server --bin fleetyd
       # Each runner's arch matches its target, so a native `go build` is correct.
+      # Ship the sidecar as a RAW per-target binary (not archived) so installers
+      # and `fleetyd update` just download + chmod — no tar/zip extraction.
       - name: Build insyra sidecar
         shell: bash
         run: |
-          out="$GITHUB_WORKSPACE/target/${{ matrix.target }}/release/fleety-insyra"
-          [ "${{ matrix.archive }}" = "zip" ] && out="$out.exe"
-          (cd sidecars/fleety-insyra && go build -trimpath -o "$out" .)
+          raw="$GITHUB_WORKSPACE/fleety-insyra-${{ matrix.target }}"
+          [ "${{ matrix.archive }}" = "zip" ] && raw="$raw.exe"
+          (cd sidecars/fleety-insyra && go build -trimpath -o "$raw" .)
       - name: Package (tar.gz)
         if: matrix.archive == 'tar.gz'
         run: |
           cd target/${{ matrix.target }}/release
-          for b in fleety fleety-server fleetyd fleety-insyra; do
+          for b in fleety fleety-server fleetyd; do
             tar -czf "$GITHUB_WORKSPACE/$b-${{ matrix.target }}.tar.gz" "$b"
           done
       - name: Package (zip)
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
-          foreach ($b in 'fleety', 'fleety-server', 'fleetyd', 'fleety-insyra') {
+          foreach ($b in 'fleety', 'fleety-server', 'fleetyd') {
             Compress-Archive -Path "target/${{ matrix.target }}/release/$b.exe" -DestinationPath "$b-${{ matrix.target }}.zip"
           }
       - name: Attach to release
@@ -90,4 +92,5 @@ jobs:
             fleety-${{ matrix.target }}.${{ matrix.archive }}
             fleety-server-${{ matrix.target }}.${{ matrix.archive }}
             fleetyd-${{ matrix.target }}.${{ matrix.archive }}
-            fleety-insyra-${{ matrix.target }}.${{ matrix.archive }}
+            fleety-insyra-${{ matrix.target }}
+            fleety-insyra-${{ matrix.target }}.exe
