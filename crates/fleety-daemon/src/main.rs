@@ -147,7 +147,16 @@ async fn run() -> Result<()> {
 
     let registry = ondevice::build_local_registry(&ondevice::device_root());
     tracing::info!(%url, "connected; holding connection");
-    while let Some(frame) = rx.next().await {
+    loop {
+        let next = tokio::select! {
+            frame = rx.next() => frame,
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("Ctrl+C received; sending Close and shutting down fleetyd");
+                let _ = tx.close().await;
+                return Ok(());
+            }
+        };
+        let Some(frame) = next else { break };
         let frame =
             frame.map_err(|e| CoreError::Provider(format!("websocket read failed: {e}")))?;
         if frame.is_close() {

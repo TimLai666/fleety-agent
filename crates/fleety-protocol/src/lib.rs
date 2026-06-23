@@ -115,6 +115,9 @@ pub enum ClientMsg {
         device_id: String,
         backup_id: String,
     },
+    /// Ask the server for its health snapshot (version, uptime, connected
+    /// device count, etc.). Used by `fleety status`.
+    ServerStatus,
 }
 
 /// Frames sent server -> client over the WebSocket.
@@ -195,6 +198,16 @@ pub enum ServerMsg {
         ok: bool,
         message: String,
     },
+    /// Reply to `ServerStatus`: a compact health snapshot. `extra_json` is
+    /// reserved for future fields so adding one doesn't break the wire.
+    ServerStatusResult {
+        version: String,
+        uptime_secs: u64,
+        connected_devices: u32,
+        device_ids_json: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        extra_json: Option<String>,
+    },
 }
 
 #[cfg(test)]
@@ -239,6 +252,23 @@ mod tests {
         };
         let json = serde_json::to_string(&msg).expect("serialize");
         assert_eq!(msg, serde_json::from_str(&json).expect("deserialize"));
+    }
+
+    #[test]
+    fn server_status_frames_roundtrip() {
+        let req = ClientMsg::ServerStatus;
+        let json = serde_json::to_string(&req).expect("ser");
+        assert_eq!(req, serde_json::from_str(&json).expect("de"));
+
+        let reply = ServerMsg::ServerStatusResult {
+            version: "0.1.0".into(),
+            uptime_secs: 1234,
+            connected_devices: 2,
+            device_ids_json: "[\"a\",\"b\"]".into(),
+            extra_json: None,
+        };
+        let json = serde_json::to_string(&reply).expect("ser");
+        assert_eq!(reply, serde_json::from_str(&json).expect("de"));
     }
 
     #[test]

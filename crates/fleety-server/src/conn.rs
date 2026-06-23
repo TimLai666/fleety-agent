@@ -426,6 +426,19 @@ async fn serve(
                     };
                 emit(out, &reply)?;
             }
+            ClientMsg::ServerStatus => {
+                let uptime_secs = crate::server_start().elapsed().as_secs();
+                let device_ids: Vec<String> = hub.lock().await.keys().cloned().collect();
+                let connected = device_ids.len() as u32;
+                let reply = ServerMsg::ServerStatusResult {
+                    version: agent_core::VERSION.to_string(),
+                    uptime_secs,
+                    connected_devices: connected,
+                    device_ids_json: serde_json::to_string(&device_ids).unwrap_or("[]".into()),
+                    extra_json: None,
+                };
+                emit(out, &reply)?;
+            }
         }
     }
 

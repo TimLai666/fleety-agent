@@ -155,6 +155,11 @@ async fn main() {
                 _ => eprintln!("usage: fleety rollback list  |  fleety rollback apply <backup_id>"),
             }
         }
+        Some("status") => {
+            if let Err(e) = status().await {
+                eprintln!("error: {}", e.report().message);
+            }
+        }
         Some("pair") => {
             let code = args.get(2).cloned().unwrap_or_default();
             if code.is_empty() {
@@ -559,7 +564,8 @@ async fn ask(text: String, attachments: Vec<WireAttachment>) -> Result<()> {
             | Some(ServerMsg::AuditListResult { .. })
             | Some(ServerMsg::AuditShowResult { .. })
             | Some(ServerMsg::RollbackListResult { .. })
-            | Some(ServerMsg::RollbackResult { .. }) => {}
+            | Some(ServerMsg::RollbackResult { .. })
+            | Some(ServerMsg::ServerStatusResult { .. }) => {}
         }
     }
     // Close the connection gracefully so the server sees a clean disconnect.
@@ -755,6 +761,49 @@ async fn rollback_list() -> Result<()> {
     Ok(())
 }
 
+async fn status() -> Result<()> {
+    let (mut tx, mut rx) = connect_hello().await?;
+    send(&mut tx, &ClientMsg::ServerStatus).await?;
+    match recv(&mut rx).await? {
+        Some(ServerMsg::ServerStatusResult {
+            version,
+            uptime_secs,
+            connected_devices,
+            device_ids_json,
+            ..
+        }) => {
+            let ids: Vec<String> = serde_json::from_str(&device_ids_json).unwrap_or_default();
+            println!("fleety-server");
+            println!("  version:        {version}");
+            println!("  uptime:         {}", format_uptime(uptime_secs));
+            println!("  connected:      {connected_devices} device(s)");
+            if !ids.is_empty() {
+                println!("  device ids:     {}", ids.join(", "));
+            }
+        }
+        Some(ServerMsg::Error { error }) => eprintln!("agent error: {}", error.message),
+        other => return Err(CoreError::Provider(format!("unexpected reply: {other:?}"))),
+    }
+    let _ = tx.close().await;
+    Ok(())
+}
+
+fn format_uptime(secs: u64) -> String {
+    let days = secs / 86_400;
+    let hours = (secs % 86_400) / 3_600;
+    let mins = (secs % 3_600) / 60;
+    let s = secs % 60;
+    if days > 0 {
+        format!("{days}d {hours}h {mins}m")
+    } else if hours > 0 {
+        format!("{hours}h {mins}m {s}s")
+    } else if mins > 0 {
+        format!("{mins}m {s}s")
+    } else {
+        format!("{s}s")
+    }
+}
+
 async fn rollback_apply(backup_id: String) -> Result<()> {
     let (mut tx, mut rx) = connect_hello().await?;
     send(
@@ -811,7 +860,15 @@ async fn recv(rx: &mut Rx) -> Result<Option<ServerMsg>> {
 
 #[cfg(test)]
 mod tests {
-    use super::format_relative;
+    use super::{format_relative, format_uptime};
+
+    #[test]
+    fn uptime_picks_the_right_band() {
+        assert_eq!(format_uptime(45), "45s");
+        assert_eq!(format_uptime(125), "2m 5s");
+        assert_eq!(format_uptime(3_725), "1h 2m 5s");
+        assert_eq!(format_uptime(180_000), "2d 2h 0m");
+    }
 
     #[test]
     fn relative_renders_each_band() {

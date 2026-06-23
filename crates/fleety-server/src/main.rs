@@ -13,6 +13,13 @@ mod bridge;
 mod browser;
 mod builtin_skills;
 mod conn;
+
+/// Process-wide moment fleety-server started. Used by `fleety status` to
+/// compute uptime without threading a start-time through every connection.
+pub(crate) fn server_start() -> std::time::Instant {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    *START.get_or_init(std::time::Instant::now)
+}
 mod echo;
 mod mcp;
 mod scheduler;
@@ -85,6 +92,8 @@ fn policy_from_env() -> agent_core::Policy {
 #[tokio::main]
 async fn main() {
     obs::init();
+    // Stamp the start time once so uptime reflects boot, not first status query.
+    let _ = server_start();
     let addr = std::env::var("FLEETY_ADDR").unwrap_or_else(|_| "127.0.0.1:8787".to_string());
     let home = agent_home();
     tracing::info!(version = agent_core::VERSION, %addr, home = %home.display(), "fleety-server starting");
@@ -150,31 +159,52 @@ async fn main() {
     tracing::info!(%addr, "listening");
 
     loop {
-        let (stream, peer) = match listener.accept().await {
-            Ok(pair) => pair,
-            Err(e) => {
-                tracing::warn!("accept failed: {e}");
-                continue;
+        let accept = listener.accept();
+        let stop = tokio::signal::ctrl_c();
+        tokio::select! {
+            accepted = accept => {
+                let (stream, peer) = match accepted {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        tracing::warn!("accept failed: {e}");
+                        continue;
+                    }
+                };
+                let storage = Arc::clone(&storage);
+                let provider = Arc::clone(&provider);
+                let workspace = Arc::clone(&workspace);
+                let hub = Arc::clone(&hub);
+                let pending = Arc::clone(&pending);
+                let handles = Arc::clone(&handles);
+                let auth = Arc::clone(&auth);
+                tokio::spawn(async move {
+                    match conn::handle_conn(
+                        stream, storage, provider, workspace, policy, hub, pending, handles, auth,
+                    )
+                    .await
+                    {
+                        Ok(()) => {}
+                        Err(e) => {
+                            tracing::warn!(%peer, report = ?e.report(), "connection error")
+                        }
+                    }
+                });
             }
-        };
-        let storage = Arc::clone(&storage);
-        let provider = Arc::clone(&provider);
-        let workspace = Arc::clone(&workspace);
-        let hub = Arc::clone(&hub);
-        let pending = Arc::clone(&pending);
-        let handles = Arc::clone(&handles);
-        let auth = Arc::clone(&auth);
-        // Each connection runs in its own task: an error or panic here is
-        // isolated and never brings the server down.
-        tokio::spawn(async move {
-            match conn::handle_conn(
-                stream, storage, provider, workspace, policy, hub, pending, handles, auth,
-            )
-            .await
-            {
-                Ok(()) => {}
-                Err(e) => tracing::warn!(%peer, report = ?e.report(), "connection error"),
+            _ = stop => {
+                tracing::info!("Ctrl+C received; closing listener and shutting down");
+                // Drop the listener so no new connections come in. In-flight
+                // connections finish their current turn (the journal protects
+                // anything they're mid-step on if they don't).
+                drop(listener);
+                // Close every live connection's writer channel so peers see
+                // the shutdown immediately, not on the next ping timeout.
+                let mut hub = hub.lock().await;
+                for (device, _) in hub.drain() {
+                    tracing::info!(%device, "closing connection on shutdown");
+                }
+                tracing::info!("fleety-server stopped");
+                return;
             }
-        });
+        }
     }
 }
