@@ -13,6 +13,7 @@ mod bridge;
 mod browser;
 mod builtin_skills;
 mod conn;
+mod gc;
 
 /// Process-wide moment fleety-server started. Used by `fleety status` to
 /// compute uptime without threading a start-time through every connection.
@@ -140,6 +141,10 @@ async fn main() {
 
     // Eagerly finish any interactive turn interrupted by a crash/redeploy, so it
     // doesn't wait for the user to reconnect. Runs in the background.
+    // Periodic retention / GC of audit + backup surfaces (skipped if the user
+    // sets FLEETY_GC_DISABLED).
+    gc::spawn(Arc::clone(&storage));
+
     tokio::spawn(conn::recover_all_interactive(
         Arc::clone(&storage),
         Arc::clone(&provider),
