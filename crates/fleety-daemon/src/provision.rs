@@ -1,4 +1,4 @@
-﻿//! Provision the fleety-insyra data-analysis sidecar onto this device.
+//! Provision the fleety-insyra data-analysis sidecar onto this device.
 //!
 //! The sidecar ships as a raw per-target binary on the GitHub release; we
 //! download it next to the fleetyd executable so the on-device `insyra_exec`
@@ -101,6 +101,83 @@ pub async fn ensure_insyra(force: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    struct EnvGuard(Option<String>);
+
+    impl EnvGuard {
+        fn set_url(url: &str) -> Self {
+            let old = std::env::var("FLEETY_INSYRA_URL").ok();
+            std::env::set_var("FLEETY_INSYRA_URL", url);
+            Self(old)
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(value) => std::env::set_var("FLEETY_INSYRA_URL", value),
+                None => std::env::remove_var("FLEETY_INSYRA_URL"),
+            }
+        }
+    }
+
+    struct SidecarGuard {
+        path: PathBuf,
+        original: Option<Vec<u8>>,
+    }
+
+    impl SidecarGuard {
+        fn new() -> Self {
+            let path = dest_path().expect("dest path");
+            let original = std::fs::read(&path).ok();
+            Self { path, original }
+        }
+
+        fn write(&self, bytes: &[u8]) {
+            if let Some(parent) = self.path.parent() {
+                std::fs::create_dir_all(parent).expect("sidecar parent");
+            }
+            std::fs::write(&self.path, bytes).expect("sidecar");
+        }
+    }
+
+    impl Drop for SidecarGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(bytes) => {
+                    let _ = std::fs::write(&self.path, bytes);
+                }
+                None => {
+                    let _ = std::fs::remove_file(&self.path);
+                }
+            }
+            let _ = std::fs::remove_file(self.path.with_extension("new"));
+        }
+    }
+
+    fn serve_once(status: &'static str, body: &'static [u8]) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut buf = [0_u8; 1024];
+            let _ = stream.read(&mut buf);
+            let header = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(header.as_bytes())
+                .and_then(|_| stream.write_all(body))
+                .expect("write response");
+        });
+        format!("http://{addr}/sidecar")
+    }
 
     #[test]
     fn target_and_filename_are_consistent() {
@@ -115,8 +192,9 @@ mod tests {
 
     // One test (not two) so the shared FLEETY_INSYRA_URL env var can't race
     // between tests running on parallel threads.
-    #[test]
-    fn url_override_then_default() {
+    #[tokio::test]
+    async fn url_override_then_default() {
+        let _env_lock = ENV_LOCK.lock().await;
         std::env::set_var("FLEETY_INSYRA_URL", "https://example.test/sidecar");
         assert_eq!(sidecar_url().unwrap(), "https://example.test/sidecar");
 
@@ -136,5 +214,51 @@ mod tests {
             Some(sidecar_filename())
         );
         assert!(dest.parent().is_some());
+    }
+
+    #[tokio::test]
+    async fn ensure_insyra_skips_existing_sidecar_unless_forced() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let sidecar = SidecarGuard::new();
+        sidecar.write(b"existing sidecar");
+        let _guard = EnvGuard::set_url("http://127.0.0.1:1/must-not-be-called");
+
+        ensure_insyra(false).await.expect("skip existing");
+        assert_eq!(
+            std::fs::read(&sidecar.path).expect("sidecar"),
+            b"existing sidecar"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_insyra_downloads_override_and_replaces_sidecar() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let sidecar = SidecarGuard::new();
+        sidecar.write(b"old sidecar");
+        let url = serve_once("200 OK", b"downloaded sidecar");
+        let _guard = EnvGuard::set_url(&url);
+
+        ensure_insyra(true).await.expect("download sidecar");
+        assert_eq!(
+            std::fs::read(&sidecar.path).expect("sidecar"),
+            b"downloaded sidecar"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_insyra_reports_download_status_errors() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let sidecar = SidecarGuard::new();
+        let url = serve_once("404 Not Found", b"missing");
+        let _guard = EnvGuard::set_url(&url);
+
+        let err = ensure_insyra(true)
+            .await
+            .expect_err("bad http status should fail");
+        assert!(err
+            .report()
+            .message
+            .contains("download fleety-insyra failed"));
+        assert!(!sidecar.path.with_extension("new").exists());
     }
 }

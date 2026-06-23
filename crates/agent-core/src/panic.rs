@@ -1,4 +1,4 @@
-﻿//! Never-crash boundaries.
+//! Never-crash boundaries.
 //!
 //! A single unit of work panicking must never take down the process. These
 //! helpers run work and convert a panic into a structured [`CoreError`] instead
@@ -21,10 +21,14 @@ where
     F: std::future::Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
-    match tokio::task::spawn(fut).await {
-        Ok(value) => Ok(value),
-        Err(join_err) if join_err.is_panic() => Err(CoreError::Panic(join_err.to_string())),
-        Err(join_err) => Err(CoreError::Task(join_err.to_string())),
+    tokio::task::spawn(fut).await.map_err(join_error_to_core)
+}
+
+fn join_error_to_core(join_err: tokio::task::JoinError) -> CoreError {
+    if join_err.is_panic() {
+        CoreError::Panic(join_err.to_string())
+    } else {
+        CoreError::Task(join_err.to_string())
     }
 }
 
@@ -53,6 +57,21 @@ mod tests {
         assert!(matches!(result, Err(CoreError::Panic(_))));
     }
 
+    #[test]
+    fn isolate_reports_owned_and_unknown_panic_payloads() {
+        let owned = isolate(|| -> i32 { panic!("{}", String::from("owned boom")) });
+        match owned {
+            Err(CoreError::Panic(message)) => assert!(message.contains("owned boom")),
+            other => panic!("unexpected result: {other:?}"),
+        }
+
+        let unknown = isolate(|| -> i32 { std::panic::panic_any(123_u8) });
+        match unknown {
+            Err(CoreError::Panic(message)) => assert_eq!(message, "unknown panic payload"),
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn isolate_async_catches_panic() {
         let result: Result<(), CoreError> = isolate_async(async { panic!("async boom") }).await;
@@ -63,5 +82,15 @@ mod tests {
     async fn isolate_async_returns_value() {
         let result: Result<i32, CoreError> = isolate_async(async { 9 }).await;
         assert!(matches!(result, Ok(9)));
+    }
+
+    #[tokio::test]
+    async fn join_error_to_core_reports_cancelled_tasks() {
+        let handle = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        handle.abort();
+        let join_err = handle.await.expect_err("aborted task");
+        assert!(matches!(join_error_to_core(join_err), CoreError::Task(_)));
     }
 }

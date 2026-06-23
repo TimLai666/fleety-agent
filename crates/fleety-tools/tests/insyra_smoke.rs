@@ -60,6 +60,8 @@ fn main() {
         let line = line.unwrap_or_default();
         if line.contains("bad-json") {
             println!("not json");
+        } else if line.contains("eof") {
+            return;
         } else if line.contains("fail") {
             println!("{}", r#"{"ok":false,"error":"boom"}"#);
         } else {
@@ -131,6 +133,19 @@ async fn insyra_exec_uses_line_json_protocol_and_surfaces_sidecar_errors() {
         )
         .await
         .is_err());
+
+    assert!(reg
+        .call("insyra_exec", json!({ "command": "eof", "session": "s" }))
+        .await
+        .is_err());
+    let after_eof = reg
+        .call(
+            "insyra_exec",
+            json!({ "command": "mean x", "session": "s" }),
+        )
+        .await
+        .expect("respawn after eof");
+    assert_eq!(after_eof["output"], json!("fake-ok"));
 }
 
 #[tokio::test]
@@ -148,4 +163,25 @@ async fn insyra_exec_reports_missing_sidecar_as_actionable_error() {
         .expect_err("missing sidecar should error");
     let message = err.report().message;
     assert!(message.contains("cannot start the fleety-insyra sidecar"));
+}
+
+#[tokio::test]
+async fn insyra_exec_reports_env_dir_creation_errors() {
+    let _env_lock = ENV_LOCK.lock().await;
+    let temp = TempDir::new("bad-root");
+    let fake = build_fake_sidecar(&temp.0);
+    let _guard = EnvGuard::set_insyra_bin(&fake);
+    let root_file = temp.0.join("not-a-dir");
+    std::fs::write(&root_file, "file").expect("root file");
+
+    let mut reg = ToolRegistry::new();
+    fleety_tools::register_insyra(&mut reg, &root_file);
+    let err = reg
+        .call("insyra_exec", json!({ "command": "mean x" }))
+        .await
+        .expect_err("root file should block env dir creation");
+    assert!(err
+        .report()
+        .message
+        .contains("cannot create insyra env dir"));
 }

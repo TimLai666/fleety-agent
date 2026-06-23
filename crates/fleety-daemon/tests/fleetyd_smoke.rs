@@ -177,3 +177,51 @@ fn daemon_clears_saved_token_when_server_rejects_auth() {
     ));
     assert!(!token_path.exists());
 }
+
+#[test]
+fn daemon_executes_run_tool_frames_and_reports_errors() {
+    let home = TempDir::new("run-tool");
+    let root = TempDir::new("device-root-run-tool");
+    std::fs::write(root.0.join("note.txt"), "hello from device").expect("seed file");
+    let (url, rx) = start_ws_server(vec![
+        vec![
+            welcome(None),
+            ServerMsg::RunTool {
+                call_id: "call-ok".into(),
+                tool: "read_file".into(),
+                args_json: r#"{"path":"note.txt"}"#.into(),
+            },
+        ],
+        vec![ServerMsg::RunTool {
+            call_id: "call-err".into(),
+            tool: "missing_tool".into(),
+            args_json: "{}".into(),
+        }],
+        vec![],
+    ]);
+
+    let output = run_connected(&home, &root, &url);
+    let received = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("server frames");
+
+    assert!(output.status.success());
+    assert!(matches!(received.first(), Some(ClientMsg::Hello { .. })));
+    match received.get(1) {
+        Some(ClientMsg::ToolResult {
+            call_id,
+            result_json,
+        }) => {
+            assert_eq!(call_id, "call-ok");
+            assert!(result_json.contains("hello from device"));
+        }
+        other => panic!("expected tool result, got {other:?}"),
+    }
+    match received.get(2) {
+        Some(ClientMsg::ToolError { call_id, error }) => {
+            assert_eq!(call_id, "call-err");
+            assert!(error.message.contains("missing_tool"));
+        }
+        other => panic!("expected tool error, got {other:?}"),
+    }
+}

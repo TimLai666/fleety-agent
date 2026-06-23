@@ -1,4 +1,4 @@
-﻿//! Runner: drive one or more goldens against a real tool registry + a
+//! Runner: drive one or more goldens against a real tool registry + a
 //! [`MockProvider`](agent_core::MockProvider), capture events, assert.
 
 use std::collections::BTreeMap;
@@ -368,5 +368,95 @@ mod tests {
         };
         let v = run_one(&golden).await;
         assert!(v.passed, "verdict: {:?}", v);
+    }
+
+    #[tokio::test]
+    async fn expectation_failures_are_collected_without_short_circuiting() {
+        let golden = Golden {
+            name: "many-failures".into(),
+            description: "".into(),
+            workspace_files: [("existing.txt".into(), "still here".into())].into(),
+            user_input: "summarise".into(),
+            system_prompt: Some("system context".into()),
+            scripted_responses: vec![ScriptedResponse {
+                content: Some("final answer".into()),
+                tool_calls: vec![],
+            }],
+            expected: Expected {
+                tools_called: vec!["read_file".into()],
+                must_not_call: vec![],
+                final_contains: vec!["missing text".into()],
+                workspace_files_after: [
+                    ("missing.txt".into(), "wanted".into()),
+                    ("existing.txt".into(), "different".into()),
+                ]
+                .into(),
+                workspace_files_absent: vec!["existing.txt".into()],
+            },
+        };
+
+        let v = run_one(&golden).await;
+        assert!(!v.passed);
+        assert!(v.failures.iter().any(|f| f.contains("expected tool")));
+        assert!(v.failures.iter().any(|f| f.contains("final output")));
+        assert!(v.failures.iter().any(|f| f.contains("not readable")));
+        assert!(v.failures.iter().any(|f| f.contains("content mismatch")));
+        assert!(v.failures.iter().any(|f| f.contains("should not exist")));
+    }
+
+    #[tokio::test]
+    async fn run_one_reports_agent_loop_errors_as_failed_verdicts() {
+        let golden = Golden {
+            name: "empty-script".into(),
+            description: "".into(),
+            workspace_files: Default::default(),
+            user_input: "hi".into(),
+            system_prompt: None,
+            scripted_responses: vec![],
+            expected: Expected::default(),
+        };
+
+        let v = run_one(&golden).await;
+        assert!(!v.passed);
+        assert!(v.failures.iter().any(|f| f.contains("agent loop error")));
+    }
+
+    #[tokio::test]
+    async fn run_file_skips_comments_and_reports_parse_errors() {
+        let root = std::env::temp_dir().join(format!("fleety-eval-file-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("root");
+        let good = Golden {
+            name: "one".into(),
+            description: "".into(),
+            workspace_files: Default::default(),
+            user_input: "hi".into(),
+            system_prompt: None,
+            scripted_responses: vec![ScriptedResponse {
+                content: Some("ok".into()),
+                tool_calls: vec![],
+            }],
+            expected: Expected {
+                final_contains: vec!["ok".into()],
+                ..Expected::default()
+            },
+        };
+        let path = root.join("goldens.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                "\n// comment\n{}\n",
+                serde_json::to_string(&good).expect("json")
+            ),
+        )
+        .expect("write good");
+        let verdicts = run_file(&path).await.expect("run file");
+        assert_eq!(verdicts.len(), 1);
+        assert!(verdicts[0].passed);
+
+        std::fs::write(&path, "{not json}\n").expect("write bad");
+        let err = run_file(&path).await.expect_err("parse error");
+        assert!(err.contains("line 1"));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -14,10 +14,21 @@ pub fn init() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn init_is_idempotent_and_non_panicking() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let old = std::env::var("RUST_LOG").ok();
         init();
         init();
+        std::env::set_var("RUST_LOG", "not a valid env filter [");
+        init();
+        match old {
+            Some(value) => std::env::set_var("RUST_LOG", value),
+            None => std::env::remove_var("RUST_LOG"),
+        }
     }
 }

@@ -1,4 +1,4 @@
-﻿//! Per-connection handling: WebSocket handshake, session, and the turn loop.
+//! Per-connection handling: WebSocket handshake, session, and the turn loop.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -895,6 +895,166 @@ mod tests {
             token: None,
             pairing_code: None,
         }
+    }
+
+    #[tokio::test]
+    async fn management_messages_replay_audit_and_rollback_over_websocket() {
+        use crate::echo::EchoProvider;
+
+        let home = std::env::temp_dir().join(format!("fleety-mgmt-{}", uuid::Uuid::new_v4()));
+        let workspace = home.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let storage = Arc::new(Storage::new(home.clone()));
+        storage
+            .append("dev", "c1", &Message::user("old question"))
+            .expect("append user");
+        storage
+            .append("dev", "c1", &Message::assistant("old answer"))
+            .expect("append assistant");
+        storage
+            .append_history(
+                "dev",
+                &Event::ToolResult {
+                    id: "hist-1".into(),
+                    result: serde_json::json!({ "ok": true }),
+                },
+            )
+            .expect("history");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        {
+            let storage = Arc::clone(&storage);
+            let workspace = Arc::new(workspace.clone());
+            tokio::spawn(async move {
+                if let Ok((stream, _)) = listener.accept().await {
+                    let _ = handle_conn(
+                        stream,
+                        storage,
+                        Arc::new(EchoProvider),
+                        workspace,
+                        Policy::FullAccess,
+                        bridge::new_hub(),
+                        bridge::new_pending(),
+                        bridge::new_handles(),
+                        open_auth(),
+                    )
+                    .await;
+                }
+            });
+        }
+
+        let url = format!("ws://{addr}");
+        let (client, _) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("connect");
+        let (mut tx, mut rx) = client.split();
+        send_client(&mut tx, &hello("dev")).await;
+        assert!(matches!(
+            recv_server(&mut rx).await,
+            Some(ServerMsg::Welcome { .. })
+        ));
+
+        send_client(
+            &mut tx,
+            &ClientMsg::Resume {
+                conversation_id: "c1".into(),
+                after_seq: 1,
+            },
+        )
+        .await;
+        match recv_server(&mut rx).await {
+            Some(ServerMsg::Replay {
+                seq, role, content, ..
+            }) => {
+                assert_eq!(seq, 2);
+                assert_eq!(role, "assistant");
+                assert_eq!(content, "old answer");
+            }
+            other => panic!("expected replay, got {other:?}"),
+        }
+        assert!(matches!(
+            recv_server(&mut rx).await,
+            Some(ServerMsg::Done { .. })
+        ));
+
+        send_client(
+            &mut tx,
+            &ClientMsg::AuditList {
+                device_id: "dev".into(),
+                since: Some(1),
+                limit: Some(10),
+            },
+        )
+        .await;
+        match recv_server(&mut rx).await {
+            Some(ServerMsg::AuditListResult { entries_json, .. }) => {
+                assert!(entries_json.contains("tool_result"));
+            }
+            other => panic!("expected audit list, got {other:?}"),
+        }
+
+        send_client(
+            &mut tx,
+            &ClientMsg::AuditShow {
+                device_id: "dev".into(),
+                index: 0,
+            },
+        )
+        .await;
+        match recv_server(&mut rx).await {
+            Some(ServerMsg::AuditShowResult { event_json, .. }) => {
+                assert!(event_json.contains("tool_result"));
+            }
+            other => panic!("expected audit show, got {other:?}"),
+        }
+
+        send_client(
+            &mut tx,
+            &ClientMsg::AuditShow {
+                device_id: "dev".into(),
+                index: 99,
+            },
+        )
+        .await;
+        assert!(matches!(
+            recv_server(&mut rx).await,
+            Some(ServerMsg::Error { .. })
+        ));
+
+        send_client(
+            &mut tx,
+            &ClientMsg::RollbackList {
+                device_id: "dev".into(),
+            },
+        )
+        .await;
+        match recv_server(&mut rx).await {
+            Some(ServerMsg::RollbackListResult { backups_json, .. }) => {
+                assert_eq!(backups_json, "[]");
+            }
+            other => panic!("expected rollback list, got {other:?}"),
+        }
+
+        send_client(
+            &mut tx,
+            &ClientMsg::RollbackApply {
+                device_id: "dev".into(),
+                backup_id: "missing".into(),
+            },
+        )
+        .await;
+        match recv_server(&mut rx).await {
+            Some(ServerMsg::RollbackResult { ok, message, .. }) => {
+                assert!(!ok);
+                assert!(message.contains("missing"));
+            }
+            other => panic!("expected rollback result, got {other:?}"),
+        }
+        let _ = tx.close().await;
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     /// Full enrollment round-trip: server requires auth, fleetyd-like device

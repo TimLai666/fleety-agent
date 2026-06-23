@@ -13,6 +13,28 @@ fn run(args: &[&str]) -> std::process::Output {
         .expect("run fleety")
 }
 
+fn rejecting_ws_url() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind rejecting server");
+    let addr = listener.local_addr().expect("rejecting addr");
+    thread::spawn(move || {
+        let _ = listener.accept();
+    });
+    format!("ws://{addr}")
+}
+
+fn run_with_rejecting_agent(args: &[&str]) -> std::process::Output {
+    let home = TempHome::new("unreachable");
+    let url = rejecting_ws_url();
+    Command::new(env!("CARGO_BIN_EXE_fleety"))
+        .args(args)
+        .env("FLEETY_AGENT_URL", url)
+        .env("HOME", &home.0)
+        .env("USERPROFILE", &home.0)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run fleety")
+}
+
 struct TempHome(std::path::PathBuf);
 
 impl TempHome {
@@ -343,4 +365,54 @@ fn commands_render_server_errors_without_panicking() {
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("server said no"));
     assert_eq!(received.len(), 2);
+}
+
+#[test]
+fn network_commands_report_connection_errors_without_panicking() {
+    for args in [
+        &["ask", "hi"][..],
+        &["resume", "c1"][..],
+        &["audit", "list"][..],
+        &["audit", "show", "1"][..],
+        &["rollback", "list"][..],
+        &["rollback", "apply", "b1"][..],
+        &["pair", "PAIR-1"][..],
+    ] {
+        let output = run_with_rejecting_agent(args);
+        assert!(output.status.success(), "{args:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("cannot connect"), "{args:?}: {stderr}");
+    }
+
+    let url = rejecting_ws_url();
+    let output = run(&["init", &url]);
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cannot connect"));
+}
+
+#[test]
+fn init_pair_and_ask_report_unexpected_server_frames() {
+    let home = TempHome::new("unexpected");
+    let server_error = ServerMsg::Error {
+        error: WireError {
+            kind: "provider".into(),
+            message: "wrong frame".into(),
+            remediation: None,
+        },
+    };
+
+    let (url, rx) = start_ws_server(vec![vec![server_error.clone()]]);
+    let (output, _) = run_against_server(&["init", &url], &url, &home, rx);
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected reply during init"));
+
+    let (url, rx) = start_ws_server(vec![vec![server_error]]);
+    let (output, _) = run_against_server(&["ask", "hi"], &url, &home, rx);
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("expected welcome"));
+
+    let (url, rx) = start_ws_server(vec![vec![welcome(None)]]);
+    let (output, _) = run_against_server(&["pair", "PAIR-2"], &url, &home, rx);
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("server returned no token"));
 }

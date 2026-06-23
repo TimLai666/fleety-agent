@@ -123,6 +123,12 @@ mod tests {
             std::env::set_var("FLEETY_UPDATE_MANIFEST", url);
             Self(old)
         }
+
+        fn unset_manifest() -> Self {
+            let old = std::env::var("FLEETY_UPDATE_MANIFEST").ok();
+            std::env::remove_var("FLEETY_UPDATE_MANIFEST");
+            Self(old)
+        }
     }
 
     impl Drop for EnvGuard {
@@ -210,6 +216,15 @@ mod tests {
         let _guard = EnvGuard::set_manifest(&manifest_url);
 
         update().await.expect("already up to date");
+    }
+
+    #[tokio::test]
+    async fn update_requires_manifest_env() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let _guard = EnvGuard::unset_manifest();
+
+        let err = update().await.expect_err("missing manifest env");
+        assert!(err.report().message.contains("FLEETY_UPDATE_MANIFEST"));
     }
 
     #[tokio::test]

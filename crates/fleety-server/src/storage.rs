@@ -1,4 +1,4 @@
-﻿//! Conversation persistence: one JSONL file of [`Message`]s per conversation,
+//! Conversation persistence: one JSONL file of [`Message`]s per conversation,
 //! under the Agent home, separate from any workspace (spec: workspace = dirty
 //! work, durable state lives in the Fleety store).
 
@@ -731,6 +731,73 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["index"], serde_json::json!(2u64));
         assert_eq!(entries[0]["kind"], serde_json::json!("tool_result"));
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn corrupt_conversation_lines_return_actionable_errors() {
+        let home = temp_home();
+        let storage = Storage::new(home.clone());
+        let path = storage.conversation_path("dev", "conv");
+        std::fs::create_dir_all(path.parent().expect("conversation parent")).expect("conv dir");
+
+        std::fs::write(&path, "\nnot json\n").expect("bad json");
+        assert!(storage
+            .load("dev", "conv")
+            .expect_err("bad json should fail")
+            .report()
+            .message
+            .contains("corrupt conversation line"));
+
+        std::fs::write(&path, r#"{"message":{"role":"user","content":"hi"}}"#).expect("no seq");
+        assert!(storage
+            .load("dev", "conv")
+            .expect_err("missing seq should fail")
+            .report()
+            .message
+            .contains("missing 'seq'"));
+
+        std::fs::write(&path, r#"{"seq":1,"message":{"role":"bogus"}}"#).expect("bad message");
+        assert!(storage
+            .load("dev", "conv")
+            .expect_err("bad message should fail")
+            .report()
+            .message
+            .contains("corrupt conversation message"));
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn journal_events_skip_non_events_and_report_corruption() {
+        let home = temp_home();
+        let storage = Storage::new(home.clone());
+
+        storage
+            .journal_begin("dev", "conv", &Message::user("hi"))
+            .expect("begin");
+        assert!(storage
+            .journal_events("dev", "conv")
+            .expect("start-only journal")
+            .is_empty());
+
+        let path = storage.journal_path("dev", "conv");
+        std::fs::write(&path, "{not json}\n").expect("bad journal");
+        assert!(storage
+            .journal_events("dev", "conv")
+            .expect_err("bad journal should fail")
+            .report()
+            .message
+            .contains("corrupt journal line"));
+
+        std::fs::write(&path, r#"{"kind":"event","event":null}"#).expect("bad event");
+        assert!(storage
+            .journal_events("dev", "conv")
+            .expect_err("bad event should fail")
+            .report()
+            .message
+            .contains("corrupt journal event"));
 
         let _ = std::fs::remove_dir_all(&home);
     }

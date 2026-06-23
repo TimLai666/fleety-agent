@@ -1,4 +1,4 @@
-﻿//! OS autostart service definitions for fleetyd.
+//! OS autostart service definitions for fleetyd.
 //!
 //! `install` writes the platform service file (systemd user unit / launchd
 //! LaunchAgent) and prints the one command to enable it; Windows uses Task
@@ -95,7 +95,10 @@ pub fn install() -> Result<()> {
         .map_err(|e| CoreError::Message(format!("cannot find current exe: {e}")))?
         .to_string_lossy()
         .to_string();
-    let def = service_def(current_os(), &exec);
+    install_def(service_def(current_os(), &exec))
+}
+
+fn install_def(def: ServiceDef) -> Result<()> {
     if let Some((path, content)) = &def.file {
         let target = expand_home(path);
         if let Some(parent) = target.parent() {
@@ -115,7 +118,10 @@ pub fn install() -> Result<()> {
 
 /// Remove the service file (if any) and print the disable command.
 pub fn uninstall() -> Result<()> {
-    let def = service_def(current_os(), "");
+    uninstall_def(service_def(current_os(), ""))
+}
+
+fn uninstall_def(def: ServiceDef) -> Result<()> {
     if let Some((path, _)) = &def.file {
         let target = expand_home(path);
         if target.exists() {
@@ -131,6 +137,9 @@ pub fn uninstall() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn defs_reference_the_exec_path() {
@@ -153,6 +162,7 @@ mod tests {
 
     #[test]
     fn expand_home_uses_home_for_tilde_paths_only() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
         let old_home = std::env::var("HOME").ok();
         let old_profile = std::env::var("USERPROFILE").ok();
         let temp = std::env::temp_dir().join(format!("fleetyd-service-{}", std::process::id()));
@@ -173,5 +183,38 @@ mod tests {
             Some(v) => std::env::set_var("USERPROFILE", v),
             None => std::env::remove_var("USERPROFILE"),
         }
+    }
+
+    #[test]
+    fn install_and_uninstall_write_and_remove_service_file() {
+        let temp =
+            std::env::temp_dir().join(format!("fleetyd-service-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).expect("temp");
+        let path = temp.join("fleetyd-test.service");
+        let path_text = path.display().to_string();
+
+        let def = ServiceDef {
+            manager: "test-manager",
+            file: Some((path_text.clone(), "ExecStart=/tmp/fleetyd".to_string())),
+            enable: "enable fleetyd".to_string(),
+            disable: "disable fleetyd".to_string(),
+        };
+        install_def(def).expect("install def");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("service file"),
+            "ExecStart=/tmp/fleetyd"
+        );
+
+        let def = ServiceDef {
+            manager: "test-manager",
+            file: Some((path_text, String::new())),
+            enable: "enable fleetyd".to_string(),
+            disable: "disable fleetyd".to_string(),
+        };
+        uninstall_def(def).expect("uninstall def");
+        assert!(!path.exists());
+
+        let _ = std::fs::remove_dir_all(&temp);
     }
 }
