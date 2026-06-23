@@ -106,6 +106,15 @@ async fn main() {
     let workspace = Arc::new(workspace_root());
     tracing::info!(workspace = %workspace.display(), "workspace for tools");
 
+    // Kick off codebase-memory's first index of the workspace in the background
+    // so the very first structural query has data — without blocking startup.
+    {
+        let workspace_for_index = Arc::clone(&workspace);
+        tokio::spawn(async move {
+            builtin_mcp::auto_index_workspace(&workspace_for_index).await;
+        });
+    }
+
     // Cross-device routing state, shared across all connections.
     let hub = bridge::new_hub();
     let pending = bridge::new_pending();

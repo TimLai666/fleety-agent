@@ -398,35 +398,57 @@ impl Tool for McpCall {
             .find(|s| s.name == server_name)
             .ok_or_else(|| CoreError::ToolNotFound(format!("mcp server '{server_name}'")))?;
 
-        let mut child = Command::new(&server.command)
-            .args(&server.args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| {
-                CoreError::Message(format!("cannot spawn mcp server '{server_name}': {e}"))
-            })?;
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| CoreError::Message("mcp server has no stdin".to_string()))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| CoreError::Message("mcp server has no stdout".to_string()))?;
-        let mut reader = BufReader::new(stdout).lines();
+        invoke_mcp(
+            server_name,
+            &server.command,
+            &server.args,
+            &tool,
+            &arguments,
+            CALL_TIMEOUT,
+        )
+        .await
+    }
+}
 
-        let exchange = mcp_exchange(&mut stdin, &mut reader, &tool, &arguments);
-        let result = tokio::time::timeout(CALL_TIMEOUT, exchange).await;
-        let _ = child.start_kill();
-        match result {
-            Ok(inner) => inner,
-            Err(_) => Err(CoreError::Provider(format!(
-                "mcp server '{server_name}' timed out after {}s",
-                CALL_TIMEOUT.as_secs()
-            ))),
-        }
+/// Spawn an MCP server over stdio, do the handshake, run one `tools/call`, and
+/// kill it. Reused by `mcp_call` (the agent-facing tool) and by startup tasks
+/// that need to talk to a built-in MCP without going through the registry. The
+/// `label` is for error messages only — it doesn't have to be a configured
+/// server name.
+pub(crate) async fn invoke_mcp(
+    label: &str,
+    command: &str,
+    args: &[String],
+    tool: &str,
+    arguments: &Value,
+    timeout: Duration,
+) -> Result<Value> {
+    let mut child = Command::new(command)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| CoreError::Message(format!("cannot spawn mcp server '{label}': {e}")))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| CoreError::Message("mcp server has no stdin".to_string()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| CoreError::Message("mcp server has no stdout".to_string()))?;
+    let mut reader = BufReader::new(stdout).lines();
+
+    let exchange = mcp_exchange(&mut stdin, &mut reader, tool, arguments);
+    let result = tokio::time::timeout(timeout, exchange).await;
+    let _ = child.start_kill();
+    match result {
+        Ok(inner) => inner,
+        Err(_) => Err(CoreError::Provider(format!(
+            "mcp server '{label}' timed out after {}s",
+            timeout.as_secs()
+        ))),
     }
 }
 

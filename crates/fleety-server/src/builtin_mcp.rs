@@ -10,9 +10,18 @@
 //! provisioning hasn't run yet.
 
 use std::path::Path;
+use std::time::Duration;
 
 use agent_core::{CoreError, Result};
 use serde_json::{json, Value};
+
+use crate::mcp::invoke_mcp;
+
+/// `list_projects` is a near-instant SQLite read — keep the timeout tight.
+const CBM_LIST_TIMEOUT: Duration = Duration::from_secs(30);
+/// `index_repository` on a large repo can run for minutes (the cbm README cites
+/// ~3 min for the Linux kernel). Cap generously so we don't kill a live run.
+const CBM_INDEX_TIMEOUT: Duration = Duration::from_secs(60 * 30);
 
 /// The name of the prebuilt codebase-memory-mcp binary on disk.
 fn cbm_binary_name() -> &'static str {
@@ -70,9 +79,166 @@ pub fn seed(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Normalise a workspace path for comparison with `list_projects` records.
+/// Canonicalise when we can (handles symlinks, mixed separators, trailing `.`);
+/// fall back to the raw path so a non-existent workspace still produces a
+/// stable string.
+fn normalise_path(path: &Path) -> String {
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    canonical.to_string_lossy().to_string()
+}
+
+/// Determine whether `workspace` is already an indexed project in the local
+/// codebase-memory store. Treats any error (binary missing, JSON shape change)
+/// as "unknown" so the caller defaults to triggering an index — index is
+/// idempotent, so over-indexing is at worst wasted CPU.
+async fn workspace_already_indexed(cbm_binary: &str, workspace: &Path) -> Result<bool> {
+    let result = invoke_mcp(
+        "codebase-memory",
+        cbm_binary,
+        &[],
+        "list_projects",
+        &json!({}),
+        CBM_LIST_TIMEOUT,
+    )
+    .await?;
+    let target = normalise_path(workspace);
+    // MCP `tools/call` results are wrapped in `{ content: [{ text: "..." }] }`.
+    // The text payload is the tool's JSON. Be tolerant of either shape so a
+    // future cbm version that returns structured `result` directly still works.
+    let projects = extract_projects(&result);
+    Ok(projects.iter().any(|p| {
+        let raw = p
+            .get("root_path")
+            .or_else(|| p.get("path"))
+            .or_else(|| p.get("repo_path"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if raw.is_empty() {
+            return false;
+        }
+        normalise_path(Path::new(raw)) == target
+    }))
+}
+
+/// Pull the project list out of an MCP `tools/call` result regardless of
+/// whether cbm returned structured content or a `{content:[{text:JSON}]}`
+/// envelope.
+fn extract_projects(result: &Value) -> Vec<Value> {
+    if let Some(arr) = result.get("projects").and_then(Value::as_array) {
+        return arr.clone();
+    }
+    if let Some(content) = result.get("content").and_then(Value::as_array) {
+        for item in content {
+            if let Some(text) = item.get("text").and_then(Value::as_str) {
+                if let Ok(inner) = serde_json::from_str::<Value>(text) {
+                    if let Some(arr) = inner.get("projects").and_then(Value::as_array) {
+                        return arr.clone();
+                    }
+                }
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Best-effort: ensure the configured workspace is indexed by the built-in
+/// `codebase-memory` MCP server, so the agent's first structural query has data
+/// to work with. Runs in the background at server startup. If cbm isn't yet
+/// provisioned, the workspace doesn't exist, or anything else fails, we log a
+/// warning and return — never crash the server.
+pub async fn auto_index_workspace(workspace: &Path) {
+    if !workspace.is_dir() {
+        tracing::warn!(
+            workspace = %workspace.display(),
+            "skipping codebase-memory auto-index: workspace is not a directory"
+        );
+        return;
+    }
+    let binary = resolve_cbm_binary();
+    match workspace_already_indexed(&binary, workspace).await {
+        Ok(true) => {
+            tracing::info!(
+                workspace = %workspace.display(),
+                "codebase-memory: workspace already indexed; skipping auto-index"
+            );
+            return;
+        }
+        Ok(false) => {}
+        Err(e) => {
+            // Most likely: cbm binary not provisioned yet, or the user's running
+            // an older fleetyd. Log clearly and fall through — we'll attempt
+            // index_repository anyway, which will surface the same error.
+            tracing::warn!(
+                report = ?e.report(),
+                "codebase-memory: could not check list_projects; attempting auto-index anyway"
+            );
+        }
+    }
+    tracing::info!(
+        workspace = %workspace.display(),
+        "codebase-memory: kicking off background index_repository(mode=full)"
+    );
+    let arguments = json!({
+        "repo_path": normalise_path(workspace),
+        "mode": "full",
+    });
+    match invoke_mcp(
+        "codebase-memory",
+        &binary,
+        &[],
+        "index_repository",
+        &arguments,
+        CBM_INDEX_TIMEOUT,
+    )
+    .await
+    {
+        Ok(_) => tracing::info!(
+            workspace = %workspace.display(),
+            "codebase-memory: auto-index complete"
+        ),
+        Err(e) => tracing::warn!(
+            report = ?e.report(),
+            "codebase-memory: auto-index failed (the agent can still run; this just means \
+             structural queries will be unavailable until the user runs index_repository)"
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_projects_handles_both_envelopes() {
+        // Direct structured shape.
+        let direct = json!({ "projects": [{ "name": "x", "root_path": "/repo" }] });
+        let p = extract_projects(&direct);
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0]["name"], json!("x"));
+
+        // MCP `tools/call` text envelope.
+        let wrapped = json!({
+            "content": [{
+                "type": "text",
+                "text": "{\"projects\":[{\"name\":\"y\",\"root_path\":\"/r\"}]}"
+            }]
+        });
+        let p = extract_projects(&wrapped);
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0]["name"], json!("y"));
+
+        // Nothing recognisable -> empty.
+        let none = json!({ "ok": true });
+        assert!(extract_projects(&none).is_empty());
+    }
+
+    #[test]
+    fn normalise_path_falls_back_when_unreadable() {
+        let bogus = Path::new("/this/should/not/exist/anywhere-12345");
+        let n = normalise_path(bogus);
+        assert!(!n.is_empty());
+    }
 
     #[test]
     fn seed_writes_codebase_memory_entry() {
