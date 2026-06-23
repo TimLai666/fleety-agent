@@ -14,6 +14,7 @@ mod browser;
 mod builtin_skills;
 mod conn;
 mod gc;
+mod mdns;
 
 /// Process-wide moment fleety-server started. Used by `fleety status` to
 /// compute uptime without threading a start-time through every connection.
@@ -165,6 +166,9 @@ async fn main() {
         }
     };
     tracing::info!(%addr, "listening");
+    // Announce ourselves via mDNS so daemons / the CLI on the same LAN can
+    // find us without a hand-typed URL. No-op when disabled.
+    mdns::spawn_advertise(&addr);
 
     loop {
         let accept = listener.accept();

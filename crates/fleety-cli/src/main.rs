@@ -293,7 +293,9 @@ fn fleety_dir() -> Option<PathBuf> {
     Some(PathBuf::from(base).join(".fleety"))
 }
 
-/// Resolve the agent URL: `FLEETY_AGENT_URL`, else saved config, else default.
+/// Resolve the agent URL: `FLEETY_AGENT_URL`, else saved config, else mDNS
+/// discovery on the LAN, else the local default. mDNS probe is short (2 s) so
+/// an offline laptop doesn't pause noticeably before falling through.
 fn agent_url() -> String {
     if let Ok(url) = std::env::var("FLEETY_AGENT_URL") {
         return url;
@@ -307,7 +309,40 @@ fn agent_url() -> String {
             }
         }
     }
+    if let Some(url) = discover_via_mdns(std::time::Duration::from_secs(2)) {
+        return url;
+    }
     "ws://127.0.0.1:8787".to_string()
+}
+
+/// Browse the LAN for a `_fleety._tcp.local.` service and return the first
+/// `ws://host:port` URL. None on timeout, error, or when the user disables
+/// mDNS via FLEETY_MDNS_DISABLED.
+fn discover_via_mdns(timeout: std::time::Duration) -> Option<String> {
+    if std::env::var("FLEETY_MDNS_DISABLED").is_ok() {
+        return None;
+    }
+    let daemon = mdns_sd::ServiceDaemon::new().ok()?;
+    let receiver = daemon.browse("_fleety._tcp.local.").ok()?;
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let recv_timeout = remaining.min(std::time::Duration::from_millis(500));
+        match receiver.recv_timeout(recv_timeout) {
+            Ok(mdns_sd::ServiceEvent::ServiceResolved(info)) => {
+                let addrs = info.get_addresses_v4();
+                if let Some(ip) = addrs.iter().next() {
+                    let url = format!("ws://{}:{}", ip, info.get_port());
+                    let _ = daemon.shutdown();
+                    return Some(url);
+                }
+            }
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+    let _ = daemon.shutdown();
+    None
 }
 
 fn device_id() -> String {
