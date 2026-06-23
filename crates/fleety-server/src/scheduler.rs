@@ -33,6 +33,7 @@ pub async fn tick(
     storage: &Arc<Storage>,
     provider: &dyn ModelProvider,
     workspace: &Path,
+    device_tools: crate::bridge::DeviceTools,
     now: u64,
 ) -> Result<usize> {
     let due = schedules::due_schedules(&storage.schedules_dir(), now)?;
@@ -53,6 +54,7 @@ pub async fn tick(
         &storage.history_path(SCHED_DEVICE),
         &storage.devices_dir(),
         &storage.schedules_dir(),
+        device_tools,
     );
     crate::skills::register(
         &mut tools,
@@ -184,13 +186,15 @@ pub fn spawn(
     storage: Arc<Storage>,
     provider: Arc<dyn ModelProvider>,
     workspace: Arc<PathBuf>,
+    device_tools: crate::bridge::DeviceTools,
     tick_secs: u64,
 ) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(tick_secs.max(1)));
         loop {
             interval.tick().await;
-            match tick(&storage, provider.as_ref(), &workspace, now_secs()).await {
+            let dt = Arc::clone(&device_tools);
+            match tick(&storage, provider.as_ref(), &workspace, dt, now_secs()).await {
                 Ok(n) if n > 0 => tracing::info!(fired = n, "scheduler fired due schedules"),
                 Ok(_) => {}
                 Err(e) => tracing::warn!(report = ?e.report(), "scheduler tick error (isolated)"),
@@ -246,9 +250,15 @@ mod tests {
         // crash here: t1 has no result.
 
         // A tick with nothing due still recovers the interrupted turn.
-        let fired = tick(&storage, &EchoProvider, &workspace, 0)
-            .await
-            .expect("tick");
+        let fired = tick(
+            &storage,
+            &EchoProvider,
+            &workspace,
+            crate::bridge::new_device_tools(),
+            0,
+        )
+        .await
+        .expect("tick");
         assert_eq!(fired, 0);
 
         // The journal is cleared and a final assistant reply was persisted —
@@ -276,7 +286,8 @@ mod tests {
         .expect("write schedule");
 
         let provider = EchoProvider;
-        let fired = tick(&storage, &provider, &workspace, 1000)
+        let dt = crate::bridge::new_device_tools();
+        let fired = tick(&storage, &provider, &workspace, Arc::clone(&dt), 1000)
             .await
             .expect("tick");
         assert_eq!(fired, 1);
@@ -285,7 +296,7 @@ mod tests {
         assert!(msgs.len() >= 2); // user prompt + assistant reply
 
         // `at:` already fired -> not due again
-        let again = tick(&storage, &provider, &workspace, 2000)
+        let again = tick(&storage, &provider, &workspace, dt, 2000)
             .await
             .expect("tick2");
         assert_eq!(again, 0);

@@ -134,18 +134,23 @@ async fn run() -> Result<()> {
     let pairing_code = std::env::var("FLEETY_PAIRING_CODE")
         .ok()
         .filter(|s| !s.is_empty());
+
+    let registry = ondevice::build_local_registry(&ondevice::device_root());
+    // Advertise the on-device tool set so the agent knows what device_exec can
+    // invoke here — without this, the server has to guess (or hardcode).
+    let local_tools_json = serde_json::to_string(&registry.specs()).ok();
+
     let hello = serde_json::to_string(&ClientMsg::Hello {
         device_id: device_id(),
         protocol: PROTOCOL_VERSION,
         token,
         pairing_code,
+        local_tools_json,
     })
     .map_err(|e| CoreError::Message(format!("serialize hello: {e}")))?;
     tx.send(WsMessage::Text(hello))
         .await
         .map_err(|e| CoreError::Provider(format!("send hello failed: {e}")))?;
-
-    let registry = ondevice::build_local_registry(&ondevice::device_root());
     tracing::info!(%url, "connected; holding connection");
     loop {
         let next = tokio::select! {

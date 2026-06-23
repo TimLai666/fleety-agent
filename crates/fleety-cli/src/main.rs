@@ -340,6 +340,9 @@ fn hello(pairing_code: Option<String>) -> ClientMsg {
         protocol: PROTOCOL_VERSION,
         token: saved_token(),
         pairing_code,
+        // CLI sessions have no on-device tool registry to advertise — only
+        // fleetyd does (it runs tools locally).
+        local_tools_json: None,
     }
 }
 

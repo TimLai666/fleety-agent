@@ -113,6 +113,7 @@ async fn main() {
     let hub = bridge::new_hub();
     let pending = bridge::new_pending();
     let handles = bridge::new_handles();
+    let device_tools = bridge::new_device_tools();
 
     // Connection auth: enforced only with FLEETY_REQUIRE_AUTH=1; FLEETY_TOKEN is
     // a bootstrap admin token for pairing the first device.
@@ -133,6 +134,7 @@ async fn main() {
         Arc::clone(&storage),
         Arc::clone(&provider),
         Arc::clone(&workspace),
+        Arc::clone(&device_tools),
         tick_secs,
     );
 
@@ -147,6 +149,7 @@ async fn main() {
         Arc::clone(&pending),
         Arc::clone(&handles),
         Arc::clone(&auth),
+        Arc::clone(&device_tools),
     ));
 
     let listener = match TcpListener::bind(&addr).await {
@@ -177,9 +180,19 @@ async fn main() {
                 let pending = Arc::clone(&pending);
                 let handles = Arc::clone(&handles);
                 let auth = Arc::clone(&auth);
+                let device_tools = Arc::clone(&device_tools);
                 tokio::spawn(async move {
                     match conn::handle_conn(
-                        stream, storage, provider, workspace, policy, hub, pending, handles, auth,
+                        stream,
+                        storage,
+                        provider,
+                        workspace,
+                        policy,
+                        hub,
+                        pending,
+                        handles,
+                        auth,
+                        device_tools,
                     )
                     .await
                     {

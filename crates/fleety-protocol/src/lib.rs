@@ -56,8 +56,12 @@ pub struct OriginContext {
 pub enum ClientMsg {
     /// First frame: identify the origin device. `token` authenticates an
     /// enrolled device; `pairing_code` enrolls a new one (the server mints and
-    /// returns a token in `Welcome`). Both optional — auth is enforced only when
-    /// the server runs with `FLEETY_REQUIRE_AUTH`.
+    /// returns a token in `Welcome`). `local_tools_json` is the JSON-encoded
+    /// list of `ToolSpec`s the on-device runtime can execute — fleetyd sends
+    /// this so the agent (and `device_show`) knows what `device_exec` can
+    /// invoke on each device. All three are optional — auth is enforced only
+    /// when the server runs with `FLEETY_REQUIRE_AUTH`, and an interactive CLI
+    /// has no local tools to advertise.
     Hello {
         device_id: String,
         protocol: u32,
@@ -65,6 +69,8 @@ pub enum ClientMsg {
         token: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pairing_code: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        local_tools_json: Option<String>,
     },
     /// A user turn. `conversation_id` continues an existing conversation, or
     /// `None` starts a new one. `attachments` carries multimodal media handed

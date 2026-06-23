@@ -19,7 +19,7 @@ use agent_core::{
 use fleety_protocol::{ClientMsg, ServerMsg, WireError, PROTOCOL_VERSION};
 
 use crate::auth::{self, AuthStore};
-use crate::bridge::{self, Handles, Hub, Pending};
+use crate::bridge::{self, DeviceTools, Handles, Hub, Pending};
 use crate::storage::Storage;
 
 /// Outbound frame sender (drained by the connection's writer task).
@@ -40,6 +40,7 @@ pub async fn handle_conn(
     pending: Pending,
     handles: Handles,
     auth: Arc<AuthStore>,
+    device_tools: DeviceTools,
 ) -> Result<()> {
     let ws = tokio_tungstenite::accept_async(stream)
         .await
@@ -53,6 +54,7 @@ pub async fn handle_conn(
             protocol,
             token,
             pairing_code,
+            local_tools_json,
         }) => {
             if protocol != PROTOCOL_VERSION {
                 tracing::warn!(
@@ -62,7 +64,23 @@ pub async fn handle_conn(
                 );
             }
             match authenticate(&auth, &device_id, token, pairing_code) {
-                Ok(minted) => (device_id, minted),
+                Ok(minted) => {
+                    // Stash any tool specs the device advertised so device_show
+                    // and downstream lookups can see them. Best-effort: a parse
+                    // failure means the device speaks a future shape we don't
+                    // recognise — log and proceed without specs.
+                    if let Some(json) = local_tools_json {
+                        match serde_json::from_str::<Vec<agent_core::ToolSpec>>(&json) {
+                            Ok(specs) => {
+                                device_tools.lock().await.insert(device_id.clone(), specs);
+                            }
+                            Err(e) => {
+                                tracing::warn!(%device_id, error = %e, "could not parse advertised tools");
+                            }
+                        }
+                    }
+                    (device_id, minted)
+                }
                 Err(message) => {
                     tracing::warn!(%device_id, "rejected unauthenticated connection");
                     send_error(
@@ -116,12 +134,14 @@ pub async fn handle_conn(
         &pending,
         &handles,
         &auth,
+        &device_tools,
         minted_token,
         &device_id,
     )
     .await;
 
     hub.lock().await.remove(&device_id);
+    device_tools.lock().await.remove(&device_id);
     writer.abort();
     tracing::info!(%device_id, "client disconnected");
     result
@@ -141,6 +161,7 @@ async fn serve(
     pending: &Pending,
     handles: &Handles,
     auth: &Arc<AuthStore>,
+    device_tools: &DeviceTools,
     minted_token: Option<String>,
     device_id: &str,
 ) -> Result<()> {
@@ -157,7 +178,16 @@ async fn serve(
         },
     )?;
 
-    let tools = build_full_registry(storage, workspace, device_id, hub, pending, handles, auth);
+    let tools = build_full_registry(
+        storage,
+        workspace,
+        device_id,
+        hub,
+        pending,
+        handles,
+        auth,
+        device_tools,
+    );
 
     while let Some(msg) = read_client(rx).await? {
         match msg {
@@ -525,6 +555,7 @@ pub(crate) fn build_full_registry(
     pending: &Pending,
     handles: &Handles,
     auth: &Arc<AuthStore>,
+    device_tools: &DeviceTools,
 ) -> ToolRegistry {
     let mut tools = crate::tools::build_registry(
         workspace,
@@ -533,6 +564,7 @@ pub(crate) fn build_full_registry(
         &storage.history_path(device_id),
         &storage.devices_dir(),
         &storage.schedules_dir(),
+        Arc::clone(device_tools),
     );
     crate::skills::register(
         &mut tools,
@@ -576,6 +608,7 @@ pub async fn recover_all_interactive(
     pending: Pending,
     handles: Handles,
     auth: Arc<AuthStore>,
+    device_tools: DeviceTools,
 ) {
     let incomplete = match storage.list_incomplete_turns() {
         Ok(turns) => turns,
@@ -597,6 +630,7 @@ pub async fn recover_all_interactive(
             &pending,
             &handles,
             &auth,
+            &device_tools,
             &device_id,
             &conversation,
         )
@@ -617,6 +651,7 @@ async fn recover_one_interactive(
     pending: &Pending,
     handles: &Handles,
     auth: &Arc<AuthStore>,
+    device_tools: &DeviceTools,
     device_id: &str,
     conversation: &str,
 ) -> Result<()> {
@@ -626,7 +661,16 @@ async fn recover_one_interactive(
         return Ok(());
     }
     tracing::info!(%device_id, %conversation, events = events.len(), "recovering interrupted interactive turn at startup");
-    let tools = build_full_registry(storage, workspace, device_id, hub, pending, handles, auth);
+    let tools = build_full_registry(
+        storage,
+        workspace,
+        device_id,
+        hub,
+        pending,
+        handles,
+        auth,
+        device_tools,
+    );
     let config = LoopConfig::default();
     let mut messages = vec![Message::system(storage.core_memory()?)];
     messages.extend(storage.load(device_id, conversation)?);
@@ -856,6 +900,7 @@ mod tests {
             bridge::new_pending(),
             bridge::new_handles(),
             auth,
+            bridge::new_device_tools(),
         )
         .await;
 
@@ -904,6 +949,7 @@ mod tests {
             protocol: PROTOCOL_VERSION,
             token: None,
             pairing_code: None,
+            local_tools_json: None,
         }
     }
 
@@ -952,6 +998,7 @@ mod tests {
                             bridge::new_pending(),
                             bridge::new_handles(),
                             auth,
+                            bridge::new_device_tools(),
                         )
                         .await;
                     });
@@ -971,6 +1018,7 @@ mod tests {
                 protocol: PROTOCOL_VERSION,
                 token: None,
                 pairing_code: Some(pairing_code.clone()),
+                local_tools_json: None,
             },
         )
         .await;
@@ -990,6 +1038,7 @@ mod tests {
                 protocol: PROTOCOL_VERSION,
                 token: Some(token.clone()),
                 pairing_code: None,
+                local_tools_json: None,
             },
         )
         .await;
@@ -1009,6 +1058,7 @@ mod tests {
                 protocol: PROTOCOL_VERSION,
                 token: Some("garbage-token-xxx".into()),
                 pairing_code: None,
+                local_tools_json: None,
             },
         )
         .await;
@@ -1068,6 +1118,7 @@ mod tests {
                     bridge::new_pending(),
                     bridge::new_handles(),
                     open_auth(),
+                    bridge::new_device_tools(),
                 )
                 .await;
             }
@@ -1184,8 +1235,10 @@ mod tests {
                             Arc::clone(&auth),
                         );
                         tokio::spawn(async move {
-                            let _ = handle_conn(stream, s, p, w, Policy::FullAccess, h, pe, hd, a)
-                                .await;
+                            let dt = bridge::new_device_tools();
+                            let _ =
+                                handle_conn(stream, s, p, w, Policy::FullAccess, h, pe, hd, a, dt)
+                                    .await;
                         });
                     }
                 }
@@ -1304,8 +1357,10 @@ mod tests {
                             Arc::clone(&auth),
                         );
                         tokio::spawn(async move {
-                            let _ = handle_conn(stream, s, p, w, Policy::FullAccess, h, pe, hd, a)
-                                .await;
+                            let dt = bridge::new_device_tools();
+                            let _ =
+                                handle_conn(stream, s, p, w, Policy::FullAccess, h, pe, hd, a, dt)
+                                    .await;
                         });
                     }
                 }
@@ -1332,6 +1387,7 @@ mod tests {
                 protocol: PROTOCOL_VERSION,
                 token: Some("admintok".into()),
                 pairing_code: None,
+                local_tools_json: None,
             },
         )
         .await;
@@ -1350,6 +1406,7 @@ mod tests {
                 protocol: PROTOCOL_VERSION,
                 token: None,
                 pairing_code: Some(code),
+                local_tools_json: None,
             },
         )
         .await;

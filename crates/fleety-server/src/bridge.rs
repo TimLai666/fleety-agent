@@ -26,6 +26,10 @@ pub type Pending = Arc<Mutex<HashMap<String, oneshot::Sender<std::result::Result
 /// Enforces the device-scoping invariant — a handle made on one device can't be
 /// used against another.
 pub type Handles = Arc<Mutex<HashMap<String, String>>>;
+/// Tool specs each connected device advertises in its `Hello`, keyed by
+/// `device_id`. Lets the agent see what `device_exec` can invoke per device
+/// (instead of guessing) and lets `device_show` enumerate device capabilities.
+pub type DeviceTools = Arc<Mutex<HashMap<String, Vec<ToolSpec>>>>;
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -38,6 +42,10 @@ pub fn new_pending() -> Pending {
 }
 
 pub fn new_handles() -> Handles {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+
+pub fn new_device_tools() -> DeviceTools {
     Arc::new(Mutex::new(HashMap::new()))
 }
 

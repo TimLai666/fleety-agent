@@ -15,7 +15,10 @@ const MEMORY_FILES: &[&str] = &["ME.md", "USER.md", "TODO.md", "TOOLS.md"];
 
 /// Build the tool registry: shared workspace tools (from `fleety-tools`, rooted
 /// at `workspace`, backing up to `backups_dir`) plus the server-only memory,
-/// history, device, and schedule tools.
+/// history, device, and schedule tools. `device_tools` is the live map of
+/// per-device advertised specs (filled in at Hello time) so `device_show` can
+/// surface them.
+#[allow(clippy::too_many_arguments)]
 pub fn build_registry(
     workspace: &Path,
     backups_dir: &Path,
@@ -23,6 +26,7 @@ pub fn build_registry(
     history_path: &Path,
     devices_dir: &Path,
     schedules_dir: &Path,
+    device_tools: crate::bridge::DeviceTools,
 ) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     fleety_tools::register_workspace(&mut registry, workspace, backups_dir);
@@ -41,6 +45,7 @@ pub fn build_registry(
     }));
     registry.register(Box::new(DeviceShow {
         devices_dir: devices_dir.to_path_buf(),
+        device_tools,
     }));
     crate::schedules::register(&mut registry, schedules_dir);
     registry
@@ -234,6 +239,7 @@ impl Tool for DeviceList {
 
 struct DeviceShow {
     devices_dir: PathBuf,
+    device_tools: crate::bridge::DeviceTools,
 }
 
 #[async_trait]
@@ -241,7 +247,10 @@ impl Tool for DeviceShow {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "device_show".to_string(),
-            description: "Show one device's record and NOTES.".to_string(),
+            description:
+                "Show one device's record, NOTES, and the on-device tools it advertised when it \
+                 last connected (so the agent knows what `device_exec` can call there)."
+                    .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": { "device": { "type": "string" } },
@@ -272,7 +281,20 @@ impl Tool for DeviceShow {
             }
         };
         let notes = std::fs::read_to_string(dir.join("NOTES.md")).unwrap_or_default();
-        Ok(json!({ "record": record, "notes": notes }))
+        // Pull the advertised tool list (if any) for this device — empty when
+        // the device is offline or didn't advertise (e.g. an interactive CLI).
+        let advertised_tools = self
+            .device_tools
+            .lock()
+            .await
+            .get(device)
+            .cloned()
+            .unwrap_or_default();
+        Ok(json!({
+            "record": record,
+            "notes": notes,
+            "advertised_tools": advertised_tools,
+        }))
     }
 }
 
@@ -290,7 +312,15 @@ mod tests {
     #[tokio::test]
     async fn list_dir_and_escape_via_registry() {
         let root = std::env::current_dir().expect("cwd");
-        let registry = build_registry(&root, &root, &root, &root, &root, &root);
+        let registry = build_registry(
+            &root,
+            &root,
+            &root,
+            &root,
+            &root,
+            &root,
+            crate::bridge::new_device_tools(),
+        );
         assert!(registry
             .call("list_dir", json!({ "path": "." }))
             .await
@@ -315,7 +345,15 @@ mod tests {
         let ws = temp_dir();
         let backups = temp_dir();
         std::fs::write(ws.join("a.txt"), "hello\nfoo bar\n").expect("seed");
-        let registry = build_registry(&ws, &backups, &ws, &ws.join("h.jsonl"), &ws, &ws);
+        let registry = build_registry(
+            &ws,
+            &backups,
+            &ws,
+            &ws.join("h.jsonl"),
+            &ws,
+            &ws,
+            crate::bridge::new_device_tools(),
+        );
 
         let edited = registry
             .call(
@@ -349,7 +387,15 @@ mod tests {
     #[tokio::test]
     async fn memory_write_then_read_and_reject_unknown() {
         let dir = temp_dir();
-        let registry = build_registry(&dir, &dir, &dir, &dir, &dir, &dir);
+        let registry = build_registry(
+            &dir,
+            &dir,
+            &dir,
+            &dir,
+            &dir,
+            &dir,
+            crate::bridge::new_device_tools(),
+        );
 
         registry
             .call(
