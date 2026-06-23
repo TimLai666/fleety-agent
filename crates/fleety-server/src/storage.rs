@@ -1,4 +1,4 @@
-//! Conversation persistence: one JSONL file of [`Message`]s per conversation,
+﻿//! Conversation persistence: one JSONL file of [`Message`]s per conversation,
 //! under the Agent home, separate from any workspace (spec: workspace = dirty
 //! work, durable state lives in the Fleety store).
 
@@ -683,6 +683,54 @@ mod tests {
         let one = storage.read_audit("dev", 0).expect("show");
         assert_eq!(one["event"], serde_json::json!("tool_call"));
         assert!(storage.read_audit("dev", 99).is_err());
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn core_memory_creates_defaults_and_reads_existing_files() {
+        let home = temp_home();
+        let storage = Storage::new(home.clone());
+
+        let first = storage.core_memory().expect("core memory");
+        assert!(first.contains("Fleety"));
+        assert!(home.join("fleet").join("ME.md").is_file());
+        assert!(home.join("fleet").join("USER.md").is_file());
+        assert!(home.join("fleet").join("TODO.md").is_file());
+
+        std::fs::write(home.join("fleet").join("USER.md"), "Custom user").expect("write user");
+        let second = storage.core_memory().expect("core memory again");
+        assert!(second.contains("Custom user"));
+        assert!(second.contains("## ME (self)"));
+        assert!(second.contains("## TODO"));
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn audit_list_tolerates_missing_blank_and_bad_lines() {
+        let home = temp_home();
+        let storage = Storage::new(home.clone());
+
+        assert!(storage
+            .list_audit("missing-dev", Some(1), Some(10))
+            .expect("missing audit")
+            .is_empty());
+
+        let history = storage.history_path("dev");
+        std::fs::create_dir_all(history.parent().expect("history parent")).expect("history dir");
+        std::fs::write(
+            &history,
+            "\nnot json\n{\"event\":\"tool_result\",\"id\":\"1\",\"result\":{\"ok\":true}}\n",
+        )
+        .expect("history");
+
+        let entries = storage
+            .list_audit("dev", Some(1), Some(10))
+            .expect("list audit");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["index"], serde_json::json!(2u64));
+        assert_eq!(entries[0]["kind"], serde_json::json!("tool_result"));
 
         let _ = std::fs::remove_dir_all(&home);
     }

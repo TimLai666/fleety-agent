@@ -1,4 +1,4 @@
-//! Self-managed schedule CRUD tools (STATUS.md #8). v0: create/list/delete
+﻿//! Self-managed schedule CRUD tools (STATUS.md #8). v0: create/list/delete
 //! persisted schedules. The fire loop (actually triggering runs at the cron/at/
 //! every time, unattended-mandate enforcement) is a later milestone.
 

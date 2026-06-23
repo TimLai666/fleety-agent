@@ -1,4 +1,4 @@
-//! The tool-calling loop.
+﻿//! The tool-calling loop.
 //!
 //! Drives a [`ModelProvider`] and a [`ToolRegistry`]: ask the model, run any
 //! tool calls it requests, feed the results back, and repeat until the model

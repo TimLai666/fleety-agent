@@ -1,4 +1,4 @@
-//! `fleety-eval` CLI: run JSONL golden files and report pass/fail.
+﻿//! `fleety-eval` CLI: run JSONL golden files and report pass/fail.
 //!
 //! Usage:
 //!   fleety-eval run <path> [<path> …]
@@ -126,4 +126,82 @@ fn report(verdicts: &[Verdict]) {
         "\n{passed} passed, {failed} failed, {} total",
         verdicts.len()
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("fleety-eval-main-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).expect("temp dir");
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn collect_files_recurses_sorts_and_ignores_non_jsonl() {
+        let temp = TempDir::new("collect");
+        let nested = temp.0.join("nested");
+        std::fs::create_dir_all(&nested).expect("nested");
+        let b = temp.0.join("b.jsonl");
+        let a = nested.join("a.jsonl");
+        let txt = nested.join("skip.txt");
+        std::fs::write(&b, "{}\n").expect("b");
+        std::fs::write(&a, "{}\n").expect("a");
+        std::fs::write(&txt, "nope").expect("txt");
+
+        let files = collect_files(&[
+            txt.display().to_string(),
+            temp.0.display().to_string(),
+            b.display().to_string(),
+        ]);
+
+        assert_eq!(files, vec![b.clone(), b, a]);
+    }
+
+    #[test]
+    fn walk_jsonl_ignores_unreadable_or_missing_dirs() {
+        let mut out = Vec::new();
+        walk_jsonl(
+            &std::env::temp_dir().join("fleety-eval-missing-dir"),
+            &mut out,
+        );
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn report_handles_passed_failed_and_empty_tool_lists() {
+        let verdicts = vec![
+            Verdict {
+                name: "pass".into(),
+                passed: true,
+                failures: Vec::new(),
+                tools_called: Vec::new(),
+                final_output: "ok".into(),
+                steps: 1,
+            },
+            Verdict {
+                name: "fail".into(),
+                passed: false,
+                failures: vec!["one\ntwo".into()],
+                tools_called: vec!["read_file".into()],
+                final_output: String::new(),
+                steps: 2,
+            },
+        ];
+
+        report(&verdicts);
+    }
 }

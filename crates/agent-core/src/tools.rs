@@ -1,4 +1,4 @@
-//! Tools the agent can call, and a registry to hold them.
+﻿//! Tools the agent can call, and a registry to hold them.
 
 use std::collections::HashMap;
 
@@ -48,5 +48,71 @@ impl ToolRegistry {
             Some(tool) => tool.call(args).await,
             None => Err(CoreError::ToolNotFound(name.to_string())),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    struct StaticTool {
+        name: &'static str,
+        output: Value,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for StaticTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: self.name.to_string(),
+                description: "static test tool".to_string(),
+                parameters: json!({"type":"object"}),
+                risk: crate::model::RiskLevel::Read,
+            }
+        }
+
+        async fn call(&self, args: Value) -> Result<Value> {
+            Ok(json!({
+                "args": args,
+                "output": self.output,
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_calls_registered_tool_and_replaces_duplicates() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(StaticTool {
+            name: "echo",
+            output: json!("first"),
+        }));
+        registry.register(Box::new(StaticTool {
+            name: "echo",
+            output: json!("second"),
+        }));
+
+        assert!(registry.contains("echo"));
+        assert_eq!(registry.specs().len(), 1);
+
+        let value = registry
+            .call("echo", json!({"x": 1}))
+            .await
+            .expect("registered tool should run");
+        assert_eq!(value["args"], json!({"x": 1}));
+        assert_eq!(value["output"], json!("second"));
+    }
+
+    #[tokio::test]
+    async fn registry_reports_missing_tool_as_actionable_error() {
+        let registry = ToolRegistry::new();
+        let err = registry
+            .call("missing", Value::Null)
+            .await
+            .expect_err("unknown tool should error");
+
+        let report = err.report();
+        assert_eq!(report.kind, "tool_not_found");
+        assert!(report.message.contains("missing"));
     }
 }

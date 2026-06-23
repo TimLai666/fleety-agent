@@ -1,4 +1,4 @@
-//! Per-connection handling: WebSocket handshake, session, and the turn loop.
+﻿//! Per-connection handling: WebSocket handshake, session, and the turn loop.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -774,6 +774,30 @@ mod tests {
     use tokio_tungstenite::MaybeTlsStream;
 
     type ClientWs = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+    #[test]
+    fn is_disconnect_classifies_close_and_disconnect_io_errors() {
+        assert!(is_disconnect(&WsErr::ConnectionClosed));
+        assert!(is_disconnect(&WsErr::AlreadyClosed));
+        assert!(is_disconnect(&WsErr::Protocol(
+            ProtocolError::ResetWithoutClosingHandshake
+        )));
+        for kind in [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::ConnectionAborted,
+            std::io::ErrorKind::BrokenPipe,
+            std::io::ErrorKind::UnexpectedEof,
+        ] {
+            assert!(is_disconnect(&WsErr::Io(std::io::Error::new(
+                kind,
+                "disconnect"
+            ))));
+        }
+        assert!(!is_disconnect(&WsErr::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "not a disconnect"
+        ))));
+    }
 
     #[tokio::test]
     async fn startup_recovers_interrupted_interactive_turn() {

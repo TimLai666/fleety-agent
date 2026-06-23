@@ -1,4 +1,4 @@
-//! OpenAI-compatible model provider.
+﻿//! OpenAI-compatible model provider.
 //!
 //! Speaks the `/chat/completions` API (OpenAI, OpenRouter, LM Studio, Ollama,
 //! vLLM, …): non-streaming request/response with tool-calling, plus SSE
@@ -487,5 +487,62 @@ mod tests {
         let response = parse_response(parsed).expect("map");
         assert_eq!(response.message.content.as_deref(), Some("hello"));
         assert!(response.message.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn request_body_includes_tools_and_stream_flag_when_enabled() {
+        let provider = OpenAiCompat::new("http://localhost:1234/v1", "model-a", Some("k".into()))
+            .with_streaming(true);
+        let body = provider.request_body(
+            &[Message::user("hi")],
+            &[ToolSpec {
+                name: "echo".into(),
+                description: "Echo input".into(),
+                parameters: json!({"type":"object"}),
+                risk: crate::model::RiskLevel::Mutate,
+            }],
+        );
+
+        assert_eq!(body["model"], json!("model-a"));
+        assert_eq!(body["stream"], json!(true));
+        assert_eq!(body["messages"][0]["role"], json!("user"));
+        assert_eq!(body["tools"][0]["function"]["name"], json!("echo"));
+    }
+
+    #[test]
+    fn wire_message_maps_tool_result_id() {
+        let wire = wire_message(&Message::tool_result("call-1", "ok"));
+
+        assert_eq!(wire["role"], json!("tool"));
+        assert_eq!(wire["content"], json!("ok"));
+        assert_eq!(wire["tool_call_id"], json!("call-1"));
+    }
+
+    #[test]
+    fn assemble_sse_ignores_noise_and_synthesizes_missing_tool_id() {
+        let mut body = String::from("event: ping\n\n");
+        body.push_str(&format!(
+            "data: {}\n",
+            json!({"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"name":"run","arguments":"not-json"}}]}}]})
+        ));
+        body.push_str("data: [DONE]\n");
+
+        let response = assemble_sse(&body).expect("sse");
+        assert_eq!(response.message.content, None);
+        assert_eq!(response.message.tool_calls.len(), 1);
+        assert_eq!(response.message.tool_calls[0].id, "call_run");
+        assert_eq!(
+            response.message.tool_calls[0].arguments,
+            json!({"_unparsed":"not-json"})
+        );
+    }
+
+    #[test]
+    fn parse_models_and_response_reject_bad_shapes() {
+        assert!(parse_models(r#"{"data":[{"name":"missing-id"}]}"#).is_err());
+
+        let parsed: ChatResponse = serde_json::from_str(r#"{"choices":[]}"#).expect("shape");
+        let err = parse_response(parsed).expect_err("empty choices should error");
+        assert!(err.report().message.contains("no choices"));
     }
 }

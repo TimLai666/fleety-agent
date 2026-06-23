@@ -1,4 +1,4 @@
-//! Browser automation over the Chrome DevTools Protocol (CDP).
+﻿//! Browser automation over the Chrome DevTools Protocol (CDP).
 //!
 //! Connects to a Chrome started with `--remote-debugging-port` (discovered via
 //! `GET {base}/json`) and drives it over a WebSocket — no extra dependency
@@ -342,6 +342,9 @@ impl Tool for BrowserClose {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    static ENV_LOCK: StdMutex<()> = StdMutex::new(());
 
     #[test]
     fn parse_ws_url_prefers_a_page() {
@@ -357,6 +360,22 @@ mod tests {
 
         assert!(parse_ws_url("[]").is_err());
         assert!(parse_ws_url("not json").is_err());
+    }
+
+    #[test]
+    fn chrome_base_prefers_trimmed_arg_then_env_then_default() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        std::env::remove_var("FLEETY_CHROME_URL");
+
+        assert_eq!(chrome_base(&json!({})), "http://127.0.0.1:9222");
+        std::env::set_var("FLEETY_CHROME_URL", "http://chrome-from-env:9222");
+        assert_eq!(chrome_base(&json!({})), "http://chrome-from-env:9222");
+        assert_eq!(
+            chrome_base(&json!({ "chrome": "http://chrome-from-arg:9222/" })),
+            "http://chrome-from-arg:9222"
+        );
+
+        std::env::remove_var("FLEETY_CHROME_URL");
     }
 
     #[tokio::test]
@@ -377,6 +396,26 @@ mod tests {
             .await
             .expect("close");
         assert_eq!(r["closed"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn browser_tools_validate_required_arguments_without_cdp() {
+        let mut registry = ToolRegistry::new();
+        register(&mut registry);
+
+        assert!(registry
+            .call("browser_navigate", json!({ "session": "s1" }))
+            .await
+            .is_err());
+        assert!(registry
+            .call("browser_eval", json!({ "session": "s1" }))
+            .await
+            .is_err());
+        assert!(registry.call("browser_close", json!({})).await.is_err());
+        assert!(registry
+            .call("browser_screenshot", json!({ "session": "missing" }))
+            .await
+            .is_err());
     }
 
     #[test]

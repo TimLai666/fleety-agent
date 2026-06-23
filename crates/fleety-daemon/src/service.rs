@@ -1,4 +1,4 @@
-//! OS autostart service definitions for fleetyd.
+﻿//! OS autostart service definitions for fleetyd.
 //!
 //! `install` writes the platform service file (systemd user unit / launchd
 //! LaunchAgent) and prints the one command to enable it; Windows uses Task
@@ -149,5 +149,29 @@ mod tests {
         assert!(win.file.is_none());
         assert!(win.enable.contains("schtasks"));
         assert!(win.enable.contains("fleetyd.exe"));
+    }
+
+    #[test]
+    fn expand_home_uses_home_for_tilde_paths_only() {
+        let old_home = std::env::var("HOME").ok();
+        let old_profile = std::env::var("USERPROFILE").ok();
+        let temp = std::env::temp_dir().join(format!("fleetyd-service-{}", std::process::id()));
+
+        std::env::set_var("HOME", &temp);
+        std::env::remove_var("USERPROFILE");
+        assert_eq!(expand_home("~/x/y"), temp.join("x/y"));
+        assert_eq!(
+            expand_home("/absolute/path"),
+            PathBuf::from("/absolute/path")
+        );
+
+        match old_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_profile {
+            Some(v) => std::env::set_var("USERPROFILE", v),
+            None => std::env::remove_var("USERPROFILE"),
+        }
     }
 }

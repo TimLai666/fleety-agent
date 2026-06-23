@@ -1,4 +1,4 @@
-//! Structured, actionable errors.
+﻿//! Structured, actionable errors.
 //!
 //! Per the spec's never-crash principle, every error states cause **and** how to
 //! proceed — never a bare "failed". [`ErrorReport`] is the actionable shape;

@@ -1,4 +1,4 @@
-//! Golden record format. One JSON object per line of a `.jsonl` file.
+﻿//! Golden record format. One JSON object per line of a `.jsonl` file.
 
 use std::collections::BTreeMap;
 

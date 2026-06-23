@@ -1,4 +1,4 @@
-//! Observability: process-wide tracing/logging init.
+﻿//! Observability: process-wide tracing/logging init.
 
 /// Initialize the global tracing subscriber from `RUST_LOG` (default `info`).
 ///
@@ -9,4 +9,15 @@ pub fn init() {
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let _ = fmt().with_env_filter(filter).try_init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn init_is_idempotent_and_non_panicking() {
+        init();
+        init();
+    }
 }

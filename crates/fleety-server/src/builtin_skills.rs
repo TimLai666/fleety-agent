@@ -1,4 +1,4 @@
-//! Built-in skills shipped inside the `fleety-server` binary and seeded into the
+﻿//! Built-in skills shipped inside the `fleety-server` binary and seeded into the
 //! builtin skills dir at startup, so `list_skills`/`use_skill` can serve them
 //! with no extra files to deploy and no runtime download. User-installed skills
 //! still override built-ins of the same name (see `skills::collect`).

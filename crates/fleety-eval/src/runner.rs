@@ -1,4 +1,4 @@
-//! Runner: drive one or more goldens against a real tool registry + a
+﻿//! Runner: drive one or more goldens against a real tool registry + a
 //! [`MockProvider`](agent_core::MockProvider), capture events, assert.
 
 use std::collections::BTreeMap;

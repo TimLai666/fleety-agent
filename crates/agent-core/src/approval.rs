@@ -1,4 +1,4 @@
-//! Approval gating for tool execution.
+﻿//! Approval gating for tool execution.
 //!
 //! Under `Policy::FullAccess` (the default) read/mutate run freely. Under
 //! `Policy::RequireApproval`, any non-read tool is sent to an [`ApprovalGate`]
@@ -131,6 +131,37 @@ mod tests {
             gate.request("delete_everything", &Value::Null, RiskLevel::Critical)
                 .await
                 .expect("ok"),
+            ApprovalDecision::Deny
+        );
+    }
+
+    #[test]
+    fn policy_gates_only_non_read_tools_when_required() {
+        assert!(!Policy::FullAccess.needs_approval(RiskLevel::Read));
+        assert!(!Policy::FullAccess.needs_approval(RiskLevel::Mutate));
+        assert!(!Policy::FullAccess.needs_approval(RiskLevel::Critical));
+
+        assert!(!Policy::RequireApproval.needs_approval(RiskLevel::Read));
+        assert!(Policy::RequireApproval.needs_approval(RiskLevel::Mutate));
+        assert!(Policy::RequireApproval.needs_approval(RiskLevel::Critical));
+    }
+
+    #[tokio::test]
+    async fn auto_gates_return_fixed_decisions() {
+        let mut approve = AutoApprove;
+        let mut deny = AutoDeny;
+
+        assert_eq!(
+            approve
+                .request("delete_file", &Value::Null, RiskLevel::Critical)
+                .await
+                .expect("approve"),
+            ApprovalDecision::Approve
+        );
+        assert_eq!(
+            deny.request("read_file", &Value::Null, RiskLevel::Read)
+                .await
+                .expect("deny"),
             ApprovalDecision::Deny
         );
     }

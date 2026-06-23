@@ -1,4 +1,4 @@
-//! Provision the fleety-insyra data-analysis sidecar onto this device.
+﻿//! Provision the fleety-insyra data-analysis sidecar onto this device.
 //!
 //! The sidecar ships as a raw per-target binary on the GitHub release; we
 //! download it next to the fleetyd executable so the on-device `insyra_exec`
@@ -126,5 +126,15 @@ mod tests {
             assert!(url.contains(&format!("fleety-insyra-{target}")));
             assert!(url.starts_with("https://github.com/"));
         }
+    }
+
+    #[test]
+    fn destination_is_next_to_current_exe_with_platform_filename() {
+        let dest = dest_path().expect("dest path");
+        assert_eq!(
+            dest.file_name().and_then(|s| s.to_str()),
+            Some(sidecar_filename())
+        );
+        assert!(dest.parent().is_some());
     }
 }

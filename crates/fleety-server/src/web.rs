@@ -1,4 +1,4 @@
-//! Read-only HTTP fetch tool: connect to platforms/APIs over HTTP.
+﻿//! Read-only HTTP fetch tool: connect to platforms/APIs over HTTP.
 //!
 //! SSRF-guarded — only `http`/`https`, and loopback/private-network hosts are
 //! refused unless `FLEETY_ALLOW_PRIVATE_NET=1`. Body is size-capped.
@@ -244,6 +244,9 @@ impl Tool for HttpRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn blocks_private_and_loopback() {
@@ -257,10 +260,13 @@ mod tests {
             "172.31.255.255",
             "::1",
             "fd00::1",
+            "fe80::1",
             "::ffff:127.0.0.1",
             "::ffff:10.0.0.1",
+            "::ffff:169.254.1.1",
             "0.0.0.0",
             "127.0.0.1.",
+            "[::1]",
         ] {
             assert!(is_blocked_host(h), "{h} should be blocked");
         }
@@ -273,6 +279,23 @@ mod tests {
         ] {
             assert!(!is_blocked_host(h), "{h} should be allowed");
         }
+    }
+
+    #[test]
+    fn guard_allows_public_urls_and_env_can_allow_private_hosts() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        std::env::remove_var("FLEETY_ALLOW_PRIVATE_NET");
+
+        let url = guard_url("https://example.com/path").expect("public url");
+        assert_eq!(url.host_str(), Some("example.com"));
+        assert!(guard_url("http://127.0.0.1:8787/").is_err());
+
+        std::env::set_var("FLEETY_ALLOW_PRIVATE_NET", "1");
+        let private = guard_url("http://127.0.0.1:8787/").expect("private allowed");
+        assert_eq!(private.host_str(), Some("127.0.0.1"));
+        std::env::remove_var("FLEETY_ALLOW_PRIVATE_NET");
+
+        no_redirect_client().expect("client");
     }
 
     #[tokio::test]
@@ -320,6 +343,22 @@ mod tests {
                 "http_request",
                 json!({ "method": "POST", "url": "file:///x" })
             )
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn tools_require_url_and_method_arguments() {
+        let mut registry = ToolRegistry::new();
+        register(&mut registry);
+
+        assert!(registry.call("fetch_url", json!({})).await.is_err());
+        assert!(registry
+            .call("http_request", json!({ "url": "https://example.com" }))
+            .await
+            .is_err());
+        assert!(registry
+            .call("http_request", json!({ "method": "GET" }))
             .await
             .is_err());
     }

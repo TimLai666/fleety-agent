@@ -1,4 +1,4 @@
-//! Self-update for fleetyd.
+﻿//! Self-update for fleetyd.
 //!
 //! `fleetyd update` fetches a manifest (`FLEETY_UPDATE_MANIFEST`), compares the
 //! version, downloads the artifact, verifies its SHA-256, and swaps it into
@@ -109,6 +109,58 @@ pub async fn update() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    struct EnvGuard(Option<String>);
+
+    impl EnvGuard {
+        fn set_manifest(url: &str) -> Self {
+            let old = std::env::var("FLEETY_UPDATE_MANIFEST").ok();
+            std::env::set_var("FLEETY_UPDATE_MANIFEST", url);
+            Self(old)
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(value) => std::env::set_var("FLEETY_UPDATE_MANIFEST", value),
+                None => std::env::remove_var("FLEETY_UPDATE_MANIFEST"),
+            }
+        }
+    }
+
+    fn serve_update(version: &str, sha256: &str, artifact: Option<Vec<u8>>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let base = format!("http://{addr}");
+        let manifest =
+            format!(r#"{{"version":"{version}","url":"{base}/artifact","sha256":"{sha256}"}}"#);
+        let mut responses = vec![manifest.into_bytes()];
+        if let Some(artifact) = artifact {
+            responses.push(artifact);
+        }
+        thread::spawn(move || {
+            for body in responses {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let mut buf = [0_u8; 1024];
+                let _ = stream.read(&mut buf);
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream
+                    .write_all(header.as_bytes())
+                    .and_then(|_| stream.write_all(&body))
+                    .expect("write response");
+            }
+        });
+        format!("{base}/manifest")
+    }
 
     #[test]
     fn parse_manifest_reads_fields() {
@@ -134,5 +186,43 @@ mod tests {
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn parse_manifest_rejects_invalid_json_and_non_string_fields() {
+        assert!(parse_manifest("not json").is_err());
+        assert!(parse_manifest(r#"{"version":1,"url":"https://x/y","sha256":"aa"}"#).is_err());
+        assert!(parse_manifest(r#"{"version":"1","url":false,"sha256":"aa"}"#).is_err());
+        assert!(parse_manifest(r#"{"version":"1","url":"https://x/y","sha256":null}"#).is_err());
+    }
+
+    #[test]
+    fn needs_update_compares_trimmed_prefix_only() {
+        assert!(!needs_update("vv1", "v1"));
+        assert!(needs_update(" 1", "1"));
+        assert!(!needs_update("v2026.06.23", "2026.06.23"));
+    }
+
+    #[tokio::test]
+    async fn update_returns_when_manifest_version_matches_current() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let manifest_url = serve_update(agent_core::VERSION, "00", None);
+        let _guard = EnvGuard::set_manifest(&manifest_url);
+
+        update().await.expect("already up to date");
+    }
+
+    #[tokio::test]
+    async fn update_downloads_artifact_and_rejects_hash_mismatch_before_install() {
+        let _env_lock = ENV_LOCK.lock().await;
+        let artifact = b"new fleetyd bytes".to_vec();
+        let version = format!("{}-next", agent_core::VERSION);
+        let manifest_url = serve_update(&version, "00", Some(artifact));
+        let _guard = EnvGuard::set_manifest(&manifest_url);
+
+        let err = update()
+            .await
+            .expect_err("hash mismatch must stop before exe replacement");
+        assert!(err.report().message.contains("sha256 mismatch"));
     }
 }

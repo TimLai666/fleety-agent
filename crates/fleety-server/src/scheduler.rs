@@ -1,4 +1,4 @@
-//! Schedule fire loop: periodically run due schedules unattended.
+﻿//! Schedule fire loop: periodically run due schedules unattended.
 //!
 //! Due `at:`/`every:` schedules run through the agent with an **unattended
 //! policy** (`RequireApproval` + `MandateGate`): reads/reporting proceed, and a
@@ -289,6 +289,57 @@ mod tests {
             .await
             .expect("tick2");
         assert_eq!(again, 0);
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn schedule_allowed_tools_restores_strings_and_defaults_to_empty() {
+        let home = std::env::temp_dir().join(format!("fleety-sched-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&home).expect("mk home");
+        let storage = Storage::new(home.clone());
+
+        assert!(schedule_allowed_tools(&storage, "interactive-c1").is_empty());
+        assert!(schedule_allowed_tools(&storage, "schedule-missing").is_empty());
+
+        let sdir = storage.schedules_dir();
+        std::fs::create_dir_all(&sdir).expect("mk sdir");
+        std::fs::write(sdir.join("bad.json"), "{not json").expect("bad schedule");
+        assert!(schedule_allowed_tools(&storage, "schedule-bad").is_empty());
+
+        std::fs::write(
+            sdir.join("s1.json"),
+            r#"{"id":"s1","allowed_tools":["read_file",42,"run_command",null]}"#,
+        )
+        .expect("schedule");
+        assert_eq!(
+            schedule_allowed_tools(&storage, "schedule-s1"),
+            vec!["read_file".to_string(), "run_command".to_string()]
+        );
+
+        std::fs::write(sdir.join("s2.json"), r#"{"id":"s2"}"#).expect("schedule");
+        assert!(schedule_allowed_tools(&storage, "schedule-s2").is_empty());
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn recovery_with_empty_journal_clears_marker_without_running_agent() {
+        let home =
+            std::env::temp_dir().join(format!("fleety-empty-recover-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&home).expect("mk home");
+        let storage = Arc::new(Storage::new(home.clone()));
+        let conv = "schedule-empty";
+        storage
+            .journal_begin(SCHED_DEVICE, conv, &Message::user("status"))
+            .expect("begin");
+
+        recover_schedule_turn(&storage, &EchoProvider, &ToolRegistry::new(), conv)
+            .await
+            .expect("recover");
+
+        assert!(storage.list_incomplete_turns().expect("list").is_empty());
+        assert!(storage.load(SCHED_DEVICE, conv).expect("load").is_empty());
 
         let _ = std::fs::remove_dir_all(&home);
     }

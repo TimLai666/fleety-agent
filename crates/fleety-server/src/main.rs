@@ -1,4 +1,4 @@
-//! fleety-server — the Fleety Agent server.
+﻿//! fleety-server — the Fleety Agent server.
 //!
 //! M2: a WebSocket server that accepts client connections, runs a session, does
 //! a conversation round-trip (echo provider for now), and persists each
@@ -176,5 +176,125 @@ async fn main() {
                 Err(e) => tracing::warn!(%peer, report = ?e.report(), "connection error"),
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_core::Message;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        saved: Vec<(&'static str, Option<String>)>,
+        temp_home: PathBuf,
+    }
+
+    impl EnvGuard {
+        fn new(name: &str) -> Self {
+            let keys = [
+                "HOME",
+                "USERPROFILE",
+                "FLEETY_AGENT_HOME",
+                "FLEETY_WORKSPACE",
+                "FLEETY_POLICY",
+                "FLEETY_MODEL_BASE_URL",
+                "FLEETY_MODEL",
+                "FLEETY_MODEL_KEY",
+                "FLEETY_MODEL_STREAM",
+            ];
+            let saved = keys
+                .into_iter()
+                .map(|key| (key, std::env::var(key).ok()))
+                .collect::<Vec<_>>();
+            let temp_home = std::env::temp_dir()
+                .join(format!("fleety-server-test-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&temp_home);
+            std::fs::create_dir_all(&temp_home).expect("temp home");
+
+            std::env::set_var("HOME", &temp_home);
+            std::env::set_var("USERPROFILE", &temp_home);
+            for key in [
+                "FLEETY_AGENT_HOME",
+                "FLEETY_WORKSPACE",
+                "FLEETY_POLICY",
+                "FLEETY_MODEL_BASE_URL",
+                "FLEETY_MODEL",
+                "FLEETY_MODEL_KEY",
+                "FLEETY_MODEL_STREAM",
+            ] {
+                std::env::remove_var(key);
+            }
+
+            Self { saved, temp_home }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.saved {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.temp_home);
+        }
+    }
+
+    #[test]
+    fn agent_home_prefers_env_then_home_default() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let guard = EnvGuard::new("agent-home");
+
+        assert_eq!(agent_home(), guard.temp_home.join(".fleety").join("agent"));
+
+        let explicit = guard.temp_home.join("custom-agent-home");
+        std::env::set_var("FLEETY_AGENT_HOME", &explicit);
+        assert_eq!(agent_home(), explicit);
+    }
+
+    #[test]
+    fn workspace_root_prefers_env_then_current_dir() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let guard = EnvGuard::new("workspace-root");
+
+        assert_eq!(
+            workspace_root(),
+            std::env::current_dir().expect("current dir")
+        );
+
+        let explicit = guard.temp_home.join("workspace");
+        std::env::set_var("FLEETY_WORKSPACE", &explicit);
+        assert_eq!(workspace_root(), explicit);
+    }
+
+    #[test]
+    fn policy_from_env_defaults_to_full_access_unless_exact_match() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("policy");
+
+        assert_eq!(policy_from_env(), agent_core::Policy::FullAccess);
+        std::env::set_var("FLEETY_POLICY", "RequireApproval");
+        assert_eq!(policy_from_env(), agent_core::Policy::FullAccess);
+        std::env::set_var("FLEETY_POLICY", "require_approval");
+        assert_eq!(policy_from_env(), agent_core::Policy::RequireApproval);
+    }
+
+    #[tokio::test]
+    async fn build_provider_uses_echo_when_model_env_is_incomplete() {
+        let provider = {
+            let _lock = ENV_LOCK.lock().expect("env lock");
+            let _guard = EnvGuard::new("provider");
+            std::env::set_var("FLEETY_MODEL_BASE_URL", "http://localhost:1234/v1");
+            build_provider()
+        };
+        let response = provider
+            .complete(&[Message::user("hello")], &[])
+            .await
+            .expect("echo provider");
+        assert_eq!(response.message.content.as_deref(), Some("echo: hello"));
     }
 }

@@ -1,4 +1,4 @@
-//! Never-crash boundaries.
+﻿//! Never-crash boundaries.
 //!
 //! A single unit of work panicking must never take down the process. These
 //! helpers run work and convert a panic into a structured [`CoreError`] instead

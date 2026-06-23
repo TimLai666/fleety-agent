@@ -1,4 +1,4 @@
-//! Skills runtime: discover and load `SKILL.md` skill packs.
+﻿//! Skills runtime: discover and load `SKILL.md` skill packs.
 //!
 //! A skill is a directory containing `SKILL.md`. Built-in skills (shipped) and
 //! installed skills (user) live in separate dirs; an installed skill overrides a
