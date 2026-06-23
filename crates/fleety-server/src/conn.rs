@@ -374,37 +374,35 @@ async fn serve(
                 device_id: target,
                 backup_id,
             } => {
-                let reply = match fleety_tools::apply_backup(
-                    workspace,
-                    &storage.backups_dir(),
-                    &backup_id,
-                ) {
-                    Ok(result) => {
-                        let restored = result
-                            .get("restored")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("")
-                            .to_string();
-                        // The rollback itself is auditable: record it.
-                        let event = agent_core::Event::ToolResult {
-                            id: format!("rollback-{}", backup_id),
-                            result: result.clone(),
-                        };
-                        let _ = storage.append_history(&target, &event);
-                        ServerMsg::RollbackResult {
+                let reply =
+                    match fleety_tools::apply_backup(workspace, &storage.backups_dir(), &backup_id)
+                    {
+                        Ok(result) => {
+                            let restored = result
+                                .get("restored")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("")
+                                .to_string();
+                            // The rollback itself is auditable: record it.
+                            let event = agent_core::Event::ToolResult {
+                                id: format!("rollback-{}", backup_id),
+                                result: result.clone(),
+                            };
+                            let _ = storage.append_history(&target, &event);
+                            ServerMsg::RollbackResult {
+                                device_id: target,
+                                backup_id,
+                                ok: true,
+                                message: format!("restored {restored}"),
+                            }
+                        }
+                        Err(e) => ServerMsg::RollbackResult {
                             device_id: target,
                             backup_id,
-                            ok: true,
-                            message: format!("restored {restored}"),
-                        }
-                    }
-                    Err(e) => ServerMsg::RollbackResult {
-                        device_id: target,
-                        backup_id,
-                        ok: false,
-                        message: e.report().message,
-                    },
-                };
+                            ok: false,
+                            message: e.report().message,
+                        },
+                    };
                 emit(out, &reply)?;
             }
         }
@@ -873,6 +871,123 @@ mod tests {
             token: None,
             pairing_code: None,
         }
+    }
+
+    /// Full enrollment round-trip: server requires auth, fleetyd-like device
+    /// arrives with a pairing code, receives a token, reconnects with the
+    /// token, then is rejected if it tries again with garbage.
+    #[tokio::test]
+    async fn enrollment_pair_then_token_then_reject_bad() {
+        use crate::auth::AuthStore;
+        use crate::echo::EchoProvider;
+
+        let home = std::env::temp_dir().join(format!("fleety-enroll-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&home).expect("mk home");
+        let storage = Arc::new(Storage::new(home.clone()));
+        let workspace = Arc::new(home.clone());
+        let auth = Arc::new(AuthStore::load(storage.auth_path(), None, true));
+
+        // The agent would have called `pair_create` to mint this; we do it
+        // directly to keep the test focused on the connect-side flow.
+        let pairing_code = auth.create_pairing().expect("mint code");
+
+        // Spawn a server that loops accepting connections (so we can do three
+        // separate connects against the same auth store).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server_storage = Arc::clone(&storage);
+        let server_workspace = Arc::clone(&workspace);
+        let server_auth = Arc::clone(&auth);
+        let server_handle = tokio::spawn(async move {
+            for _ in 0..3 {
+                if let Ok((stream, _)) = listener.accept().await {
+                    let storage = Arc::clone(&server_storage);
+                    let workspace = Arc::clone(&server_workspace);
+                    let auth = Arc::clone(&server_auth);
+                    let provider: Arc<dyn ModelProvider> = Arc::new(EchoProvider);
+                    tokio::spawn(async move {
+                        let _ = handle_conn(
+                            stream,
+                            storage,
+                            provider,
+                            workspace,
+                            Policy::FullAccess,
+                            bridge::new_hub(),
+                            bridge::new_pending(),
+                            bridge::new_handles(),
+                            auth,
+                        )
+                        .await;
+                    });
+                }
+            }
+        });
+
+        let url = format!("ws://{addr}");
+
+        // Connect #1: present the pairing code, expect a token back.
+        let (ws, _) = tokio_tungstenite::connect_async(&url).await.expect("conn1");
+        let (mut tx, mut rx) = ws.split();
+        send_client(
+            &mut tx,
+            &ClientMsg::Hello {
+                device_id: "fleetyd-new".into(),
+                protocol: PROTOCOL_VERSION,
+                token: None,
+                pairing_code: Some(pairing_code.clone()),
+            },
+        )
+        .await;
+        let token = match recv_server(&mut rx).await {
+            Some(ServerMsg::Welcome { token: Some(t), .. }) => t,
+            other => panic!("expected Welcome with token, got {other:?}"),
+        };
+        let _ = tx.close().await;
+
+        // Connect #2: token should authenticate without needing the pairing code.
+        let (ws, _) = tokio_tungstenite::connect_async(&url).await.expect("conn2");
+        let (mut tx, mut rx) = ws.split();
+        send_client(
+            &mut tx,
+            &ClientMsg::Hello {
+                device_id: "fleetyd-new".into(),
+                protocol: PROTOCOL_VERSION,
+                token: Some(token.clone()),
+                pairing_code: None,
+            },
+        )
+        .await;
+        match recv_server(&mut rx).await {
+            Some(ServerMsg::Welcome { .. }) => {}
+            other => panic!("expected Welcome on token reconnect, got {other:?}"),
+        }
+        let _ = tx.close().await;
+
+        // Connect #3: garbage token must be rejected with an actionable error.
+        let (ws, _) = tokio_tungstenite::connect_async(&url).await.expect("conn3");
+        let (mut tx, mut rx) = ws.split();
+        send_client(
+            &mut tx,
+            &ClientMsg::Hello {
+                device_id: "fleetyd-new".into(),
+                protocol: PROTOCOL_VERSION,
+                token: Some("garbage-token-xxx".into()),
+                pairing_code: None,
+            },
+        )
+        .await;
+        match recv_server(&mut rx).await {
+            Some(ServerMsg::Error { error }) => {
+                assert_eq!(error.kind, "unauthenticated", "wrong error kind");
+            }
+            other => panic!("expected unauthenticated error, got {other:?}"),
+        }
+        let _ = tx.close().await;
+
+        server_handle.abort();
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[tokio::test]

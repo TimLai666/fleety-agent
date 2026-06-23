@@ -25,10 +25,7 @@ fn summarise_event(value: &Value) -> (String, Option<String>) {
         .unwrap_or("other")
         .to_string();
     let tool = match kind.as_str() {
-        "tool_call" => value
-            .get("name")
-            .and_then(Value::as_str)
-            .map(String::from),
+        "tool_call" => value.get("name").and_then(Value::as_str).map(String::from),
         "tool_result" => value.get("id").and_then(Value::as_str).map(String::from),
         _ => None,
     };

@@ -13,11 +13,57 @@ mod provision;
 mod service;
 mod update;
 
+use std::path::PathBuf;
+
 use agent_core::{obs, CoreError, Result};
 use futures::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use fleety_protocol::{ClientMsg, ServerMsg, WireError, PROTOCOL_VERSION};
+
+/// `~/.fleety/fleetyd.token` — the path where fleetyd persists a token it
+/// received from the server after a successful pair, so a restart can come
+/// straight back without needing `FLEETY_TOKEN` or another pairing code.
+fn token_path() -> Option<PathBuf> {
+    let base = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()?;
+    Some(PathBuf::from(base).join(".fleety").join("fleetyd.token"))
+}
+
+fn read_saved_token() -> Option<String> {
+    let path = token_path()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    let trimmed = text.trim().to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+fn write_saved_token(token: &str) -> Result<()> {
+    let path =
+        token_path().ok_or_else(|| CoreError::Message("no home dir for token".to_string()))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| CoreError::Message(format!("cannot create ~/.fleety: {e}")))?;
+    }
+    std::fs::write(&path, token)
+        .map_err(|e| CoreError::Message(format!("cannot save token: {e}")))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+fn clear_saved_token() {
+    if let Some(path) = token_path() {
+        let _ = std::fs::remove_file(path);
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -76,11 +122,19 @@ async fn run() -> Result<()> {
         .map_err(|e| CoreError::Provider(format!("cannot connect to {url}: {e}")))?;
     let (mut tx, mut rx) = ws.split();
 
+    // Token precedence: env override > on-disk persisted token > pairing flow.
+    let token = std::env::var("FLEETY_TOKEN")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(read_saved_token);
+    let pairing_code = std::env::var("FLEETY_PAIRING_CODE")
+        .ok()
+        .filter(|s| !s.is_empty());
     let hello = serde_json::to_string(&ClientMsg::Hello {
         device_id: device_id(),
         protocol: PROTOCOL_VERSION,
-        token: std::env::var("FLEETY_TOKEN").ok(),
-        pairing_code: std::env::var("FLEETY_PAIRING_CODE").ok(),
+        token,
+        pairing_code,
     })
     .map_err(|e| CoreError::Message(format!("serialize hello: {e}")))?;
     tx.send(WsMessage::Text(hello))
@@ -103,8 +157,26 @@ async fn run() -> Result<()> {
             continue;
         };
         match msg {
-            ServerMsg::Welcome { session_id, .. } => {
+            ServerMsg::Welcome {
+                session_id, token, ..
+            } => {
+                if let Some(tok) = token {
+                    if let Err(e) = write_saved_token(&tok) {
+                        tracing::warn!(report = ?e.report(), "could not persist fleetyd token");
+                    } else {
+                        tracing::info!("fleetyd token persisted to ~/.fleety/fleetyd.token");
+                    }
+                }
                 tracing::info!(%session_id, "registered with agent");
+            }
+            ServerMsg::Error { ref error } if error.kind == "unauthenticated" => {
+                tracing::warn!(
+                    "server rejected our token: {} — clearing saved token so the next \
+                     connect can re-pair",
+                    error.message
+                );
+                clear_saved_token();
+                break;
             }
             ServerMsg::RunTool {
                 call_id,
