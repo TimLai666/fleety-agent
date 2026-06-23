@@ -21,12 +21,20 @@ Pass one DSL line as `command`, a multi-line `.isr` program as `script`, and a `
 The upstream reference below describes a CLI/REPL — ignore the install/REPL parts; the **`.isr` DSL command reference applies verbatim**.\n\n\
 ---\n\n";
 
-/// `(skill_name, header, upstream_body)`.
-const SKILLS: &[(&str, &str, &str)] = &[(
-    "use-insyra-cli",
-    INSYRA_HEADER,
-    include_str!("../builtin-skills/use-insyra-cli/SKILL.upstream.md"),
-)];
+/// `(skill_name, header, upstream_body)`. Skills with no upstream reference use
+/// an empty body so the entire content sits in the Fleety-authored header.
+const SKILLS: &[(&str, &str, &str)] = &[
+    (
+        "use-insyra-cli",
+        INSYRA_HEADER,
+        include_str!("../builtin-skills/use-insyra-cli/SKILL.upstream.md"),
+    ),
+    (
+        "use-codebase-memory",
+        include_str!("../builtin-skills/use-codebase-memory/SKILL.md"),
+        "",
+    ),
+];
 
 /// Write the embedded built-in skills into `builtin_dir` (overwriting built-ins
 /// so an updated binary ships an updated skill).

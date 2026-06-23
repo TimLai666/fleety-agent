@@ -11,6 +11,7 @@
 mod auth;
 mod bridge;
 mod browser;
+mod builtin_mcp;
 mod builtin_skills;
 mod conn;
 mod echo;
@@ -94,6 +95,11 @@ async fn main() {
     // must not stop the server from serving).
     if let Err(e) = builtin_skills::seed(&storage.skills_builtin_dir()) {
         tracing::warn!(error = %e, "could not seed built-in skills");
+    }
+    // Seed built-in MCP servers so the agent has them available without a
+    // manual `mcp_add` (best-effort; same posture).
+    if let Err(e) = builtin_mcp::seed(&storage.mcp_builtin_config_path()) {
+        tracing::warn!(error = %e, "could not seed built-in mcp servers");
     }
     let provider = build_provider();
     let policy = policy_from_env();

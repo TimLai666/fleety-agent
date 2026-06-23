@@ -32,6 +32,10 @@ async fn main() {
             if let Err(e) = provision::ensure_insyra(false).await {
                 tracing::warn!(report = ?e.report(), "could not provision fleety-insyra sidecar");
             }
+            // Provision the built-in codebase-memory MCP server (best-effort).
+            if let Err(e) = provision::ensure_codebase_memory(false).await {
+                tracing::warn!(report = ?e.report(), "could not provision codebase-memory-mcp");
+            }
             return;
         }
         Some("uninstall") => {
@@ -47,6 +51,10 @@ async fn main() {
             // Refresh the data-analysis sidecar alongside fleetyd (best-effort).
             if let Err(e) = provision::ensure_insyra(true).await {
                 tracing::warn!(report = ?e.report(), "could not refresh fleety-insyra sidecar");
+            }
+            // Refresh codebase-memory-mcp alongside fleetyd (best-effort).
+            if let Err(e) = provision::ensure_codebase_memory(true).await {
+                tracing::warn!(report = ?e.report(), "could not refresh codebase-memory-mcp");
             }
             return;
         }
