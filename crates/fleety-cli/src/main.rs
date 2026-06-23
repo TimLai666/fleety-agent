@@ -627,6 +627,26 @@ async fn connect_hello() -> Result<(Tx, Rx)> {
     }
 }
 
+/// Render a past unix timestamp as a short relative span (`5s ago`, `2h ago`,
+/// `3d ago`). `0` means "no timestamp recorded" — typically a legacy audit
+/// line written before this field existed; we surface it as `—` so the user
+/// sees an honest hole rather than a fake "0s ago".
+fn format_relative(now: u64, ts: u64) -> String {
+    if ts == 0 || now < ts {
+        return "—".to_string();
+    }
+    let diff = now - ts;
+    if diff < 60 {
+        format!("{diff}s ago")
+    } else if diff < 3600 {
+        format!("{}m ago", diff / 60)
+    } else if diff < 86_400 {
+        format!("{}h ago", diff / 3600)
+    } else {
+        format!("{}d ago", diff / 86_400)
+    }
+}
+
 async fn audit_list(limit: Option<u32>) -> Result<()> {
     let (mut tx, mut rx) = connect_hello().await?;
     send(
@@ -645,14 +665,20 @@ async fn audit_list(limit: Option<u32>) -> Result<()> {
             if entries.is_empty() {
                 println!("(no audit entries)");
             } else {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
                 for entry in &entries {
                     let idx = entry.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
                     let kind = entry.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
                     let tool = entry.get("tool").and_then(|v| v.as_str()).unwrap_or("");
+                    let ts = entry.get("ts_secs").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let when = format_relative(now, ts);
                     if tool.is_empty() {
-                        println!("[{idx:>5}] {kind}");
+                        println!("[{idx:>5}] {when:>8}  {kind}");
                     } else {
-                        println!("[{idx:>5}] {kind:<12} {tool}");
+                        println!("[{idx:>5}] {when:>8}  {kind:<12} {tool}");
                     }
                 }
             }
@@ -781,4 +807,27 @@ async fn recv(rx: &mut Rx) -> Result<Option<ServerMsg>> {
         }
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_relative;
+
+    #[test]
+    fn relative_renders_each_band() {
+        // Now = 1_000_000.
+        assert_eq!(format_relative(1_000_000, 999_990), "10s ago");
+        assert_eq!(format_relative(1_000_000, 999_700), "5m ago");
+        assert_eq!(format_relative(1_000_000, 996_400), "1h ago");
+        assert_eq!(format_relative(1_000_000, 913_600), "1d ago");
+    }
+
+    #[test]
+    fn relative_handles_legacy_and_clock_skew() {
+        // Zero means "no timestamp on this line" — show a dash, not "0s ago".
+        assert_eq!(format_relative(1_000_000, 0), "—");
+        // Clock skew (ts in the future) is also rendered as a dash so we don't
+        // print nonsense like "-3s ago".
+        assert_eq!(format_relative(1_000_000, 2_000_000), "—");
+    }
 }

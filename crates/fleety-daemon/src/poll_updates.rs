@@ -92,21 +92,20 @@ async fn tick(auto_apply: bool) -> Result<()> {
 mod tests {
     use super::*;
 
+    // One test, not three, so the shared FLEETY_UPDATE_POLL_SECS and
+    // FLEETY_AUTO_UPDATE env vars can't race between parallel test threads.
     #[test]
-    fn interval_falls_back_to_default_when_unset() {
+    fn env_parsing_default_floor_and_auto_apply() {
+        // Default when unset.
         std::env::remove_var("FLEETY_UPDATE_POLL_SECS");
         assert_eq!(interval_from_env(), DEFAULT_INTERVAL);
-    }
 
-    #[test]
-    fn interval_clamps_to_floor() {
+        // Below-floor values clamp up to MIN_INTERVAL.
         std::env::set_var("FLEETY_UPDATE_POLL_SECS", "1");
         assert_eq!(interval_from_env(), MIN_INTERVAL);
         std::env::remove_var("FLEETY_UPDATE_POLL_SECS");
-    }
 
-    #[test]
-    fn auto_apply_flag_parses() {
+        // Auto-apply flag.
         std::env::set_var("FLEETY_AUTO_UPDATE", "apply");
         assert!(auto_apply_enabled());
         std::env::set_var("FLEETY_AUTO_UPDATE", "notify");

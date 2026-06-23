@@ -9,7 +9,20 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_core::{CoreError, Event, EventLog, Message, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+/// One line in `history.jsonl`. `ts_secs` rides alongside the event so audit
+/// listings can show "5m ago" without a separate timestamp store. `flatten`
+/// keeps the on-disk shape the same as before (just adds a `ts_secs` field),
+/// so old lines still parse — they just deserialize with `ts_secs == 0`.
+#[derive(Serialize, Deserialize)]
+struct AuditRecord {
+    #[serde(default)]
+    ts_secs: u64,
+    #[serde(flatten)]
+    event: Event,
+}
 
 const DEFAULT_ME: &str = "Your name is Fleety. You are a cross-device, full-access agent that helps the user operate their devices. You act autonomously, keep an audit trail, and can roll back; you confirm only genuinely irreversible actions.";
 const DEFAULT_USER: &str = "(Unknown so far. Record what you learn about the user here.)";
@@ -323,24 +336,25 @@ impl Storage {
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            // Each event is a serialized `Event` enum (externally tagged). The
-            // outer key is the variant; we expose it as `kind`. Tool name is
-            // pulled from common shapes; ts isn't recorded in events today, so
-            // we surface 0 for unknown.
             let (kind, tool) = summarise_event(&value);
+            // `ts_secs` is on new lines (this is the field we wrote). Old lines
+            // (pre-timestamp) have no such field and surface as 0 — the CLI
+            // renders that as "—" so a mixed history doesn't lie.
+            let ts_secs = value.get("ts_secs").and_then(Value::as_u64).unwrap_or(0);
+            // Drop pre-`since` lines but keep ts_secs == 0 (unknown time) so
+            // a fresh `--since` doesn't silently swallow the whole pre-feature
+            // history.
+            if let Some(since) = since_secs {
+                if ts_secs != 0 && ts_secs < since {
+                    continue;
+                }
+            }
             let summary = serde_json::json!({
                 "index": idx as u64,
                 "kind": kind,
                 "tool": tool,
-                "ts_secs": 0,
+                "ts_secs": ts_secs,
             });
-            if let Some(since) = since_secs {
-                if since > 0 {
-                    // We don't track ts per event yet; fall through. Reserved
-                    // for when audit lines grow a timestamp.
-                    let _ = since;
-                }
-            }
             all.push(summary);
         }
         if let Some(limit) = limit {
@@ -374,7 +388,12 @@ impl Storage {
         )))
     }
 
-    /// Append an event to a device's audit log (`history.jsonl`).
+    /// Append an event to a device's audit log (`history.jsonl`). Each line
+    /// carries `ts_secs` (unix seconds, when the event was recorded) alongside
+    /// the event's own fields — serde `flatten` keeps the existing per-event
+    /// shape so old readers (including `HistoryList` and any lines written
+    /// before this change) keep working: `ts_secs` is just one more field to
+    /// ignore, and old lines without it parse with `ts_secs == 0`.
     pub fn append_history(&self, device_id: &str, event: &Event) -> Result<()> {
         validate_id("device_id", device_id)?;
         let path = self.history_path(device_id);
@@ -383,7 +402,14 @@ impl Storage {
                 CoreError::Message(format!("cannot create {}: {e}", parent.display()))
             })?;
         }
-        let line = serde_json::to_string(event)
+        let record = AuditRecord {
+            ts_secs: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            event: event.clone(),
+        };
+        let line = serde_json::to_string(&record)
             .map_err(|e| CoreError::Message(format!("serialize audit event failed: {e}")))?;
         let mut file = OpenOptions::new()
             .create(true)
@@ -672,6 +698,9 @@ mod tests {
         assert_eq!(entries[0]["kind"], serde_json::json!("tool_call"));
         assert_eq!(entries[0]["tool"], serde_json::json!("read_file"));
         assert_eq!(entries[2]["kind"], serde_json::json!("assistant"));
+        // Every freshly appended line carries a real timestamp now.
+        let ts0 = entries[0]["ts_secs"].as_u64().expect("ts0");
+        assert!(ts0 > 0, "ts_secs must be populated on new lines");
 
         // limit returns the LAST N (most recent).
         let entries = storage.list_audit("dev", None, Some(2)).expect("limit");
@@ -679,10 +708,58 @@ mod tests {
         assert_eq!(entries[0]["index"], serde_json::json!(1u64));
         assert_eq!(entries[1]["index"], serde_json::json!(2u64));
 
-        // show by index returns the full event.
+        // since-filter: a since in the future should drop everything; a since
+        // in the deep past should keep everything.
+        let future = ts0 + 10_000;
+        assert!(storage
+            .list_audit("dev", Some(future), None)
+            .expect("future")
+            .is_empty());
+        assert_eq!(
+            storage
+                .list_audit("dev", Some(0), None)
+                .expect("epoch")
+                .len(),
+            3
+        );
+
+        // show by index returns the full event (with ts_secs alongside).
         let one = storage.read_audit("dev", 0).expect("show");
         assert_eq!(one["event"], serde_json::json!("tool_call"));
+        assert!(one["ts_secs"].as_u64().unwrap_or(0) > 0);
         assert!(storage.read_audit("dev", 99).is_err());
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn audit_list_treats_legacy_lines_as_timeless() {
+        // Pre-timestamp lines (no `ts_secs`) still parse, but a `--since`
+        // shouldn't silently drop them — we surface ts_secs == 0 instead.
+        use std::io::Write;
+        let home = temp_home();
+        let storage = Storage::new(home.clone());
+
+        let path = storage.history_path("dev");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut f = std::fs::File::create(&path).expect("touch");
+        // Legacy line: bare Event JSON, no ts_secs.
+        writeln!(
+            f,
+            r#"{{"event":"tool_call","id":"1","name":"read_file","arguments":{{}}}}"#
+        )
+        .expect("write legacy");
+        drop(f);
+
+        let entries = storage.list_audit("dev", None, None).expect("list");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["ts_secs"], serde_json::json!(0));
+        // since-filter with ts == 0 is treated as "unknown time": kept, not
+        // silently dropped.
+        let entries = storage
+            .list_audit("dev", Some(1_000_000_000), None)
+            .expect("since");
+        assert_eq!(entries.len(), 1);
 
         let _ = std::fs::remove_dir_all(&home);
     }
