@@ -29,14 +29,30 @@ const DEFAULT_USER: &str = "(Unknown so far. Record what you learn about the use
 const DEFAULT_TODO: &str = "(No current to-dos.)";
 
 /// Categorise one serialized event into `(kind, tool)` for the audit summary.
-/// Events are internally tagged on `event` (snake_case variant name); for
-/// `tool_call`/`tool_result` we also surface the tool name.
+/// Events are internally tagged on `event` (snake_case variant name). A
+/// `tool_result` whose `result.denied == true` is surfaced as `tool_denied`
+/// instead — that's how `agent_core::run_turn` records an approval denial
+/// (it feeds the model a denial result rather than running the tool). The
+/// audit listing wants to call that out clearly, not bury it under a generic
+/// "tool_result" row.
 fn summarise_event(value: &Value) -> (String, Option<String>) {
-    let kind = value
+    let raw_kind = value
         .get("event")
         .and_then(Value::as_str)
-        .unwrap_or("other")
-        .to_string();
+        .unwrap_or("other");
+    if raw_kind == "tool_result" {
+        if let Some(result) = value.get("result") {
+            if result
+                .get("denied")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                let tool = result.get("tool").and_then(Value::as_str).map(String::from);
+                return ("tool_denied".to_string(), tool);
+            }
+        }
+    }
+    let kind = raw_kind.to_string();
     let tool = match kind.as_str() {
         "tool_call" => value.get("name").and_then(Value::as_str).map(String::from),
         "tool_result" => value.get("id").and_then(Value::as_str).map(String::from),
@@ -729,6 +745,46 @@ mod tests {
         assert!(one["ts_secs"].as_u64().unwrap_or(0) > 0);
         assert!(storage.read_audit("dev", 99).is_err());
 
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn audit_list_surfaces_approval_denials() {
+        // When `agent_core` records a denial, it pushes a synthetic
+        // ToolResult event whose `result.denied == true` and `result.tool`
+        // carries the tool name. The audit listing should call that out
+        // ("tool_denied") rather than hide it behind a generic "tool_result".
+        use agent_core::{Event, ToolCall};
+        let home = temp_home();
+        let storage = Storage::new(home.clone());
+
+        storage
+            .append_history(
+                "dev",
+                &Event::ToolCall(ToolCall {
+                    id: "1".into(),
+                    name: "write_file".into(),
+                    arguments: serde_json::json!({}),
+                }),
+            )
+            .expect("call");
+        storage
+            .append_history(
+                "dev",
+                &Event::ToolResult {
+                    id: "1".into(),
+                    result: serde_json::json!({
+                        "denied": true,
+                        "tool": "write_file",
+                        "reason": "user denied"
+                    }),
+                },
+            )
+            .expect("denial");
+
+        let entries = storage.list_audit("dev", None, None).expect("list");
+        assert_eq!(entries[1]["kind"], serde_json::json!("tool_denied"));
+        assert_eq!(entries[1]["tool"], serde_json::json!("write_file"));
         let _ = std::fs::remove_dir_all(&home);
     }
 

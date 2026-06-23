@@ -1,10 +1,16 @@
-//! Self-managed schedule CRUD tools (STATUS.md #8). v0: create/list/delete
-//! persisted schedules. The fire loop (actually triggering runs at the cron/at/
-//! every time, unattended-mandate enforcement) is a later milestone.
+//! Self-managed schedule CRUD tools (STATUS.md #8). Persists schedules + fires
+//! the `at:` / `every:` / `cron:` triggers from the scheduler loop. Cron
+//! expressions are evaluated in an optional IANA timezone (`tz` field on the
+//! schedule, default `UTC`); the `cron` crate handles the math and `chrono-tz`
+//! supplies the zone database.
 
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use async_trait::async_trait;
+use chrono::TimeZone;
+use chrono_tz::Tz;
+use cron::Schedule as CronSchedule;
 use serde_json::{json, Value};
 
 use agent_core::{CoreError, Result, RiskLevel, Tool, ToolRegistry, ToolSpec};
@@ -29,8 +35,9 @@ fn require_str<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
 }
 
 /// Validate a schedule trigger: `at:<unix_secs>`, `every:<dur>` (e.g. `30s`,
-/// `5m`, `2h`, `1d`, or bare seconds), or a 5-field cron expression. The fire
-/// loop (a later milestone) consumes the same grammar.
+/// `5m`, `2h`, `1d`, or bare seconds), or a 5-field cron expression (also
+/// accepted with an explicit `cron:` prefix). Cron timezone is configured
+/// separately via the schedule's `tz` field, not embedded in the trigger.
 fn validate_trigger(spec: &str) -> Result<()> {
     let spec = spec.trim();
     if let Some(rest) = spec.strip_prefix("at:") {
@@ -39,12 +46,34 @@ fn validate_trigger(spec: &str) -> Result<()> {
     if let Some(rest) = spec.strip_prefix("every:") {
         return parse_duration_secs(rest).map(|_| ());
     }
-    if spec.split_whitespace().count() == 5 {
-        return Ok(()); // cron expression
+    let cron_body = spec.strip_prefix("cron:").unwrap_or(spec).trim();
+    if cron_body.split_whitespace().count() == 5 {
+        // Round-trip through the parser so a syntactically broken cron expr
+        // (e.g. `99 * * * *`) gets rejected at create time, not at fire time.
+        parse_cron_expr(cron_body)?;
+        return Ok(());
     }
     Err(CoreError::Message(format!(
         "invalid trigger '{spec}'; use 'at:<unix_secs>', 'every:<dur, e.g. 30s/5m/1h/1d>', or a 5-field cron expression"
     )))
+}
+
+/// `tz` defaults to UTC; anything else must be an IANA name parseable by
+/// `chrono_tz` (e.g. `Asia/Taipei`, `America/New_York`).
+fn validate_tz(tz: &str) -> Result<Tz> {
+    Tz::from_str(tz).map_err(|_| {
+        CoreError::Message(format!(
+            "unknown timezone '{tz}'; use 'UTC' or an IANA name like 'Asia/Taipei'"
+        ))
+    })
+}
+
+/// Parse a 5-field cron expression into the 6-field shape the `cron` crate
+/// expects (it always wants the seconds slot, so we prepend `0`).
+fn parse_cron_expr(expr: &str) -> Result<CronSchedule> {
+    let normalized = format!("0 {expr}");
+    CronSchedule::from_str(&normalized)
+        .map_err(|e| CoreError::Message(format!("invalid cron '{expr}': {e}")))
 }
 
 fn parse_unix(s: &str) -> Result<u64> {
@@ -94,9 +123,9 @@ pub(crate) struct DueSchedule {
     pub allowed_tools: Vec<String>,
 }
 
-/// Whether a trigger should fire now given its last run. Only `at:`/`every:` are
-/// fired by the loop; cron is validated on create but not yet fired.
-pub(crate) fn trigger_due(spec: &str, last_run: Option<u64>, now: u64) -> bool {
+/// Whether a trigger should fire now given its last run. Handles `at:`,
+/// `every:`, and 5-field cron (with `tz` defaulting to UTC).
+pub(crate) fn trigger_due(spec: &str, tz: &str, last_run: Option<u64>, now: u64) -> bool {
     let spec = spec.trim();
     if let Some(rest) = spec.strip_prefix("at:") {
         return matches!(parse_unix(rest), Ok(t) if last_run.is_none() && now >= t);
@@ -110,7 +139,33 @@ pub(crate) fn trigger_due(spec: &str, last_run: Option<u64>, now: u64) -> bool {
             Err(_) => false,
         };
     }
+    let cron_body = spec.strip_prefix("cron:").unwrap_or(spec).trim();
+    if cron_body.split_whitespace().count() == 5 {
+        return cron_due(cron_body, tz, last_run, now).unwrap_or(false);
+    }
     false
+}
+
+/// True iff the cron expression has at least one firing in the open interval
+/// `(last_run, now]` (or `[epoch, now]` when there's no last_run yet, capped
+/// to "fire on the first matching minute that is <= now"). Any parse failure
+/// short-circuits to `false` — the validator rejected it at create time, so
+/// reaching this branch with a bad expression means the on-disk record was
+/// corrupted; safer to never fire than to crash the scheduler tick.
+fn cron_due(expr: &str, tz: &str, last_run: Option<u64>, now: u64) -> Option<bool> {
+    let schedule = parse_cron_expr(expr).ok()?;
+    let zone = Tz::from_str(tz).unwrap_or(chrono_tz::UTC);
+    let now_dt = zone.timestamp_opt(now as i64, 0).single()?;
+    let after = match last_run {
+        Some(l) => zone.timestamp_opt(l as i64, 0).single()?,
+        // No last_run: pretend the last firing was one minute before `now` so
+        // any minute that matched in the immediate past still counts.
+        None => zone
+            .timestamp_opt((now as i64).saturating_sub(60), 0)
+            .single()?,
+    };
+    let next = schedule.after(&after).next()?;
+    Some(next <= now_dt)
 }
 
 /// Schedules that are due to fire at `now` (enabled, `at:`/`every:`).
@@ -139,8 +194,9 @@ pub(crate) fn due_schedules(dir: &Path, now: u64) -> Result<Vec<DueSchedule>> {
             continue;
         }
         let trigger = value.get("trigger").and_then(Value::as_str).unwrap_or("");
+        let tz = value.get("tz").and_then(Value::as_str).unwrap_or("UTC");
         let last_run = value.get("last_run").and_then(Value::as_u64);
-        if trigger_due(trigger, last_run, now) {
+        if trigger_due(trigger, tz, last_run, now) {
             let id = value
                 .get("id")
                 .and_then(Value::as_str)
@@ -201,11 +257,12 @@ impl Tool for ScheduleCreate {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "schedule_create".to_string(),
-            description: "Create a schedule. `trigger` is a cron expr / `at:<time>` / `every:<dur>`; `mandate` describes the authorized scope; `allowed_tools` lists the non-read tools the unattended run may use (enforced at fire time).".to_string(),
+            description: "Create a schedule. `trigger` is a cron expr / `at:<time>` / `every:<dur>`; `tz` (IANA name, default `UTC`) sets the timezone cron expressions are evaluated in; `mandate` describes the authorized scope; `allowed_tools` lists the non-read tools the unattended run may use (enforced at fire time).".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "trigger": { "type": "string" },
+                    "tz": { "type": "string", "description": "IANA timezone for cron evaluation; default UTC" },
                     "prompt": { "type": "string" },
                     "mandate": { "type": "string", "description": "human-readable authorized scope, agreed now" },
                     "allowed_tools": { "type": "array", "items": { "type": "string" }, "description": "non-read tool names the unattended run may use; others are denied" }
@@ -219,6 +276,8 @@ impl Tool for ScheduleCreate {
     async fn call(&self, args: Value) -> Result<Value> {
         let trigger = require_str(&args, "trigger")?;
         validate_trigger(trigger)?;
+        let tz = args.get("tz").and_then(Value::as_str).unwrap_or("UTC");
+        validate_tz(tz)?;
         let prompt = require_str(&args, "prompt")?;
         let mandate = args.get("mandate").and_then(Value::as_str).unwrap_or("");
         let allowed_tools: Vec<String> = args
@@ -234,6 +293,7 @@ impl Tool for ScheduleCreate {
         let record = json!({
             "id": id,
             "trigger": trigger,
+            "tz": tz,
             "prompt": prompt,
             "mandate": mandate,
             "allowed_tools": allowed_tools,
@@ -376,11 +436,21 @@ mod tests {
         assert!(validate_trigger("every:1h").is_ok());
         assert!(validate_trigger("every:1d").is_ok());
         assert!(validate_trigger("every:90").is_ok());
-        assert!(validate_trigger("0 9 * * 1").is_ok()); // cron
+        assert!(validate_trigger("0 9 * * 1").is_ok()); // cron, bare
+        assert!(validate_trigger("cron:0 9 * * 1").is_ok()); // cron, prefixed
         assert!(validate_trigger("at:notanumber").is_err());
         assert!(validate_trigger("every:0").is_err());
         assert!(validate_trigger("every:5x").is_err());
+        assert!(validate_trigger("99 9 * * 1").is_err()); // syntactically invalid cron
         assert!(validate_trigger("garbage").is_err());
+    }
+
+    #[test]
+    fn tz_validation() {
+        assert!(validate_tz("UTC").is_ok());
+        assert!(validate_tz("Asia/Taipei").is_ok());
+        assert!(validate_tz("America/New_York").is_ok());
+        assert!(validate_tz("Atlantis/Lost_City").is_err());
     }
 
     #[tokio::test]
@@ -400,14 +470,36 @@ mod tests {
 
     #[test]
     fn trigger_due_logic() {
-        assert!(!trigger_due("at:100", None, 50));
-        assert!(trigger_due("at:100", None, 100));
-        assert!(!trigger_due("at:100", Some(100), 200));
-        assert!(trigger_due("every:60", None, 0));
-        assert!(!trigger_due("every:60", Some(100), 130));
-        assert!(trigger_due("every:60", Some(100), 160));
-        assert!(trigger_due("every:1m", Some(100), 160));
-        assert!(!trigger_due("0 9 * * 1", None, 999999));
+        assert!(!trigger_due("at:100", "UTC", None, 50));
+        assert!(trigger_due("at:100", "UTC", None, 100));
+        assert!(!trigger_due("at:100", "UTC", Some(100), 200));
+        assert!(trigger_due("every:60", "UTC", None, 0));
+        assert!(!trigger_due("every:60", "UTC", Some(100), 130));
+        assert!(trigger_due("every:60", "UTC", Some(100), 160));
+        assert!(trigger_due("every:1m", "UTC", Some(100), 160));
+    }
+
+    #[test]
+    fn cron_fires_in_specified_timezone() {
+        // Sun 2026-06-21 09:00 in Asia/Taipei is 2026-06-21 01:00 UTC =
+        // unix 1750467600. At that unix second a 9am-Mon-Fri cron in Taipei
+        // should fire if we just rolled into Monday 9am Taipei.
+        // Pick a Monday 9am Taipei: 2026-06-22 09:00 +08 = 2026-06-22 01:00 UTC.
+        // unix(2026-06-22 01:00 UTC) = 1_750_554_000.
+        let now = 1_750_554_000;
+        assert!(trigger_due("0 9 * * 1", "Asia/Taipei", None, now));
+        // At the same wall-clock interpreted as UTC, 9am Monday wouldn't have
+        // fired yet (UTC time at unix 1_750_554_000 is 01:00).
+        assert!(!trigger_due("0 9 * * 1", "UTC", None, now));
+    }
+
+    #[test]
+    fn cron_does_not_fire_twice_within_a_minute() {
+        let trigger = "*/5 * * * *"; // every 5 minutes UTC
+        let now = 1_750_554_000; // 01:00 UTC (a 5-minute boundary)
+        assert!(trigger_due(trigger, "UTC", None, now));
+        // Just fired this minute — shouldn't re-fire 30 s later.
+        assert!(!trigger_due(trigger, "UTC", Some(now), now + 30));
     }
 
     #[tokio::test]
