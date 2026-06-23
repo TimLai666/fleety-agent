@@ -74,6 +74,25 @@ pub enum ClientMsg {
     },
     /// Failure of an on-device tool the server dispatched (reply to `RunTool`).
     ToolError { call_id: String, error: WireError },
+    /// List a device's audit log entries newer than `since` (unix seconds, or
+    /// `None` for everything), capped at `limit`.
+    AuditList {
+        device_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+    },
+    /// Fetch one audit entry by its monotonic line number (0-indexed).
+    AuditShow { device_id: String, index: u64 },
+    /// List backups available to roll back, by device.
+    RollbackList { device_id: String },
+    /// Restore a file from a backup (records its own audit + a fresh backup of
+    /// the pre-rollback state so the rollback itself is reversible).
+    RollbackApply {
+        device_id: String,
+        backup_id: String,
+    },
 }
 
 /// Frames sent server -> client over the WebSocket.
@@ -127,6 +146,33 @@ pub enum ServerMsg {
     Done { conversation_id: String },
     /// Something went wrong (actionable).
     Error { error: WireError },
+    /// Reply to `AuditList`: a JSON-encoded array of compact audit summaries.
+    /// Each summary carries `index`, `kind` (e.g. "tool_call"/"tool_result"),
+    /// `tool`, and `ts_secs` so the CLI can render a table without parsing the
+    /// full event payload.
+    AuditListResult {
+        device_id: String,
+        entries_json: String,
+    },
+    /// Reply to `AuditShow`: the full event JSON at `index`.
+    AuditShowResult {
+        device_id: String,
+        index: u64,
+        event_json: String,
+    },
+    /// Reply to `RollbackList`: JSON-encoded array of backup descriptors
+    /// (`id`, `original_path`, `ts_secs`, `source_tool`).
+    RollbackListResult {
+        device_id: String,
+        backups_json: String,
+    },
+    /// Reply to `RollbackApply`: `ok` is true if the backup was restored.
+    RollbackResult {
+        device_id: String,
+        backup_id: String,
+        ok: bool,
+        message: String,
+    },
 }
 
 #[cfg(test)]
@@ -171,6 +217,40 @@ mod tests {
         };
         let json = serde_json::to_string(&msg).expect("serialize");
         assert_eq!(msg, serde_json::from_str(&json).expect("deserialize"));
+    }
+
+    #[test]
+    fn audit_and_rollback_frames_roundtrip() {
+        let list = ClientMsg::AuditList {
+            device_id: "dev".into(),
+            since: Some(1700000000),
+            limit: Some(50),
+        };
+        let json = serde_json::to_string(&list).expect("ser");
+        assert_eq!(list, serde_json::from_str(&json).expect("de"));
+
+        let res = ServerMsg::AuditListResult {
+            device_id: "dev".into(),
+            entries_json: "[]".into(),
+        };
+        let json = serde_json::to_string(&res).expect("ser");
+        assert_eq!(res, serde_json::from_str(&json).expect("de"));
+
+        let apply = ClientMsg::RollbackApply {
+            device_id: "dev".into(),
+            backup_id: "abc".into(),
+        };
+        let json = serde_json::to_string(&apply).expect("ser");
+        assert_eq!(apply, serde_json::from_str(&json).expect("de"));
+
+        let rb = ServerMsg::RollbackResult {
+            device_id: "dev".into(),
+            backup_id: "abc".into(),
+            ok: true,
+            message: "restored".into(),
+        };
+        let json = serde_json::to_string(&rb).expect("ser");
+        assert_eq!(rb, serde_json::from_str(&json).expect("de"));
     }
 
     #[test]

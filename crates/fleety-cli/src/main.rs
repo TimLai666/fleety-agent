@@ -71,6 +71,48 @@ async fn main() {
                 eprintln!("error: {}", e.report().message);
             }
         }
+        Some("audit") => {
+            let sub = args.get(2).cloned().unwrap_or_default();
+            match sub.as_str() {
+                "list" => {
+                    let limit = args.get(3).and_then(|s| s.parse::<u32>().ok());
+                    if let Err(e) = audit_list(limit).await {
+                        eprintln!("error: {}", e.report().message);
+                    }
+                }
+                "show" => {
+                    let index = args.get(3).and_then(|s| s.parse::<u64>().ok());
+                    match index {
+                        Some(i) => {
+                            if let Err(e) = audit_show(i).await {
+                                eprintln!("error: {}", e.report().message);
+                            }
+                        }
+                        None => eprintln!("usage: fleety audit show <index>"),
+                    }
+                }
+                _ => eprintln!("usage: fleety audit list [<limit>]  |  fleety audit show <index>"),
+            }
+        }
+        Some("rollback") => {
+            let sub = args.get(2).cloned().unwrap_or_default();
+            match sub.as_str() {
+                "list" => {
+                    if let Err(e) = rollback_list().await {
+                        eprintln!("error: {}", e.report().message);
+                    }
+                }
+                "apply" => {
+                    let id = args.get(3).cloned().unwrap_or_default();
+                    if id.is_empty() {
+                        eprintln!("usage: fleety rollback apply <backup_id>");
+                    } else if let Err(e) = rollback_apply(id).await {
+                        eprintln!("error: {}", e.report().message);
+                    }
+                }
+                _ => eprintln!("usage: fleety rollback list  |  fleety rollback apply <backup_id>"),
+            }
+        }
         Some("pair") => {
             let code = args.get(2).cloned().unwrap_or_default();
             if code.is_empty() {
@@ -386,7 +428,11 @@ async fn ask(text: String) -> Result<()> {
             Some(ServerMsg::Welcome { .. })
             | Some(ServerMsg::Replay { .. })
             | Some(ServerMsg::RunTool { .. })
-            | Some(ServerMsg::AssistantDelta { .. }) => {}
+            | Some(ServerMsg::AssistantDelta { .. })
+            | Some(ServerMsg::AuditListResult { .. })
+            | Some(ServerMsg::AuditShowResult { .. })
+            | Some(ServerMsg::RollbackListResult { .. })
+            | Some(ServerMsg::RollbackResult { .. }) => {}
         }
     }
     // Close the connection gracefully so the server sees a clean disconnect.
@@ -432,6 +478,152 @@ async fn resume(conversation_id: String, after_seq: u64) -> Result<()> {
             }
             _ => {}
         }
+    }
+    let _ = tx.close().await;
+    Ok(())
+}
+
+/// Open a connection, send Hello, await Welcome, return the streams. Common
+/// preamble for audit/rollback commands.
+async fn connect_hello() -> Result<(Tx, Rx)> {
+    let url = agent_url();
+    let (ws, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .map_err(|e| CoreError::Provider(format!("cannot connect to {url}: {e}")))?;
+    let (mut tx, mut rx) = ws.split();
+    send(&mut tx, &hello(None)).await?;
+    match recv(&mut rx).await? {
+        Some(ServerMsg::Welcome { .. }) => Ok((tx, rx)),
+        other => Err(CoreError::Provider(format!(
+            "expected welcome, got {other:?}"
+        ))),
+    }
+}
+
+async fn audit_list(limit: Option<u32>) -> Result<()> {
+    let (mut tx, mut rx) = connect_hello().await?;
+    send(
+        &mut tx,
+        &ClientMsg::AuditList {
+            device_id: device_id(),
+            since: None,
+            limit: Some(limit.unwrap_or(50)),
+        },
+    )
+    .await?;
+    match recv(&mut rx).await? {
+        Some(ServerMsg::AuditListResult { entries_json, .. }) => {
+            let entries: Vec<serde_json::Value> =
+                serde_json::from_str(&entries_json).unwrap_or_default();
+            if entries.is_empty() {
+                println!("(no audit entries)");
+            } else {
+                for entry in &entries {
+                    let idx = entry.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let kind = entry.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
+                    let tool = entry.get("tool").and_then(|v| v.as_str()).unwrap_or("");
+                    if tool.is_empty() {
+                        println!("[{idx:>5}] {kind}");
+                    } else {
+                        println!("[{idx:>5}] {kind:<12} {tool}");
+                    }
+                }
+            }
+        }
+        Some(ServerMsg::Error { error }) => {
+            eprintln!("agent error: {}", error.message);
+        }
+        other => return Err(CoreError::Provider(format!("unexpected reply: {other:?}"))),
+    }
+    let _ = tx.close().await;
+    Ok(())
+}
+
+async fn audit_show(index: u64) -> Result<()> {
+    let (mut tx, mut rx) = connect_hello().await?;
+    send(
+        &mut tx,
+        &ClientMsg::AuditShow {
+            device_id: device_id(),
+            index,
+        },
+    )
+    .await?;
+    match recv(&mut rx).await? {
+        Some(ServerMsg::AuditShowResult { event_json, .. }) => {
+            let value: serde_json::Value = serde_json::from_str(&event_json).unwrap_or_default();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&value).unwrap_or(event_json)
+            );
+        }
+        Some(ServerMsg::Error { error }) => {
+            eprintln!("agent error: {}", error.message);
+        }
+        other => return Err(CoreError::Provider(format!("unexpected reply: {other:?}"))),
+    }
+    let _ = tx.close().await;
+    Ok(())
+}
+
+async fn rollback_list() -> Result<()> {
+    let (mut tx, mut rx) = connect_hello().await?;
+    send(
+        &mut tx,
+        &ClientMsg::RollbackList {
+            device_id: device_id(),
+        },
+    )
+    .await?;
+    match recv(&mut rx).await? {
+        Some(ServerMsg::RollbackListResult { backups_json, .. }) => {
+            let backups: Vec<serde_json::Value> =
+                serde_json::from_str(&backups_json).unwrap_or_default();
+            if backups.is_empty() {
+                println!("(no backups)");
+            } else {
+                for b in &backups {
+                    let id = b.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                    let path = b
+                        .get("original_rel_path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let ts = b.get("ts_secs").and_then(|v| v.as_u64()).unwrap_or(0);
+                    println!("{id}  ({ts})  {path}");
+                }
+            }
+        }
+        Some(ServerMsg::Error { error }) => {
+            eprintln!("agent error: {}", error.message);
+        }
+        other => return Err(CoreError::Provider(format!("unexpected reply: {other:?}"))),
+    }
+    let _ = tx.close().await;
+    Ok(())
+}
+
+async fn rollback_apply(backup_id: String) -> Result<()> {
+    let (mut tx, mut rx) = connect_hello().await?;
+    send(
+        &mut tx,
+        &ClientMsg::RollbackApply {
+            device_id: device_id(),
+            backup_id: backup_id.clone(),
+        },
+    )
+    .await?;
+    match recv(&mut rx).await? {
+        Some(ServerMsg::RollbackResult { ok, message, .. }) => {
+            if ok {
+                println!("✓ {message}");
+            } else {
+                eprintln!("✗ rollback failed: {message}");
+            }
+        }
+        Some(ServerMsg::Error { error }) => {
+            eprintln!("agent error: {}", error.message);
+        }
+        other => return Err(CoreError::Provider(format!("unexpected reply: {other:?}"))),
     }
     let _ = tx.close().await;
     Ok(())

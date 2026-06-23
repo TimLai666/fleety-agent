@@ -144,6 +144,83 @@ fn first_file(dir: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Walk the backups store and return a summary entry per backup id:
+/// `{ id, original_rel_path, ts_secs }`. Best-effort: an unreadable backup is
+/// skipped, not fatal. The list is sorted newest-first by `ts_secs`.
+pub fn list_backups(backups: &Path) -> Result<Vec<Value>> {
+    let mut out = Vec::new();
+    let entries = match std::fs::read_dir(backups) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => return Err(CoreError::Message(format!("read backups dir: {e}"))),
+    };
+    for entry in entries.flatten() {
+        let id = entry.file_name().to_string_lossy().to_string();
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let Some(file) = first_file(&dir) else {
+            continue;
+        };
+        let rel = file
+            .strip_prefix(&dir)
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        let ts_secs = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        out.push(json!({
+            "id": id,
+            "original_rel_path": rel,
+            "ts_secs": ts_secs,
+        }));
+    }
+    out.sort_by(|a, b| {
+        b.get("ts_secs")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .cmp(&a.get("ts_secs").and_then(Value::as_u64).unwrap_or(0))
+    });
+    Ok(out)
+}
+
+/// Restore a backup into `root`. Used by the `rollback` tool and by the
+/// server's CLI-facing rollback handler. Returns `{ restored: <rel>,
+/// backup_id: <id> }` on success. Validates the id (no path traversal) and
+/// gracefully errors if the backup is missing or corrupt.
+pub fn apply_backup(root: &Path, backups: &Path, backup_id: &str) -> Result<Value> {
+    if backup_id.is_empty()
+        || backup_id.contains('/')
+        || backup_id.contains('\\')
+        || backup_id.contains("..")
+    {
+        return Err(CoreError::Message(format!(
+            "invalid backup id '{backup_id}'"
+        )));
+    }
+    let backup_root = backups.join(backup_id);
+    let backup_file = first_file(&backup_root)
+        .ok_or_else(|| CoreError::Message(format!("no backup '{backup_id}'")))?;
+    let rel = backup_file
+        .strip_prefix(&backup_root)
+        .map_err(|e| CoreError::Message(format!("corrupt backup '{backup_id}': {e}")))?
+        .to_string_lossy()
+        .replace('\\', "/");
+    let dest = resolve_lenient(root, &rel)?;
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| CoreError::Message(format!("cannot recreate '{rel}' parent: {e}")))?;
+    }
+    std::fs::copy(&backup_file, &dest)
+        .map_err(|e| CoreError::Message(format!("restore '{rel}' failed: {e}")))?;
+    Ok(json!({ "restored": rel, "backup_id": backup_id }))
+}
+
 /// Copy an existing file into the backups store and return a `{id, path}` handle.
 fn backup_existing(backups: &Path, rel: &str, resolved: &Path) -> Result<Value> {
     let id = uuid::Uuid::new_v4().to_string();
@@ -825,25 +902,7 @@ impl Tool for Rollback {
 
     async fn call(&self, args: Value) -> Result<Value> {
         let id = require_str(&args, "backup_id")?;
-        if id.contains('/') || id.contains('\\') || id.contains("..") {
-            return Err(CoreError::Message(format!("invalid backup id '{id}'")));
-        }
-        let backup_root = self.backups.join(id);
-        let backup_file = first_file(&backup_root)
-            .ok_or_else(|| CoreError::Message(format!("no backup '{id}'")))?;
-        let rel = backup_file
-            .strip_prefix(&backup_root)
-            .map_err(|e| CoreError::Message(format!("corrupt backup '{id}': {e}")))?
-            .to_string_lossy()
-            .replace('\\', "/");
-        let dest = resolve_lenient(&self.root, &rel)?;
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| CoreError::Message(format!("cannot recreate '{rel}' parent: {e}")))?;
-        }
-        std::fs::copy(&backup_file, &dest)
-            .map_err(|e| CoreError::Message(format!("cannot restore '{rel}': {e}")))?;
-        Ok(json!({ "restored": rel, "backup_id": id }))
+        apply_backup(&self.root, &self.backups, id)
     }
 }
 

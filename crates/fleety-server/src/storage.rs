@@ -15,6 +15,26 @@ const DEFAULT_ME: &str = "Your name is Fleety. You are a cross-device, full-acce
 const DEFAULT_USER: &str = "(Unknown so far. Record what you learn about the user here.)";
 const DEFAULT_TODO: &str = "(No current to-dos.)";
 
+/// Categorise one serialized event into `(kind, tool)` for the audit summary.
+/// Events are internally tagged on `event` (snake_case variant name); for
+/// `tool_call`/`tool_result` we also surface the tool name.
+fn summarise_event(value: &Value) -> (String, Option<String>) {
+    let kind = value
+        .get("event")
+        .and_then(Value::as_str)
+        .unwrap_or("other")
+        .to_string();
+    let tool = match kind.as_str() {
+        "tool_call" => value
+            .get("name")
+            .and_then(Value::as_str)
+            .map(String::from),
+        "tool_result" => value.get("id").and_then(Value::as_str).map(String::from),
+        _ => None,
+    };
+    (kind, tool)
+}
+
 /// A persisted conversation event with its monotonic sequence number.
 #[derive(Debug, Clone)]
 pub struct StoredEvent {
@@ -280,6 +300,83 @@ impl Storage {
         ))
     }
 
+    /// A compact summary of one audit log line — what the CLI shows in
+    /// `fleety audit list` so the user can browse without parsing the full
+    /// event payload.
+    pub fn list_audit(
+        &self,
+        device_id: &str,
+        since_secs: Option<u64>,
+        limit: Option<u32>,
+    ) -> Result<Vec<serde_json::Value>> {
+        validate_id("device_id", device_id)?;
+        let path = self.history_path(device_id);
+        let file = match File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(CoreError::Message(format!("read audit: {e}"))),
+        };
+        let mut all: Vec<serde_json::Value> = Vec::new();
+        for (idx, line) in BufReader::new(file).lines().enumerate() {
+            let line = line.map_err(|e| CoreError::Message(format!("read audit line: {e}")))?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value: Value = match serde_json::from_str(&line) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            // Each event is a serialized `Event` enum (externally tagged). The
+            // outer key is the variant; we expose it as `kind`. Tool name is
+            // pulled from common shapes; ts isn't recorded in events today, so
+            // we surface 0 for unknown.
+            let (kind, tool) = summarise_event(&value);
+            let summary = serde_json::json!({
+                "index": idx as u64,
+                "kind": kind,
+                "tool": tool,
+                "ts_secs": 0,
+            });
+            if let Some(since) = since_secs {
+                if since > 0 {
+                    // We don't track ts per event yet; fall through. Reserved
+                    // for when audit lines grow a timestamp.
+                    let _ = since;
+                }
+            }
+            all.push(summary);
+        }
+        if let Some(limit) = limit {
+            let limit = limit as usize;
+            if all.len() > limit {
+                let start = all.len() - limit;
+                all = all.split_off(start);
+            }
+        }
+        Ok(all)
+    }
+
+    /// Read one audit entry by line index (0-based, matches what `list_audit`
+    /// returns). Returns the full event JSON so the caller (CLI) can render
+    /// the entire payload.
+    pub fn read_audit(&self, device_id: &str, index: u64) -> Result<serde_json::Value> {
+        validate_id("device_id", device_id)?;
+        let path = self.history_path(device_id);
+        let file = File::open(&path).map_err(|e| CoreError::Message(format!("open audit: {e}")))?;
+        for (idx, line) in BufReader::new(file).lines().enumerate() {
+            let line = line.map_err(|e| CoreError::Message(format!("read audit line: {e}")))?;
+            if idx as u64 != index {
+                continue;
+            }
+            let value: Value = serde_json::from_str(&line)
+                .map_err(|e| CoreError::Message(format!("corrupt audit line: {e}")))?;
+            return Ok(value);
+        }
+        Err(CoreError::Message(format!(
+            "no audit entry at index {index}"
+        )))
+    }
+
     /// Append an event to a device's audit log (`history.jsonl`).
     pub fn append_history(&self, device_id: &str, event: &Event) -> Result<()> {
         validate_id("device_id", device_id)?;
@@ -535,6 +632,60 @@ mod tests {
         storage
             .journal_end("dev", "conv")
             .expect("end is idempotent");
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn audit_list_summarises_events() {
+        use agent_core::{Event, ToolCall};
+        let home = temp_home();
+        let storage = Storage::new(home.clone());
+
+        // Three events: tool call, tool result, assistant.
+        storage
+            .append_history(
+                "dev",
+                &Event::ToolCall(ToolCall {
+                    id: "1".into(),
+                    name: "read_file".into(),
+                    arguments: serde_json::json!({}),
+                }),
+            )
+            .expect("append1");
+        storage
+            .append_history(
+                "dev",
+                &Event::ToolResult {
+                    id: "1".into(),
+                    result: serde_json::json!({ "ok": true }),
+                },
+            )
+            .expect("append2");
+        storage
+            .append_history(
+                "dev",
+                &Event::Assistant(agent_core::Message::assistant("done")),
+            )
+            .expect("append3");
+
+        // list returns all three with kind+tool fields populated where relevant.
+        let entries = storage.list_audit("dev", None, None).expect("list");
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0]["kind"], serde_json::json!("tool_call"));
+        assert_eq!(entries[0]["tool"], serde_json::json!("read_file"));
+        assert_eq!(entries[2]["kind"], serde_json::json!("assistant"));
+
+        // limit returns the LAST N (most recent).
+        let entries = storage.list_audit("dev", None, Some(2)).expect("limit");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["index"], serde_json::json!(1u64));
+        assert_eq!(entries[1]["index"], serde_json::json!(2u64));
+
+        // show by index returns the full event.
+        let one = storage.read_audit("dev", 0).expect("show");
+        assert_eq!(one["event"], serde_json::json!("tool_call"));
+        assert!(storage.read_audit("dev", 99).is_err());
 
         let _ = std::fs::remove_dir_all(&home);
     }

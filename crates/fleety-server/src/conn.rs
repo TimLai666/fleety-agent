@@ -314,6 +314,99 @@ async fn serve(
             ClientMsg::Hello { .. } => {
                 // Ignore a duplicate Hello.
             }
+            ClientMsg::AuditList {
+                device_id: target,
+                since,
+                limit,
+            } => {
+                let reply = match storage.list_audit(&target, since, limit) {
+                    Ok(entries) => ServerMsg::AuditListResult {
+                        device_id: target,
+                        entries_json: serde_json::to_string(&entries).unwrap_or("[]".into()),
+                    },
+                    Err(e) => ServerMsg::Error {
+                        error: WireError {
+                            kind: e.report().kind,
+                            message: e.report().message,
+                            remediation: e.report().remediation,
+                        },
+                    },
+                };
+                emit(out, &reply)?;
+            }
+            ClientMsg::AuditShow {
+                device_id: target,
+                index,
+            } => {
+                let reply = match storage.read_audit(&target, index) {
+                    Ok(event) => ServerMsg::AuditShowResult {
+                        device_id: target,
+                        index,
+                        event_json: serde_json::to_string(&event).unwrap_or("null".into()),
+                    },
+                    Err(e) => ServerMsg::Error {
+                        error: WireError {
+                            kind: e.report().kind,
+                            message: e.report().message,
+                            remediation: e.report().remediation,
+                        },
+                    },
+                };
+                emit(out, &reply)?;
+            }
+            ClientMsg::RollbackList { device_id: target } => {
+                let reply = match fleety_tools::list_backups(&storage.backups_dir()) {
+                    Ok(backups) => ServerMsg::RollbackListResult {
+                        device_id: target,
+                        backups_json: serde_json::to_string(&backups).unwrap_or("[]".into()),
+                    },
+                    Err(e) => ServerMsg::Error {
+                        error: WireError {
+                            kind: e.report().kind,
+                            message: e.report().message,
+                            remediation: e.report().remediation,
+                        },
+                    },
+                };
+                emit(out, &reply)?;
+            }
+            ClientMsg::RollbackApply {
+                device_id: target,
+                backup_id,
+            } => {
+                let reply = match fleety_tools::apply_backup(
+                    workspace,
+                    &storage.backups_dir(),
+                    &backup_id,
+                ) {
+                    Ok(result) => {
+                        let restored = result
+                            .get("restored")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        // The rollback itself is auditable: record it.
+                        let event = agent_core::Event::ToolResult {
+                            id: format!("rollback-{}", backup_id),
+                            result: result.clone(),
+                        };
+                        let _ = storage.append_history(&target, &event);
+                        ServerMsg::RollbackResult {
+                            device_id: target,
+                            backup_id,
+                            ok: true,
+                            message: format!("restored {restored}"),
+                        }
+                    }
+                    Err(e) => ServerMsg::RollbackResult {
+                        device_id: target,
+                        backup_id,
+                        ok: false,
+                        message: e.report().message,
+                    },
+                };
+                emit(out, &reply)?;
+            }
         }
     }
 
