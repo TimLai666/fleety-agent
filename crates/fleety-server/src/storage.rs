@@ -195,15 +195,8 @@ impl Storage {
         self.home.join("auth.json")
     }
 
-    /// Built-in MCP servers (shipped with the runtime); read-only, replaced on
-    /// update. Installed servers shadow built-ins of the same name.
-    pub fn mcp_builtin_config_path(&self) -> PathBuf {
-        self.home.join("mcp").join("builtin.json")
-    }
-
-    /// Path to the user-installed MCP server config (JSON). Shadows built-ins
-    /// of the same name.
-    pub fn mcp_installed_config_path(&self) -> PathBuf {
+    /// Path to the user-installed MCP server config (JSON).
+    pub fn mcp_config_path(&self) -> PathBuf {
         self.home.join("mcp").join("installed.json")
     }
 

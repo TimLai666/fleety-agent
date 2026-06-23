@@ -23,4 +23,3 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 reqwest = { workspace = true }
 sha2 = "0.10"
-uuid = { workspace = true }

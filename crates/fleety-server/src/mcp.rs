@@ -19,25 +19,19 @@ use agent_core::{CoreError, Result, RiskLevel, Tool, ToolRegistry, ToolSpec};
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Register the MCP tools. `builtin` (read-only, seeded by the runtime) and
-/// `installed` (user) are merged; installed shadows built-ins of the same name.
-/// `mcp_add` writes only to `installed`; `mcp_remove` refuses to delete a
-/// built-in.
-pub fn register(registry: &mut ToolRegistry, builtin: &Path, installed: &Path) {
+/// Register the MCP tools, persisting config at `config_path`.
+pub fn register(registry: &mut ToolRegistry, config_path: &Path) {
     registry.register(Box::new(McpList {
-        builtin: builtin.to_path_buf(),
-        installed: installed.to_path_buf(),
+        config: config_path.to_path_buf(),
     }));
     registry.register(Box::new(McpAdd {
-        installed: installed.to_path_buf(),
+        config: config_path.to_path_buf(),
     }));
     registry.register(Box::new(McpRemove {
-        builtin: builtin.to_path_buf(),
-        installed: installed.to_path_buf(),
+        config: config_path.to_path_buf(),
     }));
     registry.register(Box::new(McpCall {
-        builtin: builtin.to_path_buf(),
-        installed: installed.to_path_buf(),
+        config: config_path.to_path_buf(),
     }));
 }
 
@@ -52,10 +46,9 @@ struct ServerCfg {
     name: String,
     command: String,
     args: Vec<String>,
-    builtin: bool,
 }
 
-fn load_one(config: &Path, builtin: bool) -> Result<Vec<ServerCfg>> {
+fn load_servers(config: &Path) -> Result<Vec<ServerCfg>> {
     let text = match std::fs::read_to_string(config) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -90,30 +83,11 @@ fn load_one(config: &Path, builtin: bool) -> Result<Vec<ServerCfg>> {
                     name,
                     command,
                     args,
-                    builtin,
                 });
             }
         }
     }
     Ok(out)
-}
-
-/// Load builtin + installed, deduplicated by name (installed shadows builtin).
-fn load_merged(builtin: &Path, installed: &Path) -> Result<Vec<ServerCfg>> {
-    let mut servers = load_one(builtin, true)?;
-    let installed_servers = load_one(installed, false)?;
-    // installed shadows builtin: drop any builtin entry whose name is also
-    // installed, then push the installed entries.
-    let installed_names: std::collections::HashSet<String> =
-        installed_servers.iter().map(|s| s.name.clone()).collect();
-    servers.retain(|s| !installed_names.contains(&s.name));
-    servers.extend(installed_servers);
-    Ok(servers)
-}
-
-/// Load installed-only (for `mcp_add`/`mcp_remove`, which never touch builtin).
-fn load_installed(installed: &Path) -> Result<Vec<ServerCfg>> {
-    load_one(installed, false)
 }
 
 fn save_servers(config: &Path, servers: &[ServerCfg]) -> Result<()> {
@@ -237,8 +211,7 @@ where
 }
 
 struct McpList {
-    builtin: PathBuf,
-    installed: PathBuf,
+    config: PathBuf,
 }
 
 #[async_trait]
@@ -246,30 +219,23 @@ impl Tool for McpList {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "mcp_list".to_string(),
-            description: "List configured MCP servers (built-in and user-installed).".to_string(),
+            description: "List configured external MCP servers.".to_string(),
             parameters: json!({ "type": "object", "properties": {} }),
             risk: RiskLevel::Read,
         }
     }
 
     async fn call(&self, _args: Value) -> Result<Value> {
-        let servers: Vec<Value> = load_merged(&self.builtin, &self.installed)?
+        let servers: Vec<Value> = load_servers(&self.config)?
             .into_iter()
-            .map(|s| {
-                json!({
-                    "name": s.name,
-                    "command": s.command,
-                    "args": s.args,
-                    "source": if s.builtin { "builtin" } else { "installed" },
-                })
-            })
+            .map(|s| json!({ "name": s.name, "command": s.command, "args": s.args }))
             .collect();
         Ok(json!({ "servers": servers }))
     }
 }
 
 struct McpAdd {
-    installed: PathBuf,
+    config: PathBuf,
 }
 
 #[async_trait]
@@ -277,10 +243,7 @@ impl Tool for McpAdd {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "mcp_add".to_string(),
-            description:
-                "Add (or replace) a user-installed MCP server by name. Shadows a built-in of the \
-                 same name."
-                    .to_string(),
+            description: "Add (or replace) an external MCP server by name.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -306,22 +269,20 @@ impl Tool for McpAdd {
                     .collect()
             })
             .unwrap_or_default();
-        let mut servers = load_installed(&self.installed)?;
+        let mut servers = load_servers(&self.config)?;
         servers.retain(|s| s.name != name);
         servers.push(ServerCfg {
             name: name.clone(),
             command,
             args: server_args,
-            builtin: false,
         });
-        save_servers(&self.installed, &servers)?;
+        save_servers(&self.config, &servers)?;
         Ok(json!({ "name": name, "added": true }))
     }
 }
 
 struct McpRemove {
-    builtin: PathBuf,
-    installed: PathBuf,
+    config: PathBuf,
 }
 
 #[async_trait]
@@ -329,9 +290,7 @@ impl Tool for McpRemove {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "mcp_remove".to_string(),
-            description:
-                "Remove a user-installed MCP server by name. Built-in servers cannot be removed."
-                    .to_string(),
+            description: "Remove a configured MCP server by name.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": { "name": { "type": "string" } },
@@ -343,29 +302,19 @@ impl Tool for McpRemove {
 
     async fn call(&self, args: Value) -> Result<Value> {
         let name = require_str(&args, "name")?;
-        let mut servers = load_installed(&self.installed)?;
+        let mut servers = load_servers(&self.config)?;
         let before = servers.len();
         servers.retain(|s| s.name != name);
         if servers.len() == before {
-            // Not installed — check whether it's a built-in so the error is honest.
-            let is_builtin = load_one(&self.builtin, true)?
-                .iter()
-                .any(|s| s.name == name);
-            if is_builtin {
-                return Err(CoreError::Message(format!(
-                    "cannot remove built-in mcp server '{name}'"
-                )));
-            }
             return Err(CoreError::Message(format!("no such mcp server '{name}'")));
         }
-        save_servers(&self.installed, &servers)?;
+        save_servers(&self.config, &servers)?;
         Ok(json!({ "name": name, "removed": true }))
     }
 }
 
 struct McpCall {
-    builtin: PathBuf,
-    installed: PathBuf,
+    config: PathBuf,
 }
 
 #[async_trait]
@@ -393,62 +342,40 @@ impl Tool for McpCall {
         let tool = require_str(&args, "tool")?.to_string();
         let arguments = args.get("arguments").cloned().unwrap_or_else(|| json!({}));
 
-        let server = load_merged(&self.builtin, &self.installed)?
+        let server = load_servers(&self.config)?
             .into_iter()
             .find(|s| s.name == server_name)
             .ok_or_else(|| CoreError::ToolNotFound(format!("mcp server '{server_name}'")))?;
 
-        invoke_mcp(
-            server_name,
-            &server.command,
-            &server.args,
-            &tool,
-            &arguments,
-            CALL_TIMEOUT,
-        )
-        .await
-    }
-}
+        let mut child = Command::new(&server.command)
+            .args(&server.args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| {
+                CoreError::Message(format!("cannot spawn mcp server '{server_name}': {e}"))
+            })?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| CoreError::Message("mcp server has no stdin".to_string()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| CoreError::Message("mcp server has no stdout".to_string()))?;
+        let mut reader = BufReader::new(stdout).lines();
 
-/// Spawn an MCP server over stdio, do the handshake, run one `tools/call`, and
-/// kill it. Reused by `mcp_call` (the agent-facing tool) and by startup tasks
-/// that need to talk to a built-in MCP without going through the registry. The
-/// `label` is for error messages only — it doesn't have to be a configured
-/// server name.
-pub(crate) async fn invoke_mcp(
-    label: &str,
-    command: &str,
-    args: &[String],
-    tool: &str,
-    arguments: &Value,
-    timeout: Duration,
-) -> Result<Value> {
-    let mut child = Command::new(command)
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| CoreError::Message(format!("cannot spawn mcp server '{label}': {e}")))?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| CoreError::Message("mcp server has no stdin".to_string()))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| CoreError::Message("mcp server has no stdout".to_string()))?;
-    let mut reader = BufReader::new(stdout).lines();
-
-    let exchange = mcp_exchange(&mut stdin, &mut reader, tool, arguments);
-    let result = tokio::time::timeout(timeout, exchange).await;
-    let _ = child.start_kill();
-    match result {
-        Ok(inner) => inner,
-        Err(_) => Err(CoreError::Provider(format!(
-            "mcp server '{label}' timed out after {}s",
-            timeout.as_secs()
-        ))),
+        let exchange = mcp_exchange(&mut stdin, &mut reader, &tool, &arguments);
+        let result = tokio::time::timeout(CALL_TIMEOUT, exchange).await;
+        let _ = child.start_kill();
+        match result {
+            Ok(inner) => inner,
+            Err(_) => Err(CoreError::Provider(format!(
+                "mcp server '{server_name}' timed out after {}s",
+                CALL_TIMEOUT.as_secs()
+            ))),
+        }
     }
 }
 
@@ -456,10 +383,10 @@ pub(crate) async fn invoke_mcp(
 mod tests {
     use super::*;
 
-    fn temp_root() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("fleety-mcp-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).expect("mk temp");
-        dir
+    fn temp_config() -> PathBuf {
+        std::env::temp_dir()
+            .join(format!("fleety-mcp-{}", uuid::Uuid::new_v4()))
+            .join("installed.json")
     }
 
     #[tokio::test]
@@ -533,11 +460,9 @@ mod tests {
 
     #[tokio::test]
     async fn config_crud() {
-        let root = temp_root();
-        let builtin = root.join("builtin.json");
-        let installed = root.join("installed.json");
+        let config = temp_config();
         let mut registry = ToolRegistry::new();
-        register(&mut registry, &builtin, &installed);
+        register(&mut registry, &config);
 
         registry
             .call(
@@ -549,7 +474,6 @@ mod tests {
         let listed = registry.call("mcp_list", json!({})).await.expect("list");
         assert_eq!(listed["servers"].as_array().map(Vec::len).unwrap_or(0), 1);
         assert_eq!(listed["servers"][0]["command"], json!("node"));
-        assert_eq!(listed["servers"][0]["source"], json!("installed"));
 
         registry
             .call("mcp_remove", json!({ "name": "files" }))
@@ -562,59 +486,8 @@ mod tests {
             .await
             .is_err());
 
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[tokio::test]
-    async fn builtin_shadowing_and_protection() {
-        let root = temp_root();
-        let builtin = root.join("builtin.json");
-        let installed = root.join("installed.json");
-        // Seed a builtin entry by hand (this is how `builtin_mcp::seed` would).
-        std::fs::write(
-            &builtin,
-            r#"{ "servers": [{ "name": "codebase-memory", "command": "/opt/cbm", "args": [] }] }"#,
-        )
-        .expect("seed builtin");
-
-        let mut registry = ToolRegistry::new();
-        register(&mut registry, &builtin, &installed);
-
-        // Built-in shows up as source=builtin and cannot be removed.
-        let listed = registry.call("mcp_list", json!({})).await.expect("list");
-        let servers = listed["servers"].as_array().expect("arr");
-        assert_eq!(servers.len(), 1);
-        assert_eq!(servers[0]["name"], json!("codebase-memory"));
-        assert_eq!(servers[0]["source"], json!("builtin"));
-        assert!(registry
-            .call("mcp_remove", json!({ "name": "codebase-memory" }))
-            .await
-            .is_err());
-
-        // Installing the same name shadows the builtin.
-        registry
-            .call(
-                "mcp_add",
-                json!({ "name": "codebase-memory", "command": "/custom/cbm", "args": [] }),
-            )
-            .await
-            .expect("add override");
-        let after = registry.call("mcp_list", json!({})).await.expect("list2");
-        let servers = after["servers"].as_array().expect("arr2");
-        assert_eq!(servers.len(), 1);
-        assert_eq!(servers[0]["command"], json!("/custom/cbm"));
-        assert_eq!(servers[0]["source"], json!("installed"));
-
-        // Removing the installed entry exposes the builtin again.
-        registry
-            .call("mcp_remove", json!({ "name": "codebase-memory" }))
-            .await
-            .expect("remove installed");
-        let restored = registry.call("mcp_list", json!({})).await.expect("list3");
-        let servers = restored["servers"].as_array().expect("arr3");
-        assert_eq!(servers.len(), 1);
-        assert_eq!(servers[0]["source"], json!("builtin"));
-
-        let _ = std::fs::remove_dir_all(&root);
+        if let Some(dir) = config.parent() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 }

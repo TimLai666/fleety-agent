@@ -11,7 +11,6 @@
 mod auth;
 mod bridge;
 mod browser;
-mod builtin_mcp;
 mod builtin_skills;
 mod conn;
 mod echo;
@@ -96,24 +95,10 @@ async fn main() {
     if let Err(e) = builtin_skills::seed(&storage.skills_builtin_dir()) {
         tracing::warn!(error = %e, "could not seed built-in skills");
     }
-    // Seed built-in MCP servers so the agent has them available without a
-    // manual `mcp_add` (best-effort; same posture).
-    if let Err(e) = builtin_mcp::seed(&storage.mcp_builtin_config_path()) {
-        tracing::warn!(error = %e, "could not seed built-in mcp servers");
-    }
     let provider = build_provider();
     let policy = policy_from_env();
     let workspace = Arc::new(workspace_root());
     tracing::info!(workspace = %workspace.display(), "workspace for tools");
-
-    // Kick off codebase-memory's first index of the workspace in the background
-    // so the very first structural query has data — without blocking startup.
-    {
-        let workspace_for_index = Arc::clone(&workspace);
-        tokio::spawn(async move {
-            builtin_mcp::auto_index_workspace(&workspace_for_index).await;
-        });
-    }
 
     // Cross-device routing state, shared across all connections.
     let hub = bridge::new_hub();
