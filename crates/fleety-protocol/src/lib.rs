@@ -20,6 +20,25 @@ pub struct WireError {
     pub remediation: Option<String>,
 }
 
+/// A media attachment riding along with a user message: an image / audio /
+/// video / file the multimodal model is supposed to see directly. We don't
+/// pre-process attachments through a vision tool — they're handed to the
+/// model alongside the user's text in one multimodal request.
+///
+/// Set exactly one of `bytes_b64` (raw bytes, base64-encoded) or `url`. The
+/// `mime` field routes the attachment into the right slot on the provider side
+/// (`image/*` → image part, `audio/*` → audio part, etc.).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WireAttachment {
+    pub mime: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_b64: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
 /// Origin context the CLI attaches so the agent knows where a message came from.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct OriginContext {
@@ -48,13 +67,16 @@ pub enum ClientMsg {
         pairing_code: Option<String>,
     },
     /// A user turn. `conversation_id` continues an existing conversation, or
-    /// `None` starts a new one.
+    /// `None` starts a new one. `attachments` carries multimodal media handed
+    /// straight to the model (images, audio, etc.) — see [`WireAttachment`].
     UserMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         conversation_id: Option<String>,
         text: String,
         #[serde(default)]
         origin: OriginContext,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<WireAttachment>,
     },
     /// Reconnect to an existing conversation; the server replays events after
     /// `after_seq`.

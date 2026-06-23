@@ -8,7 +8,7 @@
 
 mod tui;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use agent_core::{obs, CoreError, Result};
 use futures::stream::{SplitSink, SplitStream};
@@ -17,7 +17,7 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-use fleety_protocol::{ClientMsg, OriginContext, ServerMsg, PROTOCOL_VERSION};
+use fleety_protocol::{ClientMsg, OriginContext, ServerMsg, WireAttachment, PROTOCOL_VERSION};
 
 type Tx = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, WsMessage>;
 type Rx = SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
@@ -42,12 +42,53 @@ async fn main() {
             }
         }
         Some("ask") => {
-            let text = args.get(2).cloned().unwrap_or_default();
-            if text.is_empty() {
-                eprintln!("usage: fleety ask \"<message>\"");
+            // Parse: fleety ask [--image P]* [--audio P]* [--video P]* [--file P]* "<text>"
+            let mut text = String::new();
+            let mut attachment_paths: Vec<(PathBuf, &'static str)> = Vec::new();
+            let mut iter = args.iter().skip(2);
+            while let Some(arg) = iter.next() {
+                match arg.as_str() {
+                    "--image" | "-i" => {
+                        if let Some(p) = iter.next() {
+                            attachment_paths.push((PathBuf::from(p), "image"));
+                        }
+                    }
+                    "--audio" => {
+                        if let Some(p) = iter.next() {
+                            attachment_paths.push((PathBuf::from(p), "audio"));
+                        }
+                    }
+                    "--video" => {
+                        if let Some(p) = iter.next() {
+                            attachment_paths.push((PathBuf::from(p), "video"));
+                        }
+                    }
+                    "--file" => {
+                        if let Some(p) = iter.next() {
+                            attachment_paths.push((PathBuf::from(p), "file"));
+                        }
+                    }
+                    _ => {
+                        if text.is_empty() {
+                            text = arg.clone();
+                        }
+                    }
+                }
+            }
+            if text.is_empty() && attachment_paths.is_empty() {
+                eprintln!(
+                    "usage: fleety ask [--image PATH]... [--audio PATH]... [--video PATH]... [--file PATH]... \"<message>\""
+                );
                 return;
             }
-            if let Err(e) = ask(text).await {
+            let attachments = match load_attachments(&attachment_paths) {
+                Ok(a) => a,
+                Err(e) => {
+                    eprintln!("error: {}", e.report().message);
+                    return;
+                }
+            };
+            if let Err(e) = ask(text, attachments).await {
                 let report = e.report();
                 eprintln!("error: {}", report.message);
                 if let Some(hint) = report.remediation {
@@ -177,6 +218,7 @@ async fn run_tui() -> Result<()> {
                             conversation_id: None,
                             text,
                             origin: OriginContext::default(),
+                            attachments: Vec::new(),
                         }).await {
                             app.status = format!("send failed: {}", e.report().message);
                         }
@@ -374,7 +416,70 @@ async fn init(url: String) -> Result<()> {
     Ok(())
 }
 
-async fn ask(text: String) -> Result<()> {
+/// Read each attachment path from disk and base64-encode it. The CLI knows the
+/// rough kind (image/audio/video/file) the user named at the flag; we use the
+/// extension to pick a more precise MIME so the provider routes correctly.
+fn load_attachments(paths: &[(PathBuf, &'static str)]) -> Result<Vec<WireAttachment>> {
+    let mut out = Vec::with_capacity(paths.len());
+    for (path, kind) in paths {
+        let bytes = std::fs::read(path).map_err(|e| {
+            CoreError::Message(format!("cannot read attachment '{}': {e}", path.display()))
+        })?;
+        let mime = guess_mime(path, kind);
+        let name = path.file_name().and_then(|n| n.to_str()).map(String::from);
+        use base64::Engine;
+        out.push(WireAttachment {
+            mime,
+            bytes_b64: Some(base64::engine::general_purpose::STANDARD.encode(&bytes)),
+            url: None,
+            name,
+        });
+    }
+    Ok(out)
+}
+
+/// Best-effort MIME from a file extension + the flag kind the user used.
+/// Falls back to `<kind>/octet-stream` so the server still classifies it.
+fn guess_mime(path: &Path, kind: &str) -> String {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    let from_ext = match ext.as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "bmp" => Some("image/bmp"),
+        "svg" => Some("image/svg+xml"),
+        "heic" => Some("image/heic"),
+        "mp3" => Some("audio/mpeg"),
+        "wav" => Some("audio/wav"),
+        "ogg" => Some("audio/ogg"),
+        "flac" => Some("audio/flac"),
+        "m4a" => Some("audio/mp4"),
+        "mp4" => Some("video/mp4"),
+        "webm" => Some("video/webm"),
+        "mov" => Some("video/quicktime"),
+        "mkv" => Some("video/x-matroska"),
+        "pdf" => Some("application/pdf"),
+        "txt" => Some("text/plain"),
+        "json" => Some("application/json"),
+        _ => None,
+    };
+    if let Some(m) = from_ext {
+        return m.to_string();
+    }
+    match kind {
+        "image" => "image/octet-stream".to_string(),
+        "audio" => "audio/octet-stream".to_string(),
+        "video" => "video/octet-stream".to_string(),
+        _ => "application/octet-stream".to_string(),
+    }
+}
+
+async fn ask(text: String, attachments: Vec<WireAttachment>) -> Result<()> {
     let url = agent_url();
     let (ws, _) = tokio_tungstenite::connect_async(&url)
         .await
@@ -397,6 +502,7 @@ async fn ask(text: String) -> Result<()> {
             conversation_id: None,
             text,
             origin: origin(),
+            attachments,
         },
     )
     .await?;

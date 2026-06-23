@@ -9,6 +9,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod ondevice;
+mod poll_updates;
 mod provision;
 mod service;
 mod update;
@@ -99,6 +100,9 @@ async fn main() {
         _ => {}
     }
     tracing::info!(version = agent_core::VERSION, "fleetyd starting");
+    // Best-effort background update poller (no-op when the user hasn't set
+    // FLEETY_UPDATE_MANIFEST — keeps the existing dev/install posture).
+    poll_updates::spawn();
     if let Err(e) = run().await {
         tracing::error!(report = ?e.report(), "fleetyd exited with error");
     }

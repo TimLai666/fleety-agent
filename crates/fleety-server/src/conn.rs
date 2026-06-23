@@ -165,9 +165,16 @@ async fn serve(
                 conversation_id,
                 text,
                 origin,
+                attachments,
             } => {
                 let conversation = conversation_id.unwrap_or_else(|| default_conversation.clone());
-                tracing::info!(%device_id, conversation = %conversation, ?origin, "user message");
+                tracing::info!(
+                    %device_id,
+                    conversation = %conversation,
+                    attachments = attachments.len(),
+                    ?origin,
+                    "user message"
+                );
 
                 // First finish any turn left interrupted by a crash/redeploy, so
                 // it isn't lost and doesn't interleave with this message. Best
@@ -188,8 +195,22 @@ async fn serve(
                 }
 
                 // Persist the user message and open a durable turn journal, then
-                // run the turn over the history.
-                let user_msg = Message::user(text);
+                // run the turn over the history. Wire attachments map 1:1 onto
+                // agent-core's Attachment so the model sees them directly.
+                let attachments: Vec<agent_core::Attachment> = attachments
+                    .into_iter()
+                    .map(|a| agent_core::Attachment {
+                        mime: a.mime,
+                        bytes_b64: a.bytes_b64,
+                        url: a.url,
+                        name: a.name,
+                    })
+                    .collect();
+                let user_msg = if attachments.is_empty() {
+                    Message::user(text)
+                } else {
+                    Message::user_with_attachments(text, attachments)
+                };
                 storage.append(device_id, &conversation, &user_msg)?;
                 storage.journal_begin(device_id, &conversation, &user_msg)?;
                 // Inject agent-level core memory (ME/USER/TODO) as the system
@@ -1004,6 +1025,7 @@ mod tests {
                         arguments: serde_json::json!({ "path": "x.txt", "content": "hi" }),
                     }],
                     tool_call_id: None,
+                    attachments: Vec::new(),
                 },
             },
             ModelResponse {
@@ -1056,6 +1078,7 @@ mod tests {
                 conversation_id: None,
                 text: "please write".into(),
                 origin: Default::default(),
+                attachments: Vec::new(),
             },
         )
         .await;
@@ -1105,6 +1128,7 @@ mod tests {
                         arguments: serde_json::json!({ "device": "pi", "tool": "read_file", "args": { "path": "x" } }),
                     }],
                     tool_call_id: None,
+                    attachments: Vec::new(),
                 },
             },
             ModelResponse {
@@ -1195,6 +1219,7 @@ mod tests {
                 conversation_id: None,
                 text: "run on pi".into(),
                 origin: Default::default(),
+                attachments: Vec::new(),
             },
         )
         .await;

@@ -7,6 +7,7 @@ name = "agent-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "futures",
  "reqwest",
  "serde",
@@ -331,6 +332,7 @@ name = "fleety-cli"
 version = "0.1.0"
 dependencies = [
  "agent-core",
+ "base64",
  "fleety-protocol",
  "futures",
  "ratatui",

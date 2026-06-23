@@ -286,6 +286,7 @@ mod tests {
                     arguments: json!({ "text": "hi" }),
                 }],
                 tool_call_id: None,
+                attachments: Vec::new(),
             },
         }
     }
@@ -512,6 +513,7 @@ mod tests {
                 arguments: json!({}),
             }],
             tool_call_id: None,
+            attachments: Vec::new(),
         };
         let mut messages = vec![
             Message::system("sys padding to exceed the tiny threshold"),
@@ -575,6 +577,7 @@ mod tests {
                     },
                 ],
                 tool_call_id: None,
+                attachments: Vec::new(),
             },
             Message::tool_result("c1", "result one"),
             Message::tool_result("c2", "result two"),

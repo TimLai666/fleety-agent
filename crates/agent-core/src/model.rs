@@ -26,6 +26,65 @@ pub struct ToolCall {
     pub arguments: Value,
 }
 
+/// A media attachment carried alongside a user message: an image, audio clip,
+/// video, or file the multimodal model is meant to see directly. The agent
+/// does NOT pre-process attachments through a vision / OCR / transcription
+/// tool — they ride along with the user's text in a single multimodal request,
+/// so the model can decide for itself how to interpret them.
+///
+/// Set exactly one of `bytes_b64` (raw bytes, base64-encoded) or `url` (an
+/// HTTP(S) URL the model fetches itself, when supported). `mime` routes the
+/// attachment into the right part of the provider's payload: `image/*` → an
+/// image part, `audio/*` → an audio part, etc. Providers that don't speak
+/// multimodal drop the attachment with a log line rather than failing the turn.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct Attachment {
+    /// IANA MIME type (e.g. `image/png`, `audio/mpeg`, `video/mp4`).
+    pub mime: String,
+    /// Inline bytes, base64-encoded. Use for files on disk we want the model
+    /// to see directly. Mutually exclusive with `url`; if both are set, `url`
+    /// wins (the model handles fetching).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_b64: Option<String>,
+    /// HTTP(S) URL the model fetches itself. Only useful for providers that
+    /// support remote fetch (OpenAI's `image_url`, for example).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Optional filename / short description, for the provider's logs and for
+    /// the user-visible event log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+impl Attachment {
+    /// Inline a file's bytes as an attachment (base64-encodes for you).
+    pub fn from_bytes(mime: impl Into<String>, bytes: &[u8]) -> Self {
+        use base64::Engine;
+        Self {
+            mime: mime.into(),
+            bytes_b64: Some(base64::engine::general_purpose::STANDARD.encode(bytes)),
+            url: None,
+            name: None,
+        }
+    }
+
+    /// Reference an external URL the model will fetch.
+    pub fn from_url(mime: impl Into<String>, url: impl Into<String>) -> Self {
+        Self {
+            mime: mime.into(),
+            bytes_b64: None,
+            url: Some(url.into()),
+            name: None,
+        }
+    }
+
+    /// Attach a short name (typically a filename) for logs / display.
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+}
+
 /// A single conversation message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
@@ -36,6 +95,10 @@ pub struct Message {
     pub tool_calls: Vec<ToolCall>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// User-message attachments handed to a multimodal model alongside `content`.
+    /// Empty for non-user messages and for text-only turns. See [`Attachment`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<Attachment>,
 }
 
 impl Message {
@@ -45,6 +108,7 @@ impl Message {
             content: Some(text.into()),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            attachments: Vec::new(),
         }
     }
 
@@ -54,6 +118,19 @@ impl Message {
             content: Some(text.into()),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            attachments: Vec::new(),
+        }
+    }
+
+    /// A user message that ships attachments alongside its text. Use this
+    /// when the user provides images, audio, or other media for the model.
+    pub fn user_with_attachments(text: impl Into<String>, attachments: Vec<Attachment>) -> Self {
+        Self {
+            role: Role::User,
+            content: Some(text.into()),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            attachments,
         }
     }
 
@@ -63,6 +140,7 @@ impl Message {
             content: Some(text.into()),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            attachments: Vec::new(),
         }
     }
 
@@ -73,6 +151,7 @@ impl Message {
             content: Some(content.into()),
             tool_calls: Vec::new(),
             tool_call_id: Some(tool_call_id.into()),
+            attachments: Vec::new(),
         }
     }
 }

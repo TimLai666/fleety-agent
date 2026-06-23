@@ -24,7 +24,8 @@ pub use approval::{ApprovalDecision, ApprovalGate, AutoApprove, AutoDeny, Mandat
 pub use error::{CoreError, ErrorReport, Result};
 pub use event::{interrupted_tool_result, reconstruct_messages, Event, EventLog};
 pub use model::{
-    Message, MockProvider, ModelProvider, ModelResponse, RiskLevel, Role, ToolCall, ToolSpec,
+    Attachment, Message, MockProvider, ModelProvider, ModelResponse, RiskLevel, Role, ToolCall,
+    ToolSpec,
 };
 pub use openai::OpenAiCompat;
 pub use tools::{Tool, ToolRegistry};

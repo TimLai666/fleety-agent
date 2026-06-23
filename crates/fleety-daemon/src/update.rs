@@ -37,6 +37,29 @@ fn needs_update(current: &str, latest: &str) -> bool {
     current.trim_start_matches('v') != latest.trim_start_matches('v')
 }
 
+/// Public probe for the background poller: fetch and parse the manifest,
+/// return just the `version` string.
+pub async fn probe_latest() -> Result<String> {
+    let url = std::env::var("FLEETY_UPDATE_MANIFEST").map_err(|_| {
+        CoreError::Message("set FLEETY_UPDATE_MANIFEST to the update manifest URL".to_string())
+    })?;
+    let text = reqwest::Client::new()
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| CoreError::Provider(format!("fetch manifest failed: {e}")))?
+        .text()
+        .await
+        .map_err(|e| CoreError::Provider(format!("read manifest failed: {e}")))?;
+    Ok(parse_manifest(&text)?.version)
+}
+
+/// Re-export of the version-diff predicate so the background poller can use the
+/// same logic as `update()`.
+pub fn needs_update_str(current: &str, latest: &str) -> bool {
+    needs_update(current, latest)
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
