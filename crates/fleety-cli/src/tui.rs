@@ -2,8 +2,15 @@
 //! a status line. The `App` state, key handling, and rendering are unit-tested
 //! (ratatui `TestBackend` renders to an in-memory buffer); the live
 //! terminal/event/WebSocket loop in `main.rs` is the glue around them.
+//!
+//! Clipboard integration mirrors how Claude Code handles paste: Ctrl+V asks the
+//! outer loop to peek at the OS clipboard. If the clipboard holds an image, it
+//! becomes a PNG attachment. If it holds the path of an existing file, that
+//! file is attached directly. Otherwise the clipboard text is pasted into the
+//! input.
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent};
+use fleety_protocol::WireAttachment;
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Paragraph, Wrap};
@@ -15,6 +22,9 @@ pub struct App {
     pub input: String,
     pub status: String,
     pub should_quit: bool,
+    /// Attachments staged for the next `Send`. Cleared automatically when the
+    /// user submits the line.
+    pub pending_attachments: Vec<WireAttachment>,
     /// Whether the last message is an assistant reply still streaming in.
     streaming: bool,
 }
@@ -26,6 +36,7 @@ impl App {
             input: String::new(),
             status: status.into(),
             should_quit: false,
+            pending_attachments: Vec::new(),
             streaming: false,
         }
     }
@@ -59,18 +70,78 @@ impl App {
             self.push("fleety", text);
         }
     }
+
+    /// Stage one attachment for the next send. The outer loop calls this after
+    /// resolving a clipboard image or a file path.
+    pub fn attach(&mut self, attachment: WireAttachment) {
+        let label = attachment
+            .name
+            .clone()
+            .unwrap_or_else(|| attachment.mime.clone());
+        self.pending_attachments.push(attachment);
+        self.status = format!(
+            "attached {label} ({} pending)",
+            self.pending_attachments.len()
+        );
+    }
+
+    /// Drop any staged attachments without sending.
+    pub fn clear_attachments(&mut self) {
+        if !self.pending_attachments.is_empty() {
+            self.status = format!("cleared {} attachment(s)", self.pending_attachments.len());
+            self.pending_attachments.clear();
+        }
+    }
+
+    /// Title shown on the input box — includes a paperclip count when there
+    /// are staged attachments so the user can see what'll be sent.
+    pub fn input_title(&self) -> String {
+        if self.pending_attachments.is_empty() {
+            "Message (Enter=send, Ctrl+V=paste, Esc=quit)".to_string()
+        } else {
+            format!(
+                "Message [{} attached] (Enter=send, Ctrl+X=drop attachments, Esc=quit)",
+                self.pending_attachments.len()
+            )
+        }
+    }
 }
 
 /// What a keypress asks the outer loop to do.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Action {
     None,
-    Send(String),
+    /// Submit the current input + any staged attachments.
+    Send {
+        text: String,
+        attachments: Vec<WireAttachment>,
+    },
     Quit,
+    /// Ctrl+V: outer loop should consult the OS clipboard (image, file path,
+    /// or plain text) and update the app accordingly.
+    PasteFromClipboard,
 }
 
 /// Apply a keypress to the app, returning the action for the loop to perform.
 pub fn on_key(app: &mut App, key: KeyEvent) -> Action {
+    // Ctrl-prefixed shortcuts come first so plain Char fallthrough doesn't
+    // swallow them (e.g. Ctrl+V should NOT type 'v').
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        if let KeyCode::Char(c) = key.code {
+            match c.to_ascii_lowercase() {
+                'v' => return Action::PasteFromClipboard,
+                'x' => {
+                    app.clear_attachments();
+                    return Action::None;
+                }
+                'c' => {
+                    app.should_quit = true;
+                    return Action::Quit;
+                }
+                _ => {}
+            }
+        }
+    }
     match key.code {
         KeyCode::Esc => {
             app.should_quit = true;
@@ -78,11 +149,17 @@ pub fn on_key(app: &mut App, key: KeyEvent) -> Action {
         }
         KeyCode::Enter => {
             let text = std::mem::take(&mut app.input);
-            if text.trim().is_empty() {
+            let attachments = std::mem::take(&mut app.pending_attachments);
+            if text.trim().is_empty() && attachments.is_empty() {
                 Action::None
             } else {
-                app.push("you", text.clone());
-                Action::Send(text)
+                let display = if attachments.is_empty() {
+                    text.clone()
+                } else {
+                    format!("{text} [+{} attachment(s)]", attachments.len())
+                };
+                app.push("you", display);
+                Action::Send { text, attachments }
             }
         }
         KeyCode::Backspace => {
@@ -120,8 +197,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         chunks[0],
     );
     frame.render_widget(
-        Paragraph::new(app.input.as_str())
-            .block(Block::bordered().title("Message (Enter=send, Esc=quit)")),
+        Paragraph::new(app.input.as_str()).block(Block::bordered().title(app.input_title())),
         chunks[1],
     );
     frame.render_widget(Paragraph::new(app.status.as_str()), chunks[2]);
@@ -138,6 +214,10 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
     #[test]
     fn typing_enter_and_quit() {
         let mut app = App::new("ready");
@@ -148,14 +228,88 @@ mod tests {
         assert_eq!(app.input, "h");
         assert_eq!(
             on_key(&mut app, key(KeyCode::Enter)),
-            Action::Send("h".to_string())
+            Action::Send {
+                text: "h".to_string(),
+                attachments: Vec::new(),
+            }
         );
         assert_eq!(app.input, ""); // cleared on send
         assert_eq!(app.messages.last().map(|(r, _)| r.as_str()), Some("you"));
-        // Empty Enter does nothing.
+        // Empty Enter with no attachments does nothing.
         assert_eq!(on_key(&mut app, key(KeyCode::Enter)), Action::None);
         assert_eq!(on_key(&mut app, key(KeyCode::Esc)), Action::Quit);
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn ctrl_v_routes_to_paste_action() {
+        let mut app = App::new("ready");
+        assert_eq!(on_key(&mut app, ctrl('v')), Action::PasteFromClipboard);
+        // The 'v' character must not also leak into the input buffer.
+        assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn enter_sends_attachments_then_clears_them() {
+        let mut app = App::new("ready");
+        app.attach(WireAttachment {
+            mime: "image/png".into(),
+            bytes_b64: Some("AAAA".into()),
+            url: None,
+            name: Some("paste.png".into()),
+        });
+        on_key(&mut app, key(KeyCode::Char('s')));
+        on_key(&mut app, key(KeyCode::Char('e')));
+        on_key(&mut app, key(KeyCode::Char('e')));
+        let Action::Send { text, attachments } = on_key(&mut app, key(KeyCode::Enter)) else {
+            panic!("expected Send");
+        };
+        assert_eq!(text, "see");
+        assert_eq!(attachments.len(), 1);
+        assert!(app.pending_attachments.is_empty(), "cleared after send");
+    }
+
+    #[test]
+    fn enter_with_only_attachments_still_sends() {
+        let mut app = App::new("ready");
+        app.attach(WireAttachment {
+            mime: "image/png".into(),
+            bytes_b64: Some("AAAA".into()),
+            url: None,
+            name: Some("paste.png".into()),
+        });
+        let Action::Send { text, attachments } = on_key(&mut app, key(KeyCode::Enter)) else {
+            panic!("expected Send with attachments only");
+        };
+        assert!(text.is_empty());
+        assert_eq!(attachments.len(), 1);
+    }
+
+    #[test]
+    fn ctrl_x_clears_pending_attachments() {
+        let mut app = App::new("ready");
+        app.attach(WireAttachment {
+            mime: "image/png".into(),
+            bytes_b64: Some("AAAA".into()),
+            url: None,
+            name: None,
+        });
+        assert_eq!(app.pending_attachments.len(), 1);
+        assert_eq!(on_key(&mut app, ctrl('x')), Action::None);
+        assert!(app.pending_attachments.is_empty());
+    }
+
+    #[test]
+    fn input_title_reflects_attachment_count() {
+        let mut app = App::new("ready");
+        assert!(app.input_title().contains("Ctrl+V=paste"));
+        app.attach(WireAttachment {
+            mime: "image/png".into(),
+            bytes_b64: Some("AAAA".into()),
+            url: None,
+            name: None,
+        });
+        assert!(app.input_title().contains("1 attached"));
     }
 
     #[test]
@@ -178,7 +332,7 @@ mod tests {
 
     #[test]
     fn renders_all_panes() {
-        let mut terminal = Terminal::new(TestBackend::new(50, 12)).expect("term");
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).expect("term");
         let mut app = App::new("connected");
         app.push("fleety", "hello there");
         app.input = "typing".into();

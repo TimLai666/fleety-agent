@@ -343,13 +343,17 @@ fn wire_content(message: &Message) -> Value {
     }
     for att in &message.attachments {
         let mime = att.mime.to_ascii_lowercase();
-        if mime.starts_with("image/") {
+        if mime.starts_with("image/") || mime.starts_with("video/") {
+            // For images this is the standard OpenAI `image_url` part; for video
+            // it's how OpenRouter/Gemini wrappers accept clips (a `data:` URL
+            // in the same slot). Pure OpenAI rejects video here — that's an
+            // honest error for the user, not a silent text-note degradation.
             let url = if let Some(u) = &att.url {
                 u.clone()
             } else if let Some(b64) = &att.bytes_b64 {
                 format!("data:{};base64,{}", att.mime, b64)
             } else {
-                tracing::warn!(mime = %att.mime, "image attachment has no bytes or url; skipping");
+                tracing::warn!(mime = %att.mime, "media attachment has no bytes or url; skipping");
                 continue;
             };
             parts.push(json!({ "type": "image_url", "image_url": { "url": url } }));
@@ -368,11 +372,24 @@ fn wire_content(message: &Message) -> Value {
                 "type": "input_audio",
                 "input_audio": { "data": b64, "format": format },
             }));
+        } else if mime == "application/pdf" {
+            // OpenAI's PDF input shape: a `file` part with a data: URL.
+            let Some(b64) = &att.bytes_b64 else {
+                tracing::warn!("pdf attachment has no bytes; skipping");
+                continue;
+            };
+            let url = format!("data:application/pdf;base64,{b64}");
+            let mut file = json!({ "file_data": url });
+            if let Some(name) = &att.name {
+                if let Some(obj) = file.as_object_mut() {
+                    obj.insert("filename".to_string(), json!(name));
+                }
+            }
+            parts.push(json!({ "type": "file", "file": file }));
         } else {
-            // Video / arbitrary files aren't a standardised OpenAI part yet.
-            // Surface them as a text note so the model still knows they exist
-            // (and the user can see we didn't silently lose them).
-            tracing::warn!(mime = %att.mime, "attachment mime not supported as a model part; sending as text note");
+            // Everything else: surface as a text note so the model still knows
+            // an attachment existed, but we didn't pretend we could send it.
+            tracing::warn!(mime = %att.mime, "attachment mime not routable to a model part; sending as text note");
             let note = match (&att.name, &att.url) {
                 (Some(name), _) => format!("[attachment: {} ({})]", name, att.mime),
                 (None, Some(url)) => format!("[attachment: {} at {}]", att.mime, url),
@@ -507,12 +524,38 @@ mod tests {
     }
 
     #[test]
-    fn wire_content_drops_unsupported_mime_into_text_note() {
+    fn wire_content_routes_video_through_image_url() {
+        // OpenRouter / Gemini wrappers accept video in the `image_url` slot
+        // with a `data:` URL. Pure OpenAI rejects it — that's an honest error
+        // for the user, not a silent text-note degrade.
         let att = Attachment::from_bytes("video/mp4", b"\x00\x00\x00").with_name("clip.mp4");
         let msg = Message::user_with_attachments("look", vec![att]);
         let arr = wire_content(&msg).as_array().cloned().expect("array");
+        assert_eq!(arr[1]["type"], json!("image_url"));
+        let url = arr[1]["image_url"]["url"].as_str().expect("url");
+        assert!(url.starts_with("data:video/mp4;base64,"));
+    }
+
+    #[test]
+    fn wire_content_routes_pdf_through_file_part() {
+        let att = Attachment::from_bytes("application/pdf", b"%PDF-1.4").with_name("report.pdf");
+        let msg = Message::user_with_attachments("summarise", vec![att]);
+        let arr = wire_content(&msg).as_array().cloned().expect("array");
+        assert_eq!(arr[1]["type"], json!("file"));
+        assert_eq!(arr[1]["file"]["filename"], json!("report.pdf"));
+        assert!(arr[1]["file"]["file_data"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("data:application/pdf;base64,"));
+    }
+
+    #[test]
+    fn wire_content_drops_unknown_mime_into_text_note() {
+        let att = Attachment::from_bytes("application/x-weird", b"\x00").with_name("blob.bin");
+        let msg = Message::user_with_attachments("look", vec![att]);
+        let arr = wire_content(&msg).as_array().cloned().expect("array");
         assert_eq!(arr[1]["type"], json!("text"));
-        assert!(arr[1]["text"].as_str().unwrap_or("").contains("clip.mp4"));
+        assert!(arr[1]["text"].as_str().unwrap_or("").contains("blob.bin"));
     }
 
     #[test]

@@ -22,3 +22,8 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 ratatui = "0.29"
 base64 = { workspace = true }
+arboard = { workspace = true }
+png = { workspace = true }
+
+[dev-dependencies]
+uuid = { workspace = true }

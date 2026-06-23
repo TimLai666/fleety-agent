@@ -16,6 +16,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      # arboard (TUI clipboard) needs X11 + xcb dev libs on Linux to build.
+      - name: Install clipboard build deps (Linux)
+        run: sudo apt-get update && sudo apt-get install -y libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-go@v5
         with:

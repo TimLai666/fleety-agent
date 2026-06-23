@@ -6,6 +6,7 @@
 #![warn(clippy::unwrap_used, clippy::expect_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+mod clipboard;
 mod tui;
 
 use std::path::{Path, PathBuf};
@@ -212,15 +213,35 @@ async fn run_tui() -> Result<()> {
         tokio::select! {
             key = key_rx.recv() => match key {
                 Some(k) => match tui::on_key(&mut app, k) {
-                    tui::Action::Send(text) => {
+                    tui::Action::Send { text, attachments } => {
                         app.status = "sent; waiting…".to_string();
                         if let Err(e) = send(&mut tx, &ClientMsg::UserMessage {
                             conversation_id: None,
                             text,
                             origin: OriginContext::default(),
-                            attachments: Vec::new(),
+                            attachments,
                         }).await {
                             app.status = format!("send failed: {}", e.report().message);
+                        }
+                    }
+                    tui::Action::PasteFromClipboard => {
+                        // Clipboard I/O on a thread so the TUI event loop never
+                        // blocks on slow / large reads.
+                        let result = tokio::task::spawn_blocking(clipboard::read)
+                            .await
+                            .unwrap_or(clipboard::ClipboardPaste::Empty);
+                        match result {
+                            clipboard::ClipboardPaste::Image(att)
+                            | clipboard::ClipboardPaste::File(att) => {
+                                app.attach(att);
+                            }
+                            clipboard::ClipboardPaste::Text(text) => {
+                                app.input.push_str(&text);
+                                app.status = "pasted text".to_string();
+                            }
+                            clipboard::ClipboardPaste::Empty => {
+                                app.status = "clipboard empty / unavailable".to_string();
+                            }
                         }
                     }
                     tui::Action::Quit => app.should_quit = true,
