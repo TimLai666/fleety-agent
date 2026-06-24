@@ -90,6 +90,105 @@ Highest first. Data-model items (envelope, event_id, device.yaml) come before th
 11. **GET /models discovery** — HTTP route beside the WS server + `models.cache.json`, so users select models without env-var hacking.
 12. **SSE streaming** — token streaming in `OpenAiCompat` + stream assistant deltas over the protocol (pairs with the TUI).
 
+## Shipped after the original audit (2026-06)
+
+A subsequent burn of follow-on work, beyond the items above. Each bullet
+is on `main`; see commit history for the exact change.
+
+### Tooling & dev surface
+
+- **`fleety-tools` shared crate** — workspace tools (read/list/search-ripgrep/
+  write/edit/run+track/delete/move/mkdir/rollback/git_*) live in one crate the
+  server and fleetyd both register; no on-device drift.
+- **`fleety-eval` offline regression harness** — JSONL goldens replay through
+  the real loop against a `MockProvider`; 15 goldens cover workspace flows,
+  multimodal attachments, tool-error recovery, system-prompt steering, write+
+  edit chains. CI gates merge on green.
+- **CI golden gate** — `cargo run -p fleety-eval -- run crates/fleety-eval/goldens`
+  is a required step.
+
+### Durable execution + recovery
+
+- **Turn journal** — every loop event appended to `<conv>.journal.jsonl` the
+  instant it happens; mid-turn crash never loses the interrupted tool.
+- **Three-way recovery** — interactive turns recover at next user message **and**
+  at eager startup (no client needed); scheduled turns recover at next tick.
+- **`interrupted_tool_result`** — agent-core injects a sentinel result for any
+  `ToolCall` without a matching `ToolResult` instead of blindly re-running.
+
+### Audit / rollback / approvals
+
+- **`fleety audit list / show`** — browses `history.jsonl` with real timestamps
+  (`AuditRecord { ts_secs, #[serde(flatten)] event }`); rendered as relative
+  time (`5m ago`).
+- **`fleety rollback list / apply`** — surfaces backup directories; restoring
+  is itself audited and itself backed up.
+- **Approval denials** — recorded with `tool_denied` kind in the audit listing.
+
+### Enrollment
+
+- **Pairing-code flow end-to-end** — server mints / verifies; fleetyd persists
+  the received token to `~/.fleety/fleetyd.token` (chmod 0600 on Unix); clears
+  on `unauthenticated` rejection; integration test walks the 3-connect cycle.
+
+### Multimodal
+
+- **`agent_core::Attachment`** — `Message::user_with_attachments`; serialized
+  through to the wire; persisted with conversations.
+- **OpenAI provider routes** — `image_url`/`input_audio` parts; video falls
+  through `image_url` for OpenRouter+Gemini wrappers; PDF uses OpenAI's `file`
+  part.
+- **Native `Gemini` provider** — `generateContent` API with
+  `systemInstruction`, `functionDeclarations`, and `inline_data` parts
+  (image/audio/video same shape, MIME-routed). SSE streaming via
+  `streamGenerateContent?alt=sse`. The server picks Gemini automatically when
+  `FLEETY_MODEL` matches `gemini-*`.
+- **CLI**: `fleety ask --image/--audio/--video/--file PATH`.
+- **TUI**: Ctrl+V grabs the clipboard image (re-encoded to PNG via the `png`
+  crate from arboard's RGBA), or a single-line file path, or plain text;
+  Ctrl+X clears staged attachments.
+
+### Operations & lifecycle
+
+- **`fleety status`** — version, uptime, connected devices, sidecar health
+  (insyra path); served as a dedicated ws frame, not a tool.
+- **Graceful shutdown** — `tokio::signal::ctrl_c()` in server + fleetyd drains
+  the hub / closes the WS cleanly.
+- **mDNS announce + discover** — server registers
+  `_fleety._tcp.local.`; CLI / fleetyd LAN-browse as the last fallback after
+  env var + saved config. `FLEETY_MDNS_DISABLED` opt-out.
+- **Retention loop** — periodic GC of `backups/` (mtime > 7d) + rotation of
+  `history.jsonl` past 32 MiB. `FLEETY_GC_DISABLED` opt-out.
+- **fleetyd self-update polling** — daily check against
+  `FLEETY_UPDATE_MANIFEST`; notify-only by default,
+  `FLEETY_AUTO_UPDATE=apply` runs the full update.
+- **Model capability hint** — warns at boot if `FLEETY_MODEL` doesn't match a
+  known multimodal family.
+- **Device tool advertisement** — `Hello.local_tools_json` carries fleetyd's
+  on-device tool specs; `device_show` surfaces them; `device_exec` strict-
+  rejects unadvertised tool names (fail-fast vs 30 s timeout). Legacy devices
+  (no advertisement) keep the old "any tool" behaviour.
+
+### Built-ins shipped in the binary
+
+- **`builtin_skills::seed`** — embeds `use-insyra-cli/SKILL.upstream.md` (kept
+  lockstep with the insyra release via CI).
+- **Insyra DSL via Go sidecar** — `fleety-insyra` provisioned onto each
+  device by `fleetyd install/update` from the per-target asset.
+
+### Schedules
+
+- **Cron + IANA timezone** — `cron` + `chrono-tz`; `schedule_create` accepts
+  `tz`; the fire loop evaluates expressions in the right zone.
+- **`schedule_list` shows `next_fire_secs`** — predicted next firing for
+  `at:` / `every:` / cron uniformly.
+
+### Docs
+
+- [`docs/env.md`](env.md) — every `FLEETY_*` variable.
+- [`docs/eval.md`](eval.md) — golden harness format + how to add goldens.
+- [`docs/roadmap.md`](roadmap.md) — open gaps + implementation plans.
+
 ## Deferred / post-v0
 
 - **M6 ratatui TUI** — after M5. Sketch UI-event `ServerMsg` variants (`ToolExecuting`, `ToolCompleted`, `ApprovalRequested`, `ActivityUpdate`, `StatusChange`) in `fleety-protocol` now for forward-compat.

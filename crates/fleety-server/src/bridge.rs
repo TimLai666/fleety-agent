@@ -246,8 +246,7 @@ impl Tool for DeviceExec {
             let specs = self.device_tools.lock().await;
             if let Some(advertised) = specs.get(device) {
                 if !advertised.is_empty() && !advertised.iter().any(|s| s.name == tool) {
-                    let names: Vec<&str> =
-                        advertised.iter().map(|s| s.name.as_str()).collect();
+                    let names: Vec<&str> = advertised.iter().map(|s| s.name.as_str()).collect();
                     return Err(CoreError::Message(format!(
                         "device '{device}' did not advertise tool '{tool}'. \
                          Available on that device: {}",

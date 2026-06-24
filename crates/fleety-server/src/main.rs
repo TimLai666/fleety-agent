@@ -38,7 +38,7 @@ mod wiki;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use agent_core::{obs, ModelProvider, OpenAiCompat};
+use agent_core::{obs, Gemini, ModelProvider, OpenAiCompat};
 use tokio::net::TcpListener;
 
 use crate::echo::EchoProvider;
@@ -73,7 +73,6 @@ fn build_provider() -> Arc<dyn ModelProvider> {
         (Ok(base_url), Ok(model)) => {
             let key = std::env::var("FLEETY_MODEL_KEY").ok();
             let stream = std::env::var("FLEETY_MODEL_STREAM").as_deref() == Ok("1");
-            tracing::info!(%base_url, %model, stream, "using OpenAI-compatible provider");
             if !looks_multimodal(&model) {
                 tracing::warn!(
                     %model,
@@ -84,7 +83,13 @@ fn build_provider() -> Arc<dyn ModelProvider> {
                      claude-sonnet-4*, gemini-1.5-*)."
                 );
             }
-            Arc::new(OpenAiCompat::new(base_url, model, key).with_streaming(stream))
+            if agent_core::gemini::looks_like_gemini_model(&model) {
+                tracing::info!(%base_url, %model, stream, "using native Gemini provider");
+                Arc::new(Gemini::new(base_url, model, key).with_streaming(stream))
+            } else {
+                tracing::info!(%base_url, %model, stream, "using OpenAI-compatible provider");
+                Arc::new(OpenAiCompat::new(base_url, model, key).with_streaming(stream))
+            }
         }
         _ => {
             tracing::info!("no FLEETY_MODEL_BASE_URL/FLEETY_MODEL set; using echo provider");
