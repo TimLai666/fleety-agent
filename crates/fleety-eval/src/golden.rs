@@ -99,6 +99,7 @@ mod tests {
             workspace_files: [("a.txt".into(), "hi".into())].into(),
             user_input: "what does a.txt say?".into(),
             system_prompt: None,
+            user_attachments: vec![],
             scripted_responses: vec![
                 ScriptedResponse {
                     content: None,

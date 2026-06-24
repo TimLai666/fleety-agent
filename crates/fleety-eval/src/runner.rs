@@ -285,6 +285,7 @@ mod tests {
             workspace_files: [("a.txt".into(), "hello world".into())].into(),
             user_input: "what does a.txt say?".into(),
             system_prompt: None,
+            user_attachments: vec![],
             scripted_responses: vec![
                 ScriptedResponse {
                     content: None,
@@ -322,6 +323,7 @@ mod tests {
             workspace_files: Default::default(),
             user_input: "do nothing".into(),
             system_prompt: None,
+            user_attachments: vec![],
             scripted_responses: vec![
                 ScriptedResponse {
                     content: None,
@@ -358,6 +360,7 @@ mod tests {
             workspace_files: Default::default(),
             user_input: "create greet.txt".into(),
             system_prompt: None,
+            user_attachments: vec![],
             scripted_responses: vec![
                 ScriptedResponse {
                     content: None,

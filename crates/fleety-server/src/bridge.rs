@@ -49,6 +49,121 @@ pub fn new_device_tools() -> DeviceTools {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
+#[cfg(test)]
+mod strict_tests {
+    use super::*;
+    use agent_core::ToolSpec;
+
+    #[tokio::test]
+    async fn device_exec_strict_rejects_unadvertised_tool() {
+        let hub = new_hub();
+        let pending = new_pending();
+        let handles = new_handles();
+        let device_tools = new_device_tools();
+        // Pretend "pi" advertised only read_file and list_dir.
+        device_tools.lock().await.insert(
+            "pi".to_string(),
+            vec![
+                ToolSpec {
+                    name: "read_file".to_string(),
+                    description: String::new(),
+                    parameters: serde_json::json!({}),
+                    risk: agent_core::RiskLevel::Read,
+                },
+                ToolSpec {
+                    name: "list_dir".to_string(),
+                    description: String::new(),
+                    parameters: serde_json::json!({}),
+                    risk: agent_core::RiskLevel::Read,
+                },
+            ],
+        );
+
+        let mut registry = ToolRegistry::new();
+        register(&mut registry, hub, pending, handles, device_tools);
+        let err = registry
+            .call(
+                "device_exec",
+                serde_json::json!({
+                    "device": "pi",
+                    "tool": "rm_all_the_things",
+                    "args": {}
+                }),
+            )
+            .await
+            .expect_err("should reject");
+        let msg = err.report().message;
+        assert!(msg.contains("did not advertise"), "msg: {msg}");
+        assert!(msg.contains("read_file"), "lists advertised tools: {msg}");
+    }
+
+    #[tokio::test]
+    async fn device_exec_lets_advertised_tool_through_to_dispatch() {
+        // The dispatch itself will fail (no hub entry), but it must get *past*
+        // the strict-name check before failing on "not connected".
+        let hub = new_hub();
+        let pending = new_pending();
+        let handles = new_handles();
+        let device_tools = new_device_tools();
+        device_tools.lock().await.insert(
+            "pi".to_string(),
+            vec![ToolSpec {
+                name: "read_file".to_string(),
+                description: String::new(),
+                parameters: serde_json::json!({}),
+                risk: agent_core::RiskLevel::Read,
+            }],
+        );
+
+        let mut registry = ToolRegistry::new();
+        register(&mut registry, hub, pending, handles, device_tools);
+        let err = registry
+            .call(
+                "device_exec",
+                serde_json::json!({
+                    "device": "pi",
+                    "tool": "read_file",
+                    "args": {}
+                }),
+            )
+            .await
+            .expect_err("dispatch fails (no hub entry)");
+        let msg = err.report().message;
+        assert!(
+            msg.contains("not connected"),
+            "should pass strict-name check then fail dispatch: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn device_exec_skips_strict_check_when_device_never_advertised() {
+        // A legacy device that didn't advertise tools must still be reachable
+        // (backward compatibility). It'll fail on "not connected" rather than
+        // on "did not advertise".
+        let hub = new_hub();
+        let pending = new_pending();
+        let handles = new_handles();
+        let device_tools = new_device_tools();
+
+        let mut registry = ToolRegistry::new();
+        register(&mut registry, hub, pending, handles, device_tools);
+        let err = registry
+            .call(
+                "device_exec",
+                serde_json::json!({
+                    "device": "legacy",
+                    "tool": "anything",
+                    "args": {}
+                }),
+            )
+            .await
+            .expect_err("dispatch fails");
+        let msg = err.report().message;
+        assert!(!msg.contains("did not advertise"), "msg: {msg}");
+        assert!(msg.contains("not connected"), "msg: {msg}");
+    }
+}
+
 /// Reject using a handle bound to a different device (actionable: owning device
 /// + two remediation paths).
 fn check_handle(handles: &HashMap<String, String>, handle: &str, device: &str) -> Result<()> {
@@ -63,11 +178,18 @@ fn check_handle(handles: &HashMap<String, String>, handle: &str, device: &str) -
 }
 
 /// Register the `device_exec` routing tool.
-pub fn register(registry: &mut ToolRegistry, hub: Hub, pending: Pending, handles: Handles) {
+pub fn register(
+    registry: &mut ToolRegistry,
+    hub: Hub,
+    pending: Pending,
+    handles: Handles,
+    device_tools: DeviceTools,
+) {
     registry.register(Box::new(DeviceExec {
         hub,
         pending,
         handles,
+        device_tools,
     }));
 }
 
@@ -75,6 +197,11 @@ struct DeviceExec {
     hub: Hub,
     pending: Pending,
     handles: Handles,
+    /// The map of advertised on-device tool specs. When a device advertised at
+    /// Hello (most do; legacy/CLI sessions don't), we strict-check the tool
+    /// name against the list before bothering to dispatch — fail-fast beats a
+    /// 30-second timeout.
+    device_tools: DeviceTools,
 }
 
 #[async_trait]
@@ -109,6 +236,25 @@ impl Tool for DeviceExec {
         // Device-scoping: a supplied handle must belong to the target device.
         if let Some(handle) = args.get("handle").and_then(Value::as_str) {
             check_handle(&*self.handles.lock().await, handle, device)?;
+        }
+
+        // Strict tool name check against the device's advertised list — but
+        // only when the device actually advertised. A device that connected
+        // without `local_tools_json` (older fleetyd / interactive CLI) is
+        // treated as "any tool" so we don't break backward compatibility.
+        {
+            let specs = self.device_tools.lock().await;
+            if let Some(advertised) = specs.get(device) {
+                if !advertised.is_empty() && !advertised.iter().any(|s| s.name == tool) {
+                    let names: Vec<&str> =
+                        advertised.iter().map(|s| s.name.as_str()).collect();
+                    return Err(CoreError::Message(format!(
+                        "device '{device}' did not advertise tool '{tool}'. \
+                         Available on that device: {}",
+                        names.join(", ")
+                    )));
+                }
+            }
         }
 
         let call_id = uuid::Uuid::new_v4().to_string();

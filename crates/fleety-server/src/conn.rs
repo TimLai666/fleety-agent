@@ -597,6 +597,7 @@ pub(crate) fn build_full_registry(
         Arc::clone(hub),
         Arc::clone(pending),
         Arc::clone(handles),
+        Arc::clone(device_tools),
     );
     tools
 }
