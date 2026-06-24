@@ -15,6 +15,7 @@ mod builtin_skills;
 mod conn;
 mod gc;
 mod mdns;
+mod sidecar;
 
 /// Process-wide moment fleety-server started. Used by `fleety status` to
 /// compute uptime without threading a start-time through every connection.
@@ -73,6 +74,16 @@ fn build_provider() -> Arc<dyn ModelProvider> {
             let key = std::env::var("FLEETY_MODEL_KEY").ok();
             let stream = std::env::var("FLEETY_MODEL_STREAM").as_deref() == Ok("1");
             tracing::info!(%base_url, %model, stream, "using OpenAI-compatible provider");
+            if !looks_multimodal(&model) {
+                tracing::warn!(
+                    %model,
+                    "the configured model name doesn't match any known multimodal family — \
+                     image/audio/video attachments may be rejected or silently ignored by the \
+                     provider. If your model supports them, this is just a heuristic miss; \
+                     otherwise set FLEETY_MODEL to a multimodal one (e.g. gpt-4o, \
+                     claude-sonnet-4*, gemini-1.5-*)."
+                );
+            }
             Arc::new(OpenAiCompat::new(base_url, model, key).with_streaming(stream))
         }
         _ => {
@@ -80,6 +91,40 @@ fn build_provider() -> Arc<dyn ModelProvider> {
             Arc::new(EchoProvider)
         }
     }
+}
+
+/// Light heuristic for "this model name belongs to a family that handles
+/// images / audio / video". Used only for a startup warning — it's a hint, not
+/// a gate, so a miss is fine: the user can ignore the warning if they know
+/// their endpoint translates differently.
+fn looks_multimodal(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    // Known multimodal families. Best-effort: extend as new releases land.
+    const HINTS: &[&str] = &[
+        "gpt-4o",
+        "gpt-4-vision",
+        "gpt-4-turbo",
+        "gpt-5",
+        "o1",
+        "o3",
+        "claude-3",
+        "claude-sonnet-4",
+        "claude-opus-4",
+        "claude-haiku-4",
+        "claude-fable",
+        "gemini-1.5",
+        "gemini-2",
+        "gemini-pro-vision",
+        "llava",
+        "llama-3-vision",
+        "llama-3.2-vision",
+        "pixtral",
+        "qwen2-vl",
+        "qwen2.5-vl",
+        "molmo",
+        "internvl",
+    ];
+    HINTS.iter().any(|h| m.contains(h))
 }
 
 /// Approval policy from `FLEETY_POLICY` (`require_approval` → gate non-read

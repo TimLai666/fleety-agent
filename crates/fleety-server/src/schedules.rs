@@ -326,12 +326,17 @@ impl Tool for ScheduleList {
 
     async fn call(&self, _args: Value) -> Result<Value> {
         let mut schedules = Vec::new();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         match std::fs::read_dir(&self.dir) {
             Ok(entries) => {
                 for entry in entries.flatten() {
                     if entry.path().extension().and_then(|e| e.to_str()) == Some("json") {
                         if let Ok(text) = std::fs::read_to_string(entry.path()) {
-                            if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                            if let Ok(mut value) = serde_json::from_str::<Value>(&text) {
+                                annotate_next_fire(&mut value, now);
                                 schedules.push(value);
                             }
                         }
@@ -343,6 +348,59 @@ impl Tool for ScheduleList {
         }
         Ok(json!({ "schedules": schedules }))
     }
+}
+
+/// Annotate one schedule with `next_fire_secs` (unix) so `schedule_list`
+/// shows when each one is due. Best-effort: a fire time we can't compute is
+/// omitted entirely rather than guessed.
+fn annotate_next_fire(value: &mut Value, now: u64) {
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    let trigger = obj
+        .get("trigger")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let tz = obj
+        .get("tz")
+        .and_then(Value::as_str)
+        .unwrap_or("UTC")
+        .to_string();
+    let last_run = obj.get("last_run").and_then(Value::as_u64);
+    if let Some(next) = next_fire_secs(&trigger, &tz, last_run, now) {
+        obj.insert("next_fire_secs".to_string(), json!(next));
+    }
+}
+
+/// Predict the next firing time for a trigger, in unix seconds. None for
+/// triggers we can't compute (corrupt cron, `at:` already fired, …).
+fn next_fire_secs(spec: &str, tz: &str, last_run: Option<u64>, now: u64) -> Option<u64> {
+    let spec = spec.trim();
+    if let Some(rest) = spec.strip_prefix("at:") {
+        let t = parse_unix(rest).ok()?;
+        if last_run.is_some() {
+            return None; // `at:` already fired.
+        }
+        return Some(t.max(now));
+    }
+    if let Some(rest) = spec.strip_prefix("every:") {
+        let secs = parse_duration_secs(rest).ok()?;
+        let next = match last_run {
+            Some(l) => l.saturating_add(secs),
+            None => now,
+        };
+        return Some(next.max(now));
+    }
+    let cron_body = spec.strip_prefix("cron:").unwrap_or(spec).trim();
+    if cron_body.split_whitespace().count() == 5 {
+        let schedule = parse_cron_expr(cron_body).ok()?;
+        let zone = Tz::from_str(tz).unwrap_or(chrono_tz::UTC);
+        let now_dt = zone.timestamp_opt(now as i64, 0).single()?;
+        let next = schedule.after(&now_dt).next()?;
+        return Some(next.timestamp().max(0) as u64);
+    }
+    None
 }
 
 struct ScheduleDelete {
@@ -443,6 +501,33 @@ mod tests {
         assert!(validate_trigger("every:5x").is_err());
         assert!(validate_trigger("99 9 * * 1").is_err()); // syntactically invalid cron
         assert!(validate_trigger("garbage").is_err());
+    }
+
+    #[test]
+    fn next_fire_predicts_at_every_and_cron() {
+        // `at:` future fires once, past fires now (no last_run).
+        assert_eq!(next_fire_secs("at:2000", "UTC", None, 1000), Some(2000));
+        assert_eq!(next_fire_secs("at:500", "UTC", None, 1000), Some(1000));
+        assert_eq!(next_fire_secs("at:2000", "UTC", Some(1500), 1500), None);
+
+        // `every:` is last_run + dur, floored at now.
+        assert_eq!(
+            next_fire_secs("every:60", "UTC", Some(1000), 1500),
+            Some(1500)
+        );
+        assert_eq!(
+            next_fire_secs("every:60", "UTC", Some(1000), 1010),
+            Some(1060)
+        );
+
+        // Cron: 9am-Mon UTC next firing after a Sunday should be Monday 9am UTC.
+        // 2026-06-21 12:00 UTC (Sun) -> 2026-06-22 09:00 UTC (Mon) = 1_750_582_800.
+        let sunday_noon = 1_750_507_200; // 2026-06-21 12:00 UTC
+        let monday_9am = 1_750_582_800; // 2026-06-22 09:00 UTC
+        assert_eq!(
+            next_fire_secs("0 9 * * 1", "UTC", None, sunday_noon),
+            Some(monday_9am)
+        );
     }
 
     #[test]

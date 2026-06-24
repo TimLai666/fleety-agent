@@ -808,7 +808,7 @@ async fn status() -> Result<()> {
             uptime_secs,
             connected_devices,
             device_ids_json,
-            ..
+            extra_json,
         }) => {
             let ids: Vec<String> = serde_json::from_str(&device_ids_json).unwrap_or_default();
             println!("fleety-server");
@@ -817,6 +817,21 @@ async fn status() -> Result<()> {
             println!("  connected:      {connected_devices} device(s)");
             if !ids.is_empty() {
                 println!("  device ids:     {}", ids.join(", "));
+            }
+            if let Some(extra) = extra_json {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&extra) {
+                    if let Some(sidecars) = value.get("sidecars").and_then(|s| s.as_object()) {
+                        for (name, info) in sidecars {
+                            let status = info.get("status").and_then(|s| s.as_str()).unwrap_or("?");
+                            let suffix = info
+                                .get("path")
+                                .and_then(|p| p.as_str())
+                                .map(|p| format!(" ({p})"))
+                                .unwrap_or_default();
+                            println!("  {name:<14}  {status}{suffix}");
+                        }
+                    }
+                }
             }
         }
         Some(ServerMsg::Error { error }) => eprintln!("agent error: {}", error.message),

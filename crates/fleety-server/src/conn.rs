@@ -460,12 +460,26 @@ async fn serve(
                 let uptime_secs = crate::server_start().elapsed().as_secs();
                 let device_ids: Vec<String> = hub.lock().await.keys().cloned().collect();
                 let connected = device_ids.len() as u32;
+                // Sidecar health: report each known sidecar as "ok" if its
+                // binary is resolvable, "missing" otherwise. Best-effort — a
+                // false negative just makes the status look worse than it is.
+                let insyra_path = crate::sidecar::resolve_insyra();
+                let sidecars = serde_json::json!({
+                    "insyra": match &insyra_path {
+                        Some(p) => serde_json::json!({
+                            "status": "ok",
+                            "path": p.to_string_lossy(),
+                        }),
+                        None => serde_json::json!({ "status": "missing" }),
+                    }
+                });
+                let extra = serde_json::json!({ "sidecars": sidecars });
                 let reply = ServerMsg::ServerStatusResult {
                     version: agent_core::VERSION.to_string(),
                     uptime_secs,
                     connected_devices: connected,
                     device_ids_json: serde_json::to_string(&device_ids).unwrap_or("[]".into()),
-                    extra_json: None,
+                    extra_json: Some(extra.to_string()),
                 };
                 emit(out, &reply)?;
             }
