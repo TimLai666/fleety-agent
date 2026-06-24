@@ -1,223 +1,250 @@
 # Fleety Agent — Tool Surface (canonical)
 
-This is the source of truth for the tools the Fleety Agent (the LLM) may call. `prompts/protocol.md` describes how to use them in prose; this file fixes the **names, typed inputs, returns, and risk class**. When a name changes, change it here first, then sync `prompts/protocol.md` and the runtime. The runtime still exposes each tool's real JSON Schema at call time — that schema wins over this doc for argument shape.
+This is the source of truth for the tools the Fleety Agent (the LLM) may call.
+`prompts/protocol.md` describes how to use them in prose; this file fixes the
+**names, typed inputs, returns, and risk class**. When a name changes, change
+it here first, then sync `prompts/protocol.md` and the runtime. The runtime
+still exposes each tool's real JSON Schema at call time — that schema wins
+over this doc for argument shape.
+
+Last reviewed against `crates/` on 2026-06-24.
 
 ## Conventions
 
-- **Session.** Every tool except `harness` requires `session_id` (string), obtained from `harness`. A missing / stale / fabricated id is rejected before the tool runs.
-- **Targeting.** Device-scoped tools take two optional arguments:
-  - `device` (string) — device id / name / known alias. Empty = the **origin device** of the current conversation.
-  - `project` (string) — project id / name / absolute path on that device. Empty = the device's current working directory.
-  The runtime resolves the device to a concrete connector (session > daemon > ssh > http) and dispatches there. You do not pick the connector; you may read which one was used from the result.
+- **Targeting.** Tools that operate on a workspace ("workspace tools") run on
+  the **server's** `FLEETY_WORKSPACE`. Tools that operate on a device's local
+  filesystem (`device_exec`, `ssh_exec`) explicitly take a `device` argument.
 - **Risk class** (drives the access policy in `prompts/policy.md`):
   - `read` — no state change. Executes directly under any policy.
-  - `mutate` — changes state. Under `full_access` executes directly but is **audited + rollback-backed**. Under stricter policy returns `approval_required`.
-  - `critical` — irreversible / no rollback path. **Always requires explicit user confirmation**, even under `full_access`.
-- **Return envelope.** Every result carries at least: `ok` (bool), `status` (`"ok" | "approval_required" | "error" | "waiting_for_device"`), `device_id`, `connector`, and a tool-specific `data`. Mutating results also carry a `history_step_id` (the rollback handle). Never treat a result as success without checking `status`.
-- **Device-scoped handles.** Every handle a tool returns (tab id, pid, port, session, workspace ref, …) is bound to its `device_id` — there are no global handles. The runtime rejects using a handle against a different device; identical-looking ids on different devices are different things. Keep each handle paired with its device; never pass a bare handle. A cross-device rejection is **actionable**: it returns the handle's owning `device_id` and the remediation — re-issue against the owning device, or acquire a fresh handle on the device you actually meant. Errors in general state cause + how to proceed, not just "rejected".
-- **Approvals.** `approval_required` returns an `approval` record; re-call the same tool with `approval_id` set once the user approves. Never fabricate an `approval_id`.
+  - `mutate` — changes state. Under `full_access` executes directly but is
+    **audited + rollback-backed**. Under stricter policy returns
+    `approval_required`.
+  - `critical` — irreversible / no rollback path. **Always requires explicit
+    user confirmation**, even under `full_access`.
+- **Return envelope.** Tool results are JSON objects whose shape is described
+  per-tool. Errors come back as actionable messages with hints to retry / fix
+  arguments / acquire permissions, not as bare strings.
+- **Backups.** Every mutating workspace tool first writes the prior content to
+  `{home}/fleet/backups/<uuid>/` and returns a `backup.id` you can pass to
+  `rollback`. Diffs work on any device, not just git repos.
+- **Approvals.** Under `FLEETY_POLICY=require_approval`, mutating/critical
+  tools surface an `ApprovalRequested` over the WebSocket before running;
+  on `Deny` the agent gets a synthetic `tool_denied` result and continues.
+  See `prompts/policy.md` and `crates/agent-core/src/approval.rs`.
 
-## Orientation & discovery
+---
+
+## Workspace (server-side, rooted at `FLEETY_WORKSPACE`)
+
+Lives in `fleety-tools` so the same implementations run on fleetyd via
+`device_exec` (the daemon registers them locally and advertises the list).
 
 | Tool | Purpose | Key inputs | Risk |
 |---|---|---|---|
-| `harness` | Open a session; returns `session_id` + runtime/policy info. Call first. | — | read |
-| `device_list` | List known devices with status, roles, connectors. | `status?`, `tag?` | read |
-| `device_show` | Full record for one device: device.yaml, all `connectors[]` + each one's state and scope (`local`/`remote`), `mobility` (stationary/mobile/unknown), `site`, last_seen. | `device` | read |
-| `site_list` | List known sites (locations). | — | read |
+| `read_file` | Read a UTF-8 text file. | `path` | read |
+| `list_dir` | List a directory. | `path?` (default `.`) | read |
+| `search_files` | ripgrep over the workspace (respects `.gitignore`, skips binaries). | `query`, `path?`, `max_results?` | read |
+| `write_file` | Write a whole file (overwrite). Returns `backup` + unified `diff`. | `path`, `content` | mutate |
+| `edit_file` | Replace an exact, unique substring. Returns `backup` + `diff`. | `path`, `old`, `new` | mutate |
+| `delete_file` | Delete a file (backup first). | `path` | mutate |
+| `move_file` | Move / rename (backs up destination if it exists). | `from`, `to` | mutate |
+| `make_dir` | Create a directory (and any missing parents). | `path` | mutate |
+| `rollback` | Restore a file from a `backup_id` returned by a prior mutation. | `backup_id` | mutate |
+| `run_command` | Run one command in the workspace; returns `stdout`/`stderr`/`exit_code`. Pass `track: [paths]` to get a unified before/after diff of files it touched. The critical-command guard rejects irreversible shapes (wipe / mkfs / dd / `rm -rf /` / etc.). | `command`, `track?`, `timeout_secs?` | mutate, or **critical** when the critical-command guard matches |
+
+> Read before you rely; re-read before each edit (line numbers / content
+> shift). Mutations all back up first, so `rollback` is always available.
+
+## Git (read-only)
+
+| Tool | Purpose | Key inputs | Risk |
+|---|---|---|---|
+| `git_status` | Working-tree status. | — | read |
+| `git_diff` | Working-tree (or staged) diff; **includes untracked new files**. | `staged?`, `path?` | read |
+| `git_log` | Recent commit log. | `limit?` | read |
+| `git_show` | Show a commit / ref. | `ref` | read |
+
+## Web / HTTP / WebSocket / SSE
+
+Server-side egress (`fleety-server`'s network, not the target device).
+SSRF-guarded: only `http`/`https` (or `ws`/`wss` for `ws_call`), loopback /
+RFC1918 / IPv6 ULA / link-local refused unless `FLEETY_ALLOW_PRIVATE_NET=1`.
+
+| Tool | Purpose | Key inputs | Risk |
+|---|---|---|---|
+| `fetch_url` | Simple HTTP GET; returns `status`, `content_type`, `body`, `truncated`. | `url`, `max_bytes?` | read |
+| `http_request` | Any of GET/POST/PUT/PATCH/DELETE/HEAD. Supports per-call `timeout_secs`, `follow_redirects` (default 0), `verify_tls`, `headers`, `body` **xor** `multipart { fields[], files[] }`, `retry { max, backoff_ms, on_status }`, `cookie_jar` (persistent named jar), `stream_to_file` (workspace path → returns size + sha256 instead of body). | `method`, `url`, plus the knobs above | mutate |
+| `ws_call` | One-shot WebSocket: handshake → send N text frames → receive up to `max_frames` (deadlined) → close. Shares the cookie jar with HTTP via the `http://` equivalent origin. | `url`, `send?`, `max_frames?`, `timeout_secs?`, `headers?`, `cookie_jar?` | mutate |
+| `sse_stream` | Subscribe to a `text/event-stream` endpoint. Returns up to `max_events` events inline, or `stream_to_file` writes each event as one JSONL record. | `url`, `max_events?`, `timeout_secs?`, `headers?`, `cookie_jar?`, `verify_tls?`, `stream_to_file?` | read |
+
+> Multipart files are read from the workspace (path-escape guard). Cookies
+> persist under `{FLEETY_AGENT_HOME}/fleet/cookies/<name>.json` and survive
+> across calls — pass the same `cookie_jar: "session1"` to keep an OAuth /
+> session-bound API logged in.
+
+## SSH
+
+| Tool | Purpose | Key inputs | Risk |
+|---|---|---|---|
+| `ssh_exec` | Run a command on a remote host over SSH. The target is built defensively (no option injection in `host`); batch-mode only (no interactive password). | `host`, `command`, `port?`, `user?`, `identity_file?`, `timeout_secs?` | mutate (critical for irreversible commands) |
+
+## Browser (CDP)
+
+Drives a real Chrome via the DevTools Protocol. Set `FLEETY_CHROME_URL` to the
+DevTools endpoint (e.g. `http://localhost:9222`). Each `browser_open` returns
+a `session` id; subsequent ops take that id.
+
+| Tool | Purpose | Key inputs | Risk |
+|---|---|---|---|
+| `browser_open` | Open a new browser tab; returns `session`. | `url?` | mutate |
+| `browser_navigate` | Navigate an existing session. | `session`, `url` | mutate |
+| `browser_eval` | Evaluate JS in the page; returns the value. | `session`, `expression` | mutate (critical when the JS posts / sends / deletes) |
+| `browser_screenshot` | PNG screenshot. | `session` | read |
+| `browser_close` | Close a session. | `session` | mutate |
+
+## Insyra (data analysis DSL)
+
+| Tool | Purpose | Key inputs | Risk |
+|---|---|---|---|
+| `insyra_exec` | Run the Insyra `.isr` DSL — load CSV/Parquet/Excel/SQL, transform, stats, plot. Stateful per `session`; `save <var> <file>` writes results into the workspace; `reset: true` clears the session. | `command` \| `script`, `session?`, `reset?` | mutate |
+
+> Backed by the `fleety-insyra` Go sidecar that wraps Insyra's `engine/dsl`,
+> kept alive per session, with named environments persisted under
+> `<root>/.insyra`. Load the built-in `use-insyra-cli` skill for the full
+> `.isr` DSL command reference. Resolved via `FLEETY_INSYRA_BIN` → beside the
+> exe → `PATH`. fleetyd auto-provisions it on `install` / `update`.
+
+## Agent memory
+
+| Tool | Purpose | Key inputs | Risk |
+|---|---|---|---|
+| `memory_read` | Read a memory file. With `device`: that device's memory (`NOTES.md`); without: an agent-level core file (`ME.md` / `USER.md` / `TODO.md` / `TOOLS.md`). | `device?`, `file` | read |
+| `memory_write` | Update a memory file (replace). | `device?`, `file`, `content` | mutate |
+
+> The core files `ME.md` / `USER.md` / `TODO.md` are auto-injected into the
+> system prompt every turn. Use `memory_write` to record what you learn —
+> memory you never update rots into lies.
+
+## Audit log
+
+The full audit lives in `{home}/fleet/devices/<id>/history.jsonl` with
+`ts_secs` per line; CLI surfaces are `fleety audit list` / `fleety audit show`
+and `fleety rollback list` / `fleety rollback apply`.
+
+| Tool | Purpose | Key inputs | Risk |
+|---|---|---|---|
+| `history_list` | List recent audit entries for this device. | `limit?` (default 20) | read |
+
+## Devices & sites
+
+The device registry tracks each connected device's record (`device.json` +
+`NOTES.md`) and its **site** (location). `pair_create` is the enrollment seam
+the agent uses to onboard a new device.
+
+| Tool | Purpose | Key inputs | Risk |
+|---|---|---|---|
+| `device_list` | List registered devices and their records. | — | read |
+| `device_show` | One device's record + NOTES + **advertised tools** (what `device_exec` can call there). | `device` | read |
+| `device_set_site` | Assign a device to a site (or `away` / `unknown`). | `device`, `site` | mutate |
+| `device_set_mobility` | Mark `stationary` / `mobile` / `unknown`. | `device`, `mobility` | mutate |
+| `device_exec` | Run a tool on a connected device by id (routes a `RunTool` frame to that daemon, awaits the reply). **Strict**-checks `tool` against the device's advertised list when the device advertised; legacy devices that didn't advertise are not strict-checked. | `device`, `tool`, `args?`, `handle?` | mutate |
+| `pair_create` | Mint a short-lived pairing code (10 min) so a new device can enroll. | — | mutate |
+| `site_list` | List known sites. | — | read |
 | `site_show` | A site plus the devices located there. | `site` | read |
-| `site_set` | Create/update a site (location). | `id`, `name?`, `description?` | mutate |
-| `site_delete` | Delete a site (leaves device records). | `id` | mutate |
-| `device_set_site` | Set a device's current site (a registered id, or `away`/`unknown` for a mobile/in-transit device). | `device`, `site` | mutate |
-| `device_set_mobility` | Mark a device `stationary` / `mobile` / `unknown`. | `device`, `mobility` | mutate |
-| `project_list` | List registered projects/workspaces (optionally for one device). | `device?` | read |
-| `project_current` | Resolve which workspace a `device`/`project` points at. | `device?`, `project?` | read |
-| `list_skills` | List available skills + metadata. | — | read |
-| `mcp_list` | List configured external MCP servers (`probe:true` to connect + list tools). | `probe?` | read |
-| `approval_list` | Pending approval records for this session. | — | read |
+| `site_set` | Create/update a site. | `id`, `name?`, `description?` | mutate |
+| `site_delete` | Delete a site (device records unchanged). | `id` | mutate |
 
-## Device memory & capability
+> Device-scoped handles: anything `device_exec` hands back (a session, a PID,
+> a handle) is bound to its device. The runtime rejects using a handle against
+> a different device. Re-issue against the owning device, or get a fresh
+> handle on the one you actually meant.
 
-| Tool | Purpose | Key inputs | Risk |
-|---|---|---|---|
-| `memory_read` | Read a memory file. With `device`: that device's memory (NOTES.md, facts.json, capabilities.yaml, links.yaml, resources.yaml, history.jsonl). Without `device`: an agent-level core file (`ME.md`/`USER.md`/`TODO.md`/`TOOLS.md`). | `device?`, `file` | read |
-| `memory_write` | Update a memory file (append/replace). With `device`: device memory (Agent-side; does not touch the remote device). Without `device`: an agent-level core file. | `device?`, `file`, `content`, `mode?` | mutate |
-| `capability_list` | The device's known capability index with status (available / unavailable / unknown / stale / blocked). | `device` | read |
-| `capability_probe` | Run a discovery probe and update facts/capabilities. `mode` selects intrusiveness. | `device`, `capability?`, `mode` (`passive`\|`active`\|`acquire`) | `passive`/`active`: read · `acquire`: mutate |
+## Schedules (self-managed cron)
 
-> `capability_probe mode:acquire` (install a tool, pull a binary, spin a temp container) is a state change and is audited like any mutate. `passive`/`active` only observe.
-
-## Conversation recall (v0.1+)
-
-Cross-conversation memory. Within a conversation the event stream is replayed on reconnect (always on); these tools recall *past* conversations. See `docs/spec-v0.md` §5.1. (Agent-level core memory — `ME.md`/`USER.md`/`TODO.md`/`TOOLS.md` — is read/written via `memory_read`/`memory_write` with no `device`; `ME.md`/`USER.md`/`TODO.md` are auto-injected each turn — see §5.2.)
+The agent creates and manages its own schedules. They persist on the server
+and fire even with no CLI connected; a fired job spawns an agent run with the
+stored prompt under `RequireApproval` + `MandateGate` (only `allowed_tools`
+are usable). See `crates/fleety-server/src/scheduler.rs`.
 
 | Tool | Purpose | Key inputs | Risk |
 |---|---|---|---|
-| `conversation_list` | List past conversations (device-scoped by default). | `device?`, `limit?` | read |
-| `conversation_search` | Search past conversations / their summaries. | `query`, `device?` | read |
-| `conversation_read` | Read a past conversation or its summary. | `conversation_id` | read |
-
-## Workspace (device-scoped, dispatched over the connector)
-
-| Tool | Purpose | Key inputs | Risk |
-|---|---|---|---|
-| `workspace_list_files` | List a directory on the target device. | `device?`, `project?`, `path?` | read |
-| `workspace_read_file` | Read a file; returns `numbered_content` (1-based, cat -n). | `device?`, `project?`, `path` | read |
-| `workspace_search` | Search file contents on the target device. | `device?`, `project?`, `query`, `glob?` | read |
-| `workspace_write_file` | Write a whole file (new / small files). | `device?`, `project?`, `path`, `content` | mutate |
-| `workspace_apply_patch` | Apply a multi-hunk patch. | `device?`, `project?`, `patch` | mutate |
-| `workspace_replace_lines` | Replace inclusive 1-based `start_line`..`end_line` with `content` (insert: `end_line = start_line - 1`). | `device?`, `project?`, `path`, `start_line`, `end_line`, `content` | mutate |
-| `workspace_delete_file` | Delete a file; backs up first so it can be restored. | `device?`, `project?`, `path` | mutate |
-| `workspace_move_file` | Move/rename a file (backs up the destination if it exists). | `device?`, `project?`, `from`, `to` | mutate |
-| `workspace_make_dir` | Create a directory (and missing parents). | `device?`, `project?`, `path` | mutate |
-| `workspace_rollback` | Restore a file from a backup id returned by a previous write/edit/delete/move. | `device?`, `project?`, `backup_id` | mutate |
-
-> Read before you rely; re-read before each line-range edit (line numbers shift). Every mutation (write/edit/delete/move) first backs up the prior content to `.fleety-backups/` and returns a `backup` id plus a **unified diff** of the change — restore with `workspace_rollback`. Diffs work on any device, not just git repos.
-
-## Terminal
-
-| Tool | Purpose | Key inputs | Risk |
-|---|---|---|---|
-| `terminal_run` | Run one command on the target device; returns stdout/stderr/exit code. File changes it causes are recorded as history steps. Pass `track` (paths) to get a before/after unified diff of files the command changed (sed, builds, redirects). | `device?`, `project?`, `command`, `cwd?`, `timeout?`, `track?` | mutate, or **critical** if the command is irreversible (wipe/mkfs/dd/HOME delete/ssh-config/key-rotate/firewall/remote-only reboot) |
-
-> The runtime classifies obviously-destructive commands as `critical` and blocks them pending confirmation. Do not try to disguise such a command to bypass the gate.
-
-## Git
-
-| Tool | Purpose | Key inputs | Risk |
-|---|---|---|---|
-| `git_status` | Working-tree status on the target device. | `device?`, `project?` | read |
-| `git_diff` | Diff (optionally staged / a path); also lists untracked new files. | `device?`, `project?`, `path?`, `staged?` | read |
-| `git_log` | Commit log. | `device?`, `project?`, `limit?` | read |
-| `git_show` | Show a commit / object. | `device?`, `project?`, `ref` | read |
-
-## Web / HTTP
-
-General HTTP client for talking to public APIs. **Server-side**: requests
-egress from `fleety-server`, not the target device — `device?` does not apply.
-
-| Tool | Purpose | Key inputs | Risk |
-|---|---|---|---|
-| `fetch_url` | HTTP GET a public URL; returns `status`, `headers`, `body` (text). The simple read-only path. | `url`, `max_bytes?` | read |
-| `http_request` | Any of `GET`/`POST`/`PUT`/`PATCH`/`DELETE`/`HEAD` against a public URL with optional headers + body string. | `method`, `url`, `headers?`, `body?`, `max_bytes?` | mutate |
-
-> **SSRF guard.** Requests to loopback (`127.0.0.1`, `::1`) and RFC1918
-> private ranges (`10/8`, `172.16/12`, `192.168/16`, plus IPv6 ULA /
-> link-local) are rejected with an actionable error so an external prompt
-> can't turn the agent into a jump host onto the internal network. Set
-> `FLEETY_ALLOW_PRIVATE_NET=1` to disable the guard when you truly need
-> internal-network access (see [`docs/env.md`](env.md)).
->
-> **Limits.**
->
-> - Only `http://` and `https://` schemes are accepted (no `file://`,
->   `gs://`, `ftp://`, etc.). Other schemes are rejected.
-> - **No streaming response.** The body is read into memory and returned in
->   one shot. `max_bytes` caps it and adds a `truncated: true` flag rather
->   than failing — large file fetches that need to stay on disk are not
->   currently supported.
-> - **No multipart / form-data helper.** To upload a file, set
->   `Content-Type: multipart/form-data; boundary=...` yourself and assemble
->   the body string; `body` is a plain UTF-8 string, so binary uploads need
->   to be encoded (e.g. base64 inside a JSON body) or done via a different
->   transport.
-> - **No cookie jar or session.** Each request is independent; for OAuth /
->   session-bound APIs the agent has to thread the cookie / token through
->   `headers` on every call.
-> - **No per-call redirect / timeout / TLS knobs.** Redirect handling uses
->   reqwest's default (up to 10 hops), timeout is the runtime default, and
->   TLS verification is on. None are configurable per-call.
-> - **No retry logic.** Transient 5xx / network errors come straight back to
->   the agent; retrying is the agent's call.
-> - **No HTTP/2 push, WebSockets, or SSE.** Each call is a single
->   request/response.
-
-## Project registry
-
-| Tool | Purpose | Key inputs | Risk |
-|---|---|---|---|
-| `project_add` | Register an existing directory the device can see. | `device?`, `path`, `name?` | mutate |
-| `project_create` | Create an empty persistent managed workspace. | `device?`, `name` | mutate |
-| `project_clone` | `git clone` into a persistent managed workspace. | `device?`, `url`, `name?` | mutate |
-
-## Data analysis (Insyra DSL)
-
-| Tool | Purpose | Key inputs | Risk |
-|---|---|---|---|
-| `insyra_exec` | Run the Insyra `.isr` DSL — load CSV/Parquet/Excel/SQL, transform (filter/groupby/scale/encode), stats (mean/describe/ttest/anova/regression/kmeans), plot. Stateful per `session`; `save <var> <file>` writes results into the workspace. | `device?`, `command` \| `script`, `session?`, `reset?` | mutate |
-
-> Backed by the `fleety-insyra` sidecar (a Go process wrapping Insyra's `engine/dsl`), kept alive per workspace; DSL sessions keep their variables/data across calls, and named environments persist on disk under `<root>/.insyra`. Load the built-in `use-insyra-cli` skill (vendored from upstream, refreshed to the shipped Insyra version at release) for the full `.isr` DSL command reference. The sidecar ships with the server (install script + Docker image) and is provisioned onto devices by `fleetyd install`/`update`; the binary is resolved via `FLEETY_INSYRA_BIN`, then beside the executable, then `PATH`.
+| `schedule_create` | Create a schedule. `trigger` is one of `at:<unix>` / `every:<30s\|5m\|2h\|1d\|n>` / a 5-field cron (`cron:<expr>` prefix optional). `tz` is an IANA name (default UTC); cron is evaluated in that zone. `allowed_tools` is the strict mandate enforced at fire time — anything else is denied. | `trigger`, `prompt`, `tz?`, `mandate?`, `allowed_tools?` | mutate |
+| `schedule_list` | List the agent's schedules with `next_fire_secs` annotated per record. | — | read |
+| `schedule_delete` | Remove a schedule by id. | `id` | mutate |
 
 ## Skills
 
 | Tool | Purpose | Key inputs | Risk |
 |---|---|---|---|
-| `use_skill` | Return a skill's `SKILL.md` and mark it active for the session (hot-reload: call again for the current version). | `skill` | read |
+| `list_skills` | List available skills (`SKILL.md` packs) — built-in + user-installed. | — | read |
+| `use_skill` | Load a skill's instructions; follow them for the current task. | `name` | read |
 
 ## External MCP
 
-| Tool | Purpose | Key inputs | Risk |
-|---|---|---|---|
-| `mcp_call` | Call a tool on a configured MCP server; arguments validated against that tool's schema. | `server`, `tool`, `arguments` | depends on target tool; untrusted server → `mutate`/`critical` per policy |
-| `mcp_add` | Register an MCP server (hot-reloaded). | `name`, `command`, `args?`, `env?` | mutate |
-| `mcp_remove` | Remove an MCP server. | `name` | mutate |
-
-## Knowledge wiki (post-v0)
-
-The agent's long-term Obsidian-format knowledge vault — its second brain, separate from per-device memory and workspaces. All tools write only into the vault; the runtime enforces location and conventions (see `docs/spec-v0.md` §14).
+User-installed MCP servers shadow built-ins of the same name. `mcp_call`
+spawns the named server over stdio JSON-RPC, completes one `tools/call`, then
+kills it (single-shot, 30 s timeout).
 
 | Tool | Purpose | Key inputs | Risk |
 |---|---|---|---|
-| `wiki_search` | Search the vault (orient / dedup before writing). | `query` | read |
-| `wiki_read` | Read a page (or `index.md` / `SCHEMA.md` / `log.md`). | `path` | read |
-| `wiki_write` | Create or update a page; maintains frontmatter, `[[wikilinks]]`, index and log. | `path`, `content`, `frontmatter` | mutate |
-| `wiki_list` | List pages by type. | `type?` | read |
-| `wiki_lint` | Surface orphans, broken links, stale/contradictory/index issues. | — | read |
+| `mcp_list` | List configured MCP servers; each entry carries `source: "builtin" \| "installed"`. | — | read |
+| `mcp_add` | Add (or replace) a **user-installed** server. Shadows a built-in of the same name. | `name`, `command`, `args?` | mutate |
+| `mcp_remove` | Remove a user-installed server. Built-in servers cannot be removed. | `name` | mutate |
+| `mcp_call` | Call a tool on a configured MCP server. | `server`, `tool`, `arguments?` | mutate |
 
-## Browser (skill-provided, post-v0)
+## Knowledge wiki
 
-Drive a chosen device's own Chrome via CDP — the CDP control runs locally on the target device, only high-level intents cross the connector (see `docs/spec-v0.md` §12). Delivered by a browser skill, not core runtime.
+The agent's long-term Obsidian vault under `{home}/wiki/`. Separate from
+per-device memory and per-conversation history.
 
 | Tool | Purpose | Key inputs | Risk |
 |---|---|---|---|
-| `browser` | Operate a browser session on a device. One tool, many actions. snapshot-ref based acting (not CSS selectors). | `device?`, `profile` (`managed`/`user`), `action` (`snapshot`/`screenshot`/`act`/`navigate`/`open`/`tabs`/`wait`/`evaluate`/`dialog`/`status`), action args | read for snapshot/screenshot/status; mutate for navigate/act/evaluate; **critical** for acts that send/pay/post/delete in a logged-in (`user`) profile. `user` profile attach is co-location/approval gated. |
+| `wiki_search` | Search the vault. | `query` | read |
+| `wiki_read` | Read a page. | `path` | read |
+| `wiki_list` | List pages. | — | read |
+| `wiki_write` | Create or update a page (frontmatter + `[[wikilinks]]` preserved). | `path`, `content`, `frontmatter?` | mutate |
 
-## Computer-use (built-in MCP, post-v0)
+## CLI-only surfaces (not invokable by the agent)
 
-Control a device's desktop (screen / mouse / keyboard) via the built-in `computer-use-mcp`, which runs on that device. Called through `mcp_call` dispatched to the device; handles are device-scoped. See `docs/spec-v0.md` §13.
+These are not tools the LLM picks — they're operator commands. Listed here
+so the surface is complete.
 
-| Action | Purpose | Risk |
+| CLI | Purpose |
+|---|---|
+| `fleety init <url>` | Save the agent URL into `~/.fleety/config.json`. |
+| `fleety pair <code>` | Enroll this device with a code minted by `pair_create` somewhere else. |
+| `fleety ask "..."` | One-shot conversation. Multimodal: `--image PATH`, `--audio PATH`, `--video PATH`, `--file PATH` (read once, base64-encoded, attached). |
+| `fleety tui` | Interactive multi-pane TUI. **Ctrl+V** pastes a clipboard image (re-encoded to PNG) or a single-line file path as an attachment; **Ctrl+X** clears staged attachments. |
+| `fleety resume <conv> [after_seq]` | Replay a conversation. |
+| `fleety status` | Version, uptime, connected devices, sidecar health (insyra binary path / missing). |
+| `fleety audit list [N]` / `fleety audit show <i>` | Browse the audit log; `5m ago` relative time. |
+| `fleety rollback list` / `fleety rollback apply <id>` | Inspect and restore backups. |
+
+## Built-in MCP / sidecars
+
+| Sidecar | Owns | Provisioned by |
 |---|---|---|
-| `screenshot` | See what a device is doing. | read — **exempt from frequency limits**, fine even while the user is active |
-| `click` / `type` / `move` / `scroll` / `key` | Drive the desktop UI. | mutate, **intrusive** — hijacks the user's input; use sparingly, prefer API/MCP > browser(CDP) > computer-use; **if the user is active on that device, warn first**; destructive desktop actions are `critical` |
-
-## Scheduling (self-managed cron)
-
-The agent creates and manages its own schedules. Schedules persist on the Server and fire even with no CLI connected; a fired job spawns an agent run with the stored prompt + context. Unattended runs follow the policy in `prompts/policy.md` (critical actions are parked, not executed). See `docs/spec-v0.md` §10.2.
-
-| Tool | Purpose | Key inputs | Risk |
-|---|---|---|---|
-| `schedule_create` | Create a schedule. `mandate` = the concrete authorized actions (incl. critical) **inferred from the user's request** at creation, recorded explicitly; fire-time enforcement matches it strictly. | `trigger` (`{cron}`/`{at}`/`{every}`), `prompt`, `mandate`, `context?` (device/project/conversation binding), `label?` | mutate |
-| `schedule_list` | List schedules with next/last run. | `enabled?` | read |
-| `schedule_show` | One schedule + run history. | `schedule_id` | read |
-| `schedule_update` | Enable/disable or modify a schedule. | `schedule_id`, fields to change | mutate |
-| `schedule_delete` | Remove a schedule. | `schedule_id` | mutate |
-
-## History & audit / rollback
-
-| Tool | Purpose | Key inputs | Risk |
-|---|---|---|---|
-| `history_list` | Recent history steps; filter by device/project/session. | `device_id?`, `project_id?`, `session_id?` | read |
-| `history_show` | One step + its before/after diff. | `step_id` | read |
-| `history_restore_preview` | Preview the diff a restore would apply (no change). | `step_id` | read |
-| `history_restore` | Restore a workspace to a recorded version. | `step_id` | mutate (critical if the rollback itself is irreversible in context) |
+| `fleety-insyra` (Go) | `insyra_exec` over NDJSON | `fleetyd install` / `fleetyd update` |
+| `use-insyra-cli` (built-in skill, shipped in-binary) | DSL reference for `insyra_exec` | `builtin_skills::seed` at server boot |
 
 ## Risk class → policy (summary)
 
-| Class | `full_access` (default) | stricter policy |
+| Class | `full_access` (default) | `require_approval` |
 |---|---|---|
 | `read` | direct | direct |
-| `mutate` | direct, audited + rollback-backed (`history_step_id`) | `approval_required` → re-call with `approval_id` |
+| `mutate` | direct, audited + rollback-backed | `ApprovalRequested` → re-call after `Approve` |
 | `critical` | **blocked pending explicit user confirmation** | blocked pending explicit user confirmation |
 
-Cross-device tasks add their own gates regardless of class: lock single-owner resources (serial / GPU / USB / container / workspace) before use, unlock after, honor timeouts, and clean up executor scratch on completion (see `prompts/protocol.md` → Cross-Device Tasks).
+The same gate fires for scheduled (unattended) turns via `MandateGate`: only
+`allowed_tools` named at schedule creation can run; everything else is denied.
+Denials are recorded in the audit as `tool_denied` with the real tool name —
+see `fleety audit list`.
+
+## Planned (not yet shipped)
+
+The earlier draft of this file listed `harness`, `capability_probe`,
+`conversation_list/search/read`, `project_*`, `workspace_*` aliases, the
+`computer-use-mcp` plane, and built-in `browser` skill action vocabulary.
+Those are still planned but not in the runtime today; see `docs/spec-v0.md`
+for scope and `docs/roadmap.md` for next-up implementation plans. When they
+land, they belong in this file in the corresponding section.
