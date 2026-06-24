@@ -49,6 +49,20 @@ pub struct Expected {
     pub workspace_files_absent: Vec<String>,
 }
 
+/// Optional attachments the user "sends" with the message. Mirrors the
+/// `agent-core::Attachment` shape; for golden purposes a tiny base64 stub is
+/// enough to verify the loop accepts the multimodal envelope without crashing.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GoldenAttachment {
+    pub mime: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_b64: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
 /// One full golden record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Golden {
@@ -60,6 +74,11 @@ pub struct Golden {
     pub workspace_files: BTreeMap<String, String>,
     /// The user message that drives the loop.
     pub user_input: String,
+    /// Optional attachments riding along with the user message — for
+    /// regression-testing the multimodal path (the MockProvider doesn't *see*
+    /// them, but the loop must accept and persist them without crashing).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub user_attachments: Vec<GoldenAttachment>,
     /// Optional system prompt prepended to the conversation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,

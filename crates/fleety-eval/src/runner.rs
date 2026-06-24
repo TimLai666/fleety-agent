@@ -6,8 +6,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use agent_core::{
-    run_turn, AutoApprove, Event, LoopConfig, Message, MockProvider, ModelResponse, Policy,
-    ToolCall, ToolRegistry,
+    run_turn, Attachment, AutoApprove, Event, LoopConfig, Message, MockProvider, ModelResponse,
+    Policy, ToolCall, ToolRegistry,
 };
 use serde::Serialize;
 
@@ -65,7 +65,24 @@ pub async fn run_one(golden: &Golden) -> Verdict {
     if let Some(prompt) = &golden.system_prompt {
         messages.push(Message::system(prompt.clone()));
     }
-    messages.push(Message::user(golden.user_input.clone()));
+    if golden.user_attachments.is_empty() {
+        messages.push(Message::user(golden.user_input.clone()));
+    } else {
+        let attachments: Vec<Attachment> = golden
+            .user_attachments
+            .iter()
+            .map(|a| Attachment {
+                mime: a.mime.clone(),
+                bytes_b64: a.bytes_b64.clone(),
+                url: a.url.clone(),
+                name: a.name.clone(),
+            })
+            .collect();
+        messages.push(Message::user_with_attachments(
+            golden.user_input.clone(),
+            attachments,
+        ));
+    }
 
     let mut events = agent_core::EventLog::new();
     let mut gate = AutoApprove;
