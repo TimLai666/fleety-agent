@@ -91,6 +91,47 @@ Cross-conversation memory. Within a conversation the event stream is replayed on
 | `git_log` | Commit log. | `device?`, `project?`, `limit?` | read |
 | `git_show` | Show a commit / object. | `device?`, `project?`, `ref` | read |
 
+## Web / HTTP
+
+General HTTP client for talking to public APIs. **Server-side**: requests
+egress from `fleety-server`, not the target device — `device?` does not apply.
+
+| Tool | Purpose | Key inputs | Risk |
+|---|---|---|---|
+| `fetch_url` | HTTP GET a public URL; returns `status`, `headers`, `body` (text). The simple read-only path. | `url`, `max_bytes?` | read |
+| `http_request` | Any of `GET`/`POST`/`PUT`/`PATCH`/`DELETE`/`HEAD` against a public URL with optional headers + body string. | `method`, `url`, `headers?`, `body?`, `max_bytes?` | mutate |
+
+> **SSRF guard.** Requests to loopback (`127.0.0.1`, `::1`) and RFC1918
+> private ranges (`10/8`, `172.16/12`, `192.168/16`, plus IPv6 ULA /
+> link-local) are rejected with an actionable error so an external prompt
+> can't turn the agent into a jump host onto the internal network. Set
+> `FLEETY_ALLOW_PRIVATE_NET=1` to disable the guard when you truly need
+> internal-network access (see [`docs/env.md`](env.md)).
+>
+> **Limits.**
+>
+> - Only `http://` and `https://` schemes are accepted (no `file://`,
+>   `gs://`, `ftp://`, etc.). Other schemes are rejected.
+> - **No streaming response.** The body is read into memory and returned in
+>   one shot. `max_bytes` caps it and adds a `truncated: true` flag rather
+>   than failing — large file fetches that need to stay on disk are not
+>   currently supported.
+> - **No multipart / form-data helper.** To upload a file, set
+>   `Content-Type: multipart/form-data; boundary=...` yourself and assemble
+>   the body string; `body` is a plain UTF-8 string, so binary uploads need
+>   to be encoded (e.g. base64 inside a JSON body) or done via a different
+>   transport.
+> - **No cookie jar or session.** Each request is independent; for OAuth /
+>   session-bound APIs the agent has to thread the cookie / token through
+>   `headers` on every call.
+> - **No per-call redirect / timeout / TLS knobs.** Redirect handling uses
+>   reqwest's default (up to 10 hops), timeout is the runtime default, and
+>   TLS verification is on. None are configurable per-call.
+> - **No retry logic.** Transient 5xx / network errors come straight back to
+>   the agent; retrying is the agent's call.
+> - **No HTTP/2 push, WebSockets, or SSE.** Each call is a single
+>   request/response.
+
 ## Project registry
 
 | Tool | Purpose | Key inputs | Risk |
