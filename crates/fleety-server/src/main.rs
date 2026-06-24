@@ -16,6 +16,8 @@ mod conn;
 mod gc;
 mod mdns;
 mod sidecar;
+mod sse;
+mod websocket;
 
 /// Process-wide moment fleety-server started. Used by `fleety status` to
 /// compute uptime without threading a start-time through every connection.

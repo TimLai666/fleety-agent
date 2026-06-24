@@ -247,6 +247,13 @@ impl Storage {
     }
 
     /// The knowledge wiki vault (Obsidian-style markdown), separate from workspaces.
+    /// Persistent cookie jars used by `http_request` / `ws_call` / `sse_stream`
+    /// when the agent passes a `cookie_jar: <name>` to keep a session-bound
+    /// API logged in across calls. Each jar is a single JSON file under here.
+    pub fn cookies_dir(&self) -> PathBuf {
+        self.home.join("fleet").join("cookies")
+    }
+
     pub fn wiki_dir(&self) -> PathBuf {
         self.home.join("wiki")
     }
