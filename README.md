@@ -121,16 +121,23 @@ cargo run -p fleety-cli -- tui        # or: ask "hello"  /  resume <conversation
 cargo run -p fleety-daemon            # fleetyd install → autostart; fleetyd update → self-update
 ```
 
-Useful env vars: `FLEETY_MODEL_BASE_URL` / `FLEETY_MODEL` / `FLEETY_MODEL_KEY`
+Common env vars: `FLEETY_MODEL_BASE_URL` / `FLEETY_MODEL` / `FLEETY_MODEL_KEY`
 (+ `FLEETY_MODEL_STREAM=1`), `FLEETY_POLICY=require_approval` (gate non-read
-tools), `FLEETY_ADDR`, `FLEETY_WORKSPACE`, `FLEETY_AGENT_HOME`, `FLEETY_DEVICE_ROOT`,
-`FLEETY_CHROME_URL`.
+tools), `FLEETY_ADDR`, `FLEETY_WORKSPACE`, `FLEETY_AGENT_HOME`.
+
+See [`docs/env.md`](docs/env.md) for the **full reference** — every
+`FLEETY_*` variable the runtime reads, grouped by binary (server, daemon,
+sidecars, CLI). Includes mDNS discovery, retention / GC, self-update
+polling, and on-device tool routing.
 
 ## Design docs
 
 - [`docs/spec-v0.md`](docs/spec-v0.md) — v0 scope, architecture, milestones M0–M11
 - [`docs/STATUS.md`](docs/STATUS.md) — what's implemented vs. remaining (current status)
 - [`docs/tools.md`](docs/tools.md) — agent tool surface
+- [`docs/env.md`](docs/env.md) — every `FLEETY_*` environment variable
+- [`docs/eval.md`](docs/eval.md) — offline golden-conversation harness
+- [`docs/roadmap.md`](docs/roadmap.md) — open gaps + implementation plans
 - [`prompts/`](prompts/) — protocol / memory / policy / rules (the agent system prompt)
 
 ## License

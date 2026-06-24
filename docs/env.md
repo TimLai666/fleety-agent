@@ -1,0 +1,94 @@
+# Fleety environment variables
+
+The complete reference for every `FLEETY_*` variable the runtime reads.
+Grouped by which binary cares about it. Anything unset uses the default.
+
+## Server (`fleety-server`)
+
+| Var | Default | Meaning |
+|---|---|---|
+| `FLEETY_ADDR` | `127.0.0.1:8787` | WebSocket listen address. Bind `0.0.0.0:8787` to expose on the LAN. |
+| `FLEETY_AGENT_HOME` | `$HOME/.fleety/agent` | Durable store root: conversations, history, backups, skills, MCP config, schedules, wiki. |
+| `FLEETY_WORKSPACE` | cwd | Directory the workspace tools (`read_file`/`write_file`/etc.) operate within. |
+| `FLEETY_POLICY` | `full_access` | `require_approval` gates every non-read tool through the approval flow. |
+| `FLEETY_REQUIRE_AUTH` | `0` | Set to `1` to require a valid token / pairing code on every `Hello`. |
+| `FLEETY_TOKEN` | (unset) | Bootstrap admin token. Use it once to pair the first device. |
+| `FLEETY_SCHED_TICK` | `60` | Seconds between scheduler fire-loop ticks. |
+
+## Model provider
+
+| Var | Default | Meaning |
+|---|---|---|
+| `FLEETY_MODEL_BASE_URL` | (unset → echo) | OpenAI-compatible `/v1` root (OpenAI, OpenRouter, vLLM, Ollama, LM Studio, …). |
+| `FLEETY_MODEL` | (unset → echo) | Model name to request. |
+| `FLEETY_MODEL_KEY` | (unset) | Bearer token, when the endpoint needs one. |
+| `FLEETY_MODEL_STREAM` | `0` | Set to `1` to use the SSE streaming endpoint (token-by-token TUI display). |
+
+## Retention / GC (server background loop)
+
+Six-hour periodic sweep that keeps audit + backup surfaces bounded.
+
+| Var | Default | Meaning |
+|---|---|---|
+| `FLEETY_GC_DISABLED` | (unset) | Set anything to skip the loop entirely. |
+| `FLEETY_GC_INTERVAL_SECS` | `21600` (6 h) | How often to run a sweep. Clamped to a 60 s floor. |
+| `FLEETY_BACKUPS_RETENTION_SECS` | `604800` (7 d) | Backup directories older than this are deleted. |
+| `FLEETY_HISTORY_ROTATE_BYTES` | `33554432` (32 MiB) | When a device's `history.jsonl` crosses this size, it's renamed to `history.jsonl.<unix_ts>` (archive kept; live file resets). |
+
+## mDNS service discovery
+
+Server announces `_fleety._tcp.local.`; CLI / fleetyd browse for it as the
+last fallback when no URL is configured.
+
+| Var | Default | Meaning |
+|---|---|---|
+| `FLEETY_MDNS_DISABLED` | (unset) | Set anything to skip both announce and browse. Useful on corporate networks that block mDNS. |
+| `FLEETY_MDNS_HOST_IP` | (auto) | Force the advertised IP. **Required when `FLEETY_ADDR` binds to `0.0.0.0`** — the server doesn't enumerate interfaces. |
+| `FLEETY_MDNS_HOST` | hostname / `COMPUTERNAME` / `HOSTNAME` | mDNS instance name. |
+
+## Daemon (`fleetyd`)
+
+| Var | Default | Meaning |
+|---|---|---|
+| `FLEETY_AGENT_URL` | mDNS → `ws://127.0.0.1:8787` | Server WebSocket URL. Tries mDNS (2 s) before falling back to localhost. |
+| `FLEETY_DEVICE_ID` | hostname / `COMPUTERNAME` / `HOSTNAME` / `fleetyd-device` | This device's id (path-safe; no slashes / `:`). |
+| `FLEETY_DEVICE_ROOT` | cwd | Filesystem root the on-device tools operate within. |
+| `FLEETY_TOKEN` | (unset, then `~/.fleety/fleetyd.token`) | Auth token. fleetyd persists a freshly-paired one to `~/.fleety/fleetyd.token`; this env var overrides. |
+| `FLEETY_PAIRING_CODE` | (unset) | Pass once to enroll a new device; server mints a token in `Welcome`, fleetyd writes it to disk. |
+
+## Self-update polling (`fleetyd` background loop)
+
+24h periodic check of the release manifest. Only spawns when a manifest URL is
+set; without `FLEETY_AUTO_UPDATE=apply` it's notify-only (log a warning).
+
+| Var | Default | Meaning |
+|---|---|---|
+| `FLEETY_UPDATE_MANIFEST` | (unset → no poll) | URL of the JSON manifest with `version`, `url`, `sha256`. |
+| `FLEETY_UPDATE_POLL_SECS` | `86400` (24 h) | How often to check. Floor 60 s. |
+| `FLEETY_AUTO_UPDATE` | `notify` | Set to `apply` to run the full update on each tick (`fleetyd update` equivalent). |
+
+## Sidecar binaries (`fleetyd` + tools)
+
+| Var | Default | Meaning |
+|---|---|---|
+| `FLEETY_INSYRA_BIN` | (auto: beside exe) | Path to the `fleety-insyra` Go sidecar. The `insyra_exec` tool spawns this. |
+| `FLEETY_INSYRA_URL` | `releases/latest/download/…` | Override the download URL for `fleetyd install` / `fleetyd update`. |
+
+## Tools that talk to the network
+
+| Var | Default | Meaning |
+|---|---|---|
+| `FLEETY_CHROME_URL` | (unset) | Chrome DevTools Protocol endpoint for `browser_*` tools (e.g. `http://localhost:9222`). |
+| `FLEETY_ALLOW_PRIVATE_NET` | `0` | Set to `1` to allow `http_request`/`fetch_url` against RFC1918 / loopback hosts. Default refuses for safety. |
+
+## Install scripts
+
+| Var | Default | Meaning |
+|---|---|---|
+| `FLEETY_INSTALL_DIR` | `~/.fleety/bin` (or `/usr/local/bin` for root) | Where `scripts/install-server.sh` lands the binary. |
+
+---
+
+When in doubt, the source of truth for each var is its lookup site —
+`grep -rn '"FLEETY_<NAME>"' crates/` will show you exactly where it's read
+and what the default is.
