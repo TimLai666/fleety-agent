@@ -102,6 +102,19 @@ Server seeds the entry into `{home}/mcp/builtin.json` every boot.
 | `FLEETY_DDGS_AUTO_INSTALL` | (unset → on) | Set to `0` to **disable** the boot-time auto-install **and** the 24h auto-upgrade loop (hermetic / air-gapped hosts). Any other value (or unset) leaves both on. |
 | `FLEETY_DDGS_UPGRADE_SECS` | `86400` (24 h) | Cadence of the background auto-upgrade loop. Clamped to a 60 s floor. |
 
+## Wiki semantic search (embedding model)
+
+`wiki_semantic_search` runs a local **EmbeddingGemma 300M** model
+(`onnx-community/embeddinggemma-300m-ONNX`, Q8) in-process via fastembed/ONNX on
+CPU. The model downloads once (~300MB) on first use / boot warm, then runs
+offline. The vector index lives at `{wiki}/.index/embeddings.json` and stays
+current automatically (re-embeds notes whose content hash changed).
+
+| Var | Default | Meaning |
+|---|---|---|
+| `FLEETY_WIKI_EMBED` | (unset → on) | Set to `0` to disable semantic search (no model download; `wiki_semantic_search` returns an error pointing at `wiki_search`). |
+| `FLEETY_MODELS_DIR` | `{FLEETY_AGENT_HOME}/models` | Cache dir for downloaded model weights. |
+
 ## Tools that talk to the network
 
 | Var | Default | Meaning |

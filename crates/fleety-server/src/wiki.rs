@@ -10,8 +10,9 @@ use serde_json::{json, Value};
 
 use agent_core::{CoreError, Result, RiskLevel, Tool, ToolRegistry, ToolSpec};
 
-/// Register the wiki tools rooted at `vault`.
-pub fn register(registry: &mut ToolRegistry, vault: &Path) {
+/// Register the wiki tools rooted at `vault`. `models_dir` is the cache for the
+/// semantic-search embedding model.
+pub fn register(registry: &mut ToolRegistry, vault: &Path, models_dir: &Path) {
     registry.register(Box::new(WikiWrite {
         vault: vault.to_path_buf(),
     }));
@@ -23,6 +24,10 @@ pub fn register(registry: &mut ToolRegistry, vault: &Path) {
     }));
     registry.register(Box::new(WikiSearch {
         vault: vault.to_path_buf(),
+    }));
+    registry.register(Box::new(crate::wiki_embed::WikiSemanticSearch {
+        vault: vault.to_path_buf(),
+        cache_dir: models_dir.to_path_buf(),
     }));
 }
 
@@ -235,8 +240,9 @@ mod tests {
     #[tokio::test]
     async fn write_read_list_search() {
         let vault = temp();
+        let models = temp();
         let mut registry = ToolRegistry::new();
-        register(&mut registry, &vault);
+        register(&mut registry, &vault, &models);
 
         registry
             .call("wiki_write", json!({ "path": "concepts/esp32", "content": "# ESP32\nflash via espflash [[serial-ports]]" }))

@@ -332,10 +332,21 @@ per-conversation history.
 
 | Tool | Purpose | Key inputs | Risk |
 |---|---|---|---|
-| `wiki_search` | Search the vault. | `query` | read |
-| `wiki_read` | Read a page. | `path` | read |
+| `wiki_search` | Exact substring search over the vault (case-insensitive). | `query` | read |
+| `wiki_semantic_search` | Search by **meaning** — local EmbeddingGemma vectors, cosine-ranked. Finds related notes even with different wording. Returns top notes with `score` + snippet. | `query`, `top_k?` | read |
+| `wiki_read` | Read a page; returns raw `content` + line-numbered `numbered` + `line_count` (slice with `start_line`/`end_line`). | `path`, `start_line?`, `end_line?` | read |
 | `wiki_list` | List pages. | — | read |
-| `wiki_write` | Create or update a page (frontmatter + `[[wikilinks]]` preserved). | `path`, `content`, `frontmatter?` | mutate |
+| `wiki_write` | Create or overwrite a page (markdown; use frontmatter + `[[wikilinks]]`). | `path`, `content` | mutate |
+
+**Semantic search engine.** `wiki_semantic_search` runs a local **EmbeddingGemma
+300M** model (`onnx-community/embeddinggemma-300m-ONNX`, Q8) in-process via
+fastembed/ONNX on CPU — no external service. The first call (or the boot-time
+background warm) downloads the model once (~300MB) into `{FLEETY_AGENT_HOME}/
+models/`, then runs offline. The index lives at `{vault}/.index/embeddings.json`
+and is kept current automatically: notes are chunked and embedded, and each
+search re-embeds any note whose content hash changed and drops deleted ones.
+`FLEETY_WIKI_EMBED=0` disables it (no download; the tool returns an actionable
+error pointing at `wiki_search`). See [`docs/env.md`](env.md).
 
 ## CLI-only surfaces (not invokable by the agent)
 

@@ -276,6 +276,17 @@ impl Storage {
         self.home.join("wiki")
     }
 
+    /// Local model cache (e.g. the EmbeddingGemma weights fastembed downloads
+    /// for wiki semantic search). Override with `FLEETY_MODELS_DIR`.
+    pub fn models_dir(&self) -> PathBuf {
+        if let Ok(d) = std::env::var("FLEETY_MODELS_DIR") {
+            if !d.is_empty() {
+                return PathBuf::from(d);
+            }
+        }
+        self.home.join("models")
+    }
+
     /// Ensure a device is registered: create `devices/{id}/device.json` (with
     /// defaults) and an initial `NOTES.md` if missing, and stamp `last_seen`.
     /// v0 stores the record as JSON; the spec's device.yaml has the same fields.

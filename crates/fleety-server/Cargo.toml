@@ -32,6 +32,8 @@ mdns-sd = { workspace = true }
 flume = "0.11"
 sha2 = "0.10"
 base64 = { workspace = true }
+# Local embedding model (EmbeddingGemma via ONNX) for wiki semantic search.
+fastembed = "5"
 
 [dev-dependencies]
 filetime = "0.2"

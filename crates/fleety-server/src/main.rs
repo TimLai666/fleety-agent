@@ -36,6 +36,7 @@ mod storage;
 mod tools;
 mod web;
 mod wiki;
+mod wiki_embed;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -181,6 +182,9 @@ async fn main() {
             fleety_tools::upgrade_managed_chrome().await;
         }
     });
+    // Warm the wiki semantic-search index in the background (downloads the
+    // EmbeddingGemma model on first run; opt out with FLEETY_WIKI_EMBED=0).
+    tokio::spawn(wiki_embed::warm(storage.wiki_dir(), storage.models_dir()));
     let provider = build_provider();
     let policy = policy_from_env();
     let workspace = Arc::new(workspace_root());

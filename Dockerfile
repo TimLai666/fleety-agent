@@ -20,6 +20,7 @@ RUN apt-get update \
       ca-certificates git openssh-client \
       python3 python3-pip pipx \
       chromium \
+      libgomp1 \
  && rm -rf /var/lib/apt/lists/* \
  # Built-in `ddgs` MCP (search_text / search_images / search_news / search_videos
  # / search_books / extract_content) — installed into a system-managed pipx venv
@@ -33,7 +34,8 @@ COPY --from=gobuild /out/fleety-insyra /usr/local/bin/fleety-insyra
 ENV FLEETY_ADDR=0.0.0.0:8787 \
     FLEETY_AGENT_HOME=/data/agent \
     FLEETY_WORKSPACE=/workspace \
-    FLEETY_CHROME_DIR=/data/chrome
+    FLEETY_CHROME_DIR=/data/chrome \
+    FLEETY_MODELS_DIR=/data/models
 EXPOSE 8787
 VOLUME ["/data", "/workspace"]
 CMD ["fleety-server"]
