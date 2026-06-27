@@ -37,6 +37,9 @@ pub fn build_registry(
     registry.register(Box::new(MemoryWrite {
         dir: memory_dir.to_path_buf(),
     }));
+    registry.register(Box::new(MemoryEdit {
+        dir: memory_dir.to_path_buf(),
+    }));
     registry.register(Box::new(HistoryList {
         path: history_path.to_path_buf(),
     }));
@@ -155,6 +158,80 @@ impl Tool for MemoryWrite {
             }
         }
         Ok(json!({ "file": file, "mode": mode, "bytes": content.len() }))
+    }
+}
+
+struct MemoryEdit {
+    dir: PathBuf,
+}
+
+#[async_trait]
+impl Tool for MemoryEdit {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "memory_edit".to_string(),
+            description:
+                "Edit a core memory file (ME.md/USER.md/TODO.md/TOOLS.md) by replacing an \
+                 exact substring — the precise alternative to memory_write's full rewrite. By \
+                 default `old` must appear exactly once; set replace_all:true to replace every \
+                 occurrence."
+                    .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "file": { "type": "string", "enum": ["ME.md", "USER.md", "TODO.md", "TOOLS.md"] },
+                    "old": { "type": "string", "description": "exact text to replace (must be unique unless replace_all)" },
+                    "new": { "type": "string" },
+                    "replace_all": { "type": "boolean", "description": "replace every occurrence instead of requiring a unique match (default false)" }
+                },
+                "required": ["file", "old", "new"]
+            }),
+            risk: RiskLevel::Mutate,
+        }
+    }
+
+    async fn call(&self, args: Value) -> Result<Value> {
+        let file = require_str(&args, "file")?;
+        let old = require_str(&args, "old")?;
+        let new = require_str(&args, "new")?;
+        if old.is_empty() {
+            return Err(CoreError::Message(
+                "'old' must be non-empty; use memory_write to create or append content".to_string(),
+            ));
+        }
+        let replace_all = args
+            .get("replace_all")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let path = memory_path(&self.dir, file)?;
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(CoreError::Message(format!(
+                    "{file} is empty; nothing to edit — use memory_write to create it first"
+                )))
+            }
+            Err(e) => return Err(CoreError::Message(format!("cannot read {file}: {e}"))),
+        };
+        let count = content.matches(old).count();
+        if count == 0 {
+            return Err(CoreError::Message(format!(
+                "the 'old' text was not found in {file}; read it with memory_read and copy the exact text"
+            )));
+        }
+        if count > 1 && !replace_all {
+            return Err(CoreError::Message(format!(
+                "the 'old' text appears {count} times in {file}; add surrounding context to make it unique, or set replace_all:true"
+            )));
+        }
+        let (updated, replaced) = if replace_all {
+            (content.replace(old, new), count)
+        } else {
+            (content.replacen(old, new, 1), 1)
+        };
+        std::fs::write(&path, &updated)
+            .map_err(|e| CoreError::Message(format!("write {file} failed: {e}")))?;
+        Ok(json!({ "file": file, "replaced": replaced, "bytes": updated.len() }))
     }
 }
 
@@ -414,6 +491,82 @@ mod tests {
             .call(
                 "memory_write",
                 json!({ "file": "secrets.md", "content": "x" })
+            )
+            .await
+            .is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn memory_edit_fragment_and_guards() {
+        let dir = temp_dir();
+        let registry = build_registry(
+            &dir,
+            &dir,
+            &dir,
+            &dir,
+            &dir,
+            &dir,
+            crate::bridge::new_device_tools(),
+        );
+
+        registry
+            .call(
+                "memory_write",
+                json!({ "file": "TODO.md", "content": "- buy milk\n- buy milk\n- call Tim\n" }),
+            )
+            .await
+            .expect("seed");
+
+        // Ambiguous single-match edit is rejected (two "buy milk" lines).
+        assert!(registry
+            .call(
+                "memory_edit",
+                json!({ "file": "TODO.md", "old": "buy milk", "new": "buy oat milk" })
+            )
+            .await
+            .is_err());
+
+        // replace_all rewrites every occurrence.
+        let all = registry
+            .call(
+                "memory_edit",
+                json!({ "file": "TODO.md", "old": "buy milk", "new": "buy oat milk", "replace_all": true }),
+            )
+            .await
+            .expect("replace_all");
+        assert_eq!(all["replaced"], json!(2));
+
+        // A unique fragment edits in place.
+        registry
+            .call(
+                "memory_edit",
+                json!({ "file": "TODO.md", "old": "call Tim", "new": "call Tim about release" }),
+            )
+            .await
+            .expect("unique edit");
+        let read = registry
+            .call("memory_read", json!({ "file": "TODO.md" }))
+            .await
+            .expect("read");
+        let body = read["content"].as_str().unwrap_or_default();
+        assert!(body.contains("buy oat milk"));
+        assert!(body.contains("call Tim about release"));
+        assert!(!body.contains("- buy milk\n"));
+
+        // Missing 'old' text errors; editing an empty file errors.
+        assert!(registry
+            .call(
+                "memory_edit",
+                json!({ "file": "TODO.md", "old": "nonexistent", "new": "x" })
+            )
+            .await
+            .is_err());
+        assert!(registry
+            .call(
+                "memory_edit",
+                json!({ "file": "ME.md", "old": "anything", "new": "x" })
             )
             .await
             .is_err());

@@ -154,12 +154,14 @@ itself is always read from the server's storage.
 
 | Tool | Purpose | Key inputs | Risk |
 |---|---|---|---|
-| `memory_read` | Read a memory file. With `device`: that device's memory (`NOTES.md`); without: an agent-level core file (`ME.md` / `USER.md` / `TODO.md` / `TOOLS.md`). | `device?`, `file` | read |
-| `memory_write` | Update a memory file (replace). | `device?`, `file`, `content` | mutate |
+| `memory_read` | Read a core memory file (`ME.md` / `USER.md` / `TODO.md` / `TOOLS.md`). | `file` | read |
+| `memory_write` | Write a core memory file whole — `mode` `replace` (default) or `append`. | `file`, `content`, `mode?` | mutate |
+| `memory_edit` | Replace an exact substring in a core memory file — the precise alternative to a full rewrite. `old` must be unique unless `replace_all:true`. | `file`, `old`, `new`, `replace_all?` | mutate |
 
 > The core files `ME.md` / `USER.md` / `TODO.md` are auto-injected into the
-> system prompt every turn. Use `memory_write` to record what you learn —
-> memory you never update rots into lies.
+> system prompt every turn. Use `memory_edit` for surgical updates and
+> `memory_write` to create or wholesale-replace — memory you never update rots
+> into lies.
 
 ## Audit log
 
