@@ -87,12 +87,54 @@ struct BuiltinEntry {
     args: Vec<String>,
 }
 
+/// `0` removes the built-in `computer-use` MCP (desktop control). Default on.
+fn computer_use_enabled() -> bool {
+    std::env::var("FLEETY_COMPUTER_USE").as_deref() != Ok("0")
+}
+
+/// Resolve the `npx` launcher used to run `computer-use-mcp` (Node, fetched on
+/// first spawn via `npx -y`). Env override > PATH (npx / npx.cmd) > bare `npx`.
+fn resolve_npx_command() -> String {
+    if let Ok(p) = std::env::var("FLEETY_NPX_BIN") {
+        if !p.is_empty() {
+            return p;
+        }
+    }
+    let names: &[&str] = if cfg!(windows) {
+        &["npx.cmd", "npx.exe", "npx"]
+    } else {
+        &["npx"]
+    };
+    for n in names {
+        if let Some(found) = which_on_path(n) {
+            return found;
+        }
+    }
+    if cfg!(windows) {
+        "npx.cmd".to_string()
+    } else {
+        "npx".to_string()
+    }
+}
+
 fn builtin_servers() -> Vec<BuiltinEntry> {
-    vec![BuiltinEntry {
+    let mut servers = vec![BuiltinEntry {
         name: "ddgs",
         command: resolve_ddgs_command(),
         args: ddgs_args(),
-    }]
+    }];
+    if computer_use_enabled() {
+        // domdomegg/computer-use-mcp — desktop control (screenshot / mouse /
+        // keyboard) over stdio. `npx -y` fetches it on first spawn; needs Node
+        // and a display session on whatever host runs fleety-server. Intrusive:
+        // governed by policy.md (prefer API/MCP > browser > computer-use).
+        servers.push(BuiltinEntry {
+            name: "computer-use",
+            command: resolve_npx_command(),
+            args: vec!["-y".to_string(), "computer-use-mcp".to_string()],
+        });
+    }
+    servers
 }
 
 /// Write the built-in MCP server list into `path`, overwriting. Best-effort:
@@ -300,6 +342,8 @@ mod tests {
 
     #[test]
     fn seed_writes_ddgs_entry() {
+        // Flag-agnostic: assert the ddgs entry is present regardless of whether
+        // the computer-use built-in is also seeded (another test toggles that).
         let dir = std::env::temp_dir().join(format!("fleety-bmcp-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("mk");
         let path = dir.join("builtin.json");
@@ -307,12 +351,29 @@ mod tests {
         let text = std::fs::read_to_string(&path).expect("read");
         let v: Value = serde_json::from_str(&text).expect("json");
         let servers = v["servers"].as_array().expect("arr");
-        assert_eq!(servers.len(), 1);
-        assert_eq!(servers[0]["name"], json!("ddgs"));
-        assert_eq!(servers[0]["args"], json!(["mcp"]));
+        let ddgs = servers
+            .iter()
+            .find(|s| s["name"] == json!("ddgs"))
+            .expect("ddgs entry present");
+        assert_eq!(ddgs["args"], json!(["mcp"]));
         // command is non-empty even when ddgs isn't installed (falls back to bare name).
-        assert!(!servers[0]["command"].as_str().unwrap_or("").is_empty());
+        assert!(!ddgs["command"].as_str().unwrap_or("").is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn computer_use_seeded_by_default() {
+        // The default (env unset) includes computer-use. This is the only test
+        // that asserts on the flag; seed_writes_ddgs_entry is flag-agnostic.
+        assert!(computer_use_enabled());
+        let cu = builtin_servers()
+            .into_iter()
+            .find(|s| s.name == "computer-use")
+            .expect("computer-use seeded by default");
+        assert_eq!(
+            cu.args,
+            vec!["-y".to_string(), "computer-use-mcp".to_string()]
+        );
     }
 
     #[test]

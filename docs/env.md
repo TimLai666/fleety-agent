@@ -101,6 +101,8 @@ Server seeds the entry into `{home}/mcp/builtin.json` every boot.
 | `FLEETY_DDGS_ARGS` | `["mcp"]` | JSON array of args passed to `ddgs`. Use `["mcp","-pr","socks5h://127.0.0.1:9150"]` for ddgs's proxy mode. |
 | `FLEETY_DDGS_AUTO_INSTALL` | (unset → on) | Set to `0` to **disable** the boot-time auto-install **and** the 24h auto-upgrade loop (hermetic / air-gapped hosts). Any other value (or unset) leaves both on. |
 | `FLEETY_DDGS_UPGRADE_SECS` | `86400` (24 h) | Cadence of the background auto-upgrade loop. Clamped to a 60 s floor. |
+| `FLEETY_COMPUTER_USE` | (unset → on) | Set to `0` to drop the built-in `computer-use` MCP (desktop control via `npx computer-use-mcp`; needs Node + a display). |
+| `FLEETY_NPX_BIN` | (auto: `npx` / `npx.cmd`) | Override the `npx` launcher used to spawn `computer-use-mcp`. |
 
 ## Wiki semantic search (embedding model)
 

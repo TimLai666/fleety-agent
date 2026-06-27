@@ -285,7 +285,7 @@ timeout.
 
 | Tool | Purpose | Key inputs | Risk |
 |---|---|---|---|
-| `mcp_list` | List configured MCP servers; each entry carries `source: "builtin" \| "installed"`. | — | read |
+| `mcp_list` | List configured MCP servers; each entry carries `source: "builtin" \| "installed"`. Built-ins: `ddgs` (web search) and `computer-use` (desktop control). | — | read |
 | `mcp_add` | Add (or replace) a **user-installed** server. Shadows a built-in of the same name. | `name`, `command`, `args?` | mutate |
 | `mcp_remove` | Remove a user-installed server. Built-in servers cannot be removed (override by `mcp_add`-ing the same name). | `name` | mutate |
 | `mcp_call` | Call a tool on a configured MCP server. | `server`, `tool`, `arguments?` | mutate |
@@ -331,6 +331,22 @@ Manual fallback if all of the above missed: `pip install -U 'ddgs[mcp]'`.
 spawn args (defaults to `["mcp"]`; pass `["mcp","-pr","socks5h://…"]` for
 ddgs's proxy mode). See [`docs/env.md`](env.md).
 
+### Built-in: `computer-use` — desktop control
+
+`mcp_call(server="computer-use", tool=…)` drives the desktop of **whatever host
+runs `fleety-server`** (screenshot / mouse / keyboard) via
+[`domdomegg/computer-use-mcp`](https://github.com/domdomegg/computer-use-mcp).
+Seeded into `builtin.json` at boot; `npx -y computer-use-mcp` fetches it on
+first spawn, so the only prerequisite is **Node.js** (and a display session —
+it won't work headless). `FLEETY_COMPUTER_USE=0` removes the built-in;
+`FLEETY_NPX_BIN` overrides the `npx` launcher.
+
+This is the **most intrusive** UI path — `policy.md` ranks it last (prefer a
+dedicated API/MCP > `browser_*` CDP > computer-use), it takes over the user's
+own mouse/keyboard, and destructive desktop actions are `critical`. Note MCP
+servers run on the server host, so this controls the server's desktop; for a
+*remote* device's screen, use the `browser_*` tools via `device_exec` instead.
+
 ## Knowledge wiki
 
 **Runs on:** server only. The agent's long-term Obsidian vault under
@@ -349,9 +365,14 @@ per-conversation history.
 300M** model (`onnx-community/embeddinggemma-300m-ONNX`, Q8) in-process via
 fastembed/ONNX on CPU — no external service. The first call (or the boot-time
 background warm) downloads the model once (~300MB) into `{FLEETY_AGENT_HOME}/
-models/`, then runs offline. The index lives at `{vault}/.index/embeddings.json`
-and is kept current automatically: notes are chunked and embedded, and each
-search re-embeds any note whose content hash changed and drops deleted ones.
+models/`, then runs offline. Vectors are indexed in an **HNSW** graph (`hnsw_rs`)
+for fast approximate nearest-neighbour search; the metadata (chunk text +
+vectors + content hash) is the source of truth at `{vault}/.index/
+embeddings.json`, and the graph is rebuilt from it whenever a note changes (HNSW
+can't delete, so a rebuild also handles removals). The index stays current
+automatically: each search re-embeds any note whose hash changed and drops
+deleted ones, and `wiki_write` re-embeds the edited note immediately. The graph
+lives in memory while serving (rebuilt from the persisted metadata, never lost).
 `FLEETY_WIKI_EMBED=0` disables it (no download; the tool returns an actionable
 error pointing at `wiki_search`). See [`docs/env.md`](env.md).
 

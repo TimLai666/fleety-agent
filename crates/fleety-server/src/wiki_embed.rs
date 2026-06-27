@@ -17,11 +17,13 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use agent_core::{CoreError, Result, RiskLevel, Tool, ToolSpec};
 use async_trait::async_trait;
 use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
+use hnsw_rs::prelude::{DistCosine, Hnsw};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -111,19 +113,38 @@ fn chunk_note(content: &str) -> Vec<String> {
     chunks
 }
 
-fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    let mut dot = 0.0f32;
-    let mut na = 0.0f32;
-    let mut nb = 0.0f32;
-    for (x, y) in a.iter().zip(b.iter()) {
-        dot += x * y;
-        na += x * x;
-        nb += y * y;
+/// The HNSW (approximate nearest neighbour) graph plus the per-point mapping
+/// back to `(note rel, chunk index)`. Built from the metadata index, which stays
+/// the source of truth — HNSW can't delete points, so on any change we just
+/// rebuild (cheap at personal-wiki scale, and it handles deletes for free).
+struct HnswState {
+    hnsw: Hnsw<'static, f32, DistCosine>,
+    ids: Vec<(String, usize)>,
+}
+
+fn hnsw_cell() -> &'static Mutex<Option<HnswState>> {
+    static H: OnceLock<Mutex<Option<HnswState>>> = OnceLock::new();
+    H.get_or_init(|| Mutex::new(None))
+}
+
+/// Set when the metadata index changed so the next search rebuilds the graph.
+fn dirty() -> &'static AtomicBool {
+    static D: OnceLock<AtomicBool> = OnceLock::new();
+    D.get_or_init(|| AtomicBool::new(true))
+}
+
+/// Build an HNSW graph over every chunk vector in the metadata index.
+fn build_hnsw(idx: &Index) -> HnswState {
+    let total: usize = idx.notes.values().map(|n| n.chunks.len()).sum();
+    let hnsw = Hnsw::<f32, DistCosine>::new(16, total.max(1), 16, 200, DistCosine {});
+    let mut ids = Vec::with_capacity(total);
+    for (rel, note) in &idx.notes {
+        for (ci, chunk) in note.chunks.iter().enumerate() {
+            hnsw.insert((chunk.vec.as_slice(), ids.len()));
+            ids.push((rel.clone(), ci));
+        }
     }
-    if na == 0.0 || nb == 0.0 {
-        return 0.0;
-    }
-    dot / (na.sqrt() * nb.sqrt())
+    HnswState { hnsw, ids }
 }
 
 /// Initialise the model if needed, returning a guard error on failure. Blocking.
@@ -219,16 +240,26 @@ fn sync_index(vault: &Path, cache_dir: &Path) -> Result<()> {
         let idx = guard
             .as_mut()
             .ok_or_else(|| CoreError::Message("index unavailable".to_string()))?;
+        let before = idx.notes.len();
         idx.notes.retain(|rel, _| present.contains(rel));
+        let removed = before - idx.notes.len();
         for (rel, hash, content) in &current {
             let fresh = idx.notes.get(rel).map(|n| &n.hash == hash).unwrap_or(false);
             if !fresh {
                 to_embed.push((rel.clone(), chunk_note(content)));
             }
         }
+        // Deletions alone (no re-embeds) still change the searchable set.
+        if removed > 0 {
+            dirty().store(true, Ordering::SeqCst);
+        }
     }
 
     if to_embed.is_empty() {
+        // Persist any deletions, then we're done.
+        if dirty().load(Ordering::SeqCst) {
+            save_index(vault)?;
+        }
         return Ok(());
     }
 
@@ -272,6 +303,7 @@ fn sync_index(vault: &Path, cache_dir: &Path) -> Result<()> {
         );
     }
     drop(guard);
+    dirty().store(true, Ordering::SeqCst);
     save_index(vault)?;
     Ok(())
 }
@@ -314,29 +346,61 @@ fn search_blocking(vault: &Path, cache_dir: &Path, query: &str, top_k: usize) ->
             .unwrap_or_default())
     })?;
 
+    // Lock order: index first, then hnsw (build reads the index).
     let guard = index_cell()
         .lock()
         .map_err(|_| CoreError::Message("index lock poisoned".to_string()))?;
     let idx = guard
         .as_ref()
         .ok_or_else(|| CoreError::Message("index unavailable".to_string()))?;
-    // Best chunk per note.
-    let mut scored: Vec<(f32, String, String)> = Vec::new(); // (score, rel, snippet)
-    for (rel, note) in &idx.notes {
-        let mut best: Option<(f32, &str)> = None;
-        for chunk in &note.chunks {
-            let s = cosine(&qvec, &chunk.vec);
-            if best.map(|(bs, _)| s > bs).unwrap_or(true) {
-                best = Some((s, chunk.text.as_str()));
-            }
-        }
-        if let Some((s, text)) = best {
-            let snippet: String = text.chars().take(200).collect();
-            scored.push((s, rel.clone(), snippet));
+
+    let mut hguard = hnsw_cell()
+        .lock()
+        .map_err(|_| CoreError::Message("hnsw lock poisoned".to_string()))?;
+    if hguard.is_none() || dirty().swap(false, Ordering::SeqCst) {
+        *hguard = Some(build_hnsw(idx));
+    }
+    let state = hguard
+        .as_ref()
+        .ok_or_else(|| CoreError::Message("hnsw unavailable".to_string()))?;
+
+    // Over-fetch so we can keep the best chunk per note, then trim to top_k.
+    let want = top_k.max(1);
+    let knbn = (want * 4).min(state.ids.len().max(1));
+    let ef = knbn.max(64);
+    let neighbours = state.hnsw.search(&qvec, knbn, ef);
+
+    // Best (smallest cosine distance) chunk per note.
+    let mut best_per_note: HashMap<&str, (f32, &str)> = HashMap::new();
+    for n in &neighbours {
+        let Some((rel, ci)) = state.ids.get(n.d_id) else {
+            continue;
+        };
+        let Some(text) = idx
+            .notes
+            .get(rel)
+            .and_then(|note| note.chunks.get(*ci))
+            .map(|c| c.text.as_str())
+        else {
+            continue;
+        };
+        let entry = best_per_note
+            .entry(rel.as_str())
+            .or_insert((f32::MAX, text));
+        if n.distance < entry.0 {
+            *entry = (n.distance, text);
         }
     }
+    let mut scored: Vec<(f32, String, String)> = best_per_note
+        .into_iter()
+        .map(|(rel, (dist, text))| {
+            // DistCosine returns a distance (smaller = closer); report similarity.
+            let score = 1.0 - dist;
+            (score, rel.to_string(), text.chars().take(200).collect())
+        })
+        .collect();
     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    scored.truncate(top_k.max(1));
+    scored.truncate(want);
     let matches: Vec<Value> = scored
         .into_iter()
         .map(|(score, path, snippet)| json!({ "path": path, "score": score, "snippet": snippet }))
@@ -383,6 +447,7 @@ fn reindex_note_blocking(vault: &Path, cache_dir: &Path, rel: &str, content: &st
             },
         );
     }
+    dirty().store(true, Ordering::SeqCst);
     save_index(vault)
 }
 
@@ -499,10 +564,39 @@ mod tests {
     }
 
     #[test]
-    fn cosine_basic() {
-        assert!((cosine(&[1.0, 0.0], &[1.0, 0.0]) - 1.0).abs() < 1e-6);
-        assert!(cosine(&[1.0, 0.0], &[0.0, 1.0]).abs() < 1e-6);
-        assert_eq!(cosine(&[0.0, 0.0], &[1.0, 1.0]), 0.0);
+    fn hnsw_finds_nearest() {
+        // Three orthogonal-ish 3D vectors; a query close to the second should
+        // rank it first via the HNSW graph.
+        let mut idx = Index {
+            model: MODEL_TAG.to_string(),
+            notes: HashMap::new(),
+        };
+        idx.notes.insert(
+            "a.md".into(),
+            NoteIndex {
+                hash: "x".into(),
+                chunks: vec![Chunk {
+                    text: "alpha".into(),
+                    vec: vec![1.0, 0.0, 0.0],
+                }],
+            },
+        );
+        idx.notes.insert(
+            "b.md".into(),
+            NoteIndex {
+                hash: "y".into(),
+                chunks: vec![Chunk {
+                    text: "beta".into(),
+                    vec: vec![0.0, 1.0, 0.0],
+                }],
+            },
+        );
+        let state = build_hnsw(&idx);
+        assert_eq!(state.ids.len(), 2);
+        let res = state.hnsw.search(&[0.0, 0.9, 0.1], 1, 16);
+        assert_eq!(res.len(), 1);
+        let (rel, _) = &state.ids[res[0].d_id];
+        assert_eq!(rel, "b.md");
     }
 
     #[test]
