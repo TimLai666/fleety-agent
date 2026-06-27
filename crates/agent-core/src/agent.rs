@@ -140,7 +140,7 @@ pub async fn run_turn_streaming(
                 id: call.id.clone(),
                 result: result.clone(),
             });
-            let fed = budget_text(&result.to_string(), config.max_tool_result_chars);
+            let fed = crate::compress::compress_tool_result(&result, config.max_tool_result_chars);
             messages.push(Message::tool_result(call.id.clone(), fed));
         }
     }
@@ -149,17 +149,6 @@ pub async fn run_turn_streaming(
         "reached max steps ({}) without a final answer; raise max_steps or simplify the task",
         config.max_steps
     )))
-}
-
-/// Truncate `text` to at most `max_chars`, appending a marker noting how much was
-/// omitted. The full text lives in the event log, so this is reversible.
-pub(crate) fn budget_text(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
-    }
-    let kept: String = text.chars().take(max_chars).collect();
-    let omitted = text.chars().count() - max_chars;
-    format!("{kept}\n... [truncated {omitted} chars; full result retained in the event log]")
 }
 
 /// Look up a tool's declared risk by name (defaults to read if unknown).
@@ -438,14 +427,6 @@ mod tests {
             |e| matches!(e, Event::ToolResult { result, .. } if result.to_string().len() > 40_000),
         );
         assert!(full_logged);
-    }
-
-    #[test]
-    fn budget_text_passes_short_and_truncates_long() {
-        assert_eq!(budget_text("short", 10), "short");
-        let long = "x".repeat(100);
-        let out = budget_text(&long, 10);
-        assert!(out.contains("truncated 90 chars"));
     }
 
     #[tokio::test]
