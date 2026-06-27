@@ -344,6 +344,70 @@ fn search_blocking(vault: &Path, cache_dir: &Path, query: &str, top_k: usize) ->
     Ok(json!({ "matches": matches }))
 }
 
+/// Re-embed a single note immediately (blocking). Called right after wiki_write
+/// so the semantic index reflects the new content without waiting for the next
+/// search's lazy sync. Skips work if the note's hash is already current.
+fn reindex_note_blocking(vault: &Path, cache_dir: &Path, rel: &str, content: &str) -> Result<()> {
+    load_index(vault)?;
+    let hash = hash_str(content);
+    {
+        let guard = index_cell()
+            .lock()
+            .map_err(|_| CoreError::Message("index lock poisoned".to_string()))?;
+        if let Some(idx) = guard.as_ref() {
+            if idx.notes.get(rel).map(|n| n.hash == hash).unwrap_or(false) {
+                return Ok(()); // unchanged
+            }
+        }
+    }
+    let chunks = chunk_note(content);
+    let prefixed: Vec<String> = chunks.iter().map(|c| format!("{DOC_PREFIX}{c}")).collect();
+    let vectors = with_model(cache_dir, |m| embed_texts(m, prefixed))?;
+    {
+        let mut guard = index_cell()
+            .lock()
+            .map_err(|_| CoreError::Message("index lock poisoned".to_string()))?;
+        let idx = guard
+            .as_mut()
+            .ok_or_else(|| CoreError::Message("index unavailable".to_string()))?;
+        let note_chunks = chunks
+            .into_iter()
+            .zip(vectors)
+            .map(|(text, vec)| Chunk { text, vec })
+            .collect();
+        idx.notes.insert(
+            rel.to_string(),
+            NoteIndex {
+                hash,
+                chunks: note_chunks,
+            },
+        );
+    }
+    save_index(vault)
+}
+
+/// Fire-and-forget re-embed of one note after a wiki_write. Best-effort: a
+/// failure (e.g. model not yet downloaded) just leaves the next search's lazy
+/// sync to catch up. No-op when semantic search is disabled.
+pub fn reindex_note(vault: PathBuf, cache_dir: PathBuf, rel: String, content: String) {
+    if !enabled() {
+        return;
+    }
+    tokio::spawn(async move {
+        let res = tokio::task::spawn_blocking(move || {
+            reindex_note_blocking(&vault, &cache_dir, &rel, &content)
+        })
+        .await;
+        match res {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::debug!(report = ?e.report(), "wiki note reindex deferred to lazy sync")
+            }
+            Err(e) => tracing::debug!("wiki reindex task join error: {e}"),
+        }
+    });
+}
+
 /// Background warm at boot: build/refresh the index so the first search is fast.
 /// Best-effort and non-fatal.
 pub async fn warm(vault: PathBuf, cache_dir: PathBuf) {

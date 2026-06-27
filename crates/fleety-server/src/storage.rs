@@ -28,6 +28,13 @@ const DEFAULT_ME: &str = "Your name is Fleety. You are a cross-device, full-acce
 const DEFAULT_USER: &str = "(Unknown so far. Record what you learn about the user here.)";
 const DEFAULT_TODO: &str = "(No current to-dos.)";
 
+// The static behavioural prompt, embedded at build time. Reconciled to the
+// actual tool surface (docs/tools.md); see `system_prompt`.
+const PROTOCOL_MD: &str = include_str!("../../../prompts/protocol.md");
+const RULES_MD: &str = include_str!("../../../prompts/rules.md");
+const MEMORY_MD: &str = include_str!("../../../prompts/memory.md");
+const POLICY_MD: &str = include_str!("../../../prompts/policy.md");
+
 /// Categorise one serialized event into `(kind, tool)` for the audit summary.
 /// Events are internally tagged on `event` (snake_case variant name). A
 /// `tool_result` whose `result.denied == true` is surfaced as `tool_denied`
@@ -359,6 +366,23 @@ impl Storage {
         let todo = self.core_file("TODO.md", DEFAULT_TODO)?;
         Ok(format!(
             "You are operating with the following core memory.\n\n## ME (self)\n{me}\n\n## USER\n{user}\n\n## TODO\n{todo}"
+        ))
+    }
+
+    /// The full system prompt: the static behavioural docs (protocol → rules →
+    /// memory → policy, embedded at build time) followed by this agent's
+    /// editable core memory (ME/USER/TODO). This is the `system` message; the
+    /// run loop keeps it at index 0 and compaction preserves it, so it survives
+    /// a context summary without being re-sent as a separate reminder.
+    /// `FLEETY_SYSTEM_PROMPT=minimal` drops the static docs (core memory only)
+    /// for token-lean / debugging runs.
+    pub fn system_prompt(&self) -> Result<String> {
+        let core = self.core_memory()?;
+        if std::env::var("FLEETY_SYSTEM_PROMPT").as_deref() == Ok("minimal") {
+            return Ok(core);
+        }
+        Ok(format!(
+            "{PROTOCOL_MD}\n\n---\n\n{RULES_MD}\n\n---\n\n{MEMORY_MD}\n\n---\n\n{POLICY_MD}\n\n---\n\n# Core Memory\n\n{core}"
         ))
     }
 

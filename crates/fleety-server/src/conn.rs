@@ -245,7 +245,7 @@ async fn serve(
                 storage.journal_begin(device_id, &conversation, &user_msg)?;
                 // Inject agent-level core memory (ME/USER/TODO) as the system
                 // preamble each turn; it is ephemeral, not persisted to the convo.
-                let mut messages = vec![Message::system(storage.core_memory()?)];
+                let mut messages = vec![Message::system(storage.system_prompt()?)];
                 messages.extend(storage.load(device_id, &conversation)?);
                 // Journal every loop event the instant it happens, so a crash
                 // mid-turn is recoverable.
@@ -692,7 +692,7 @@ async fn recover_one_interactive(
         device_tools,
     );
     let config = LoopConfig::default();
-    let mut messages = vec![Message::system(storage.core_memory()?)];
+    let mut messages = vec![Message::system(storage.system_prompt()?)];
     messages.extend(storage.load(device_id, conversation)?);
     messages.extend(reconstruct_messages(&events, config.max_tool_result_chars));
     let mut log = storage.journaling_log(device_id, conversation);
@@ -740,7 +740,7 @@ async fn recover_incomplete_turn(
     tracing::info!(%device_id, %conversation, events = events.len(), "recovering interrupted turn");
 
     let config = LoopConfig::default();
-    let mut messages = vec![Message::system(storage.core_memory()?)];
+    let mut messages = vec![Message::system(storage.system_prompt()?)];
     messages.extend(storage.load(device_id, conversation)?);
     messages.extend(reconstruct_messages(&events, config.max_tool_result_chars));
 

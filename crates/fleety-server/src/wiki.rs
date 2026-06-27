@@ -15,6 +15,7 @@ use agent_core::{CoreError, Result, RiskLevel, Tool, ToolRegistry, ToolSpec};
 pub fn register(registry: &mut ToolRegistry, vault: &Path, models_dir: &Path) {
     registry.register(Box::new(WikiWrite {
         vault: vault.to_path_buf(),
+        models_dir: models_dir.to_path_buf(),
     }));
     registry.register(Box::new(WikiRead {
         vault: vault.to_path_buf(),
@@ -81,6 +82,7 @@ fn collect_notes(vault: &Path, dir: &Path, out: &mut Vec<String>) {
 
 struct WikiWrite {
     vault: PathBuf,
+    models_dir: PathBuf,
 }
 
 #[async_trait]
@@ -111,6 +113,16 @@ impl Tool for WikiWrite {
         }
         std::fs::write(&resolved, content)
             .map_err(|e| CoreError::Message(format!("cannot write wiki note: {e}")))?;
+        // Refresh the semantic index for just this note (best-effort, async).
+        if let Ok(rel) = resolved.strip_prefix(&self.vault) {
+            let rel = rel.to_string_lossy().replace('\\', "/");
+            crate::wiki_embed::reindex_note(
+                self.vault.clone(),
+                self.models_dir.clone(),
+                rel,
+                content.to_string(),
+            );
+        }
         Ok(json!({ "path": path, "bytes_written": content.len() }))
     }
 }
