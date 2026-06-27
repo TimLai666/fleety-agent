@@ -44,7 +44,7 @@ Before firing a physical-presence action, confirm the **target is co-located wit
 
 Controlling a device's desktop directly (mouse, keyboard, screen) hijacks the user's own input on that machine. Prefer a less intrusive interface in this order: a dedicated **API / MCP** for the app > **browser** automation (CDP) > **computer-use** (raw clicking) as the last resort.
 
-- **Screenshots are exempt** — observing a device's screen is low-impact; take them freely, even while the user is active.
+- **Screenshots are exempt — and they're your low-friction way to check on a device.** Observing a screen is low-impact, so take one **anytime to see what a device is doing**, even while the user is active. `computer_screenshot` grabs a device's whole desktop, `browser_screenshot` a single page; both run on any device via `device_exec`. The intrusive part is *driving* the UI (clicks / keystrokes), below — not looking.
 - **UI actions (click/type/move/scroll/key) are intrusive** — use them sparingly, not in tight loops. Before driving the UI of a device the **user is actively using** (recent input / not idle), warn them first; you are about to take over their mouse and keyboard.
 - Destructive desktop actions are `critical`; unattended runs may only use UI control within their mandate.
 
