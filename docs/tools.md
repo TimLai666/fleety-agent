@@ -11,6 +11,21 @@ Last reviewed against `crates/` on 2026-06-24.
 
 ## Conventions
 
+- **Where each tool runs.** Each section below carries a **Runs on:** marker.
+  The three values are:
+  - **server only** — the tool's code only lives in `fleety-server`. The agent
+    can't reach another device's filesystem / network this way. Examples: web
+    egress (`fetch_url`, `http_request`, `ws_call`, `sse_stream`), wiki,
+    schedules, the device registry.
+  - **any device** — the tool lives in the shared `fleety-tools` crate, so it's
+    registered in **both** the server's registry (operating on
+    `FLEETY_WORKSPACE`) and every fleetyd's local registry (operating on
+    `FLEETY_DEVICE_ROOT`). Examples: `read_file`, `write_file`, `run_command`,
+    git, insyra. To route one of these to a specific device, wrap it with
+    `device_exec(device="…", tool="read_file", args={…})`; call it by its
+    bare name and you hit the server's workspace.
+  - **server-only routing** — the tool exists on the server but its job is to
+    coordinate other devices (e.g. `device_exec` itself, `pair_create`).
 - **Targeting.** Tools that operate on a workspace ("workspace tools") run on
   the **server's** `FLEETY_WORKSPACE`. Tools that operate on a device's local
   filesystem (`device_exec`, `ssh_exec`) explicitly take a `device` argument.
@@ -34,10 +49,13 @@ Last reviewed against `crates/` on 2026-06-24.
 
 ---
 
-## Workspace (server-side, rooted at `FLEETY_WORKSPACE`)
+## Workspace tools
 
-Lives in `fleety-tools` so the same implementations run on fleetyd via
-`device_exec` (the daemon registers them locally and advertises the list).
+**Runs on:** any device. Lives in the shared `fleety-tools` crate, so the same
+implementations register on `fleety-server` (against `FLEETY_WORKSPACE`) and
+inside every `fleetyd` (against `FLEETY_DEVICE_ROOT`). Call by bare name → hits
+the server's workspace. Wrap in `device_exec(device="laptop", tool="read_file",
+args={…})` → hits the laptop's filesystem instead.
 
 | Tool | Purpose | Key inputs | Risk |
 |---|---|---|---|
@@ -57,6 +75,8 @@ Lives in `fleety-tools` so the same implementations run on fleetyd via
 
 ## Git (read-only)
 
+**Runs on:** any device. Same dual registration as the workspace tools above.
+
 | Tool | Purpose | Key inputs | Risk |
 |---|---|---|---|
 | `git_status` | Working-tree status. | — | read |
@@ -66,9 +86,10 @@ Lives in `fleety-tools` so the same implementations run on fleetyd via
 
 ## Web / HTTP / WebSocket / SSE
 
-Server-side egress (`fleety-server`'s network, not the target device).
-SSRF-guarded: only `http`/`https` (or `ws`/`wss` for `ws_call`), loopback /
-RFC1918 / IPv6 ULA / link-local refused unless `FLEETY_ALLOW_PRIVATE_NET=1`.
+**Runs on:** server only. Egresses from `fleety-server`'s network, not the
+target device. SSRF-guarded: only `http`/`https` (or `ws`/`wss` for `ws_call`),
+loopback / RFC1918 / IPv6 ULA / link-local refused unless
+`FLEETY_ALLOW_PRIVATE_NET=1`.
 
 | Tool | Purpose | Key inputs | Risk |
 |---|---|---|---|
@@ -84,13 +105,17 @@ RFC1918 / IPv6 ULA / link-local refused unless `FLEETY_ALLOW_PRIVATE_NET=1`.
 
 ## SSH
 
+**Runs on:** server only. The SSH session originates from `fleety-server`'s
+host using its own keychain / config / network egress.
+
 | Tool | Purpose | Key inputs | Risk |
 |---|---|---|---|
 | `ssh_exec` | Run a command on a remote host over SSH. The target is built defensively (no option injection in `host`); batch-mode only (no interactive password). | `host`, `command`, `port?`, `user?`, `identity_file?`, `timeout_secs?` | mutate (critical for irreversible commands) |
 
 ## Browser (CDP)
 
-Drives a real Chrome via the DevTools Protocol. Set `FLEETY_CHROME_URL` to the
+**Runs on:** server only. Drives a real Chrome via the DevTools Protocol;
+`fleety-server` opens the CDP connection. Set `FLEETY_CHROME_URL` to the
 DevTools endpoint (e.g. `http://localhost:9222`). Each `browser_open` returns
 a `session` id; subsequent ops take that id.
 
@@ -104,6 +129,11 @@ a `session` id; subsequent ops take that id.
 
 ## Insyra (data analysis DSL)
 
+**Runs on:** any device. Like the workspace tools, registered on both
+`fleety-server` and every `fleetyd`; sessions live in whichever process spawned
+the sidecar. Route to a specific device via `device_exec(device="…",
+tool="insyra_exec", args={…})`.
+
 | Tool | Purpose | Key inputs | Risk |
 |---|---|---|---|
 | `insyra_exec` | Run the Insyra `.isr` DSL — load CSV/Parquet/Excel/SQL, transform, stats, plot. Stateful per `session`; `save <var> <file>` writes results into the workspace; `reset: true` clears the session. | `command` \| `script`, `session?`, `reset?` | mutate |
@@ -116,6 +146,12 @@ a `session` id; subsequent ops take that id.
 
 ## Agent memory
 
+**Runs on:** server only. Memory lives in `{FLEETY_AGENT_HOME}/fleet/` —
+agent's core (`ME.md` / `USER.md` / `TODO.md` / `TOOLS.md`) and per-device
+records (`NOTES.md`). The `device?` argument selects which **device's** notes
+file to read/write; it doesn't route the tool to that device — the file
+itself is always read from the server's storage.
+
 | Tool | Purpose | Key inputs | Risk |
 |---|---|---|---|
 | `memory_read` | Read a memory file. With `device`: that device's memory (`NOTES.md`); without: an agent-level core file (`ME.md` / `USER.md` / `TODO.md` / `TOOLS.md`). | `device?`, `file` | read |
@@ -127,9 +163,10 @@ a `session` id; subsequent ops take that id.
 
 ## Audit log
 
-The full audit lives in `{home}/fleet/devices/<id>/history.jsonl` with
-`ts_secs` per line; CLI surfaces are `fleety audit list` / `fleety audit show`
-and `fleety rollback list` / `fleety rollback apply`.
+**Runs on:** server only. The full audit lives in
+`{FLEETY_AGENT_HOME}/fleet/devices/<id>/history.jsonl` with `ts_secs` per line;
+CLI surfaces are `fleety audit list` / `fleety audit show` and `fleety
+rollback list` / `fleety rollback apply`.
 
 | Tool | Purpose | Key inputs | Risk |
 |---|---|---|---|
@@ -137,9 +174,11 @@ and `fleety rollback list` / `fleety rollback apply`.
 
 ## Devices & sites
 
-The device registry tracks each connected device's record (`device.json` +
-`NOTES.md`) and its **site** (location). `pair_create` is the enrollment seam
-the agent uses to onboard a new device.
+**Runs on:** server only (router). The device registry lives on the server;
+`device_exec` is how the agent **reaches** another device's local tools, but
+`device_exec` itself runs on the server (it dispatches a `RunTool` frame over
+the WebSocket bridge). `pair_create` is the enrollment seam the agent uses to
+onboard a new device.
 
 | Tool | Purpose | Key inputs | Risk |
 |---|---|---|---|
@@ -161,10 +200,10 @@ the agent uses to onboard a new device.
 
 ## Schedules (self-managed cron)
 
-The agent creates and manages its own schedules. They persist on the server
-and fire even with no CLI connected; a fired job spawns an agent run with the
-stored prompt under `RequireApproval` + `MandateGate` (only `allowed_tools`
-are usable). See `crates/fleety-server/src/scheduler.rs`.
+**Runs on:** server only. The scheduler loop lives in the server and persists
+records under `{FLEETY_AGENT_HOME}/fleet/schedules/`. A fired job spawns an
+agent run with the stored prompt under `RequireApproval` + `MandateGate` (only
+`allowed_tools` are usable). See `crates/fleety-server/src/scheduler.rs`.
 
 | Tool | Purpose | Key inputs | Risk |
 |---|---|---|---|
@@ -174,6 +213,10 @@ are usable). See `crates/fleety-server/src/scheduler.rs`.
 
 ## Skills
 
+**Runs on:** server only. Skills live in `{FLEETY_AGENT_HOME}/skills/` —
+built-in (shipped in the server binary, refreshed every boot) plus
+user-installed (preserved across updates; shadow built-ins by name).
+
 | Tool | Purpose | Key inputs | Risk |
 |---|---|---|---|
 | `list_skills` | List available skills (`SKILL.md` packs) — built-in + user-installed. | — | read |
@@ -181,9 +224,11 @@ are usable). See `crates/fleety-server/src/scheduler.rs`.
 
 ## External MCP
 
-User-installed MCP servers shadow built-ins of the same name. `mcp_call`
-spawns the named server over stdio JSON-RPC, completes one `tools/call`, then
-kills it (single-shot, 30 s timeout).
+**Runs on:** server only. `mcp_call` spawns the configured stdio MCP process on
+the server's host; the MCP server's own tools then run with the server's
+network / filesystem. User-installed MCP servers shadow built-ins of the same
+name; the spawn is single-shot (initialize → `tools/call` → kill) with a 30 s
+timeout.
 
 | Tool | Purpose | Key inputs | Risk |
 |---|---|---|---|
@@ -194,11 +239,11 @@ kills it (single-shot, 30 s timeout).
 
 ### Built-in: `ddgs` — web search
 
-Server seeds `ddgs` into `{home}/mcp/builtin.json` at every boot — agents see
-it in `mcp_list` immediately and use it via `mcp_call(server="ddgs", tool=…)`.
-This is Fleety's only general web search; the workspace's `search_files` is
-ripgrep over local files, the wiki's `wiki_search` is the agent's Obsidian
-vault. Neither reaches the public internet.
+Server seeds `ddgs` into `{FLEETY_AGENT_HOME}/mcp/builtin.json` at every boot —
+agents see it in `mcp_list` immediately and use it via `mcp_call(server="ddgs",
+tool=…)`. This is Fleety's only **general web** search; the workspace's
+`search_files` is ripgrep over local files, the wiki's `wiki_search` is the
+agent's Obsidian vault. Neither reaches the public internet.
 
 | ddgs tool (called via `mcp_call`) | Purpose |
 |---|---|
@@ -209,22 +254,27 @@ vault. Neither reaches the public internet.
 | `search_books` | Book search. |
 | `extract_content` | Extract page content from a URL (markdown-ified). |
 
-**Install prerequisite** — ddgs is a Python package. Run once on the server:
+**Install.** ddgs is a Python package; the runtime installs it automatically:
 
-```sh
-pip install -U ddgs[mcp]            # or:  pipx install ddgs[mcp]
-```
+- `scripts/install-server.sh` runs `pipx install ddgs[mcp]` (then `pip --user`)
+  right after dropping the binary
+- The official Docker image (`Dockerfile`) bakes `ddgs[mcp]` into the runtime
+  layer (`pipx`-installed under `/usr/local/bin`)
+- At server boot, if `ddgs` still isn't on PATH the runtime tries the install
+  itself (pipx → pip --user → `python -m pip --user`). Set
+  `FLEETY_DDGS_AUTO_INSTALL=0` to opt out (e.g. air-gapped hosts).
 
-Set `FLEETY_DDGS_AUTO_INSTALL=1` to let the server try the install itself at
-boot when `ddgs` isn't on PATH (tries pipx → pip --user → `python -m pip`).
-`FLEETY_DDGS_BIN` overrides the resolved path; `FLEETY_DDGS_ARGS` overrides
-the spawn args (defaults to `["mcp"]`; pass `["mcp","-pr","socks5h://…"]` for
+Manual fallback if all of the above missed: `pip install -U 'ddgs[mcp]'`.
+
+`FLEETY_DDGS_BIN` overrides the resolved path; `FLEETY_DDGS_ARGS` overrides the
+spawn args (defaults to `["mcp"]`; pass `["mcp","-pr","socks5h://…"]` for
 ddgs's proxy mode). See [`docs/env.md`](env.md).
 
 ## Knowledge wiki
 
-The agent's long-term Obsidian vault under `{home}/wiki/`. Separate from
-per-device memory and per-conversation history.
+**Runs on:** server only. The agent's long-term Obsidian vault under
+`{FLEETY_AGENT_HOME}/wiki/`. Separate from per-device memory and
+per-conversation history.
 
 | Tool | Purpose | Key inputs | Risk |
 |---|---|---|---|

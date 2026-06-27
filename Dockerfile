@@ -11,11 +11,18 @@ WORKDIR /sidecar
 COPY sidecars/fleety-insyra/ ./
 RUN go build -trimpath -o /out/fleety-insyra .
 
-# Slim runtime with the tools the agent shells out to (git, ssh, TLS roots).
+# Slim runtime with the tools the agent shells out to (git, ssh, TLS roots,
+# Python for the built-in `ddgs` web-search MCP).
 FROM debian:bookworm-slim
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates git openssh-client \
- && rm -rf /var/lib/apt/lists/*
+ && apt-get install -y --no-install-recommends \
+      ca-certificates git openssh-client \
+      python3 python3-pip pipx \
+ && rm -rf /var/lib/apt/lists/* \
+ # Built-in `ddgs` MCP (search_text / search_images / search_news / search_videos
+ # / search_books / extract_content) — installed into a system-managed pipx venv
+ # so the `ddgs` binary lands on /root/.local/bin. The PATH below picks it up.
+ && PIPX_HOME=/opt/pipx PIPX_BIN_DIR=/usr/local/bin pipx install "ddgs[mcp]"
 COPY --from=build /src/target/release/fleety-server /usr/local/bin/fleety-server
 COPY --from=gobuild /out/fleety-insyra /usr/local/bin/fleety-insyra
 # Listen on all interfaces inside the container; persist state under /data.

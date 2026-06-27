@@ -23,9 +23,17 @@ const DDGS_BIN_ENV: &str = "FLEETY_DDGS_BIN";
 /// array (e.g. `["mcp","-pr","socks5h://127.0.0.1:9150"]`) for the proxy mode
 /// in upstream's README.
 const DDGS_ARGS_ENV: &str = "FLEETY_DDGS_ARGS";
-/// `1` = try `pipx install ddgs[mcp]` then `pip install --user ddgs[mcp]` when
-/// the binary isn't on PATH. Anything else (default) just logs a warning.
+/// Default behaviour at server boot when ddgs isn't on PATH: try to install
+/// it (pipx → pip --user → python -m pip --user). Set
+/// `FLEETY_DDGS_AUTO_INSTALL=0` to opt out and get a notify-only warning
+/// instead — useful for hermetic / no-network environments where pip would
+/// fail anyway. The previous behaviour (notify-only by default) was reversed
+/// once we made ddgs the canonical built-in web-search MCP.
 const DDGS_AUTO_INSTALL_ENV: &str = "FLEETY_DDGS_AUTO_INSTALL";
+
+fn auto_install_enabled() -> bool {
+    std::env::var(DDGS_AUTO_INSTALL_ENV).as_deref() != Ok("0")
+}
 
 fn ddgs_binary_name() -> &'static str {
     if cfg!(windows) {
@@ -155,36 +163,38 @@ async fn try_install_ddgs() -> bool {
     false
 }
 
-/// Check ddgs availability and emit an actionable log line. When
-/// `FLEETY_DDGS_AUTO_INSTALL=1` and the binary isn't on PATH, try installing
-/// it via pipx / pip --user. Runs after seeding the builtin so the
-/// builtin.json points at whatever resolution succeeded.
+/// Check ddgs availability and, by default, install it if it isn't reachable
+/// (`FLEETY_DDGS_AUTO_INSTALL=0` opts out for hermetic / no-network setups).
+/// Runs after seeding the builtin so `mcp_call(server="ddgs", …)` works on
+/// the very first turn after server boot.
 pub async fn check_ddgs() {
     let command = resolve_ddgs_command();
     if ddgs_runs(&command).await {
         tracing::info!(%command, "ddgs MCP available");
         return;
     }
-    let want_install = std::env::var(DDGS_AUTO_INSTALL_ENV).as_deref() == Ok("1");
-    if want_install {
-        if try_install_ddgs().await {
-            // Refresh PATH lookup (pipx / --user may have just added a new dir).
-            let refreshed = resolve_ddgs_command();
-            if ddgs_runs(&refreshed).await {
-                tracing::info!(command = %refreshed, "ddgs MCP installed and reachable");
-                return;
-            }
-        }
+    if !auto_install_enabled() {
         tracing::warn!(
-            "FLEETY_DDGS_AUTO_INSTALL=1 was set but ddgs could not be installed automatically. \
-             Install manually: `pip install -U ddgs[mcp]` (or `pipx install ddgs[mcp]`)."
+            "ddgs MCP binary not on PATH and FLEETY_DDGS_AUTO_INSTALL=0; the built-in \
+             `ddgs` MCP server won't work until you install it manually. \
+             Run `pip install -U ddgs[mcp]` (or `pipx install ddgs[mcp]`), or set \
+             FLEETY_DDGS_BIN to an absolute path."
         );
         return;
     }
+    if try_install_ddgs().await {
+        // Refresh PATH lookup (pipx / --user may have just added a new dir).
+        let refreshed = resolve_ddgs_command();
+        if ddgs_runs(&refreshed).await {
+            tracing::info!(command = %refreshed, "ddgs MCP installed and reachable");
+            return;
+        }
+    }
     tracing::warn!(
-        "ddgs MCP binary not on PATH; the built-in `ddgs` MCP server won't work until you install it. \
-         Run `pip install -U ddgs[mcp]` (or set FLEETY_DDGS_BIN to an absolute path, \
-         or FLEETY_DDGS_AUTO_INSTALL=1 to let fleety try `pipx`/`pip --user`)."
+        "ddgs auto-install failed (no pipx / pip / python on PATH, or the install itself errored). \
+         The built-in `ddgs` MCP server won't work until you install it manually: \
+         `pip install -U ddgs[mcp]` (or `pipx install ddgs[mcp]`). \
+         Set FLEETY_DDGS_AUTO_INSTALL=0 to silence this warning."
     );
 }
 
@@ -215,6 +225,20 @@ mod tests {
         let args = ddgs_args();
         std::env::remove_var(DDGS_ARGS_ENV);
         assert_eq!(args, vec!["mcp", "-pr", "socks5h://127.0.0.1:9150"]);
+    }
+
+    #[test]
+    fn auto_install_defaults_on_and_opts_out_with_zero() {
+        // Default (unset) → on.
+        std::env::remove_var(DDGS_AUTO_INSTALL_ENV);
+        assert!(auto_install_enabled());
+        // `=0` → off (the only explicit opt-out shape).
+        std::env::set_var(DDGS_AUTO_INSTALL_ENV, "0");
+        assert!(!auto_install_enabled());
+        // Anything else → on (so an accidental "true" / "1" doesn't change behaviour).
+        std::env::set_var(DDGS_AUTO_INSTALL_ENV, "yes");
+        assert!(auto_install_enabled());
+        std::env::remove_var(DDGS_AUTO_INSTALL_ENV);
     }
 
     #[test]

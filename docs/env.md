@@ -76,16 +76,24 @@ set; without `FLEETY_AUTO_UPDATE=apply` it's notify-only (log a warning).
 
 ## Built-in MCP: ddgs (web search)
 
-`ddgs` is the metasearch MCP shipped as a built-in (`pip install -U ddgs[mcp]`),
-giving the agent `search_text` / `search_images` / `search_news` /
-`search_videos` / `search_books` / `extract_content`. Server seeds it into
-`{home}/mcp/builtin.json` at every boot.
+`ddgs` is the metasearch MCP shipped as a built-in, giving the agent
+`search_text` / `search_images` / `search_news` / `search_videos` /
+`search_books` / `extract_content`. **Installed automatically** alongside the
+server:
+
+- `scripts/install-server.sh` runs `pipx install ddgs[mcp]` (then
+  `pip --user`) after dropping the binary
+- The Docker image bakes `pipx install ddgs[mcp]` into the runtime layer
+- At server boot, if `ddgs` is still missing the runtime tries to install it
+  (`pipx` → `pip install --user` → `python -m pip --user`)
+
+Server seeds the entry into `{home}/mcp/builtin.json` every boot.
 
 | Var | Default | Meaning |
 |---|---|---|
 | `FLEETY_DDGS_BIN` | (auto: `which ddgs`) | Absolute path to the `ddgs` binary. Useful when it's not on PATH (e.g. a venv). |
 | `FLEETY_DDGS_ARGS` | `["mcp"]` | JSON array of args passed to `ddgs`. Use `["mcp","-pr","socks5h://127.0.0.1:9150"]` for ddgs's proxy mode. |
-| `FLEETY_DDGS_AUTO_INSTALL` | (unset) | Set to `1` to let the server try `pipx install ddgs[mcp]` → `pip install --user -U ddgs[mcp]` → `python -m pip install --user …` at boot when the binary isn't reachable. Default is notify-only via a tracing warning. |
+| `FLEETY_DDGS_AUTO_INSTALL` | (unset → on) | Set to `0` to **disable** the boot-time auto-install (hermetic / air-gapped hosts). Any other value (or unset) leaves it on. |
 
 ## Tools that talk to the network
 

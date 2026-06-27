@@ -73,6 +73,37 @@ if curl -fsSL "$sidecar_url" -o "$tmp/fleety-insyra" 2>/dev/null; then
 else
   echo "fleety-insyra: sidecar asset not available yet; insyra_exec stays off until it is" >&2
 fi
+
+# Best-effort: install the ddgs[mcp] Python package so the built-in `ddgs` MCP
+# (web search: text/images/news/videos/books + extract_content) works the first
+# time the server runs. Tries pipx (cleanest, isolated venv) then `pip --user`.
+# Non-fatal — the server logs an actionable warning at boot if it still can't
+# find the binary.
+install_ddgs() {
+  if command -v ddgs >/dev/null 2>&1; then
+    echo "ddgs: already installed ($(command -v ddgs))"
+    return 0
+  fi
+  if command -v pipx >/dev/null 2>&1; then
+    if pipx install "ddgs[mcp]" >/dev/null 2>&1; then
+      echo "ddgs: installed via pipx (built-in web-search MCP)"
+      return 0
+    fi
+  fi
+  for py in python3 python; do
+    if command -v "$py" >/dev/null 2>&1; then
+      if "$py" -m pip install --user -U "ddgs[mcp]" >/dev/null 2>&1; then
+        echo "ddgs: installed via $py -m pip --user (built-in web-search MCP)"
+        return 0
+      fi
+    fi
+  done
+  echo "ddgs: could not install automatically; the server will log a warning at boot." >&2
+  echo "      Install manually: pip install -U 'ddgs[mcp]'   (or: pipx install 'ddgs[mcp]')" >&2
+  return 1
+}
+install_ddgs || true
+
 echo
 echo "Run it (listens on FLEETY_ADDR, default 127.0.0.1:8787 — set 0.0.0.0:8787 to expose):"
 echo "  FLEETY_ADDR=0.0.0.0:8787 $BIN"
