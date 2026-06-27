@@ -23,7 +23,7 @@ pub mod tools;
 
 pub use agent::{run_turn, run_turn_streaming, LoopConfig, TurnOutcome};
 pub use approval::{ApprovalDecision, ApprovalGate, AutoApprove, AutoDeny, MandateGate, Policy};
-pub use compress::{CacheAligner, ContextCompressor, SmartCrusher};
+pub use compress::{CacheAligner, CodeCompressor, ContextCompressor, Lang, SmartCrusher};
 pub use error::{CoreError, ErrorReport, Result};
 pub use event::{interrupted_tool_result, reconstruct_messages, Event, EventLog};
 pub use gemini::Gemini;
