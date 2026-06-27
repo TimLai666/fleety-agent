@@ -74,16 +74,33 @@ else
   echo "fleety-insyra: sidecar asset not available yet; insyra_exec stays off until it is" >&2
 fi
 
-# Best-effort: install the ddgs[mcp] Python package so the built-in `ddgs` MCP
-# (web search: text/images/news/videos/books + extract_content) works the first
-# time the server runs. Tries pipx (cleanest, isolated venv) then `pip --user`.
-# Non-fatal — the server logs an actionable warning at boot if it still can't
-# find the binary.
+# Best-effort: install (or upgrade) the ddgs[mcp] Python package so the
+# built-in `ddgs` MCP (web search: text/images/news/videos/books +
+# extract_content) works the first time the server runs, AND so re-running
+# this script after a fleety-server release refreshes the bundled MCP to
+# latest. Tries pipx (cleanest, isolated venv) then `pip --user`. Non-fatal —
+# the server logs an actionable warning at boot if it still can't find the
+# binary, and the 24h background loop will keep retrying.
 install_ddgs() {
+  # Already installed? Upgrade to latest. Re-running install-server.sh after
+  # a release should refresh the MCP, not no-op.
   if command -v ddgs >/dev/null 2>&1; then
-    echo "ddgs: already installed ($(command -v ddgs))"
+    if command -v pipx >/dev/null 2>&1 && pipx upgrade ddgs >/dev/null 2>&1; then
+      echo "ddgs: upgraded to latest via pipx ($(command -v ddgs))"
+      return 0
+    fi
+    for py in python3 python; do
+      if command -v "$py" >/dev/null 2>&1; then
+        if "$py" -m pip install --user -U "ddgs[mcp]" >/dev/null 2>&1; then
+          echo "ddgs: upgraded to latest via $py -m pip --user"
+          return 0
+        fi
+      fi
+    done
+    echo "ddgs: already installed but upgrade failed; server's background loop will retry." >&2
     return 0
   fi
+  # Fresh install path.
   if command -v pipx >/dev/null 2>&1; then
     if pipx install "ddgs[mcp]" >/dev/null 2>&1; then
       echo "ddgs: installed via pipx (built-in web-search MCP)"

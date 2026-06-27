@@ -165,8 +165,13 @@ async fn main() {
         tracing::warn!(error = %e, "could not seed built-in MCP servers");
     }
     // Background: check whether ddgs is actually installed and optionally
-    // auto-install it (controlled by FLEETY_DDGS_AUTO_INSTALL).
+    // auto-install it (controlled by FLEETY_DDGS_AUTO_INSTALL). Also schedules
+    // an immediate background upgrade if it was already installed, so a
+    // fleety-server upgrade picks up the latest ddgs without operator action.
     tokio::spawn(builtin_mcp::check_ddgs());
+    // 24h background loop that keeps built-in MCPs at their latest upstream
+    // version. Same opt-out as install (FLEETY_DDGS_AUTO_INSTALL=0).
+    builtin_mcp::spawn_auto_upgrade_loop();
     let provider = build_provider();
     let policy = policy_from_env();
     let workspace = Arc::new(workspace_root());

@@ -13,6 +13,7 @@
 
 use std::path::Path;
 use std::process::Stdio;
+use std::time::Duration;
 
 use agent_core::{CoreError, Result};
 use serde_json::{json, Value};
@@ -133,6 +134,43 @@ async fn ddgs_runs(command: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Best-effort upgrade of an already-installed ddgs to the latest PyPI version.
+/// Tries `pipx upgrade` (pipx tracks the bare package name without extras) then
+/// falls back to `pip install -U --user`. Returns true on the first success.
+/// Used both at boot (so a `fleety-server` upgrade pulls a fresh ddgs even
+/// without rerunning the install script) and from the 24h background poll.
+async fn try_upgrade_ddgs() -> bool {
+    let candidates: &[(&str, &[&str])] = &[
+        ("pipx", &["upgrade", "ddgs"]),
+        ("pip3", &["install", "--user", "-U", "ddgs[mcp]"]),
+        ("pip", &["install", "--user", "-U", "ddgs[mcp]"]),
+        (
+            "python3",
+            &["-m", "pip", "install", "--user", "-U", "ddgs[mcp]"],
+        ),
+        (
+            "python",
+            &["-m", "pip", "install", "--user", "-U", "ddgs[mcp]"],
+        ),
+    ];
+    for (cmd, args) in candidates {
+        match tokio::process::Command::new(cmd)
+            .args(*args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+        {
+            Ok(s) if s.success() => {
+                tracing::info!(installer = cmd, "ddgs upgraded to latest");
+                return true;
+            }
+            Ok(_) | Err(_) => continue,
+        }
+    }
+    false
+}
+
 /// Best-effort `pip install` of `ddgs[mcp]`. Tries `pipx` first (isolated venv),
 /// falls back to `pip install --user`. Returns true on success.
 async fn try_install_ddgs() -> bool {
@@ -163,14 +201,24 @@ async fn try_install_ddgs() -> bool {
     false
 }
 
-/// Check ddgs availability and, by default, install it if it isn't reachable
-/// (`FLEETY_DDGS_AUTO_INSTALL=0` opts out for hermetic / no-network setups).
-/// Runs after seeding the builtin so `mcp_call(server="ddgs", …)` works on
-/// the very first turn after server boot.
+/// Boot-time ddgs check. Three branches:
+/// 1. Already installed → kick off a best-effort background upgrade so the
+///    built-in tracks latest across `fleety-server` updates. Boot itself
+///    doesn't wait — the running ddgs stays usable while the upgrade runs.
+/// 2. Missing + auto-install on (default) → run the install path inline.
+/// 3. Missing + auto-install off (`FLEETY_DDGS_AUTO_INSTALL=0`) → log an
+///    actionable warning and move on. Air-gapped / hermetic deployments.
 pub async fn check_ddgs() {
     let command = resolve_ddgs_command();
     if ddgs_runs(&command).await {
         tracing::info!(%command, "ddgs MCP available");
+        if auto_install_enabled() {
+            tokio::spawn(async {
+                if try_upgrade_ddgs().await {
+                    tracing::info!("ddgs MCP refreshed to latest at boot");
+                }
+            });
+        }
         return;
     }
     if !auto_install_enabled() {
@@ -196,6 +244,54 @@ pub async fn check_ddgs() {
          `pip install -U ddgs[mcp]` (or `pipx install ddgs[mcp]`). \
          Set FLEETY_DDGS_AUTO_INSTALL=0 to silence this warning."
     );
+}
+
+/// Default cadence for the background ddgs auto-upgrade loop (24h, matching
+/// `fleetyd`'s self-update polling). Override with `FLEETY_DDGS_UPGRADE_SECS`.
+const DEFAULT_UPGRADE_INTERVAL_SECS: u64 = 24 * 60 * 60;
+
+fn upgrade_interval() -> Duration {
+    let secs = std::env::var("FLEETY_DDGS_UPGRADE_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_UPGRADE_INTERVAL_SECS)
+        .max(60);
+    Duration::from_secs(secs)
+}
+
+/// Background loop that keeps built-in MCP servers up to date with their
+/// upstream release (24h default, mirroring fleetyd's self-update polling).
+/// When a `fleety-server` upgrade lands but the box isn't rebuilt, this keeps
+/// the MCP layer current without operator action. Disabled when
+/// `FLEETY_DDGS_AUTO_INSTALL=0` — same opt-out as the install path, since
+/// the conditions that make install impossible (no network / no pip) also
+/// make upgrade impossible.
+pub fn spawn_auto_upgrade_loop() {
+    if !auto_install_enabled() {
+        tracing::debug!("FLEETY_DDGS_AUTO_INSTALL=0; skipping built-in MCP auto-upgrade loop");
+        return;
+    }
+    let interval = upgrade_interval();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        // First tick fires immediately; skip it (check_ddgs already ran an
+        // upgrade at boot). Subsequent ticks happen every `interval`.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            if !ddgs_runs(&resolve_ddgs_command()).await {
+                // Got uninstalled out from under us — fall back to install.
+                tracing::info!("background sweep: ddgs missing, reinstalling");
+                if try_install_ddgs().await {
+                    tracing::info!("background sweep: ddgs reinstalled");
+                }
+                continue;
+            }
+            if try_upgrade_ddgs().await {
+                tracing::info!("background sweep: ddgs upgraded to latest");
+            }
+        }
+    });
 }
 
 #[cfg(test)]

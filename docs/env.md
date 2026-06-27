@@ -78,14 +78,20 @@ set; without `FLEETY_AUTO_UPDATE=apply` it's notify-only (log a warning).
 
 `ddgs` is the metasearch MCP shipped as a built-in, giving the agent
 `search_text` / `search_images` / `search_news` / `search_videos` /
-`search_books` / `extract_content`. **Installed automatically** alongside the
-server:
+`search_books` / `extract_content`. **Installed and kept up to date
+automatically** alongside the server:
 
-- `scripts/install-server.sh` runs `pipx install ddgs[mcp]` (then
-  `pip --user`) after dropping the binary
-- The Docker image bakes `pipx install ddgs[mcp]` into the runtime layer
-- At server boot, if `ddgs` is still missing the runtime tries to install it
-  (`pipx` → `pip install --user` → `python -m pip --user`)
+- `scripts/install-server.sh` runs `pipx install ddgs[mcp]` on first run, and
+  `pipx upgrade ddgs` (fallback `pip install -U --user`) when re-run after a
+  `fleety-server` release
+- The Docker image bakes `pipx install ddgs[mcp]` into the runtime layer — a
+  rebuild (`docker compose up -d --build`) pulls the latest PyPI version
+- At server boot, if `ddgs` is missing the runtime installs it; if already
+  installed, a best-effort background `pipx upgrade` (fallback `pip -U
+  --user`) refreshes it so a binary upgrade picks up the latest MCP without
+  operator action
+- A 24h background loop on the server upgrades the built-in MCPs to latest
+  for long-running deployments that never reboot
 
 Server seeds the entry into `{home}/mcp/builtin.json` every boot.
 
@@ -93,7 +99,8 @@ Server seeds the entry into `{home}/mcp/builtin.json` every boot.
 |---|---|---|
 | `FLEETY_DDGS_BIN` | (auto: `which ddgs`) | Absolute path to the `ddgs` binary. Useful when it's not on PATH (e.g. a venv). |
 | `FLEETY_DDGS_ARGS` | `["mcp"]` | JSON array of args passed to `ddgs`. Use `["mcp","-pr","socks5h://127.0.0.1:9150"]` for ddgs's proxy mode. |
-| `FLEETY_DDGS_AUTO_INSTALL` | (unset → on) | Set to `0` to **disable** the boot-time auto-install (hermetic / air-gapped hosts). Any other value (or unset) leaves it on. |
+| `FLEETY_DDGS_AUTO_INSTALL` | (unset → on) | Set to `0` to **disable** the boot-time auto-install **and** the 24h auto-upgrade loop (hermetic / air-gapped hosts). Any other value (or unset) leaves both on. |
+| `FLEETY_DDGS_UPGRADE_SECS` | `86400` (24 h) | Cadence of the background auto-upgrade loop. Clamped to a 60 s floor. |
 
 ## Tools that talk to the network
 

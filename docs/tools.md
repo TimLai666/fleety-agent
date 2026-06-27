@@ -254,15 +254,23 @@ agent's Obsidian vault. Neither reaches the public internet.
 | `search_books` | Book search. |
 | `extract_content` | Extract page content from a URL (markdown-ified). |
 
-**Install.** ddgs is a Python package; the runtime installs it automatically:
+**Install & auto-update.** ddgs is a Python package; the runtime installs and
+keeps it updated automatically — a `fleety-server` upgrade refreshes the
+bundled MCP through whichever channel applies:
 
-- `scripts/install-server.sh` runs `pipx install ddgs[mcp]` (then `pip --user`)
-  right after dropping the binary
+- `scripts/install-server.sh` runs `pipx install ddgs[mcp]` on first run, and
+  `pipx upgrade ddgs` (fallback `pip install -U --user`) when re-run after a
+  release — so the one-liner that updates the server also refreshes the
+  bundled MCP
 - The official Docker image (`Dockerfile`) bakes `ddgs[mcp]` into the runtime
-  layer (`pipx`-installed under `/usr/local/bin`)
-- At server boot, if `ddgs` still isn't on PATH the runtime tries the install
-  itself (pipx → pip --user → `python -m pip --user`). Set
-  `FLEETY_DDGS_AUTO_INSTALL=0` to opt out (e.g. air-gapped hosts).
+  layer; `docker compose up -d --build` pulls the latest PyPI version
+- At server boot: missing → install inline; already installed → background
+  `pipx upgrade` (fallback `pip -U --user`) so a binary swap picks up latest
+- On long-running servers, a 24h background loop keeps the built-in MCPs at
+  their upstream release without operator action (configurable via
+  `FLEETY_DDGS_UPGRADE_SECS`)
+- `FLEETY_DDGS_AUTO_INSTALL=0` disables both the install and the upgrade
+  paths (air-gapped / hermetic deployments)
 
 Manual fallback if all of the above missed: `pip install -U 'ddgs[mcp]'`.
 
