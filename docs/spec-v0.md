@@ -37,7 +37,7 @@
 - headroom 的 ML prose 壓縮模型（階段二）。v0 只做 §10.1 階段一的演算法類原生壓縮（已內建 agent-core，非外掛）
 - 自管排程 / cron（§10.2）。設計與工具先定，scheduler 實作 post-v0（M8）
 - 瀏覽器自動化（§12）。以 skill 在目標裝置本機用該機 Chrome（CDP）驅動，post-v0（M9）
-- 電腦操作 computer-use（§13）。內建 MCP（computer-use-mcp）在裝置本機控制螢幕/鍵鼠，隨 client runtime 自動裝，post-v0（M10）
+- 電腦操作 computer-use（§13）。~~內建 MCP（computer-use-mcp）~~**改原生 `computer_*` 工具（fleety-tools，跨裝置 via device_exec）**，在裝置本機控制螢幕/鍵鼠（見 §13 更新）
 - 知識 Wiki（§14）。Obsidian 格式第二大腦，agent-core 子系統、專屬 vault + 管理機制，post-v0（M11，實作輕量）
 
 > Skills 與 MCP 在 `prompts/protocol.md` 已寫入協定。v0 runtime 對 `list_skills` / `use_skill` / `mcp_*` 回「未啟用」即可，不需實作，避免 prompt 與 runtime 對不上時 Agent 亂猜。
@@ -343,7 +343,7 @@ v0 範圍：前綴指紋 + 檔案 hash 失效屬 M1／M3；skills/MCP 熱重載�
 - **M7 語音對話（post-v0）**：終端做 STT／TTS（server 仍只進出文字）；啟用 speech 輸出通道 + device deixis；voice mode 旗標。協定欄位 M0–M2 就先留，引擎這裡才接。
 - **M8 自管排程 / cron（post-v0）**：agent-core scheduler（cron/at/every、fire→spawn run）、`schedule_*` 工具、無人值守政策（critical 停泊回報）、離線不補跑。學 openclaw、補安全層（§10.2）。
 - **M9 瀏覽器自動化（post-v0）**：browser skill，目標裝置本機 CDP 驅動該機 Chrome（managed/user profile）、snapshot-ref 動作、SSRF 防護、user-profile 綁 co-location/核准、登入態敏感 act＝critical（§12）。
-- **M10 電腦操作 computer-use（post-v0）**：內建 computer-use-mcp 隨 runtime 自動裝在裝置端、版本隨 runtime 更新；screenshot 自由用、UI 控制節制使用且使用者活躍時先提醒；偏好順序 API/MCP > browser > computer-use（§13）。
+- **M10 電腦操作 computer-use（post-v0）**：**已改原生 `computer_*` 工具（fleety-tools、`enigo`+`xcap`、跨裝置 via device_exec），非 MCP（見 §13 更新）**；screenshot 自由用、UI 控制節制使用且使用者活躍時先提醒；偏好順序 API/MCP > browser > computer-use（§13）。
 - **M11 知識 Wiki（post-v0，輕量）**：agent-core wiki 子系統、`<agent-home>/wiki/` Obsidian vault、三層結構、`wiki_*` 工具（強制寫進 vault）、dedup/index/log/lint 管理機制、矛盾不靜默覆寫（§14）。
 
 順序刻意把最難、最該驗證的（loop、永不崩潰、工具橋）放前面；enrollment 與 TUI 美化放後面。M7 語音是 post-v0。Skills/MCP v0 stub，不列 milestone。`speech` 輸出欄位與 voice mode 旗標在 fleety-protocol 從 M2 就先定義（不實作引擎），避免日後改協定。
@@ -365,7 +365,9 @@ v0 範圍：前綴指紋 + 檔案 hash 失效屬 M1／M3；skills/MCP 熱重載�
 
 ## 13. 電腦操作 computer-use（裝置能力，post-v0）
 
-讓 Fleety 操作每一台裝置的桌面，或截圖看某台裝置在幹嘛。內建 [computer-use-mcp](https://github.com/domdomegg/computer-use-mcp)（nut.js、跨平台、screenshot/click/type/move/scroll/key）。
+> **已更新（實作時改變方向）**：本節原規劃「內建 computer-use-mcp、走 builtin MCP、隨 client runtime 自動裝在裝置端」。實際**改成原生 Rust 工具**（`computer_*`：`enigo` 鍵鼠 + `xcap` 截圖）放進共享的 `fleety-tools` crate，server 與每台 fleetyd 都註冊，透過 `device_exec` 控任一裝置桌面——和 `browser_*` 同一條路。改原生的理由：MCP 一律在 server 主機 spawn，控不到別台裝置；原生雙註冊才真的跨裝置，也不必依賴 Node/npx。本節下面關於「builtin MCP / 自動裝在裝置端 / npx 版本通道」的描述已被取代，僅保留作歷史；現況見 `docs/tools.md` 的 Computer-use 段。下面的**使用節制原則仍然有效**。
+
+讓 Fleety 操作每一台裝置的桌面，或截圖看某台裝置在幹嘛。~~內建 [computer-use-mcp](https://github.com/domdomegg/computer-use-mcp)~~（已改原生，見上方更新；能力面相同：screenshot/click/type/move/scroll/key、跨平台）。
 
 - **內建、隨 client runtime 自動裝在裝置端**：computer-use-mcp 在被控裝置本機跑（控制該機螢幕/鍵鼠），所以必須裝在裝置端。歸入 builtin MCP（見 §3 內建 vs 安裝），跟 CLI/daemon 一起自動安裝。
 - **版本維持最新，但走 runtime 更新通道、不在執行期亂抓 latest**：pin 到隨 runtime 發布的測試過版本，靠 fleety-updater 整包更新（守永不崩潰）。執行期 `npx latest` 這種會在無人值守時突然壞掉，不採用。
