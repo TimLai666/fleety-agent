@@ -71,6 +71,7 @@ pub async fn tick(
     crate::wiki::register(&mut tools, &storage.wiki_dir(), &storage.models_dir());
     crate::ssh::register(&mut tools);
     fleety_tools::register_browser(&mut tools);
+    fleety_tools::register_computer(&mut tools);
     crate::sites::register(&mut tools, &storage.sites_dir(), &storage.devices_dir());
     // Finish interrupted scheduled turns first (best-effort, each isolated).
     for conversation in incomplete {

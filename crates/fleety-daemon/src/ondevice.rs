@@ -27,6 +27,9 @@ pub fn build_local_registry(root: &Path) -> ToolRegistry {
     // Browser (CDP) tools so the agent can drive this device's browser via
     // device_exec; Chrome is auto-provisioned on first use.
     fleety_tools::register_browser(&mut registry);
+    // Native computer-use (desktop control) so device_exec can drive this
+    // device's screen/mouse/keyboard. Errors actionably on headless hosts.
+    fleety_tools::register_computer(&mut registry);
     registry
 }
 

@@ -22,9 +22,11 @@ use agent_core::{CoreError, Result, RiskLevel, Tool, ToolRegistry, ToolSpec};
 
 mod browser;
 mod chrome;
+mod computer;
 mod insyra;
 pub use browser::register_browser;
 pub use chrome::{ensure_chrome, upgrade_managed_chrome};
+pub use computer::register_computer;
 pub use insyra::register_insyra;
 
 /// Register the workspace tools rooted at `root`; mutations back up to `backups_dir`.

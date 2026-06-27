@@ -21,9 +21,10 @@ Last reviewed against `crates/` on 2026-06-24.
     registered in **both** the server's registry (operating on
     `FLEETY_WORKSPACE`) and every fleetyd's local registry (operating on
     `FLEETY_DEVICE_ROOT`). Examples: `read_file`, `write_file`, `run_command`,
-    git, insyra, the `browser_*` (CDP) tools. To route one of these to a
-    specific device, wrap it with `device_exec(device="…", tool="read_file",
-    args={…})`; call it by its bare name and you hit the server's workspace.
+    git, insyra, the `browser_*` (CDP) tools, the `computer_*` (desktop) tools.
+    To route one of these to a specific device, wrap it with
+    `device_exec(device="…", tool="read_file", args={…})`; call it by its bare
+    name and you hit the server's workspace.
   - **server-only routing** — the tool exists on the server but its job is to
     coordinate other devices (e.g. `device_exec` itself, `pair_create`).
 - **Targeting.** Tools that operate on a workspace ("workspace tools") run on
@@ -150,6 +151,29 @@ non-loopback `FLEETY_CHROME_URL` / `chrome=`) are never provisioned. Knobs:
 `FLEETY_CHROME_AUTO_INSTALL=0` (detect+launch only), `FLEETY_CHROME_BIN`
 (force a binary), `FLEETY_CHROME_DIR` (managed-download cache) — see
 [`docs/env.md`](env.md).
+
+## Computer-use (native desktop control)
+
+**Runs on:** any device. Native (`enigo` input + `xcap` capture) in the shared
+`fleety-tools` crate, so `device_exec(device="laptop", tool="computer_click")`
+drives the **laptop's** desktop, a bare call drives the server's. Needs a real
+display session — headless hosts and Linux/Wayland (synthetic input restricted)
+return an actionable error instead of acting.
+
+This is the **most intrusive** interface — `policy.md` ranks it last (prefer a
+dedicated API/MCP > `browser_*` CDP > computer-use): it takes over the user's
+own mouse/keyboard, so warn before driving a device the user is actively using,
+and destructive desktop actions are `critical`. Screenshots are exempt
+(low-impact).
+
+| Tool | Purpose | Key inputs | Risk |
+|---|---|---|---|
+| `computer_screenshot` | Capture the desktop as a base64 PNG. | `monitor?` | read |
+| `computer_move` | Move the cursor to absolute pixels. | `x`, `y` | mutate |
+| `computer_click` | Click `left`/`right`/`middle` (optionally move to `x`,`y` first). | `button?`, `x?`, `y?` | mutate |
+| `computer_type` | Type a string at the current focus. | `text` | mutate |
+| `computer_key` | Press a key (char or named: enter/tab/esc/arrows/f1-f12…) with optional modifiers (ctrl/alt/shift/meta). | `key`, `modifiers?` | mutate |
+| `computer_scroll` | Scroll the wheel (`vertical`/`horizontal`). | `amount`, `axis?` | mutate |
 
 ## Insyra (data analysis DSL)
 
@@ -285,7 +309,7 @@ timeout.
 
 | Tool | Purpose | Key inputs | Risk |
 |---|---|---|---|
-| `mcp_list` | List configured MCP servers; each entry carries `source: "builtin" \| "installed"`. Built-ins: `ddgs` (web search) and `computer-use` (desktop control). | — | read |
+| `mcp_list` | List configured MCP servers; each entry carries `source: "builtin" \| "installed"`. Built-in: `ddgs` (web search). | — | read |
 | `mcp_add` | Add (or replace) a **user-installed** server. Shadows a built-in of the same name. | `name`, `command`, `args?` | mutate |
 | `mcp_remove` | Remove a user-installed server. Built-in servers cannot be removed (override by `mcp_add`-ing the same name). | `name` | mutate |
 | `mcp_call` | Call a tool on a configured MCP server. | `server`, `tool`, `arguments?` | mutate |
@@ -331,21 +355,6 @@ Manual fallback if all of the above missed: `pip install -U 'ddgs[mcp]'`.
 spawn args (defaults to `["mcp"]`; pass `["mcp","-pr","socks5h://…"]` for
 ddgs's proxy mode). See [`docs/env.md`](env.md).
 
-### Built-in: `computer-use` — desktop control
-
-`mcp_call(server="computer-use", tool=…)` drives the desktop of **whatever host
-runs `fleety-server`** (screenshot / mouse / keyboard) via
-[`domdomegg/computer-use-mcp`](https://github.com/domdomegg/computer-use-mcp).
-Seeded into `builtin.json` at boot; `npx -y computer-use-mcp` fetches it on
-first spawn, so the only prerequisite is **Node.js** (and a display session —
-it won't work headless). `FLEETY_COMPUTER_USE=0` removes the built-in;
-`FLEETY_NPX_BIN` overrides the `npx` launcher.
-
-This is the **most intrusive** UI path — `policy.md` ranks it last (prefer a
-dedicated API/MCP > `browser_*` CDP > computer-use), it takes over the user's
-own mouse/keyboard, and destructive desktop actions are `critical`. Note MCP
-servers run on the server host, so this controls the server's desktop; for a
-*remote* device's screen, use the `browser_*` tools via `device_exec` instead.
 
 ## Knowledge wiki
 
@@ -415,8 +424,9 @@ see `fleety audit list`.
 ## Planned (not yet shipped)
 
 The earlier draft of this file listed `harness`, `capability_probe`,
-`conversation_list/search/read`, `project_*`, `workspace_*` aliases, the
-`computer-use-mcp` plane, and built-in `browser` skill action vocabulary.
-Those are still planned but not in the runtime today; see `docs/spec-v0.md`
+`conversation_list/search/read`, `project_*`, `workspace_*` aliases, and
+built-in `browser` skill action vocabulary. Those are still planned but not in
+the runtime today. (Desktop control shipped natively as the `computer_*`
+tools — see the Computer-use section above.) See `docs/spec-v0.md`
 for scope and `docs/roadmap.md` for next-up implementation plans. When they
 land, they belong in this file in the corresponding section.
