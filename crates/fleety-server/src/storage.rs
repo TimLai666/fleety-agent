@@ -241,9 +241,18 @@ impl Storage {
         self.home.join("auth.json")
     }
 
-    /// Path to the user-installed MCP server config (JSON).
-    pub fn mcp_config_path(&self) -> PathBuf {
+    /// Path to the user-installed MCP server config (JSON). Shadows built-in
+    /// servers of the same name.
+    pub fn mcp_installed_config_path(&self) -> PathBuf {
         self.home.join("mcp").join("installed.json")
+    }
+
+    /// Built-in MCP servers (shipped with the runtime); seeded by
+    /// `builtin_mcp::seed` at server boot, read-only from the user's PoV.
+    /// `mcp_remove` refuses to delete built-ins — to override one, `mcp_add` it
+    /// at `installed`, which shadows the built-in by name.
+    pub fn mcp_builtin_config_path(&self) -> PathBuf {
+        self.home.join("mcp").join("builtin.json")
     }
 
     /// The knowledge wiki vault (Obsidian-style markdown), separate from workspaces.

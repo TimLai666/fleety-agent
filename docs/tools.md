@@ -189,8 +189,37 @@ kills it (single-shot, 30 s timeout).
 |---|---|---|---|
 | `mcp_list` | List configured MCP servers; each entry carries `source: "builtin" \| "installed"`. | — | read |
 | `mcp_add` | Add (or replace) a **user-installed** server. Shadows a built-in of the same name. | `name`, `command`, `args?` | mutate |
-| `mcp_remove` | Remove a user-installed server. Built-in servers cannot be removed. | `name` | mutate |
+| `mcp_remove` | Remove a user-installed server. Built-in servers cannot be removed (override by `mcp_add`-ing the same name). | `name` | mutate |
 | `mcp_call` | Call a tool on a configured MCP server. | `server`, `tool`, `arguments?` | mutate |
+
+### Built-in: `ddgs` — web search
+
+Server seeds `ddgs` into `{home}/mcp/builtin.json` at every boot — agents see
+it in `mcp_list` immediately and use it via `mcp_call(server="ddgs", tool=…)`.
+This is Fleety's only general web search; the workspace's `search_files` is
+ripgrep over local files, the wiki's `wiki_search` is the agent's Obsidian
+vault. Neither reaches the public internet.
+
+| ddgs tool (called via `mcp_call`) | Purpose |
+|---|---|
+| `search_text` | Web text search; metasearch aggregator (DuckDuckGo / Bing / Yandex / Brave / Mojeek / etc.). |
+| `search_images` | Image search. |
+| `search_news` | News search. |
+| `search_videos` | Video search. |
+| `search_books` | Book search. |
+| `extract_content` | Extract page content from a URL (markdown-ified). |
+
+**Install prerequisite** — ddgs is a Python package. Run once on the server:
+
+```sh
+pip install -U ddgs[mcp]            # or:  pipx install ddgs[mcp]
+```
+
+Set `FLEETY_DDGS_AUTO_INSTALL=1` to let the server try the install itself at
+boot when `ddgs` isn't on PATH (tries pipx → pip --user → `python -m pip`).
+`FLEETY_DDGS_BIN` overrides the resolved path; `FLEETY_DDGS_ARGS` overrides
+the spawn args (defaults to `["mcp"]`; pass `["mcp","-pr","socks5h://…"]` for
+ddgs's proxy mode). See [`docs/env.md`](env.md).
 
 ## Knowledge wiki
 

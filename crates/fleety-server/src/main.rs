@@ -11,6 +11,7 @@
 mod auth;
 mod bridge;
 mod browser;
+mod builtin_mcp;
 mod builtin_skills;
 mod conn;
 mod gc;
@@ -158,6 +159,14 @@ async fn main() {
     if let Err(e) = builtin_skills::seed(&storage.skills_builtin_dir()) {
         tracing::warn!(error = %e, "could not seed built-in skills");
     }
+    // Seed built-in MCP servers (ddgs for web search) so the agent has them
+    // available without a manual `mcp_add`. Same posture as builtin_skills.
+    if let Err(e) = builtin_mcp::seed(&storage.mcp_builtin_config_path()) {
+        tracing::warn!(error = %e, "could not seed built-in MCP servers");
+    }
+    // Background: check whether ddgs is actually installed and optionally
+    // auto-install it (controlled by FLEETY_DDGS_AUTO_INSTALL).
+    tokio::spawn(builtin_mcp::check_ddgs());
     let provider = build_provider();
     let policy = policy_from_env();
     let workspace = Arc::new(workspace_root());

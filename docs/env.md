@@ -74,6 +74,19 @@ set; without `FLEETY_AUTO_UPDATE=apply` it's notify-only (log a warning).
 | `FLEETY_INSYRA_BIN` | (auto: beside exe) | Path to the `fleety-insyra` Go sidecar. The `insyra_exec` tool spawns this. |
 | `FLEETY_INSYRA_URL` | `releases/latest/download/…` | Override the download URL for `fleetyd install` / `fleetyd update`. |
 
+## Built-in MCP: ddgs (web search)
+
+`ddgs` is the metasearch MCP shipped as a built-in (`pip install -U ddgs[mcp]`),
+giving the agent `search_text` / `search_images` / `search_news` /
+`search_videos` / `search_books` / `extract_content`. Server seeds it into
+`{home}/mcp/builtin.json` at every boot.
+
+| Var | Default | Meaning |
+|---|---|---|
+| `FLEETY_DDGS_BIN` | (auto: `which ddgs`) | Absolute path to the `ddgs` binary. Useful when it's not on PATH (e.g. a venv). |
+| `FLEETY_DDGS_ARGS` | `["mcp"]` | JSON array of args passed to `ddgs`. Use `["mcp","-pr","socks5h://127.0.0.1:9150"]` for ddgs's proxy mode. |
+| `FLEETY_DDGS_AUTO_INSTALL` | (unset) | Set to `1` to let the server try `pipx install ddgs[mcp]` → `pip install --user -U ddgs[mcp]` → `python -m pip install --user …` at boot when the binary isn't reachable. Default is notify-only via a tracing warning. |
+
 ## Tools that talk to the network
 
 | Var | Default | Meaning |
