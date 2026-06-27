@@ -53,10 +53,19 @@ Last reviewed against `crates/` on 2026-06-24.
 ## Workspace tools
 
 **Runs on:** any device. Lives in the shared `fleety-tools` crate, so the same
-implementations register on `fleety-server` (against `FLEETY_WORKSPACE`) and
-inside every `fleetyd` (against `FLEETY_DEVICE_ROOT`). Call by bare name → hits
-the server's workspace. Wrap in `device_exec(device="laptop", tool="read_file",
-args={…})` → hits the laptop's filesystem instead.
+implementations register on `fleety-server` (relative paths against
+`FLEETY_WORKSPACE`) and inside every `fleetyd` (against `FLEETY_DEVICE_ROOT`).
+Call by bare name → hits the server; wrap in `device_exec(device="laptop",
+tool="read_file", args={…})` → hits the laptop's filesystem instead.
+
+**Filesystem scope.** By default (the `full_access` posture) these tools are
+**not sandboxed to the root** — absolute paths and paths outside the root work
+(read or audited + rollback-backed write), since the root is just the base for
+*relative* paths. A sensitive-path guard still refuses **mutations** of critical
+paths (SSH keys/config, `/etc/shadow`, `/dev`, Windows system dirs, …) with an
+actionable "do this deliberately / confirm with the user" error; reads are
+unrestricted. Set `FLEETY_FS_SCOPE=workspace` to re-confine everything to the
+root (the old `..`/absolute/symlink-tight sandbox).
 
 | Tool | Purpose | Key inputs | Risk |
 |---|---|---|---|

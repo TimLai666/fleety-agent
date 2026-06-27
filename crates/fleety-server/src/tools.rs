@@ -445,6 +445,8 @@ mod tests {
     // Workspace tools come from fleety-tools; these confirm the wiring works.
     #[tokio::test]
     async fn list_dir_and_escape_via_registry() {
+        // Pin the confined sandbox for the escape assertion (default is whole-disk).
+        std::env::set_var("FLEETY_FS_SCOPE", "workspace");
         let root = std::env::current_dir().expect("cwd");
         let registry = build_registry(
             &root,

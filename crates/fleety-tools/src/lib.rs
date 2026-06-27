@@ -6,8 +6,16 @@
 //! (backup + unified diff), `delete_file` / `move_file` / `make_dir`,
 //! `rollback` (restore a backup), `run_command` (critical-command guard; can
 //! `track` paths to diff what it changed), and `git_status`/`git_diff` (incl.
-//! untracked)/`git_log`/`git_show`. All paths are confined to `root` with a
-//! path-escape guard; mutations back up to `backups_dir`.
+//! untracked)/`git_log`/`git_show`. Relative paths resolve against `root`;
+//! mutations back up to `backups_dir`.
+//!
+//! **Filesystem scope:** by default (the `full_access` posture) the structured
+//! tools may read/write **anywhere on the device** — absolute paths and paths
+//! outside `root` are allowed, still audited + rollback-backed — with a
+//! `sensitive_write_reason` guard refusing mutations of truly critical paths
+//! (SSH keys/config, `/etc/shadow`, `/dev`, the Windows dir, …). Set
+//! `FLEETY_FS_SCOPE=workspace` to re-confine every path to `root` (a
+//! `..`/absolute/symlink-tight sandbox).
 #![forbid(unsafe_code)]
 #![warn(clippy::unwrap_used, clippy::expect_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
@@ -69,8 +77,78 @@ fn require_str<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
         .ok_or_else(|| CoreError::Message(format!("missing required string argument '{key}'")))
 }
 
-/// Resolve `rel` against `root`, refusing paths that escape it.
+/// Whether the workspace file tools are sandboxed to `root`. Default (and the
+/// `full_access` posture) is **unconfined** — the structured tools may read and
+/// (audited + rollback-backed) write anywhere on the device, with a sensitive-
+/// path guard refusing the truly critical ones. Set `FLEETY_FS_SCOPE=workspace`
+/// to re-confine them to `root` (a `..`/absolute/symlink-tight sandbox).
+fn fs_confined() -> bool {
+    std::env::var("FLEETY_FS_SCOPE").as_deref() == Ok("workspace")
+}
+
+fn is_absolute_path(rel: &str) -> bool {
+    Path::new(rel).is_absolute() || rel.starts_with('/') || rel.starts_with('\\')
+}
+
+/// Truly critical paths whose **mutation** is irreversible / system-breaking, so
+/// the structured tools refuse it even unconfined (policy.md: critical needs
+/// explicit user confirmation — do it deliberately, don't have the agent edit
+/// it as routine). Best-effort, matched on the resolved path. Reads are allowed.
+fn sensitive_write_reason(resolved: &Path) -> Option<&'static str> {
+    let p = resolved
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    const PATTERNS: &[(&str, &str)] = &[
+        ("/.ssh/", "SSH keys / authorized_keys"),
+        ("/etc/ssh", "SSH server config / host keys"),
+        ("sshd_config", "SSH server config"),
+        ("authorized_keys", "SSH authorized_keys"),
+        ("/etc/shadow", "the shadow password file"),
+        ("/etc/passwd", "the passwd file"),
+        ("/etc/sudoers", "the sudoers policy"),
+        ("/etc/pam", "PAM auth config"),
+        ("/boot/", "boot files"),
+        ("/dev/", "a device node"),
+        ("/proc/", "the proc filesystem"),
+        ("/sys/", "the sys filesystem"),
+        ("/windows/system32", "Windows system files"),
+        ("/windows/", "the Windows directory"),
+        ("ntuser.dat", "a Windows registry hive"),
+    ];
+    PATTERNS
+        .iter()
+        .find(|(pat, _)| p.contains(pat))
+        .map(|(_, why)| *why)
+}
+
+/// Refuse a mutation of a critical path with an actionable error.
+fn guard_sensitive(resolved: &Path) -> Result<()> {
+    if let Some(why) = sensitive_write_reason(resolved) {
+        return Err(CoreError::Message(format!(
+            "refusing to modify {} ({}) — this is a critical, hard-to-reverse path. Confirm with \
+             the user and do it deliberately (e.g. via run_command), not as a routine file edit.",
+            resolved.display(),
+            why
+        )));
+    }
+    Ok(())
+}
+
+/// Resolve `rel` for reading. Confined: must stay within `root`. Unconfined
+/// (default): `rel` may be absolute or escape `root`; relative paths resolve
+/// against `root`. The path must exist.
 fn resolve_in_root(root: &Path, rel: &str) -> Result<PathBuf> {
+    if !fs_confined() {
+        let base = if is_absolute_path(rel) {
+            PathBuf::from(rel)
+        } else {
+            root.join(rel)
+        };
+        return base
+            .canonicalize()
+            .map_err(|e| CoreError::Message(format!("path '{rel}' not found: {e}")));
+    }
     let canon_root = root
         .canonicalize()
         .map_err(|e| CoreError::Message(format!("root unavailable: {e}")))?;
@@ -80,29 +158,40 @@ fn resolve_in_root(root: &Path, rel: &str) -> Result<PathBuf> {
         .map_err(|e| CoreError::Message(format!("path '{rel}' not found: {e}")))?;
     if !resolved.starts_with(&canon_root) {
         return Err(CoreError::Message(format!(
-            "path '{rel}' escapes the workspace; use a path inside it"
+            "path '{rel}' escapes the workspace; use a path inside it (or set FLEETY_FS_SCOPE off)"
         )));
     }
     Ok(resolved)
 }
 
-/// Resolve a path for writing: parent must exist and stay within `root`, the
-/// leaf may be new, and the leaf must not be a symlink.
+/// Resolve a path for writing: the parent must exist and the leaf must not be a
+/// symlink. Confined: parent must stay within `root`. Unconfined (default): the
+/// parent may be anywhere.
 fn resolve_for_write(root: &Path, rel: &str) -> Result<PathBuf> {
-    let canon_root = root
-        .canonicalize()
-        .map_err(|e| CoreError::Message(format!("root unavailable: {e}")))?;
-    let target = canon_root.join(rel);
+    let confined = fs_confined();
+    let target = if !confined && is_absolute_path(rel) {
+        PathBuf::from(rel)
+    } else {
+        let canon_root = root
+            .canonicalize()
+            .map_err(|e| CoreError::Message(format!("root unavailable: {e}")))?;
+        canon_root.join(rel)
+    };
     let parent = target
         .parent()
         .ok_or_else(|| CoreError::Message(format!("invalid path '{rel}'")))?;
     let canon_parent = parent
         .canonicalize()
         .map_err(|e| CoreError::Message(format!("parent directory of '{rel}' not found: {e}")))?;
-    if !canon_parent.starts_with(&canon_root) {
-        return Err(CoreError::Message(format!(
-            "path '{rel}' escapes the workspace"
-        )));
+    if confined {
+        let canon_root = root
+            .canonicalize()
+            .map_err(|e| CoreError::Message(format!("root unavailable: {e}")))?;
+        if !canon_parent.starts_with(&canon_root) {
+            return Err(CoreError::Message(format!(
+                "path '{rel}' escapes the workspace"
+            )));
+        }
     }
     let file_name = target
         .file_name()
@@ -120,10 +209,23 @@ fn resolve_for_write(root: &Path, rel: &str) -> Result<PathBuf> {
     Ok(resolved)
 }
 
-/// Resolve a workspace-relative path lexically (no `..`, not absolute) without
-/// requiring it to exist — for paths a tool may create or that aren't there yet.
+/// Resolve a path lexically without requiring it to exist — for paths a tool may
+/// create. Confined: relative only, no `..`. Unconfined (default): absolute and
+/// escaping paths are allowed.
 fn resolve_lenient(root: &Path, rel: &str) -> Result<PathBuf> {
-    if rel.is_empty() || Path::new(rel).is_absolute() || rel.split(['/', '\\']).any(|c| c == "..") {
+    if rel.is_empty() {
+        return Err(CoreError::Message("path must not be empty".to_string()));
+    }
+    if !fs_confined() {
+        if is_absolute_path(rel) {
+            return Ok(PathBuf::from(rel));
+        }
+        let canon_root = root
+            .canonicalize()
+            .map_err(|e| CoreError::Message(format!("root unavailable: {e}")))?;
+        return Ok(canon_root.join(rel));
+    }
+    if Path::new(rel).is_absolute() || rel.split(['/', '\\']).any(|c| c == "..") {
         return Err(CoreError::Message(format!(
             "path '{rel}' must be a relative path inside the workspace (no '..')"
         )));
@@ -218,6 +320,7 @@ pub fn apply_backup(root: &Path, backups: &Path, backup_id: &str) -> Result<Valu
         .to_string_lossy()
         .replace('\\', "/");
     let dest = resolve_lenient(root, &rel)?;
+    guard_sensitive(&dest)?;
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| CoreError::Message(format!("cannot recreate '{rel}' parent: {e}")))?;
@@ -634,6 +737,7 @@ impl Tool for WriteFile {
         let path = require_str(&args, "path")?;
         let content = require_str(&args, "content")?;
         let resolved = resolve_for_write(&self.root, path)?;
+        guard_sensitive(&resolved)?;
 
         let old = std::fs::read_to_string(&resolved).unwrap_or_default();
         let mut backup = Value::Null;
@@ -686,6 +790,7 @@ impl Tool for EditFile {
         let path = require_str(&args, "path")?;
         let new = require_str(&args, "new")?;
         let resolved = resolve_in_root(&self.root, path)?;
+        guard_sensitive(&resolved)?;
         let content = std::fs::read_to_string(&resolved)
             .map_err(|e| CoreError::Message(format!("cannot read '{path}': {e}")))?;
 
@@ -950,6 +1055,7 @@ impl Tool for DeleteFile {
     async fn call(&self, args: Value) -> Result<Value> {
         let path = require_str(&args, "path")?;
         let resolved = resolve_in_root(&self.root, path)?;
+        guard_sensitive(&resolved)?;
         if resolved.is_dir() {
             return Err(CoreError::Message(format!(
                 "'{path}' is a directory; use run_command for directory removal"
@@ -990,6 +1096,8 @@ impl Tool for MoveFile {
         let to = require_str(&args, "to")?;
         let src = resolve_in_root(&self.root, from)?;
         let dest = resolve_lenient(&self.root, to)?;
+        guard_sensitive(&src)?;
+        guard_sensitive(&dest)?;
         let mut backup = Value::Null;
         if dest.exists() {
             backup = backup_existing(&self.backups, to, &dest)?;
@@ -1069,6 +1177,8 @@ mod tests {
         dir
     }
 
+    use serial_test::serial;
+
     #[tokio::test]
     async fn read_search_edit_with_diff_and_escape_guard() {
         let root = temp();
@@ -1121,7 +1231,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn track_diff_delete_rollback_move_mkdir() {
+        // This test asserts the confined sandbox (escape rejection).
+        std::env::set_var("FLEETY_FS_SCOPE", "workspace");
         let root = temp();
         let backups = root.join(".bak");
         std::fs::write(root.join("t.txt"), "one\ntwo\n").expect("seed");
@@ -1268,6 +1381,51 @@ mod tests {
             .contains("GAMMA"));
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn unconfined_writes_outside_root_but_refuses_sensitive() {
+        std::env::set_var("FLEETY_FS_SCOPE", "full"); // whole-disk (the default)
+        let root = temp();
+        let outside = temp(); // a dir outside `root`
+        let backups = root.join(".bak");
+        let mut reg = ToolRegistry::new();
+        register_workspace(&mut reg, &root, &backups);
+
+        // An absolute path outside the workspace is allowed (audited + backed up).
+        let abs = outside.join("note.txt");
+        reg.call(
+            "write_file",
+            json!({ "path": abs.to_string_lossy(), "content": "hi" }),
+        )
+        .await
+        .expect("write outside root");
+        assert_eq!(std::fs::read_to_string(&abs).expect("read"), "hi");
+
+        // A critical/sensitive path is refused even unconfined.
+        let sensitive = if cfg!(windows) {
+            "C:/Windows/note.fleetytest"
+        } else {
+            "/etc/shadow"
+        };
+        assert!(reg
+            .call("write_file", json!({ "path": sensitive, "content": "x" }))
+            .await
+            .is_err());
+
+        for d in [&root, &outside] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[test]
+    fn sensitive_path_guard_matches_keys_and_system() {
+        assert!(sensitive_write_reason(Path::new("/home/u/.ssh/authorized_keys")).is_some());
+        assert!(sensitive_write_reason(Path::new("/etc/ssh/sshd_config")).is_some());
+        assert!(sensitive_write_reason(Path::new("/etc/shadow")).is_some());
+        assert!(sensitive_write_reason(Path::new("C:\\Windows\\System32\\drivers\\x")).is_some());
+        assert!(sensitive_write_reason(Path::new("/home/u/project/src/main.rs")).is_none());
     }
 
     #[test]
