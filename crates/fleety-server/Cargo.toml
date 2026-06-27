@@ -32,10 +32,13 @@ mdns-sd = { workspace = true }
 flume = "0.11"
 sha2 = "0.10"
 base64 = { workspace = true }
-# Local embedding model (EmbeddingGemma via ONNX) + HNSW vector index for wiki
-# semantic search.
+# Local embedding model (EmbeddingGemma via ONNX) + on-disk sqlite-vec vector
+# store (vectors live in a SQLite DB file, queried via SQL — no in-RAM index)
+# for wiki semantic search. The one unsafe sqlite-vec registration is isolated
+# in the `fleety-vec` crate so this crate stays `forbid(unsafe_code)`.
 fastembed = "5"
-hnsw_rs = "0.3"
+rusqlite = { version = "0.32", features = ["bundled"] }
+fleety-vec = { workspace = true }
 
 [dev-dependencies]
 filetime = "0.2"

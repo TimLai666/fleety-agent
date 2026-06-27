@@ -1,30 +1,32 @@
 //! Semantic search over the knowledge wiki, backed by a local **EmbeddingGemma**
 //! model (fastembed / ONNX, CPU — downloaded once from the ungated
-//! `onnx-community/embeddinggemma-300m-ONNX`, then offline).
+//! `onnx-community/embeddinggemma-300m-ONNX`, then offline) and an **on-disk
+//! sqlite-vec** vector store.
 //!
-//! `wiki_search` (substring) is unchanged; this adds `wiki_semantic_search`,
-//! which embeds the query and ranks note chunks by cosine similarity. The index
-//! (`<vault>/.index/embeddings.json`) is kept in sync lazily: each search
-//! re-embeds notes whose content hash changed and drops deleted ones, so it
-//! never goes stale. A boot-time `warm()` does the same in the background so the
-//! first search is fast.
+//! Everything lives in one SQLite file, `<vault>/.index/wiki.db` — vectors
+//! included. There is **no in-RAM vector index**: the `vec0` virtual table holds
+//! the embeddings on disk and KNN runs as a SQL query (`WHERE embedding MATCH ?
+//! ORDER BY distance`), so memory doesn't grow with the wiki. Tables:
+//! `meta(model, dim)`, `notes(rel, hash)`, `chunks(key, rel, text)`, and the
+//! `vec_chunks` vec0 table keyed by `chunks.key` (cosine distance).
 //!
-//! The model is a process-global singleton (the tool registry is rebuilt per
-//! connection, so per-registry state would reload the weights every time). All
-//! model/index work runs on a blocking thread (`spawn_blocking`) since fastembed
-//! is synchronous and CPU-bound. `FLEETY_WIKI_EMBED=0` disables it (no download,
-//! the tool returns an actionable error pointing at `wiki_search`).
+//! The index stays current automatically: each search re-embeds notes whose
+//! content hash changed and `DELETE`s the rows of changed/deleted notes (real
+//! incremental updates). `wiki_write` re-embeds the edited note immediately. A
+//! boot-time `warm()` syncs in the background. `FLEETY_WIKI_EMBED=0` disables it
+//! (no download; the tool returns an actionable error pointing at `wiki_search`).
+//!
+//! The model + DB connection are process-global singletons (the tool registry
+//! is rebuilt per connection). All model/DB work runs on a blocking thread
+//! (`spawn_blocking`); fastembed and rusqlite are synchronous.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use agent_core::{CoreError, Result, RiskLevel, Tool, ToolSpec};
 use async_trait::async_trait;
 use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
-use hnsw_rs::prelude::{DistCosine, Hnsw};
-use serde::{Deserialize, Serialize};
+use rusqlite::Connection;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -32,8 +34,7 @@ use sha2::{Digest, Sha256};
 /// alignment). Applied manually — fastembed runs the tokenizer on raw text.
 const QUERY_PREFIX: &str = "task: search result | query: ";
 const DOC_PREFIX: &str = "title: none | text: ";
-/// Q8 (int8) build — the chosen quality/size balance (~300MB). fastembed names
-/// the int8 quantization `...Q`; `...Q4` is 4-bit, no suffix is fp32.
+/// Q8 (int8) build — the chosen quality/size balance (~300MB).
 const MODEL: EmbeddingModel = EmbeddingModel::EmbeddingGemma300MQ;
 const MODEL_TAG: &str = "embeddinggemma-300m-q8";
 /// Rough chunk size in bytes; notes are split on blank lines and packed up to this.
@@ -49,32 +50,14 @@ fn model_cell() -> &'static Mutex<Option<TextEmbedding>> {
     M.get_or_init(|| Mutex::new(None))
 }
 
-/// Process-global in-memory index cache (one wiki vault per server).
-fn index_cell() -> &'static Mutex<Option<Index>> {
-    static I: OnceLock<Mutex<Option<Index>>> = OnceLock::new();
-    I.get_or_init(|| Mutex::new(None))
+/// Process-global SQLite connection (one wiki vault per server).
+fn conn_cell() -> &'static Mutex<Option<Connection>> {
+    static C: OnceLock<Mutex<Option<Connection>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(None))
 }
 
-#[derive(Default, Serialize, Deserialize)]
-struct Index {
-    model: String,
-    notes: HashMap<String, NoteIndex>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct NoteIndex {
-    hash: String,
-    chunks: Vec<Chunk>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct Chunk {
-    text: String,
-    vec: Vec<f32>,
-}
-
-fn index_path(vault: &Path) -> PathBuf {
-    vault.join(".index").join("embeddings.json")
+fn db_path(vault: &Path) -> PathBuf {
+    vault.join(".index").join("wiki.db")
 }
 
 fn hash_str(s: &str) -> String {
@@ -99,7 +82,6 @@ fn chunk_note(content: &str) -> Vec<String> {
             cur.push_str("\n\n");
         }
         cur.push_str(para);
-        // A single huge paragraph becomes its own (over-size) chunk.
         if cur.len() >= CHUNK_BYTES {
             chunks.push(std::mem::take(&mut cur));
         }
@@ -113,41 +95,14 @@ fn chunk_note(content: &str) -> Vec<String> {
     chunks
 }
 
-/// The HNSW (approximate nearest neighbour) graph plus the per-point mapping
-/// back to `(note rel, chunk index)`. Built from the metadata index, which stays
-/// the source of truth — HNSW can't delete points, so on any change we just
-/// rebuild (cheap at personal-wiki scale, and it handles deletes for free).
-struct HnswState {
-    hnsw: Hnsw<'static, f32, DistCosine>,
-    ids: Vec<(String, usize)>,
+fn vec_bytes(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
-fn hnsw_cell() -> &'static Mutex<Option<HnswState>> {
-    static H: OnceLock<Mutex<Option<HnswState>>> = OnceLock::new();
-    H.get_or_init(|| Mutex::new(None))
-}
+/// `(note rel, content hash, [(chunk text, embedding)])` for one (re)embedded note.
+type EmbeddedNote = (String, String, Vec<(String, Vec<f32>)>);
 
-/// Set when the metadata index changed so the next search rebuilds the graph.
-fn dirty() -> &'static AtomicBool {
-    static D: OnceLock<AtomicBool> = OnceLock::new();
-    D.get_or_init(|| AtomicBool::new(true))
-}
-
-/// Build an HNSW graph over every chunk vector in the metadata index.
-fn build_hnsw(idx: &Index) -> HnswState {
-    let total: usize = idx.notes.values().map(|n| n.chunks.len()).sum();
-    let hnsw = Hnsw::<f32, DistCosine>::new(16, total.max(1), 16, 200, DistCosine {});
-    let mut ids = Vec::with_capacity(total);
-    for (rel, note) in &idx.notes {
-        for (ci, chunk) in note.chunks.iter().enumerate() {
-            hnsw.insert((chunk.vec.as_slice(), ids.len()));
-            ids.push((rel.clone(), ci));
-        }
-    }
-    HnswState { hnsw, ids }
-}
-
-/// Initialise the model if needed, returning a guard error on failure. Blocking.
+/// Initialise the model if needed. Blocking.
 fn with_model<T>(cache_dir: &Path, f: impl FnOnce(&mut TextEmbedding) -> Result<T>) -> Result<T> {
     let mut guard = model_cell()
         .lock()
@@ -172,139 +127,84 @@ fn with_model<T>(cache_dir: &Path, f: impl FnOnce(&mut TextEmbedding) -> Result<
     f(model)
 }
 
-/// Embed a batch of texts (already prefixed). Blocking.
 fn embed_texts(model: &mut TextEmbedding, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
     model
         .embed(texts, None)
         .map_err(|e| CoreError::Message(format!("embedding failed: {e}")))
 }
 
-/// Load the on-disk index into the global cache if not already loaded.
-fn load_index(vault: &Path) -> Result<()> {
-    let mut guard = index_cell()
-        .lock()
-        .map_err(|_| CoreError::Message("index lock poisoned".to_string()))?;
-    if guard.is_some() {
-        return Ok(());
+/// Open the DB (creating base tables); reset everything if the model changed.
+fn open_db(vault: &Path) -> Result<Connection> {
+    fleety_vec::register();
+    if let Some(parent) = db_path(vault).parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| CoreError::Message(format!("create index dir: {e}")))?;
     }
-    let path = index_path(vault);
-    let idx = match std::fs::read_to_string(&path) {
-        Ok(text) => serde_json::from_str::<Index>(&text).unwrap_or_default(),
-        Err(_) => Index::default(),
-    };
-    // A model change invalidates every vector.
-    let idx = if idx.model == MODEL_TAG {
-        idx
-    } else {
-        Index {
-            model: MODEL_TAG.to_string(),
-            notes: HashMap::new(),
-        }
-    };
-    *guard = Some(idx);
-    Ok(())
+    let conn = Connection::open(db_path(vault))
+        .map_err(|e| CoreError::Message(format!("open wiki index db: {e}")))?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS meta(id INTEGER PRIMARY KEY CHECK (id = 0), model TEXT, dim INTEGER);
+         CREATE TABLE IF NOT EXISTS notes(rel TEXT PRIMARY KEY, hash TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS chunks(key INTEGER PRIMARY KEY AUTOINCREMENT, rel TEXT NOT NULL, text TEXT NOT NULL);
+         CREATE INDEX IF NOT EXISTS chunks_rel ON chunks(rel);",
+    )
+    .map_err(|e| CoreError::Message(format!("init wiki index schema: {e}")))?;
+
+    // A model change invalidates every vector; wipe and start fresh.
+    let stored: Option<String> = conn
+        .query_row("SELECT model FROM meta WHERE id = 0", [], |r| r.get(0))
+        .ok();
+    if stored.as_deref() != Some(MODEL_TAG) {
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS vec_chunks; DELETE FROM chunks; DELETE FROM notes;",
+        )
+        .map_err(|e| CoreError::Message(format!("reset wiki index: {e}")))?;
+        conn.execute(
+            "INSERT INTO meta(id, model, dim) VALUES (0, ?1, NULL)
+             ON CONFLICT(id) DO UPDATE SET model = ?1, dim = NULL",
+            [MODEL_TAG],
+        )
+        .map_err(|e| CoreError::Message(format!("set model tag: {e}")))?;
+    }
+    Ok(conn)
 }
 
-fn save_index(vault: &Path) -> Result<()> {
-    let guard = index_cell()
+/// Run `f` with the global connection, opening it on first use. Blocking.
+fn with_conn<T>(vault: &Path, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+    let mut guard = conn_cell()
         .lock()
-        .map_err(|_| CoreError::Message("index lock poisoned".to_string()))?;
-    if let Some(idx) = guard.as_ref() {
-        let path = index_path(vault);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| CoreError::Message(format!("create index dir: {e}")))?;
-        }
-        let body = serde_json::to_string(idx)
-            .map_err(|e| CoreError::Message(format!("serialize index: {e}")))?;
-        std::fs::write(&path, body).map_err(|e| CoreError::Message(format!("write index: {e}")))?;
+        .map_err(|_| CoreError::Message("wiki db lock poisoned".to_string()))?;
+    if guard.is_none() {
+        *guard = Some(open_db(vault)?);
     }
-    Ok(())
+    let conn = guard
+        .as_ref()
+        .ok_or_else(|| CoreError::Message("wiki db unavailable".to_string()))?;
+    f(conn)
 }
 
-/// Re-embed notes whose content changed and drop deleted ones. Blocking.
-fn sync_index(vault: &Path, cache_dir: &Path) -> Result<()> {
-    load_index(vault)?;
-    // Collect current notes + hashes (read outside the model lock).
-    let mut current: Vec<(String, String, String)> = Vec::new(); // (rel, hash, content)
-    collect_notes(vault, vault, &mut current);
+/// The vector dimensionality recorded in `meta`, if any.
+fn stored_dim(conn: &Connection) -> Option<usize> {
+    conn.query_row("SELECT dim FROM meta WHERE id = 0", [], |r| {
+        r.get::<_, Option<i64>>(0)
+    })
+    .ok()
+    .flatten()
+    .map(|d| d as usize)
+}
 
-    // Figure out which notes need (re)embedding.
-    let mut to_embed: Vec<(String, Vec<String>)> = Vec::new();
-    let present: std::collections::HashSet<String> =
-        current.iter().map(|(rel, _, _)| rel.clone()).collect();
-    {
-        let mut guard = index_cell()
-            .lock()
-            .map_err(|_| CoreError::Message("index lock poisoned".to_string()))?;
-        let idx = guard
-            .as_mut()
-            .ok_or_else(|| CoreError::Message("index unavailable".to_string()))?;
-        let before = idx.notes.len();
-        idx.notes.retain(|rel, _| present.contains(rel));
-        let removed = before - idx.notes.len();
-        for (rel, hash, content) in &current {
-            let fresh = idx.notes.get(rel).map(|n| &n.hash == hash).unwrap_or(false);
-            if !fresh {
-                to_embed.push((rel.clone(), chunk_note(content)));
-            }
-        }
-        // Deletions alone (no re-embeds) still change the searchable set.
-        if removed > 0 {
-            dirty().store(true, Ordering::SeqCst);
-        }
-    }
-
-    if to_embed.is_empty() {
-        // Persist any deletions, then we're done.
-        if dirty().load(Ordering::SeqCst) {
-            save_index(vault)?;
-        }
+/// Create the `vec_chunks` virtual table at `dim` (idempotent) and record the dim.
+fn ensure_vec_table(conn: &Connection, dim: usize) -> Result<()> {
+    if stored_dim(conn) == Some(dim) {
         return Ok(());
     }
-
-    // Embed all changed chunks in one model session.
-    let prefixed: Vec<String> = to_embed
-        .iter()
-        .flat_map(|(_, chunks)| chunks.iter().map(|c| format!("{DOC_PREFIX}{c}")))
-        .collect();
-    let vectors = with_model(cache_dir, |m| embed_texts(m, prefixed))?;
-
-    // Stitch vectors back per note and update the index.
-    let mut guard = index_cell()
-        .lock()
-        .map_err(|_| CoreError::Message("index lock poisoned".to_string()))?;
-    let idx = guard
-        .as_mut()
-        .ok_or_else(|| CoreError::Message("index unavailable".to_string()))?;
-    let mut vi = 0usize;
-    let hashes: HashMap<&str, &str> = current
-        .iter()
-        .map(|(rel, hash, _)| (rel.as_str(), hash.as_str()))
-        .collect();
-    for (rel, chunks) in &to_embed {
-        let mut note_chunks = Vec::with_capacity(chunks.len());
-        for text in chunks {
-            if vi < vectors.len() {
-                note_chunks.push(Chunk {
-                    text: text.clone(),
-                    vec: vectors[vi].clone(),
-                });
-                vi += 1;
-            }
-        }
-        let hash = hashes.get(rel.as_str()).copied().unwrap_or("").to_string();
-        idx.notes.insert(
-            rel.clone(),
-            NoteIndex {
-                hash,
-                chunks: note_chunks,
-            },
-        );
-    }
-    drop(guard);
-    dirty().store(true, Ordering::SeqCst);
-    save_index(vault)?;
+    conn.execute_batch(&format!(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0(\
+            key INTEGER PRIMARY KEY, embedding float[{dim}] distance_metric=cosine);"
+    ))
+    .map_err(|e| CoreError::Message(format!("create vec table: {e}")))?;
+    conn.execute("UPDATE meta SET dim = ?1 WHERE id = 0", [dim as i64])
+        .map_err(|e| CoreError::Message(format!("set dim: {e}")))?;
     Ok(())
 }
 
@@ -319,7 +219,6 @@ fn collect_notes(vault: &Path, dir: &Path, out: &mut Vec<(String, String, String
         }
         let path = entry.path();
         if path.is_dir() {
-            // Skip the index dir itself.
             if path.file_name().and_then(|n| n.to_str()) == Some(".index") {
                 continue;
             }
@@ -336,9 +235,148 @@ fn collect_notes(vault: &Path, dir: &Path, out: &mut Vec<(String, String, String
     }
 }
 
+/// Delete a note's chunks + vectors (best-effort) and its `notes` row.
+fn delete_note_rows(conn: &Connection, rel: &str) -> Result<()> {
+    // vec_chunks may not exist yet (no dim); ignore that error.
+    let _ = conn.execute(
+        "DELETE FROM vec_chunks WHERE key IN (SELECT key FROM chunks WHERE rel = ?1)",
+        [rel],
+    );
+    conn.execute("DELETE FROM chunks WHERE rel = ?1", [rel])
+        .map_err(|e| CoreError::Message(format!("delete chunks: {e}")))?;
+    conn.execute("DELETE FROM notes WHERE rel = ?1", [rel])
+        .map_err(|e| CoreError::Message(format!("delete note: {e}")))?;
+    Ok(())
+}
+
+/// Insert a note's chunks + vectors and its hash. Requires the vec table.
+fn insert_note_rows(
+    conn: &Connection,
+    rel: &str,
+    hash: &str,
+    chunks: &[(String, Vec<f32>)],
+) -> Result<()> {
+    for (text, vec) in chunks {
+        conn.execute(
+            "INSERT INTO chunks(rel, text) VALUES (?1, ?2)",
+            rusqlite::params![rel, text],
+        )
+        .map_err(|e| CoreError::Message(format!("insert chunk: {e}")))?;
+        let key = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO vec_chunks(key, embedding) VALUES (?1, ?2)",
+            rusqlite::params![key, vec_bytes(vec)],
+        )
+        .map_err(|e| CoreError::Message(format!("insert vector: {e}")))?;
+    }
+    conn.execute(
+        "INSERT INTO notes(rel, hash) VALUES (?1, ?2)
+         ON CONFLICT(rel) DO UPDATE SET hash = ?2",
+        rusqlite::params![rel, hash],
+    )
+    .map_err(|e| CoreError::Message(format!("upsert note: {e}")))?;
+    Ok(())
+}
+
+/// Re-embed notes whose content changed and drop deleted ones. Blocking.
+fn sync_index(vault: &Path, cache_dir: &Path) -> Result<()> {
+    let mut current: Vec<(String, String, String)> = Vec::new();
+    collect_notes(vault, vault, &mut current);
+
+    // Phase 1: deletions + work list (DB lock, no embedding).
+    let to_embed: Vec<(String, String, Vec<String>)> = with_conn(vault, |conn| {
+        let present: std::collections::HashSet<&str> =
+            current.iter().map(|(r, _, _)| r.as_str()).collect();
+        let known: Vec<(String, String)> = conn
+            .prepare("SELECT rel, hash FROM notes")
+            .and_then(|mut s| {
+                s.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                    .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
+            })
+            .map_err(|e| CoreError::Message(format!("read notes: {e}")))?;
+        let known_map: std::collections::HashMap<&str, &str> = known
+            .iter()
+            .map(|(r, h)| (r.as_str(), h.as_str()))
+            .collect();
+
+        // Deleted notes.
+        for (rel, _) in &known {
+            if !present.contains(rel.as_str()) {
+                delete_note_rows(conn, rel)?;
+            }
+        }
+        // Changed / new notes.
+        let mut to_embed = Vec::new();
+        for (rel, hash, content) in &current {
+            if known_map.get(rel.as_str()) != Some(&hash.as_str()) {
+                delete_note_rows(conn, rel)?;
+                to_embed.push((rel.clone(), hash.clone(), chunk_note(content)));
+            }
+        }
+        Ok(to_embed)
+    })?;
+
+    if to_embed.is_empty() {
+        return Ok(());
+    }
+
+    // Phase 2: embed (no DB lock).
+    let embedded = embed_notes(cache_dir, to_embed)?;
+    let dim = embedded
+        .iter()
+        .find_map(|(_, _, cs)| cs.first().map(|(_, v)| v.len()))
+        .unwrap_or(0);
+
+    // Phase 3: insert (DB lock).
+    with_conn(vault, |conn| {
+        if dim > 0 {
+            ensure_vec_table(conn, dim)?;
+        }
+        for (rel, hash, chunks) in &embedded {
+            insert_note_rows(conn, rel, hash, chunks)?;
+        }
+        Ok(())
+    })
+}
+
+/// Embed each note's chunks in one model session; returns `(rel, hash, [(text, vec)])`.
+fn embed_notes(
+    cache_dir: &Path,
+    to_embed: Vec<(String, String, Vec<String>)>,
+) -> Result<Vec<EmbeddedNote>> {
+    if to_embed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let prefixed: Vec<String> = to_embed
+        .iter()
+        .flat_map(|(_, _, chunks)| chunks.iter().map(|c| format!("{DOC_PREFIX}{c}")))
+        .collect();
+    let vectors = with_model(cache_dir, |m| embed_texts(m, prefixed))?;
+    let mut out = Vec::with_capacity(to_embed.len());
+    let mut vi = 0usize;
+    for (rel, hash, chunks) in to_embed {
+        let mut cs = Vec::with_capacity(chunks.len());
+        for text in chunks {
+            if vi < vectors.len() {
+                cs.push((text, vectors[vi].clone()));
+                vi += 1;
+            }
+        }
+        out.push((rel, hash, cs));
+    }
+    Ok(out)
+}
+
 /// Run a semantic search end-to-end (blocking).
 fn search_blocking(vault: &Path, cache_dir: &Path, query: &str, top_k: usize) -> Result<Value> {
     sync_index(vault, cache_dir)?;
+    let want = top_k.max(1);
+
+    let has_vectors = with_conn(vault, |conn| Ok(stored_dim(conn).is_some()))?;
+    if !has_vectors {
+        return Ok(json!({ "matches": [] })); // nothing indexed yet
+    }
+
     let qvec = with_model(cache_dir, |m| {
         Ok(embed_texts(m, vec![format!("{QUERY_PREFIX}{query}")])?
             .into_iter()
@@ -346,114 +384,89 @@ fn search_blocking(vault: &Path, cache_dir: &Path, query: &str, top_k: usize) ->
             .unwrap_or_default())
     })?;
 
-    // Lock order: index first, then hnsw (build reads the index).
-    let guard = index_cell()
-        .lock()
-        .map_err(|_| CoreError::Message("index lock poisoned".to_string()))?;
-    let idx = guard
-        .as_ref()
-        .ok_or_else(|| CoreError::Message("index unavailable".to_string()))?;
+    let matches = with_conn(vault, |conn| {
+        // KNN over-fetches (want*4) so we can keep the best chunk per note.
+        let knn: Vec<(i64, f32)> = conn
+            .prepare(
+                "SELECT key, distance FROM vec_chunks WHERE embedding MATCH ?1 ORDER BY distance LIMIT ?2",
+            )
+            .and_then(|mut s| {
+                s.query_map(
+                    rusqlite::params![vec_bytes(&qvec), (want * 4) as i64],
+                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)? as f32)),
+                )
+                .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
+            })
+            .map_err(|e| CoreError::Message(format!("vector search: {e}")))?;
 
-    let mut hguard = hnsw_cell()
-        .lock()
-        .map_err(|_| CoreError::Message("hnsw lock poisoned".to_string()))?;
-    if hguard.is_none() || dirty().swap(false, Ordering::SeqCst) {
-        *hguard = Some(build_hnsw(idx));
-    }
-    let state = hguard
-        .as_ref()
-        .ok_or_else(|| CoreError::Message("hnsw unavailable".to_string()))?;
-
-    // Over-fetch so we can keep the best chunk per note, then trim to top_k.
-    let want = top_k.max(1);
-    let knbn = (want * 4).min(state.ids.len().max(1));
-    let ef = knbn.max(64);
-    let neighbours = state.hnsw.search(&qvec, knbn, ef);
-
-    // Best (smallest cosine distance) chunk per note.
-    let mut best_per_note: HashMap<&str, (f32, &str)> = HashMap::new();
-    for n in &neighbours {
-        let Some((rel, ci)) = state.ids.get(n.d_id) else {
-            continue;
-        };
-        let Some(text) = idx
-            .notes
-            .get(rel)
-            .and_then(|note| note.chunks.get(*ci))
-            .map(|c| c.text.as_str())
-        else {
-            continue;
-        };
-        let entry = best_per_note
-            .entry(rel.as_str())
-            .or_insert((f32::MAX, text));
-        if n.distance < entry.0 {
-            *entry = (n.distance, text);
+        // Best (smallest cosine distance) chunk per note.
+        let mut best: std::collections::HashMap<String, (f32, String)> =
+            std::collections::HashMap::new();
+        for (key, dist) in knn {
+            let row: rusqlite::Result<(String, String)> =
+                conn.query_row("SELECT rel, text FROM chunks WHERE key = ?1", [key], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                });
+            if let Ok((rel, text)) = row {
+                let entry = best.entry(rel).or_insert((f32::MAX, text.clone()));
+                if dist < entry.0 {
+                    *entry = (dist, text);
+                }
+            }
         }
-    }
-    let mut scored: Vec<(f32, String, String)> = best_per_note
-        .into_iter()
-        .map(|(rel, (dist, text))| {
-            // DistCosine returns a distance (smaller = closer); report similarity.
-            let score = 1.0 - dist;
-            (score, rel.to_string(), text.chars().take(200).collect())
-        })
-        .collect();
-    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    scored.truncate(want);
-    let matches: Vec<Value> = scored
+        let mut scored: Vec<(f32, String, String)> = best
+            .into_iter()
+            .map(|(rel, (dist, text))| {
+                let score = 1.0 - dist; // cosine distance -> similarity
+                (score, rel, text.chars().take(200).collect())
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(want);
+        Ok(scored)
+    })?;
+
+    let out: Vec<Value> = matches
         .into_iter()
         .map(|(score, path, snippet)| json!({ "path": path, "score": score, "snippet": snippet }))
         .collect();
-    Ok(json!({ "matches": matches }))
+    Ok(json!({ "matches": out }))
 }
 
-/// Re-embed a single note immediately (blocking). Called right after wiki_write
-/// so the semantic index reflects the new content without waiting for the next
-/// search's lazy sync. Skips work if the note's hash is already current.
+/// Re-embed a single note immediately (blocking). Skips work if its hash is
+/// already current; otherwise removes its old rows and inserts fresh chunks.
 fn reindex_note_blocking(vault: &Path, cache_dir: &Path, rel: &str, content: &str) -> Result<()> {
-    load_index(vault)?;
     let hash = hash_str(content);
-    {
-        let guard = index_cell()
-            .lock()
-            .map_err(|_| CoreError::Message("index lock poisoned".to_string()))?;
-        if let Some(idx) = guard.as_ref() {
-            if idx.notes.get(rel).map(|n| n.hash == hash).unwrap_or(false) {
-                return Ok(()); // unchanged
-            }
+    let unchanged = with_conn(vault, |conn| {
+        let cur: Option<String> = conn
+            .query_row("SELECT hash FROM notes WHERE rel = ?1", [rel], |r| r.get(0))
+            .ok();
+        Ok(cur.as_deref() == Some(hash.as_str()))
+    })?;
+    if unchanged {
+        return Ok(());
+    }
+    let embedded = embed_notes(
+        cache_dir,
+        vec![(rel.to_string(), hash, chunk_note(content))],
+    )?;
+    let dim = embedded
+        .iter()
+        .find_map(|(_, _, cs)| cs.first().map(|(_, v)| v.len()))
+        .unwrap_or(0);
+    with_conn(vault, |conn| {
+        delete_note_rows(conn, rel)?;
+        if dim > 0 {
+            ensure_vec_table(conn, dim)?;
         }
-    }
-    let chunks = chunk_note(content);
-    let prefixed: Vec<String> = chunks.iter().map(|c| format!("{DOC_PREFIX}{c}")).collect();
-    let vectors = with_model(cache_dir, |m| embed_texts(m, prefixed))?;
-    {
-        let mut guard = index_cell()
-            .lock()
-            .map_err(|_| CoreError::Message("index lock poisoned".to_string()))?;
-        let idx = guard
-            .as_mut()
-            .ok_or_else(|| CoreError::Message("index unavailable".to_string()))?;
-        let note_chunks = chunks
-            .into_iter()
-            .zip(vectors)
-            .map(|(text, vec)| Chunk { text, vec })
-            .collect();
-        idx.notes.insert(
-            rel.to_string(),
-            NoteIndex {
-                hash,
-                chunks: note_chunks,
-            },
-        );
-    }
-    dirty().store(true, Ordering::SeqCst);
-    save_index(vault)
+        for (r, h, chunks) in &embedded {
+            insert_note_rows(conn, r, h, chunks)?;
+        }
+        Ok(())
+    })
 }
 
-/// Fire-and-forget re-embed of one note after a wiki_write. Best-effort: a
-/// failure (e.g. model not yet downloaded) just leaves the next search's lazy
-/// sync to catch up. No-op when semantic search is disabled.
+/// Fire-and-forget re-embed of one note after a wiki_write. Best-effort.
 pub fn reindex_note(vault: PathBuf, cache_dir: PathBuf, rel: String, content: String) {
     if !enabled() {
         return;
@@ -474,12 +487,8 @@ pub fn reindex_note(vault: PathBuf, cache_dir: PathBuf, rel: String, content: St
 }
 
 /// Background warm at boot: build/refresh the index so the first search is fast.
-/// Best-effort and non-fatal.
 pub async fn warm(vault: PathBuf, cache_dir: PathBuf) {
-    if !enabled() {
-        return;
-    }
-    if !vault.is_dir() {
+    if !enabled() || !vault.is_dir() {
         return;
     }
     let res = tokio::task::spawn_blocking(move || sync_index(&vault, &cache_dir)).await;
@@ -552,56 +561,68 @@ mod tests {
     fn chunking_packs_paragraphs() {
         let note = "# Title\n\npara one\n\npara two\n\npara three";
         let chunks = chunk_note(note);
-        assert!(!chunks.is_empty());
-        // small note fits in one chunk
         assert_eq!(chunks.len(), 1);
         assert!(chunks[0].contains("para three"));
-
-        // a big paragraph forces a split
         let big = format!("{}\n\n{}", "x".repeat(1300), "tail");
-        let c2 = chunk_note(&big);
-        assert!(c2.len() >= 2);
-    }
-
-    #[test]
-    fn hnsw_finds_nearest() {
-        // Three orthogonal-ish 3D vectors; a query close to the second should
-        // rank it first via the HNSW graph.
-        let mut idx = Index {
-            model: MODEL_TAG.to_string(),
-            notes: HashMap::new(),
-        };
-        idx.notes.insert(
-            "a.md".into(),
-            NoteIndex {
-                hash: "x".into(),
-                chunks: vec![Chunk {
-                    text: "alpha".into(),
-                    vec: vec![1.0, 0.0, 0.0],
-                }],
-            },
-        );
-        idx.notes.insert(
-            "b.md".into(),
-            NoteIndex {
-                hash: "y".into(),
-                chunks: vec![Chunk {
-                    text: "beta".into(),
-                    vec: vec![0.0, 1.0, 0.0],
-                }],
-            },
-        );
-        let state = build_hnsw(&idx);
-        assert_eq!(state.ids.len(), 2);
-        let res = state.hnsw.search(&[0.0, 0.9, 0.1], 1, 16);
-        assert_eq!(res.len(), 1);
-        let (rel, _) = &state.ids[res[0].d_id];
-        assert_eq!(rel, "b.md");
+        assert!(chunk_note(&big).len() >= 2);
     }
 
     #[test]
     fn hash_is_stable_and_sensitive() {
         assert_eq!(hash_str("abc"), hash_str("abc"));
         assert_ne!(hash_str("abc"), hash_str("abd"));
+    }
+
+    #[test]
+    fn sqlite_vec_store_roundtrip() {
+        // Exercise the on-disk store directly: insert two vectors, the query
+        // nearest the second returns it; deleting it leaves the first.
+        fleety_vec::register();
+        let conn = Connection::open_in_memory().expect("db");
+        conn.execute_batch(
+            "CREATE TABLE chunks(key INTEGER PRIMARY KEY AUTOINCREMENT, rel TEXT, text TEXT);
+             CREATE VIRTUAL TABLE vec_chunks USING vec0(key INTEGER PRIMARY KEY, embedding float[3] distance_metric=cosine);",
+        )
+        .expect("schema");
+        for (rel, v) in [("a.md", [1.0f32, 0.0, 0.0]), ("b.md", [0.0f32, 1.0, 0.0])] {
+            conn.execute("INSERT INTO chunks(rel, text) VALUES (?1, ?1)", [rel])
+                .expect("chunk");
+            let key = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO vec_chunks(key, embedding) VALUES (?1, ?2)",
+                rusqlite::params![key, vec_bytes(&v)],
+            )
+            .expect("vec");
+        }
+        let q = vec_bytes(&[0.0f32, 0.9, 0.1]);
+        // vec0 KNN needs the LIMIT on the MATCH scan itself, then look up the row.
+        let nearest: i64 = conn
+            .query_row(
+                "SELECT key FROM vec_chunks WHERE embedding MATCH ?1 ORDER BY distance LIMIT 1",
+                rusqlite::params![q],
+                |r| r.get(0),
+            )
+            .expect("knn");
+        let rel: String = conn
+            .query_row("SELECT rel FROM chunks WHERE key=?1", [nearest], |r| {
+                r.get(0)
+            })
+            .expect("rel");
+        assert_eq!(rel, "b.md");
+
+        // remove the nearest -> the other becomes nearest
+        conn.execute("DELETE FROM vec_chunks WHERE key=?1", [nearest])
+            .expect("del");
+        let next: i64 = conn
+            .query_row(
+                "SELECT key FROM vec_chunks WHERE embedding MATCH ?1 ORDER BY distance LIMIT 1",
+                rusqlite::params![q],
+                |r| r.get(0),
+            )
+            .expect("knn2");
+        let rel2: String = conn
+            .query_row("SELECT rel FROM chunks WHERE key=?1", [next], |r| r.get(0))
+            .expect("rel2");
+        assert_eq!(rel2, "a.md");
     }
 }
