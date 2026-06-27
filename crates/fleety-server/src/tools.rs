@@ -78,11 +78,18 @@ impl Tool for MemoryRead {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "memory_read".to_string(),
-            description: "Read an agent core memory file (ME.md, USER.md, TODO.md, or TOOLS.md)."
+            description: "Read an agent core memory file (ME.md, USER.md, TODO.md, or TOOLS.md). \
+                 Returns raw `content` plus a line-numbered `numbered` view and `line_count`; pass \
+                 `start_line`/`end_line` for a slice. Use the line numbers for memory_edit's \
+                 line-range mode."
                 .to_string(),
             parameters: json!({
                 "type": "object",
-                "properties": { "file": { "type": "string", "enum": ["ME.md", "USER.md", "TODO.md", "TOOLS.md"] } },
+                "properties": {
+                    "file": { "type": "string", "enum": ["ME.md", "USER.md", "TODO.md", "TOOLS.md"] },
+                    "start_line": { "type": "integer", "description": "first line to return (1-based)" },
+                    "end_line": { "type": "integer", "description": "last line (1-based, inclusive)" }
+                },
                 "required": ["file"]
             }),
             risk: RiskLevel::Read,
@@ -91,13 +98,29 @@ impl Tool for MemoryRead {
 
     async fn call(&self, args: Value) -> Result<Value> {
         let file = require_str(&args, "file")?;
+        let start_line = args
+            .get("start_line")
+            .and_then(Value::as_u64)
+            .map(|n| n as usize);
+        let end_line = args
+            .get("end_line")
+            .and_then(Value::as_u64)
+            .map(|n| n as usize);
         let path = memory_path(&self.dir, file)?;
-        let content = match std::fs::read_to_string(&path) {
+        let full = match std::fs::read_to_string(&path) {
             Ok(content) => content,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(e) => return Err(CoreError::Message(format!("cannot read {file}: {e}"))),
         };
-        Ok(json!({ "file": file, "content": content }))
+        let (slice, start, end, total) = fleety_tools::slice_lines(&full, start_line, end_line);
+        Ok(json!({
+            "file": file,
+            "content": slice,
+            "numbered": fleety_tools::line_numbered(&slice, start.max(1)),
+            "start_line": start,
+            "end_line": end,
+            "line_count": total,
+        }))
     }
 }
 
@@ -171,20 +194,23 @@ impl Tool for MemoryEdit {
         ToolSpec {
             name: "memory_edit".to_string(),
             description:
-                "Edit a core memory file (ME.md/USER.md/TODO.md/TOOLS.md) by replacing an \
-                 exact substring — the precise alternative to memory_write's full rewrite. By \
-                 default `old` must appear exactly once; set replace_all:true to replace every \
-                 occurrence."
+                "Edit a core memory file (ME.md/USER.md/TODO.md/TOOLS.md) precisely — the \
+                 alternative to memory_write's full rewrite. Two modes: (1) substring — replace \
+                 `old` with `new` (`old` unique unless replace_all:true); (2) line-range — replace \
+                 lines `start_line`..`end_line` (1-based, from memory_read) with `new` (empty `new` \
+                 deletes them). Returns an `applied` line-numbered view of the change."
                     .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "file": { "type": "string", "enum": ["ME.md", "USER.md", "TODO.md", "TOOLS.md"] },
-                    "old": { "type": "string", "description": "exact text to replace (must be unique unless replace_all)" },
+                    "old": { "type": "string", "description": "substring mode: exact text to replace" },
                     "new": { "type": "string" },
-                    "replace_all": { "type": "boolean", "description": "replace every occurrence instead of requiring a unique match (default false)" }
+                    "replace_all": { "type": "boolean", "description": "substring mode: replace every occurrence (default false)" },
+                    "start_line": { "type": "integer", "description": "line-range mode: first line (1-based)" },
+                    "end_line": { "type": "integer", "description": "line-range mode: last line (1-based, inclusive)" }
                 },
-                "required": ["file", "old", "new"]
+                "required": ["file", "new"]
             }),
             risk: RiskLevel::Mutate,
         }
@@ -192,17 +218,7 @@ impl Tool for MemoryEdit {
 
     async fn call(&self, args: Value) -> Result<Value> {
         let file = require_str(&args, "file")?;
-        let old = require_str(&args, "old")?;
         let new = require_str(&args, "new")?;
-        if old.is_empty() {
-            return Err(CoreError::Message(
-                "'old' must be non-empty; use memory_write to create or append content".to_string(),
-            ));
-        }
-        let replace_all = args
-            .get("replace_all")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
         let path = memory_path(&self.dir, file)?;
         let content = match std::fs::read_to_string(&path) {
             Ok(content) => content,
@@ -213,25 +229,66 @@ impl Tool for MemoryEdit {
             }
             Err(e) => return Err(CoreError::Message(format!("cannot read {file}: {e}"))),
         };
-        let count = content.matches(old).count();
-        if count == 0 {
-            return Err(CoreError::Message(format!(
-                "the 'old' text was not found in {file}; read it with memory_read and copy the exact text"
-            )));
-        }
-        if count > 1 && !replace_all {
-            return Err(CoreError::Message(format!(
-                "the 'old' text appears {count} times in {file}; add surrounding context to make it unique, or set replace_all:true"
-            )));
-        }
-        let (updated, replaced) = if replace_all {
-            (content.replace(old, new), count)
+
+        let start_arg = args
+            .get("start_line")
+            .and_then(Value::as_u64)
+            .map(|n| n as usize);
+        let (updated, replaced, change_start, change_len) = if let Some(start) = start_arg {
+            // Line-range mode.
+            let end = args
+                .get("end_line")
+                .and_then(Value::as_u64)
+                .map(|n| n as usize)
+                .unwrap_or(start);
+            let (updated, inserted) = fleety_tools::replace_line_range(&content, start, end, new)?;
+            (updated, 1usize, start, inserted)
         } else {
-            (content.replacen(old, new, 1), 1)
+            // Substring mode.
+            let old = require_str(&args, "old")?;
+            if old.is_empty() {
+                return Err(CoreError::Message(
+                    "provide 'old' (substring mode) or 'start_line'/'end_line' (line-range mode)"
+                        .to_string(),
+                ));
+            }
+            let replace_all = args
+                .get("replace_all")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let count = content.matches(old).count();
+            if count == 0 {
+                return Err(CoreError::Message(format!(
+                    "the 'old' text was not found in {file}; read it with memory_read and copy the exact text"
+                )));
+            }
+            if count > 1 && !replace_all {
+                return Err(CoreError::Message(format!(
+                    "the 'old' text appears {count} times in {file}; add surrounding context to make it unique, or set replace_all:true"
+                )));
+            }
+            let pos = content.find(old).unwrap_or(0);
+            let (updated, replaced) = if replace_all {
+                (content.replace(old, new), count)
+            } else {
+                (content.replacen(old, new, 1), 1)
+            };
+            (
+                updated,
+                replaced,
+                fleety_tools::line_of_offset(&content, pos),
+                new.lines().count().max(1),
+            )
         };
+
         std::fs::write(&path, &updated)
             .map_err(|e| CoreError::Message(format!("write {file} failed: {e}")))?;
-        Ok(json!({ "file": file, "replaced": replaced, "bytes": updated.len() }))
+        Ok(json!({
+            "file": file,
+            "replaced": replaced,
+            "applied": fleety_tools::region_view(&updated, change_start, change_len, 3),
+            "line_count": updated.lines().count(),
+        }))
     }
 }
 
@@ -538,14 +595,18 @@ mod tests {
             .expect("replace_all");
         assert_eq!(all["replaced"], json!(2));
 
-        // A unique fragment edits in place.
-        registry
+        // A unique fragment edits in place; the result carries the numbered region.
+        let edited = registry
             .call(
                 "memory_edit",
                 json!({ "file": "TODO.md", "old": "call Tim", "new": "call Tim about release" }),
             )
             .await
             .expect("unique edit");
+        assert!(edited["applied"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("call Tim about release"));
         let read = registry
             .call("memory_read", json!({ "file": "TODO.md" }))
             .await
@@ -553,7 +614,24 @@ mod tests {
         let body = read["content"].as_str().unwrap_or_default();
         assert!(body.contains("buy oat milk"));
         assert!(body.contains("call Tim about release"));
-        assert!(!body.contains("- buy milk\n"));
+        assert!(read["numbered"].as_str().unwrap_or_default().contains('\t'));
+
+        // Line-range mode: replace line 3 (the "call Tim" line).
+        registry
+            .call(
+                "memory_edit",
+                json!({ "file": "TODO.md", "start_line": 3, "end_line": 3, "new": "- done" }),
+            )
+            .await
+            .expect("line edit");
+        let after = registry
+            .call(
+                "memory_read",
+                json!({ "file": "TODO.md", "start_line": 3, "end_line": 3 }),
+            )
+            .await
+            .expect("read slice");
+        assert_eq!(after["content"], json!("- done"));
 
         // Missing 'old' text errors; editing an empty file errors.
         assert!(registry

@@ -246,6 +246,90 @@ fn unified_diff(old: &str, new: &str, path: &str) -> String {
         .to_string()
 }
 
+// --- line-addressed read/edit helpers (shared by workspace + memory + wiki) ---
+
+/// Render text as a 1-based `cat -n` view, numbering from `start_line`.
+pub fn line_numbered(content: &str, start_line: usize) -> String {
+    content
+        .lines()
+        .enumerate()
+        .map(|(i, line)| format!("{:>6}\t{}", start_line + i, line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Slice `[start, end]` (1-based, inclusive, clamped to the file) of `content`'s
+/// logical lines. Returns `(slice_text, start, end, total_lines)`; an empty file
+/// yields `("", 0, 0, 0)`.
+pub fn slice_lines(
+    content: &str,
+    start_line: Option<usize>,
+    end_line: Option<usize>,
+) -> (String, usize, usize, usize) {
+    let lines: Vec<&str> = content.lines().collect();
+    let total = lines.len();
+    if total == 0 {
+        return (String::new(), 0, 0, 0);
+    }
+    let start = start_line.unwrap_or(1).clamp(1, total);
+    let end = end_line.unwrap_or(total).clamp(start, total);
+    (lines[start - 1..end].join("\n"), start, end, total)
+}
+
+/// Replace logical lines `[start_line, end_line]` (1-based, inclusive) of
+/// `content` with `new`, preserving a trailing newline if the original had one.
+/// Returns `(updated, inserted_line_count)`. Errors if the range is invalid.
+pub fn replace_line_range(
+    content: &str,
+    start_line: usize,
+    end_line: usize,
+    new: &str,
+) -> Result<(String, usize)> {
+    let mut lines: Vec<String> = content.lines().map(String::from).collect();
+    let total = lines.len();
+    if start_line == 0 || start_line > total {
+        return Err(CoreError::Message(format!(
+            "start_line {start_line} is out of range (file has {total} lines)"
+        )));
+    }
+    if end_line < start_line || end_line > total {
+        return Err(CoreError::Message(format!(
+            "end_line {end_line} must be between start_line {start_line} and {total}"
+        )));
+    }
+    let new_lines: Vec<String> = if new.is_empty() {
+        Vec::new()
+    } else {
+        new.lines().map(String::from).collect()
+    };
+    let inserted = new_lines.len();
+    lines.splice(start_line - 1..=end_line - 1, new_lines);
+    let mut result = lines.join("\n");
+    if content.ends_with('\n') && !result.is_empty() {
+        result.push('\n');
+    }
+    Ok((result, inserted))
+}
+
+/// A numbered view of the changed region: the lines `[start, start+len-1]` of
+/// `content` plus `ctx` lines of context either side. Used so an edit can hand
+/// the agent the post-edit picture without a re-read.
+pub fn region_view(content: &str, start_line: usize, len: usize, ctx: usize) -> String {
+    let total = content.lines().count();
+    if total == 0 {
+        return String::new();
+    }
+    let from = start_line.saturating_sub(ctx).max(1);
+    let to = (start_line + len.saturating_sub(1) + ctx).min(total);
+    let (slice, s, _, _) = slice_lines(content, Some(from), Some(to));
+    line_numbered(&slice, s)
+}
+
+/// 1-based line number where byte offset `pos` falls in `content`.
+pub fn line_of_offset(content: &str, pos: usize) -> usize {
+    content[..pos.min(content.len())].matches('\n').count() + 1
+}
+
 /// Critical-command guard: refuses clearly irreversible commands. Conservative
 /// (ordinary `rm -rf ./build` is allowed); whitespace is normalized first.
 fn critical_reason(command: &str) -> Option<&'static str> {
@@ -396,10 +480,19 @@ impl Tool for ReadFile {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "read_file".to_string(),
-            description: "Read a UTF-8 text file within the workspace.".to_string(),
+            description:
+                "Read a UTF-8 text file within the workspace. Returns raw `content` plus a \
+                 line-numbered `numbered` view and `line_count`; pass `start_line`/`end_line` \
+                 (1-based, inclusive) to read just a slice. Use the line numbers to target \
+                 edit_file's line-range mode."
+                    .to_string(),
             parameters: json!({
                 "type": "object",
-                "properties": { "path": { "type": "string", "description": "workspace-relative path" } },
+                "properties": {
+                    "path": { "type": "string", "description": "workspace-relative path" },
+                    "start_line": { "type": "integer", "description": "first line to return (1-based)" },
+                    "end_line": { "type": "integer", "description": "last line to return (1-based, inclusive)" }
+                },
                 "required": ["path"]
             }),
             risk: RiskLevel::Read,
@@ -408,10 +501,26 @@ impl Tool for ReadFile {
 
     async fn call(&self, args: Value) -> Result<Value> {
         let path = require_str(&args, "path")?;
+        let start_line = args
+            .get("start_line")
+            .and_then(Value::as_u64)
+            .map(|n| n as usize);
+        let end_line = args
+            .get("end_line")
+            .and_then(Value::as_u64)
+            .map(|n| n as usize);
         let resolved = resolve_in_root(&self.root, path)?;
-        let content = std::fs::read_to_string(&resolved)
+        let full = std::fs::read_to_string(&resolved)
             .map_err(|e| CoreError::Message(format!("cannot read '{path}': {e}")))?;
-        Ok(json!({ "path": path, "content": content }))
+        let (slice, start, end, total) = slice_lines(&full, start_line, end_line);
+        Ok(json!({
+            "path": path,
+            "content": slice,
+            "numbered": line_numbered(&slice, start.max(1)),
+            "start_line": start,
+            "end_line": end,
+            "line_count": total,
+        }))
     }
 }
 
@@ -550,15 +659,22 @@ impl Tool for EditFile {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "edit_file".to_string(),
-            description: "Replace an exact, unique substring in a workspace file (precise edit). The prior content is backed up; the result includes a unified diff.".to_string(),
+            description: "Precise edit of a workspace file, two modes: (1) substring — replace an \
+                 exact, unique `old` with `new`; (2) line-range — replace lines `start_line`..\
+                 `end_line` (1-based, inclusive, from read_file's numbers) with `new` (empty `new` \
+                 deletes them). The prior content is backed up; the result includes a unified \
+                 diff and an `applied` line-numbered view of the changed region to confirm."
+                .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string" },
-                    "old": { "type": "string", "description": "exact text to replace (must be unique in the file)" },
-                    "new": { "type": "string" }
+                    "old": { "type": "string", "description": "substring mode: exact text to replace (must be unique)" },
+                    "new": { "type": "string", "description": "replacement text (both modes)" },
+                    "start_line": { "type": "integer", "description": "line-range mode: first line to replace (1-based)" },
+                    "end_line": { "type": "integer", "description": "line-range mode: last line to replace (1-based, inclusive)" }
                 },
-                "required": ["path", "old", "new"]
+                "required": ["path", "new"]
             }),
             risk: RiskLevel::Mutate,
         }
@@ -566,31 +682,62 @@ impl Tool for EditFile {
 
     async fn call(&self, args: Value) -> Result<Value> {
         let path = require_str(&args, "path")?;
-        let old = require_str(&args, "old")?;
         let new = require_str(&args, "new")?;
         let resolved = resolve_in_root(&self.root, path)?;
         let content = std::fs::read_to_string(&resolved)
             .map_err(|e| CoreError::Message(format!("cannot read '{path}': {e}")))?;
-        let count = content.matches(old).count();
-        if count == 0 {
-            return Err(CoreError::Message(format!(
-                "the 'old' text was not found in '{path}'; read the file and copy the exact text"
-            )));
-        }
-        if count > 1 {
-            return Err(CoreError::Message(format!(
-                "the 'old' text appears {count} times in '{path}'; include more surrounding context to make it unique"
-            )));
-        }
+
+        let start_arg = args
+            .get("start_line")
+            .and_then(Value::as_u64)
+            .map(|n| n as usize);
+        let (updated, change_start, change_len) = if let Some(start) = start_arg {
+            // Line-range mode.
+            let end = args
+                .get("end_line")
+                .and_then(Value::as_u64)
+                .map(|n| n as usize)
+                .unwrap_or(start);
+            let (updated, inserted) = replace_line_range(&content, start, end, new)?;
+            (updated, start, inserted)
+        } else {
+            // Substring mode.
+            let old = require_str(&args, "old")?;
+            if old.is_empty() {
+                return Err(CoreError::Message(
+                    "provide 'old' (substring mode) or 'start_line'/'end_line' (line-range mode)"
+                        .to_string(),
+                ));
+            }
+            let count = content.matches(old).count();
+            if count == 0 {
+                return Err(CoreError::Message(format!(
+                    "the 'old' text was not found in '{path}'; read the file and copy the exact text"
+                )));
+            }
+            if count > 1 {
+                return Err(CoreError::Message(format!(
+                    "the 'old' text appears {count} times in '{path}'; include more surrounding context to make it unique"
+                )));
+            }
+            let pos = content.find(old).unwrap_or(0);
+            let updated = content.replacen(old, new, 1);
+            (
+                updated,
+                line_of_offset(&content, pos),
+                new.lines().count().max(1),
+            )
+        };
+
         let backup = backup_existing(&self.backups, path, &resolved)?;
-        let updated = content.replacen(old, new, 1);
         std::fs::write(&resolved, &updated)
             .map_err(|e| CoreError::Message(format!("cannot write '{path}': {e}")))?;
         Ok(json!({
             "path": path,
-            "replaced": 1,
             "backup": backup,
             "diff": unified_diff(&content, &updated, path),
+            "applied": region_view(&updated, change_start, change_len, 3),
+            "line_count": updated.lines().count(),
         }))
     }
 }
@@ -1037,6 +1184,86 @@ mod tests {
             .call("rollback", json!({ "backup_id": "../x" }))
             .await
             .is_err());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn line_helpers() {
+        let c = "a\nb\nc\nd\n";
+        // slice
+        let (s, st, en, total) = slice_lines(c, Some(2), Some(3));
+        assert_eq!((s.as_str(), st, en, total), ("b\nc", 2, 3, 4));
+        // clamp + defaults
+        assert_eq!(slice_lines(c, None, None).0, "a\nb\nc\nd");
+        assert_eq!(slice_lines(c, Some(3), Some(99)).0, "c\nd");
+        assert_eq!(slice_lines("", Some(1), Some(5)), (String::new(), 0, 0, 0));
+        // numbered (tab-separated, right-aligned)
+        assert!(line_numbered("x\ny", 1).contains("     1\tx"));
+        assert!(line_numbered("x\ny", 5).contains("     6\ty"));
+        // replace a middle line, trailing newline preserved
+        let (out, n) = replace_line_range(c, 2, 3, "B\nC2").expect("range");
+        assert_eq!(out, "a\nB\nC2\nd\n");
+        assert_eq!(n, 2);
+        // delete a line with empty new
+        assert_eq!(replace_line_range(c, 2, 2, "").expect("del").0, "a\nc\nd\n");
+        // out of range errors
+        assert!(replace_line_range(c, 0, 1, "x").is_err());
+        assert!(replace_line_range(c, 2, 99, "x").is_err());
+        // line_of_offset
+        assert_eq!(line_of_offset(c, 0), 1);
+        assert_eq!(line_of_offset(c, 2), 2); // after first '\n'
+    }
+
+    #[tokio::test]
+    async fn read_numbered_and_edit_by_line() {
+        let root = temp();
+        let backups = root.join(".bak");
+        std::fs::write(root.join("f.txt"), "alpha\nbeta\ngamma\n").expect("seed");
+        let mut reg = ToolRegistry::new();
+        register_workspace(&mut reg, &root, &backups);
+
+        // numbered read + slice
+        let r = reg
+            .call(
+                "read_file",
+                json!({ "path": "f.txt", "start_line": 2, "end_line": 3 }),
+            )
+            .await
+            .expect("read");
+        assert_eq!(r["content"], json!("beta\ngamma"));
+        assert_eq!(r["line_count"], json!(3));
+        assert!(r["numbered"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("     2\tbeta"));
+
+        // edit by line range; result carries the post-edit numbered region
+        let e = reg
+            .call(
+                "edit_file",
+                json!({ "path": "f.txt", "start_line": 2, "end_line": 2, "new": "BETA" }),
+            )
+            .await
+            .expect("edit");
+        assert!(e["applied"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("     2\tBETA"));
+        assert_eq!(
+            std::fs::read_to_string(root.join("f.txt")).expect("read"),
+            "alpha\nBETA\ngamma\n"
+        );
+        // substring mode still works
+        reg.call(
+            "edit_file",
+            json!({ "path": "f.txt", "old": "gamma", "new": "GAMMA" }),
+        )
+        .await
+        .expect("substr edit");
+        assert!(std::fs::read_to_string(root.join("f.txt"))
+            .expect("r")
+            .contains("GAMMA"));
 
         let _ = std::fs::remove_dir_all(&root);
     }

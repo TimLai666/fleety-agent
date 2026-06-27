@@ -119,10 +119,17 @@ impl Tool for WikiRead {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "wiki_read".to_string(),
-            description: "Read a knowledge-wiki note by vault-relative path.".to_string(),
+            description: "Read a knowledge-wiki note by vault-relative path. Returns raw `content` \
+                 plus a line-numbered `numbered` view and `line_count`; pass `start_line`/`end_line` \
+                 for a slice."
+                .to_string(),
             parameters: json!({
                 "type": "object",
-                "properties": { "path": { "type": "string" } },
+                "properties": {
+                    "path": { "type": "string" },
+                    "start_line": { "type": "integer" },
+                    "end_line": { "type": "integer" }
+                },
                 "required": ["path"]
             }),
             risk: RiskLevel::Read,
@@ -131,10 +138,26 @@ impl Tool for WikiRead {
 
     async fn call(&self, args: Value) -> Result<Value> {
         let path = require_str(&args, "path")?;
+        let start_line = args
+            .get("start_line")
+            .and_then(Value::as_u64)
+            .map(|n| n as usize);
+        let end_line = args
+            .get("end_line")
+            .and_then(Value::as_u64)
+            .map(|n| n as usize);
         let resolved = resolve(&self.vault, path)?;
-        let content = std::fs::read_to_string(&resolved)
+        let full = std::fs::read_to_string(&resolved)
             .map_err(|e| CoreError::Message(format!("cannot read wiki note '{path}': {e}")))?;
-        Ok(json!({ "path": path, "content": content }))
+        let (slice, start, end, total) = fleety_tools::slice_lines(&full, start_line, end_line);
+        Ok(json!({
+            "path": path,
+            "content": slice,
+            "numbered": fleety_tools::line_numbered(&slice, start.max(1)),
+            "start_line": start,
+            "end_line": end,
+            "line_count": total,
+        }))
     }
 }
 
