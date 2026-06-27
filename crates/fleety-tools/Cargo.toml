@@ -16,6 +16,14 @@ uuid = { workspace = true }
 grep = "0.3"
 ignore = "0.4"
 similar = "2"
+# Browser (CDP) tools + Chrome auto-provisioning, shared so they run on the
+# server and on any device via fleetyd.
+tokio = { workspace = true }
+reqwest = { workspace = true }
+futures = { workspace = true }
+tokio-tungstenite = { workspace = true }
+tracing = { workspace = true }
+zip = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

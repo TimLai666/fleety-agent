@@ -1,10 +1,16 @@
 //! Browser automation over the Chrome DevTools Protocol (CDP).
 //!
+//! Shared so the same tools run on the server and on any device via fleetyd —
+//! `device_exec(device="laptop", tool="browser_screenshot")` drives the laptop's
+//! browser. The persistent-session map is process-wide, so a `browser_open` on a
+//! device lives in that device's daemon and later `browser_*` calls routed to it
+//! reuse the same connection.
+//!
 //! Connects to a Chrome started with `--remote-debugging-port` (discovered via
-//! `GET {base}/json`) and drives it over a WebSocket — no extra dependency
-//! (reqwest + tokio-tungstenite are already used). The page is intrusive UI, so
-//! prefer screenshots and use sparingly. The CDP framing / page discovery is
-//! unit-tested; the live connection follows the logic-tested/live-manual posture.
+//! `GET {base}/json`). When the local endpoint is down, [`crate::chrome`]
+//! auto-provisions one (detect → launch → install/download). The CDP framing /
+//! page discovery is unit-tested; the live connection follows the
+//! logic-tested/live-manual posture.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -38,8 +44,8 @@ fn sessions() -> &'static Mutex<HashMap<String, Arc<Session>>> {
     SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Register the browser tools.
-pub fn register(registry: &mut ToolRegistry) {
+/// Register the browser (CDP) tools.
+pub fn register_browser(registry: &mut ToolRegistry) {
     registry.register(Box::new(BrowserOpen));
     registry.register(Box::new(BrowserClose));
     registry.register(Box::new(BrowserNavigate));
@@ -123,6 +129,7 @@ async fn discover_ws(http_base: &str) -> Result<String> {
 
 /// Run one CDP command on a fresh connection (no persistent session).
 async fn cdp(http_base: &str, method: &str, params: Value) -> Result<Value> {
+    crate::chrome::ensure_chrome(http_base).await?;
     let ws_url = discover_ws(http_base).await?;
     let exchange = async {
         let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
@@ -192,7 +199,8 @@ impl Tool for BrowserNavigate {
         ToolSpec {
             name: "browser_navigate".to_string(),
             description:
-                "Navigate the connected Chrome to a URL (CDP). Intrusive UI — use sparingly."
+                "Navigate the connected Chrome to a URL (CDP). Runs on the device you target \
+                 (bare = server; via device_exec = that device). Intrusive UI — use sparingly."
                     .to_string(),
             parameters: json!({
                 "type": "object",
@@ -283,14 +291,16 @@ impl Tool for BrowserOpen {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "browser_open".to_string(),
-            description: "Open a persistent browser (CDP) session and return its handle; pass `session` to browser_navigate/eval/screenshot to reuse the connection.".to_string(),
+            description: "Open a persistent browser (CDP) session and return its handle; pass `session` to browser_navigate/eval/screenshot to reuse the connection. Auto-provisions a local Chrome if none is running.".to_string(),
             parameters: json!({ "type": "object", "properties": { "chrome": { "type": "string" } } }),
             risk: RiskLevel::Mutate,
         }
     }
 
     async fn call(&self, args: Value) -> Result<Value> {
-        let ws_url = discover_ws(&chrome_base(&args)).await?;
+        let base = chrome_base(&args);
+        crate::chrome::ensure_chrome(&base).await?;
+        let ws_url = discover_ws(&base).await?;
         let (ws, _) = tokio_tungstenite::connect_async(&ws_url)
             .await
             .map_err(|e| CoreError::Provider(format!("CDP websocket connect failed: {e}")))?;
@@ -362,7 +372,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_session_errors_and_close_is_idempotent() {
         let mut registry = ToolRegistry::new();
-        register(&mut registry);
+        register_browser(&mut registry);
         // Using a bogus session handle is rejected (no network involved).
         assert!(registry
             .call(

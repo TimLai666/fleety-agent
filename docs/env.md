@@ -106,8 +106,21 @@ Server seeds the entry into `{home}/mcp/builtin.json` every boot.
 
 | Var | Default | Meaning |
 |---|---|---|
-| `FLEETY_CHROME_URL` | (unset) | Chrome DevTools Protocol endpoint for `browser_*` tools (e.g. `http://localhost:9222`). |
+| `FLEETY_CHROME_URL` | `http://127.0.0.1:9222` | Chrome DevTools Protocol endpoint for `browser_*` tools. A non-loopback URL is treated as remote and never auto-provisioned. |
 | `FLEETY_ALLOW_PRIVATE_NET` | `0` | Set to `1` to allow `http_request`/`fetch_url` against RFC1918 / loopback hosts. Default refuses for safety. |
+
+## Browser / Chrome auto-provisioning
+
+The `browser_*` (CDP) tools run on any device. When the local CDP endpoint is
+down, the runtime detects an installed Chrome/Chromium and launches it headless;
+if none is found it installs one (OS package manager, then a chrome-for-testing
+`chrome-headless-shell` download). Runs on whichever device the tool executes.
+
+| Var | Default | Meaning |
+|---|---|---|
+| `FLEETY_CHROME_BIN` | (auto: PATH / well-known paths / managed download) | Absolute path to a Chrome/Chromium (or `chrome-headless-shell`) binary. Skips detection. |
+| `FLEETY_CHROME_AUTO_INSTALL` | (unset → on) | Set to `0` to disable installing/downloading Chrome when none is found (detect + launch still run). Air-gapped / hermetic hosts. |
+| `FLEETY_CHROME_DIR` | `$HOME/.fleety/chrome` (or `%USERPROFILE%`) | Cache dir for managed chrome-for-testing downloads. |
 
 ## Install scripts
 

@@ -10,7 +10,6 @@
 
 mod auth;
 mod bridge;
-mod browser;
 mod builtin_mcp;
 mod builtin_skills;
 mod conn;
@@ -172,6 +171,16 @@ async fn main() {
     // 24h background loop that keeps built-in MCPs at their latest upstream
     // version. Same opt-out as install (FLEETY_DDGS_AUTO_INSTALL=0).
     builtin_mcp::spawn_auto_upgrade_loop();
+    // Keep a managed chrome-for-testing build (if we downloaded one) current.
+    // A system / package-manager Chrome self-updates, so this is a no-op there.
+    tokio::spawn(async {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(24 * 60 * 60));
+        ticker.tick().await; // immediate tick — skip
+        loop {
+            ticker.tick().await;
+            fleety_tools::upgrade_managed_chrome().await;
+        }
+    });
     let provider = build_provider();
     let policy = policy_from_env();
     let workspace = Arc::new(workspace_root());

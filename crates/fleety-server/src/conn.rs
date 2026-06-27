@@ -594,7 +594,7 @@ pub(crate) fn build_full_registry(
     );
     crate::wiki::register(&mut tools, &storage.wiki_dir());
     crate::ssh::register(&mut tools);
-    crate::browser::register(&mut tools);
+    fleety_tools::register_browser(&mut tools);
     crate::sites::register(&mut tools, &storage.sites_dir(), &storage.devices_dir());
     auth::register(&mut tools, Arc::clone(auth));
     bridge::register(

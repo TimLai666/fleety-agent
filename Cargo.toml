@@ -36,3 +36,4 @@ cron = "0.15"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 chrono-tz = { version = "0.10", default-features = false }
 mdns-sd = "0.13"
+zip = { version = "2", default-features = false, features = ["deflate"] }

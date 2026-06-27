@@ -21,9 +21,9 @@ Last reviewed against `crates/` on 2026-06-24.
     registered in **both** the server's registry (operating on
     `FLEETY_WORKSPACE`) and every fleetyd's local registry (operating on
     `FLEETY_DEVICE_ROOT`). Examples: `read_file`, `write_file`, `run_command`,
-    git, insyra. To route one of these to a specific device, wrap it with
-    `device_exec(device="…", tool="read_file", args={…})`; call it by its
-    bare name and you hit the server's workspace.
+    git, insyra, the `browser_*` (CDP) tools. To route one of these to a
+    specific device, wrap it with `device_exec(device="…", tool="read_file",
+    args={…})`; call it by its bare name and you hit the server's workspace.
   - **server-only routing** — the tool exists on the server but its job is to
     coordinate other devices (e.g. `device_exec` itself, `pair_create`).
 - **Targeting.** Tools that operate on a workspace ("workspace tools") run on
@@ -114,18 +114,42 @@ host using its own keychain / config / network egress.
 
 ## Browser (CDP)
 
-**Runs on:** server only. Drives a real Chrome via the DevTools Protocol;
-`fleety-server` opens the CDP connection. Set `FLEETY_CHROME_URL` to the
-DevTools endpoint (e.g. `http://localhost:9222`). Each `browser_open` returns
-a `session` id; subsequent ops take that id.
+**Runs on:** any device. The browser tools live in the shared `fleety-tools`
+crate, so they're registered on `fleety-server` and on every `fleetyd` —
+`device_exec(device="laptop", tool="browser_screenshot")` drives the **laptop's**
+browser, a bare `browser_*` call drives the server's. The persistent-session map
+is process-wide, so a `browser_open` on a device lives in that device's daemon
+and later session-scoped calls routed there reuse the same connection.
+
+Drives a real Chrome over the DevTools Protocol. The endpoint defaults to
+`http://127.0.0.1:9222` (override per-call with `chrome`, or globally with
+`FLEETY_CHROME_URL`). When the local endpoint is down, Chrome is
+**auto-provisioned** — see below.
 
 | Tool | Purpose | Key inputs | Risk |
 |---|---|---|---|
-| `browser_open` | Open a new browser tab; returns `session`. | `url?` | mutate |
-| `browser_navigate` | Navigate an existing session. | `session`, `url` | mutate |
-| `browser_eval` | Evaluate JS in the page; returns the value. | `session`, `expression` | mutate (critical when the JS posts / sends / deletes) |
-| `browser_screenshot` | PNG screenshot. | `session` | read |
+| `browser_open` | Open a persistent CDP session; returns `session`. Auto-provisions a local Chrome if none is running. | `chrome?` | mutate |
+| `browser_navigate` | Navigate (a `session`, or a fresh connection). | `url`, `session?`, `chrome?` | mutate |
+| `browser_eval` | Evaluate JS in the page; returns the value. | `expression`, `session?`, `chrome?` | mutate (critical when the JS posts / sends / deletes) |
+| `browser_screenshot` | PNG screenshot (base64). The low-impact way to observe a device's screen. | `session?`, `chrome?` | read |
 | `browser_close` | Close a session. | `session` | mutate |
+
+**Chrome auto-provisioning.** Before connecting to a local endpoint that isn't
+up, the runtime ensures one (on whichever device the tool runs):
+
+1. Endpoint already reachable → use it.
+2. Local but down → find an installed Chrome/Chromium and launch it headless on
+   the port (`--remote-debugging-port`, isolated profile).
+3. None installed + auto-install on → OS package manager (winget / brew /
+   apt|snap), then a **chrome-for-testing** `chrome-headless-shell` download
+   unpacked into a managed cache dir.
+
+A managed (downloaded) Chrome is kept current by a 24h background loop on the
+server; a system / package-manager Chrome self-updates. Remote endpoints (a
+non-loopback `FLEETY_CHROME_URL` / `chrome=`) are never provisioned. Knobs:
+`FLEETY_CHROME_AUTO_INSTALL=0` (detect+launch only), `FLEETY_CHROME_BIN`
+(force a binary), `FLEETY_CHROME_DIR` (managed-download cache) — see
+[`docs/env.md`](env.md).
 
 ## Insyra (data analysis DSL)
 
