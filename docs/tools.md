@@ -253,20 +253,27 @@ precedence:
 
 `list_skills` tags each entry with its `source`.
 
+A skill is a **directory** — it may hold `SKILL.md` plus scripts / reference
+files — so editing is file-level. The tier of a skill decides what may mutate
+it; a write to a skill that doesn't exist yet lands in **authored**.
+
 | Tool | Purpose | Key inputs | Risk |
 |---|---|---|---|
-| `list_skills` | List available skills; each carries `source: "builtin" \| "authored" \| "installed"`. | — | read |
-| `use_skill` | Load a skill's instructions; follow them for the current task. | `name` | read |
-| `skill_install` | Install/replace a **user** skill (only when the user asks). Body from `content`, `from_url` (public hosts, SSRF-guarded), or `from_path` (local SKILL.md / skill dir). | `name`, one of `content`/`from_url`/`from_path` | mutate |
-| `skill_uninstall` | Remove a user-installed skill (only at the user's request). Refuses builtin/authored. | `name` | mutate |
-| `skill_author` | Create/replace a skill the agent authors for itself — a whole SKILL.md in one shot. Autonomous. **Merge** = author the combined one then delete originals; **split** = author the pieces then delete the original. | `name`, `content` | mutate |
-| `skill_author_edit` | Surgical substring edit to one of the agent's authored skills (`old` unique unless `replace_all`). Authored only. | `name`, `old`, `new`, `replace_all?` | mutate |
-| `skill_author_delete` | Delete one of the agent's authored skills. Autonomous; never touches builtin/installed. | `name` | mutate |
+| `list_skills` | List skills; each carries `source: "builtin" \| "authored" \| "installed"` and its `path`. | — | read |
+| `use_skill` | Load a skill's `SKILL.md`; follow it for the current task. | `name` | read |
+| `skill_install` | Install/replace a **user** skill into the installed tier (only when the user asks). Body from `content`, `from_url` (public hosts, SSRF-guarded), or `from_path` (local SKILL.md / whole skill dir). | `name`, one of `content`/`from_url`/`from_path` | mutate |
+| `skill_remove` | Remove a whole skill. Authored: free. Installed: only at user request. Builtin: refused (shadow it instead). | `name` | mutate |
+| `skill_list_files` | List the files inside a skill + its tier. | `name` | read |
+| `skill_read_file` | Read a file in a skill (default `SKILL.md`); numbered + `line_count`, optional `start_line`/`end_line`. | `name`, `file?`, `start_line?`, `end_line?` | read |
+| `skill_write_file` | Create/overwrite a file in a skill (SKILL.md, a script, a reference). New skill → **authored**. This is how multi-file skills are authored. | `name`, `file?`, `content` | mutate |
+| `skill_edit_file` | Precise edit of a skill file — substring or line-range mode; returns the post-edit `applied` region. | `name`, `file?`, `old`/`new` or `start_line`/`end_line`/`new` | mutate |
+| `skill_delete_file` | Delete a file in a skill (not `SKILL.md` — use `skill_remove` for the pack). | `name`, `file` | mutate |
 
-> **Consent boundary.** `skill_install` / `skill_uninstall` act on the user's
-> behalf — only call them when the user explicitly asks to install or remove a
-> skill. The `skill_author*` tools operate solely on the agent's own
-> `authored` tier and need no consent.
+> **Tier rules (enforced).** **builtin** skills are read-only — every mutating
+> tool refuses them (to customise one, `skill_install` or author a skill of the
+> same name; it shadows the builtin). **authored** skills the agent owns and
+> edits autonomously. **installed** skills should be created/edited/removed
+> **only at the user's request**.
 
 ## External MCP
 

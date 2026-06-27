@@ -1,17 +1,21 @@
 //! Skills runtime: discover, load, and manage `SKILL.md` skill packs.
 //!
-//! A skill is a directory containing `SKILL.md`. Three tiers live in separate
-//! dirs and merge by name with **installed > authored > builtin** precedence:
+//! A skill is a **directory** (it may hold `SKILL.md` plus scripts / reference
+//! files). Three tiers live in separate dirs and merge by name with
+//! **installed > authored > builtin** precedence:
 //!
-//! - **builtin** — shipped in the binary, seeded at boot, read-only.
-//! - **authored** — the agent writes these for itself from experience
-//!   (Hermes-style). It may create / edit / delete them autonomously
-//!   (`skill_author` / `skill_author_edit` / `skill_author_delete`).
-//! - **installed** — user-chosen packs. The agent installs/removes these
-//!   **only at the user's request** (`skill_install` / `skill_uninstall`);
-//!   they shadow a builtin or authored skill of the same name.
+//! - **builtin** — shipped in the binary, seeded at boot, **read-only**.
+//! - **authored** — skills the agent writes for itself from experience
+//!   (Hermes-style). The agent owns these and edits them **autonomously**.
+//! - **installed** — user-chosen packs. The agent installs/removes/edits these
+//!   **only at the user's request**; they shadow a builtin/authored of the
+//!   same name.
 //!
-//! `list_skills` enumerates; `use_skill` returns a skill's instructions.
+//! Skills can be multi-file, so editing is file-level: `skill_list_files` /
+//! `skill_read_file` / `skill_write_file` / `skill_edit_file` /
+//! `skill_delete_file` operate on individual files within a skill, enforcing the
+//! tier rules (builtin never mutated; a write to a not-yet-existing skill lands
+//! in `authored`). `skill_install` / `skill_remove` manage whole packs.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -33,18 +37,12 @@ pub fn register(registry: &mut ToolRegistry, builtin: &Path, authored: &Path, in
     registry.register(Box::new(SkillInstall {
         installed: installed.to_path_buf(),
     }));
-    registry.register(Box::new(SkillUninstall {
-        installed: installed.to_path_buf(),
-    }));
-    registry.register(Box::new(SkillAuthor {
-        authored: authored.to_path_buf(),
-    }));
-    registry.register(Box::new(SkillAuthorEdit {
-        authored: authored.to_path_buf(),
-    }));
-    registry.register(Box::new(SkillAuthorDelete {
-        authored: authored.to_path_buf(),
-    }));
+    registry.register(Box::new(SkillRemove(tiers())));
+    registry.register(Box::new(SkillListFiles(tiers())));
+    registry.register(Box::new(SkillReadFile(tiers())));
+    registry.register(Box::new(SkillWriteFile(tiers())));
+    registry.register(Box::new(SkillEditFile(tiers())));
+    registry.register(Box::new(SkillDeleteFile(tiers())));
 }
 
 #[derive(Clone)]
@@ -54,13 +52,36 @@ struct Tiers {
     installed: PathBuf,
 }
 
+impl Tiers {
+    /// Tiers in precedence order (highest first): installed, authored, builtin.
+    fn ordered(&self) -> [(&Path, &'static str); 3] {
+        [
+            (&self.installed, "installed"),
+            (&self.authored, "authored"),
+            (&self.builtin, "builtin"),
+        ]
+    }
+
+    /// Where the skill `name` currently lives (highest-precedence tier that has
+    /// a directory for it), or `None` if it doesn't exist yet.
+    fn locate(&self, name: &str) -> Option<(PathBuf, &'static str)> {
+        for (dir, source) in self.ordered() {
+            let d = dir.join(name);
+            if d.is_dir() {
+                return Some((d, source));
+            }
+        }
+        None
+    }
+}
+
 struct SkillInfo {
     description: String,
-    path: PathBuf,
+    path: PathBuf, // the SKILL.md path
     source: &'static str,
 }
 
-/// Reject names that could escape the skills store.
+/// Reject skill names that could escape the skills store.
 fn valid_name(name: &str) -> Result<()> {
     if name.is_empty()
         || name.contains('/')
@@ -73,10 +94,26 @@ fn valid_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Collect skills by name across the three tiers; later tiers override earlier
-/// ones, so the precedence is installed > authored > builtin.
+/// Reject in-skill file paths that could escape the skill directory.
+fn valid_file(file: &str) -> Result<String> {
+    let f = file.trim().replace('\\', "/");
+    if f.is_empty()
+        || f.starts_with('/')
+        || f.split('/').any(|c| c == ".." || c.is_empty())
+        || f.contains(':')
+        || f.contains('\0')
+    {
+        return Err(CoreError::Message(format!(
+            "invalid file path '{file}': must be relative inside the skill, no '..'"
+        )));
+    }
+    Ok(f)
+}
+
+/// Collect skills by name across the three tiers; installed > authored > builtin.
 fn collect(t: &Tiers) -> BTreeMap<String, SkillInfo> {
     let mut map = BTreeMap::new();
+    // Insert builtin first, then authored, then installed so later overrides win.
     for (dir, source) in [
         (&t.builtin, "builtin"),
         (&t.authored, "authored"),
@@ -86,7 +123,6 @@ fn collect(t: &Tiers) -> BTreeMap<String, SkillInfo> {
             continue;
         };
         for entry in entries.flatten() {
-            // Skip symlinked skill dirs (could point outside the skills store).
             if entry.file_type().map(|ft| ft.is_symlink()).unwrap_or(false) {
                 continue;
             }
@@ -129,6 +165,24 @@ fn require_str<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
         .ok_or_else(|| CoreError::Message(format!("missing required string argument '{key}'")))
 }
 
+/// Recursively list files (relative paths) under a skill directory.
+fn list_files_rec(base: &Path, dir: &Path, out: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_type().map(|ft| ft.is_symlink()).unwrap_or(false) {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            list_files_rec(base, &path, out);
+        } else if let Ok(rel) = path.strip_prefix(base) {
+            out.push(rel.to_string_lossy().replace('\\', "/"));
+        }
+    }
+}
+
 // --- read-only: list / use ---
 
 struct ListSkills(Tiers);
@@ -139,8 +193,9 @@ impl Tool for ListSkills {
         ToolSpec {
             name: "list_skills".to_string(),
             description: "List available skills (SKILL.md packs). Each entry's `source` is \
-                 `\"builtin\"`, `\"authored\"` (you wrote it), or `\"installed\"` (user-chosen). \
-                 Precedence when names collide: installed > authored > builtin."
+                 `\"builtin\"` (read-only), `\"authored\"` (you wrote it), or `\"installed\"` \
+                 (user-chosen), plus its `path`. Precedence when names collide: installed > \
+                 authored > builtin."
                 .to_string(),
             parameters: json!({ "type": "object", "properties": {} }),
             risk: RiskLevel::Read,
@@ -151,7 +206,17 @@ impl Tool for ListSkills {
         let skills: Vec<Value> = collect(&self.0)
             .into_iter()
             .map(|(name, info)| {
-                json!({ "name": name, "description": info.description, "source": info.source })
+                let dir = info
+                    .path
+                    .parent()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                json!({
+                    "name": name,
+                    "description": info.description,
+                    "source": info.source,
+                    "path": dir,
+                })
             })
             .collect();
         Ok(json!({ "skills": skills }))
@@ -165,7 +230,8 @@ impl Tool for UseSkill {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "use_skill".to_string(),
-            description: "Load a skill's instructions by name; follow them for the current task."
+            description: "Load a skill's SKILL.md instructions by name; follow them for the \
+                 current task. (Read other files in the skill with skill_read_file.)"
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -189,34 +255,57 @@ impl Tool for UseSkill {
     }
 }
 
-// --- shared write helpers ---
+// --- whole-pack lifecycle ---
 
-/// Write a skill's `SKILL.md` into `<tier_dir>/<name>/SKILL.md`, overwriting.
-fn write_skill_md(tier_dir: &Path, name: &str, content: &str) -> Result<PathBuf> {
-    let dir = tier_dir.join(name);
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| CoreError::Message(format!("cannot create skill dir '{name}': {e}")))?;
-    let md = dir.join("SKILL.md");
-    std::fs::write(&md, content)
-        .map_err(|e| CoreError::Message(format!("cannot write skill '{name}': {e}")))?;
-    Ok(md)
+struct SkillInstall {
+    installed: PathBuf,
 }
 
-/// Remove `<tier_dir>/<name>` entirely. `Ok(false)` if it didn't exist.
-fn remove_skill_dir(tier_dir: &Path, name: &str) -> Result<bool> {
-    let dir = tier_dir.join(name);
-    let md = dir.join("SKILL.md");
-    if !md.is_file() {
-        return Ok(false);
+#[async_trait]
+impl Tool for SkillInstall {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "skill_install".to_string(),
+            description: "Install (or replace) a USER skill into the installed tier — only when \
+                 the user asks you to install a skill. Provide the SKILL.md body via `content`, \
+                 `from_url` (fetched, public hosts only), or `from_path` (a local SKILL.md file \
+                 or a whole skill directory, copied including extra files). To create a skill for \
+                 yourself, use skill_write_file instead (it lands in your authored tier)."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "content": { "type": "string", "description": "inline SKILL.md body" },
+                    "from_url": { "type": "string", "description": "URL to fetch SKILL.md from (public hosts only)" },
+                    "from_path": { "type": "string", "description": "local SKILL.md file or skill directory to copy" }
+                },
+                "required": ["name"]
+            }),
+            risk: RiskLevel::Mutate,
+        }
     }
-    std::fs::remove_dir_all(&dir)
-        .map_err(|e| CoreError::Message(format!("cannot remove skill '{name}': {e}")))?;
-    Ok(true)
+
+    async fn call(&self, args: Value) -> Result<Value> {
+        let name = require_str(&args, "name")?;
+        valid_name(name)?;
+        let dir = self.installed.join(name);
+        let (body, dir_src) = resolve_install_body(&args).await?;
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| CoreError::Message(format!("cannot create skill dir '{name}': {e}")))?;
+        std::fs::write(dir.join("SKILL.md"), body)
+            .map_err(|e| CoreError::Message(format!("cannot write skill '{name}': {e}")))?;
+        let mut extra = 0;
+        if let Some(src) = dir_src {
+            extra = copy_extra_files(&src, &dir)?;
+        }
+        Ok(json!({ "name": name, "source": "installed", "installed": true, "extra_files": extra }))
+    }
 }
 
-/// Resolve the SKILL.md body for an install request: inline `content`, a
-/// `from_url` fetch (SSRF-guarded), or a `from_path` (a local SKILL.md file or
-/// a skill directory containing one). Returns `(content, copied_dir_from)`.
+/// Resolve the SKILL.md body for an install: inline `content`, a `from_url`
+/// fetch (SSRF-guarded), or a `from_path` (a local SKILL.md file or a skill
+/// directory). Returns `(content, copied_dir_from)`.
 async fn resolve_install_body(args: &Value) -> Result<(String, Option<PathBuf>)> {
     if let Some(content) = args.get("content").and_then(Value::as_str) {
         return Ok((content.to_string(), None));
@@ -250,84 +339,50 @@ async fn resolve_install_body(args: &Value) -> Result<(String, Option<PathBuf>)>
     ))
 }
 
-/// Copy the non-SKILL.md files of a skill directory alongside the SKILL.md we
-/// already wrote (best-effort, one level deep — no nested dirs, no symlinks).
+/// Copy the non-SKILL.md files of a skill directory (best-effort, recursive,
+/// no symlinks) alongside the SKILL.md we already wrote.
 fn copy_extra_files(src_dir: &Path, dest_dir: &Path) -> Result<usize> {
-    let mut copied = 0;
-    let Ok(entries) = std::fs::read_dir(src_dir) else {
-        return Ok(0);
-    };
-    for entry in entries.flatten() {
-        if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
-            let name = entry.file_name();
-            if name == "SKILL.md" {
+    fn walk(src: &Path, base_src: &Path, base_dest: &Path, n: &mut usize) {
+        let Ok(entries) = std::fs::read_dir(src) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if entry.file_type().map(|ft| ft.is_symlink()).unwrap_or(false) {
                 continue;
             }
-            let dest = dest_dir.join(&name);
-            if std::fs::copy(entry.path(), &dest).is_ok() {
-                copied += 1;
+            let p = entry.path();
+            if p.is_dir() {
+                walk(&p, base_src, base_dest, n);
+            } else if let Ok(rel) = p.strip_prefix(base_src) {
+                if rel.to_string_lossy() == "SKILL.md" {
+                    continue;
+                }
+                let dest = base_dest.join(rel);
+                if let Some(parent) = dest.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if std::fs::copy(&p, &dest).is_ok() {
+                    *n += 1;
+                }
             }
         }
     }
-    Ok(copied)
+    let mut n = 0;
+    walk(src_dir, src_dir, dest_dir, &mut n);
+    Ok(n)
 }
 
-// --- user-installed lifecycle (consent required: only at user request) ---
-
-struct SkillInstall {
-    installed: PathBuf,
-}
+struct SkillRemove(Tiers);
 
 #[async_trait]
-impl Tool for SkillInstall {
+impl Tool for SkillRemove {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "skill_install".to_string(),
-            description: "Install (or replace) a USER skill — only do this when the user asks you \
-                 to install a skill. Provide the SKILL.md body via one of: `content` (inline), \
-                 `from_url` (fetched, public hosts only), or `from_path` (a local SKILL.md file \
-                 or a skill directory). Installed skills shadow builtin/authored of the same name. \
-                 Use `skill_author` instead for skills you create for yourself."
-                .to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "name": { "type": "string" },
-                    "content": { "type": "string", "description": "inline SKILL.md body" },
-                    "from_url": { "type": "string", "description": "URL to fetch SKILL.md from (public hosts only)" },
-                    "from_path": { "type": "string", "description": "local SKILL.md file or skill directory to copy" }
-                },
-                "required": ["name"]
-            }),
-            risk: RiskLevel::Mutate,
-        }
-    }
-
-    async fn call(&self, args: Value) -> Result<Value> {
-        let name = require_str(&args, "name")?;
-        valid_name(name)?;
-        let (body, dir_src) = resolve_install_body(&args).await?;
-        write_skill_md(&self.installed, name, &body)?;
-        let mut extra = 0;
-        if let Some(src) = dir_src {
-            extra = copy_extra_files(&src, &self.installed.join(name))?;
-        }
-        Ok(json!({ "name": name, "source": "installed", "installed": true, "extra_files": extra }))
-    }
-}
-
-struct SkillUninstall {
-    installed: PathBuf,
-}
-
-#[async_trait]
-impl Tool for SkillUninstall {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec {
-            name: "skill_uninstall".to_string(),
-            description: "Remove a USER-installed skill by name — only at the user's request. \
-                 Cannot remove builtin skills (shipped) or authored skills (use \
-                 skill_author_delete for those)."
+            name: "skill_remove".to_string(),
+            description: "Remove a whole skill by name. Authored skills: remove freely. Installed \
+                 skills: only at the user's request. Built-in skills cannot be removed (to \
+                 override one, install or author a skill of the same name — it shadows the \
+                 built-in)."
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -341,37 +396,141 @@ impl Tool for SkillUninstall {
     async fn call(&self, args: Value) -> Result<Value> {
         let name = require_str(&args, "name")?;
         valid_name(name)?;
-        if !remove_skill_dir(&self.installed, name)? {
-            return Err(CoreError::Message(format!(
-                "no user-installed skill '{name}' (builtin and authored skills aren't removed here)"
-            )));
+        match self.0.locate(name) {
+            Some((_, "builtin")) => Err(CoreError::Message(format!(
+                "built-in skill '{name}' cannot be removed; install or author one of the same name to shadow it"
+            ))),
+            Some((dir, source)) => {
+                std::fs::remove_dir_all(&dir)
+                    .map_err(|e| CoreError::Message(format!("cannot remove skill '{name}': {e}")))?;
+                Ok(json!({ "name": name, "source": source, "removed": true }))
+            }
+            None => Err(CoreError::Message(format!("no such skill '{name}'"))),
         }
-        Ok(json!({ "name": name, "removed": true }))
     }
 }
 
-// --- agent-authored lifecycle (autonomous: no user consent needed) ---
+// --- file-level editing within a skill ---
 
-struct SkillAuthor {
-    authored: PathBuf,
+/// Resolve the directory + source for a file op. `for_write` decides what to do
+/// when the skill doesn't exist yet (create in `authored`) and refuses builtin.
+fn resolve_skill_dir(t: &Tiers, name: &str, for_write: bool) -> Result<(PathBuf, &'static str)> {
+    match t.locate(name) {
+        Some((_, "builtin")) if for_write => Err(CoreError::Message(format!(
+            "built-in skill '{name}' is read-only; install or author a skill of the same name to customise it"
+        ))),
+        Some((dir, source)) => Ok((dir, source)),
+        None if for_write => Ok((t.authored.join(name), "authored")),
+        None => Err(CoreError::Message(format!("no such skill '{name}'"))),
+    }
 }
 
+struct SkillListFiles(Tiers);
+
 #[async_trait]
-impl Tool for SkillAuthor {
+impl Tool for SkillListFiles {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "skill_author".to_string(),
-            description: "Create or replace a skill you author for yourself from experience \
-                 (Hermes-style) — a whole SKILL.md in one shot. You own authored skills and may \
-                 do this autonomously. To MERGE skills, author the combined one then \
-                 skill_author_delete the originals; to SPLIT, author the new pieces then delete \
-                 the original. For surgical changes use skill_author_edit."
+            name: "skill_list_files".to_string(),
+            description: "List the files inside a skill (relative paths) and its tier.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "name": { "type": "string" } },
+                "required": ["name"]
+            }),
+            risk: RiskLevel::Read,
+        }
+    }
+
+    async fn call(&self, args: Value) -> Result<Value> {
+        let name = require_str(&args, "name")?;
+        valid_name(name)?;
+        let (dir, source) = resolve_skill_dir(&self.0, name, false)?;
+        let mut files = Vec::new();
+        list_files_rec(&dir, &dir, &mut files);
+        files.sort();
+        Ok(json!({ "name": name, "source": source, "files": files }))
+    }
+}
+
+struct SkillReadFile(Tiers);
+
+#[async_trait]
+impl Tool for SkillReadFile {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "skill_read_file".to_string(),
+            description:
+                "Read a file inside a skill (default SKILL.md). Returns raw `content` plus \
+                 a line-numbered `numbered` view and `line_count`; pass `start_line`/`end_line` \
+                 for a slice. Works on any tier."
+                    .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "file": { "type": "string", "description": "skill-relative file (default SKILL.md)" },
+                    "start_line": { "type": "integer" },
+                    "end_line": { "type": "integer" }
+                },
+                "required": ["name"]
+            }),
+            risk: RiskLevel::Read,
+        }
+    }
+
+    async fn call(&self, args: Value) -> Result<Value> {
+        let name = require_str(&args, "name")?;
+        valid_name(name)?;
+        let file = valid_file(
+            args.get("file")
+                .and_then(Value::as_str)
+                .unwrap_or("SKILL.md"),
+        )?;
+        let start_line = args
+            .get("start_line")
+            .and_then(Value::as_u64)
+            .map(|n| n as usize);
+        let end_line = args
+            .get("end_line")
+            .and_then(Value::as_u64)
+            .map(|n| n as usize);
+        let (dir, source) = resolve_skill_dir(&self.0, name, false)?;
+        let full = std::fs::read_to_string(dir.join(&file)).map_err(|e| {
+            CoreError::Message(format!("cannot read '{file}' in skill '{name}': {e}"))
+        })?;
+        let (slice, start, end, total) = fleety_tools::slice_lines(&full, start_line, end_line);
+        Ok(json!({
+            "name": name,
+            "source": source,
+            "file": file,
+            "content": slice,
+            "numbered": fleety_tools::line_numbered(&slice, start.max(1)),
+            "start_line": start,
+            "end_line": end,
+            "line_count": total,
+        }))
+    }
+}
+
+struct SkillWriteFile(Tiers);
+
+#[async_trait]
+impl Tool for SkillWriteFile {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "skill_write_file".to_string(),
+            description: "Create or overwrite a file inside a skill (e.g. SKILL.md, a script, a \
+                 reference). A write to a skill that doesn't exist yet creates it in your AUTHORED \
+                 tier. Editing an installed skill's files: only at the user's request. Built-in \
+                 skills are read-only. This is how you author multi-file skills."
                 .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "name": { "type": "string" },
-                    "content": { "type": "string", "description": "the full SKILL.md body" }
+                    "file": { "type": "string", "description": "skill-relative file (default SKILL.md)" },
+                    "content": { "type": "string" }
                 },
                 "required": ["name", "content"]
             }),
@@ -382,34 +541,50 @@ impl Tool for SkillAuthor {
     async fn call(&self, args: Value) -> Result<Value> {
         let name = require_str(&args, "name")?;
         valid_name(name)?;
+        let file = valid_file(
+            args.get("file")
+                .and_then(Value::as_str)
+                .unwrap_or("SKILL.md"),
+        )?;
         let content = require_str(&args, "content")?;
-        write_skill_md(&self.authored, name, content)?;
-        Ok(json!({ "name": name, "source": "authored", "saved": true, "bytes": content.len() }))
+        let (dir, source) = resolve_skill_dir(&self.0, name, true)?;
+        let target = dir.join(&file);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| CoreError::Message(format!("cannot create dir for '{file}': {e}")))?;
+        }
+        std::fs::write(&target, content).map_err(|e| {
+            CoreError::Message(format!("cannot write '{file}' in skill '{name}': {e}"))
+        })?;
+        Ok(json!({ "name": name, "source": source, "file": file, "bytes": content.len() }))
     }
 }
 
-struct SkillAuthorEdit {
-    authored: PathBuf,
-}
+struct SkillEditFile(Tiers);
 
 #[async_trait]
-impl Tool for SkillAuthorEdit {
+impl Tool for SkillEditFile {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "skill_author_edit".to_string(),
-            description: "Edit one of YOUR authored skills by exact substring replacement — the \
-                 precise alternative to rewriting the whole SKILL.md with skill_author. `old` \
-                 must be unique unless replace_all:true. Only works on authored skills."
+            name: "skill_edit_file".to_string(),
+            description: "Precise edit of a file inside a skill, two modes: (1) substring — \
+                 replace `old` with `new` (`old` unique unless replace_all:true); (2) line-range \
+                 — replace lines `start_line`..`end_line` (from skill_read_file) with `new`. \
+                 Returns the post-edit `applied` region. Installed skills: only at the user's \
+                 request. Built-in skills are read-only."
                 .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "name": { "type": "string" },
+                    "file": { "type": "string", "description": "skill-relative file (default SKILL.md)" },
                     "old": { "type": "string" },
                     "new": { "type": "string" },
-                    "replace_all": { "type": "boolean" }
+                    "replace_all": { "type": "boolean" },
+                    "start_line": { "type": "integer" },
+                    "end_line": { "type": "integer" }
                 },
-                "required": ["name", "old", "new"]
+                "required": ["name", "new"]
             }),
             risk: RiskLevel::Mutate,
         }
@@ -418,70 +593,99 @@ impl Tool for SkillAuthorEdit {
     async fn call(&self, args: Value) -> Result<Value> {
         let name = require_str(&args, "name")?;
         valid_name(name)?;
-        let old = require_str(&args, "old")?;
+        let file = valid_file(
+            args.get("file")
+                .and_then(Value::as_str)
+                .unwrap_or("SKILL.md"),
+        )?;
         let new = require_str(&args, "new")?;
-        if old.is_empty() {
-            return Err(CoreError::Message(
-                "'old' must be non-empty; use skill_author to create or replace the skill"
-                    .to_string(),
-            ));
-        }
-        let replace_all = args
-            .get("replace_all")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let md = self.authored.join(name).join("SKILL.md");
-        let content = match std::fs::read_to_string(&md) {
-            Ok(c) => c,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(CoreError::Message(format!(
-                    "no authored skill '{name}'; create it with skill_author first"
-                )))
-            }
-            Err(e) => {
-                return Err(CoreError::Message(format!(
-                    "cannot read skill '{name}': {e}"
-                )))
-            }
-        };
-        let count = content.matches(old).count();
-        if count == 0 {
-            return Err(CoreError::Message(format!(
-                "the 'old' text was not found in skill '{name}'"
-            )));
-        }
-        if count > 1 && !replace_all {
-            return Err(CoreError::Message(format!(
-                "the 'old' text appears {count} times in skill '{name}'; add context or set replace_all:true"
-            )));
-        }
-        let (updated, replaced) = if replace_all {
-            (content.replace(old, new), count)
+        let (dir, source) = resolve_skill_dir(&self.0, name, true)?;
+        let path = dir.join(&file);
+        let content = std::fs::read_to_string(&path).map_err(|e| {
+            CoreError::Message(format!("cannot read '{file}' in skill '{name}': {e}"))
+        })?;
+
+        let start_arg = args
+            .get("start_line")
+            .and_then(Value::as_u64)
+            .map(|n| n as usize);
+        let (updated, replaced, change_start, change_len) = if let Some(start) = start_arg {
+            let end = args
+                .get("end_line")
+                .and_then(Value::as_u64)
+                .map(|n| n as usize)
+                .unwrap_or(start);
+            let (updated, inserted) = fleety_tools::replace_line_range(&content, start, end, new)?;
+            (updated, 1usize, start, inserted)
         } else {
-            (content.replacen(old, new, 1), 1)
+            let old = require_str(&args, "old")?;
+            if old.is_empty() {
+                return Err(CoreError::Message(
+                    "provide 'old' (substring mode) or 'start_line'/'end_line' (line-range mode)"
+                        .to_string(),
+                ));
+            }
+            let replace_all = args
+                .get("replace_all")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let count = content.matches(old).count();
+            if count == 0 {
+                return Err(CoreError::Message(format!(
+                    "the 'old' text was not found in '{file}'"
+                )));
+            }
+            if count > 1 && !replace_all {
+                return Err(CoreError::Message(format!(
+                    "the 'old' text appears {count} times in '{file}'; add context or set replace_all:true"
+                )));
+            }
+            let pos = content.find(old).unwrap_or(0);
+            let (updated, replaced) = if replace_all {
+                (content.replace(old, new), count)
+            } else {
+                (content.replacen(old, new, 1), 1)
+            };
+            (
+                updated,
+                replaced,
+                fleety_tools::line_of_offset(&content, pos),
+                new.lines().count().max(1),
+            )
         };
-        std::fs::write(&md, &updated)
-            .map_err(|e| CoreError::Message(format!("cannot write skill '{name}': {e}")))?;
-        Ok(json!({ "name": name, "source": "authored", "replaced": replaced }))
+
+        std::fs::write(&path, &updated).map_err(|e| {
+            CoreError::Message(format!("cannot write '{file}' in skill '{name}': {e}"))
+        })?;
+        Ok(json!({
+            "name": name,
+            "source": source,
+            "file": file,
+            "replaced": replaced,
+            "applied": fleety_tools::region_view(&updated, change_start, change_len, 3),
+            "line_count": updated.lines().count(),
+        }))
     }
 }
 
-struct SkillAuthorDelete {
-    authored: PathBuf,
-}
+struct SkillDeleteFile(Tiers);
 
 #[async_trait]
-impl Tool for SkillAuthorDelete {
+impl Tool for SkillDeleteFile {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
-            name: "skill_author_delete".to_string(),
-            description: "Delete one of YOUR authored skills by name. You own authored skills and \
-                 may do this autonomously. Does not touch builtin or user-installed skills."
+            name: "skill_delete_file".to_string(),
+            description: "Delete a file inside a skill (not SKILL.md — use skill_remove for the \
+                 whole pack). Installed skills: only at the user's request. Built-in skills are \
+                 read-only."
                 .to_string(),
             parameters: json!({
                 "type": "object",
-                "properties": { "name": { "type": "string" } },
-                "required": ["name"]
+                "properties": {
+                    "name": { "type": "string" },
+                    "file": { "type": "string" }
+                },
+                "required": ["name", "file"]
             }),
             risk: RiskLevel::Mutate,
         }
@@ -490,10 +694,23 @@ impl Tool for SkillAuthorDelete {
     async fn call(&self, args: Value) -> Result<Value> {
         let name = require_str(&args, "name")?;
         valid_name(name)?;
-        if !remove_skill_dir(&self.authored, name)? {
-            return Err(CoreError::Message(format!("no authored skill '{name}'")));
+        let file = valid_file(require_str(&args, "file")?)?;
+        if file == "SKILL.md" {
+            return Err(CoreError::Message(
+                "won't delete SKILL.md (that unmakes the skill); use skill_remove to delete the whole skill".to_string(),
+            ));
         }
-        Ok(json!({ "name": name, "removed": true }))
+        let (dir, source) = resolve_skill_dir(&self.0, name, true)?;
+        let target = dir.join(&file);
+        if !target.is_file() {
+            return Err(CoreError::Message(format!(
+                "no file '{file}' in skill '{name}'"
+            )));
+        }
+        std::fs::remove_file(&target).map_err(|e| {
+            CoreError::Message(format!("cannot delete '{file}' in skill '{name}': {e}"))
+        })?;
+        Ok(json!({ "name": name, "source": source, "file": file, "removed": true }))
     }
 }
 
@@ -514,170 +731,185 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_and_use_with_precedence() {
-        let builtin = temp();
-        let authored = temp();
-        let installed = temp();
-        write_skill(&builtin, "esp32", "# ESP32\nflash (builtin)");
-        write_skill(&builtin, "docker", "# Docker\nbuild images");
-        write_skill(&authored, "esp32", "# ESP32\nflash (authored)");
-        write_skill(&authored, "habits", "# Habits\nlearned routine");
-        write_skill(&installed, "esp32", "# ESP32\nflash (installed)");
+    async fn list_use_precedence_and_path() {
+        let (b, a, i) = (temp(), temp(), temp());
+        write_skill(&b, "esp32", "# ESP32\n(builtin)");
+        write_skill(&a, "esp32", "# ESP32\n(authored)");
+        write_skill(&i, "esp32", "# ESP32\n(installed)");
+        write_skill(&b, "docker", "# Docker\nbuild");
+        let mut reg = ToolRegistry::new();
+        register(&mut reg, &b, &a, &i);
 
-        let mut registry = ToolRegistry::new();
-        register(&mut registry, &builtin, &authored, &installed);
-
-        let listed = registry.call("list_skills", json!({})).await.expect("list");
+        let listed = reg.call("list_skills", json!({})).await.expect("list");
         let arr = listed["skills"].as_array().expect("arr");
-        // esp32 (collapsed) + docker + habits = 3
-        assert_eq!(arr.len(), 3);
+        assert_eq!(arr.len(), 2); // esp32 (collapsed) + docker
+        let esp = arr
+            .iter()
+            .find(|s| s["name"] == json!("esp32"))
+            .expect("esp");
+        assert_eq!(esp["source"], json!("installed"));
+        assert!(esp["path"].as_str().unwrap_or_default().contains("esp32"));
 
-        // installed wins over authored wins over builtin
-        let used = registry
+        let used = reg
             .call("use_skill", json!({ "name": "esp32" }))
             .await
             .expect("use");
         assert_eq!(used["source"], json!("installed"));
-        assert!(used["content"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("installed"));
 
-        let habit = registry
-            .call("use_skill", json!({ "name": "habits" }))
-            .await
-            .expect("use habits");
-        assert_eq!(habit["source"], json!("authored"));
-
-        for d in [&builtin, &authored, &installed] {
+        for d in [&b, &a, &i] {
             let _ = std::fs::remove_dir_all(d);
         }
     }
 
     #[tokio::test]
-    async fn install_uninstall_and_builtin_protection() {
-        let builtin = temp();
-        let authored = temp();
-        let installed = temp();
-        write_skill(&builtin, "shipped", "# Shipped\nbuiltin");
+    async fn author_multifile_and_builtin_is_readonly() {
+        let (b, a, i) = (temp(), temp(), temp());
+        write_skill(&b, "shipped", "# Shipped\nbuiltin");
+        let mut reg = ToolRegistry::new();
+        register(&mut reg, &b, &a, &i);
 
-        let mut registry = ToolRegistry::new();
-        register(&mut registry, &builtin, &authored, &installed);
+        // Writing a new skill's SKILL.md creates it in authored.
+        reg.call(
+            "skill_write_file",
+            json!({ "name": "triage", "file": "SKILL.md", "content": "# Triage\nstep one\nstep two\n" }),
+        )
+        .await
+        .expect("author skill");
+        // Add a second file (script) to the same authored skill.
+        reg.call(
+            "skill_write_file",
+            json!({ "name": "triage", "file": "scripts/run.sh", "content": "echo hi\n" }),
+        )
+        .await
+        .expect("author script");
+        let files = reg
+            .call("skill_list_files", json!({ "name": "triage" }))
+            .await
+            .expect("files");
+        let list = files["files"].as_array().expect("arr");
+        assert!(list.iter().any(|f| f == "SKILL.md"));
+        assert!(list.iter().any(|f| f == "scripts/run.sh"));
+        assert_eq!(files["source"], json!("authored"));
 
-        // Install from inline content.
-        registry
+        // Line-range edit of the authored SKILL.md, with post-edit region.
+        let e = reg
             .call(
-                "skill_install",
-                json!({ "name": "deploy", "content": "# Deploy\nuser skill" }),
+                "skill_edit_file",
+                json!({ "name": "triage", "start_line": 2, "end_line": 2, "new": "step ONE" }),
             )
             .await
-            .expect("install");
-        let listed = registry.call("list_skills", json!({})).await.expect("list");
-        let arr = listed["skills"].as_array().expect("arr");
-        assert_eq!(arr.len(), 2);
+            .expect("edit");
+        assert!(e["applied"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("step ONE"));
 
-        // Uninstall removes only from installed; a builtin name can't be uninstalled.
-        assert!(registry
-            .call("skill_uninstall", json!({ "name": "shipped" }))
+        // Built-in skills are read-only for every mutation.
+        assert!(reg
+            .call(
+                "skill_write_file",
+                json!({ "name": "shipped", "file": "x.txt", "content": "y" })
+            )
             .await
             .is_err());
-        registry
-            .call("skill_uninstall", json!({ "name": "deploy" }))
+        assert!(reg
+            .call(
+                "skill_edit_file",
+                json!({ "name": "shipped", "old": "builtin", "new": "z" })
+            )
             .await
-            .expect("uninstall");
-        assert!(registry
-            .call("skill_uninstall", json!({ "name": "deploy" }))
+            .is_err());
+        assert!(reg
+            .call("skill_remove", json!({ "name": "shipped" }))
             .await
             .is_err());
 
-        // install with no source is rejected.
-        assert!(registry
+        // delete a non-SKILL file; refuse SKILL.md
+        reg.call(
+            "skill_delete_file",
+            json!({ "name": "triage", "file": "scripts/run.sh" }),
+        )
+        .await
+        .expect("del file");
+        assert!(reg
+            .call(
+                "skill_delete_file",
+                json!({ "name": "triage", "file": "SKILL.md" })
+            )
+            .await
+            .is_err());
+
+        // remove the whole authored skill
+        reg.call("skill_remove", json!({ "name": "triage" }))
+            .await
+            .expect("remove");
+        assert!(reg
+            .call("use_skill", json!({ "name": "triage" }))
+            .await
+            .is_err());
+
+        for d in [&b, &a, &i] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[tokio::test]
+    async fn install_from_content_then_remove() {
+        let (b, a, i) = (temp(), temp(), temp());
+        let mut reg = ToolRegistry::new();
+        register(&mut reg, &b, &a, &i);
+
+        reg.call(
+            "skill_install",
+            json!({ "name": "deploy", "content": "# Deploy\nuser skill" }),
+        )
+        .await
+        .expect("install");
+        let used = reg
+            .call("use_skill", json!({ "name": "deploy" }))
+            .await
+            .expect("use");
+        assert_eq!(used["source"], json!("installed"));
+
+        // install with no source errors
+        assert!(reg
             .call("skill_install", json!({ "name": "x" }))
             .await
             .is_err());
 
-        for d in [&builtin, &authored, &installed] {
+        reg.call("skill_remove", json!({ "name": "deploy" }))
+            .await
+            .expect("remove");
+        assert!(reg
+            .call("use_skill", json!({ "name": "deploy" }))
+            .await
+            .is_err());
+
+        for d in [&b, &a, &i] {
             let _ = std::fs::remove_dir_all(d);
         }
     }
 
     #[tokio::test]
-    async fn author_create_edit_delete() {
-        let builtin = temp();
-        let authored = temp();
-        let installed = temp();
-        let mut registry = ToolRegistry::new();
-        register(&mut registry, &builtin, &authored, &installed);
-
-        // Author a whole skill.
-        registry
-            .call(
-                "skill_author",
-                json!({ "name": "triage", "content": "# Triage\nstep one\nstep two\n" }),
-            )
-            .await
-            .expect("author");
-        let used = registry
-            .call("use_skill", json!({ "name": "triage" }))
-            .await
-            .expect("use");
-        assert_eq!(used["source"], json!("authored"));
-
-        // Fragment edit.
-        registry
-            .call(
-                "skill_author_edit",
-                json!({ "name": "triage", "old": "step two", "new": "step two (refined)" }),
-            )
-            .await
-            .expect("edit");
-        let after = registry
-            .call("use_skill", json!({ "name": "triage" }))
-            .await
-            .expect("use2");
-        assert!(after["content"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("refined"));
-
-        // Editing a non-existent authored skill errors.
-        assert!(registry
-            .call(
-                "skill_author_edit",
-                json!({ "name": "ghost", "old": "a", "new": "b" })
-            )
-            .await
-            .is_err());
-
-        // Delete.
-        registry
-            .call("skill_author_delete", json!({ "name": "triage" }))
-            .await
-            .expect("delete");
-        assert!(registry
-            .call("use_skill", json!({ "name": "triage" }))
-            .await
-            .is_err());
-
-        for d in [&builtin, &authored, &installed] {
-            let _ = std::fs::remove_dir_all(d);
-        }
-    }
-
-    #[tokio::test]
-    async fn rejects_unsafe_names() {
-        let builtin = temp();
-        let authored = temp();
-        let installed = temp();
-        let mut registry = ToolRegistry::new();
-        register(&mut registry, &builtin, &authored, &installed);
-        for bad in ["../etc", "a/b", "a\\b", ".hidden", ""] {
-            assert!(registry
-                .call("skill_author", json!({ "name": bad, "content": "x" }))
+    async fn rejects_unsafe_names_and_files() {
+        let (b, a, i) = (temp(), temp(), temp());
+        let mut reg = ToolRegistry::new();
+        register(&mut reg, &b, &a, &i);
+        for bad in ["../etc", "a/b", ".hidden", ""] {
+            assert!(reg
+                .call("skill_write_file", json!({ "name": bad, "content": "x" }))
                 .await
                 .is_err());
         }
-        for d in [&builtin, &authored, &installed] {
+        // path escape in file
+        assert!(reg
+            .call(
+                "skill_write_file",
+                json!({ "name": "ok", "file": "../escape.txt", "content": "x" })
+            )
+            .await
+            .is_err());
+        for d in [&b, &a, &i] {
             let _ = std::fs::remove_dir_all(d);
         }
     }
