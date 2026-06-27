@@ -215,14 +215,34 @@ agent run with the stored prompt under `RequireApproval` + `MandateGate` (only
 
 ## Skills
 
-**Runs on:** server only. Skills live in `{FLEETY_AGENT_HOME}/skills/` —
-built-in (shipped in the server binary, refreshed every boot) plus
-user-installed (preserved across updates; shadow built-ins by name).
+**Runs on:** server only. Skills live in `{FLEETY_AGENT_HOME}/skills/` across
+three tiers that merge by name with **installed > authored > builtin**
+precedence:
+
+- **builtin** — shipped in the server binary, re-seeded every boot, read-only.
+- **authored** — skills the agent writes for itself from experience
+  (Hermes-style). The agent owns these and manages them **autonomously**, no
+  user consent needed.
+- **installed** — user-chosen packs. The agent installs/removes these **only
+  at the user's request**; they shadow a builtin/authored skill of the same
+  name.
+
+`list_skills` tags each entry with its `source`.
 
 | Tool | Purpose | Key inputs | Risk |
 |---|---|---|---|
-| `list_skills` | List available skills (`SKILL.md` packs) — built-in + user-installed. | — | read |
+| `list_skills` | List available skills; each carries `source: "builtin" \| "authored" \| "installed"`. | — | read |
 | `use_skill` | Load a skill's instructions; follow them for the current task. | `name` | read |
+| `skill_install` | Install/replace a **user** skill (only when the user asks). Body from `content`, `from_url` (public hosts, SSRF-guarded), or `from_path` (local SKILL.md / skill dir). | `name`, one of `content`/`from_url`/`from_path` | mutate |
+| `skill_uninstall` | Remove a user-installed skill (only at the user's request). Refuses builtin/authored. | `name` | mutate |
+| `skill_author` | Create/replace a skill the agent authors for itself — a whole SKILL.md in one shot. Autonomous. **Merge** = author the combined one then delete originals; **split** = author the pieces then delete the original. | `name`, `content` | mutate |
+| `skill_author_edit` | Surgical substring edit to one of the agent's authored skills (`old` unique unless `replace_all`). Authored only. | `name`, `old`, `new`, `replace_all?` | mutate |
+| `skill_author_delete` | Delete one of the agent's authored skills. Autonomous; never touches builtin/installed. | `name` | mutate |
+
+> **Consent boundary.** `skill_install` / `skill_uninstall` act on the user's
+> behalf — only call them when the user explicitly asks to install or remove a
+> skill. The `skill_author*` tools operate solely on the agent's own
+> `authored` tier and need no consent.
 
 ## External MCP
 

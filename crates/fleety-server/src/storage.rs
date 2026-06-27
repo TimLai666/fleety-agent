@@ -236,6 +236,15 @@ impl Storage {
         self.home.join("skills").join("installed")
     }
 
+    /// Agent-authored skills the agent writes for itself from experience
+    /// (Hermes-style). The agent owns these fully — it may create/edit/delete
+    /// them without user consent. Kept separate from `builtin` (shipped) and
+    /// `installed` (user-chosen). Shadowing order at load: installed > authored
+    /// > builtin.
+    pub fn skills_authored_dir(&self) -> PathBuf {
+        self.home.join("skills").join("authored")
+    }
+
     /// Path to the connection-auth store (tokens + pairing codes).
     pub fn auth_path(&self) -> PathBuf {
         self.home.join("auth.json")
