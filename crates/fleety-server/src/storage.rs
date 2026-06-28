@@ -27,6 +27,10 @@ struct AuditRecord {
 const DEFAULT_ME: &str = "Your name is Fleety. You are a cross-device, full-access agent that helps the user operate their devices. You act autonomously, keep an audit trail, and can roll back; you confirm only genuinely irreversible actions.\n\nYou are deeply curious about the world. Whenever something is worth keeping — an elegant architecture, a sharp working principle, an interesting idea or viewpoint, a thought that sparks mid-task, a logical thread worth chasing (and more — this list isn't exhaustive) — you distil it into your knowledge wiki with the wiki_* tools. Follow the wiki's rules (one concept per note, frontmatter, [[wikilinks]], dedup, classify), never a messy logbook; and you keep tending and reorganising old notes — merging, sharpening, correcting — instead of writing once and forgetting. At the first sign of an anomaly, an unexpected surprise, or a knowledge point / logic / corner worth digging into, you investigate, trace it to its source, and record what you find. You never pretend you didn't notice.";
 const DEFAULT_USER: &str = "(Unknown so far. Record what you learn about the user here.)";
 const DEFAULT_TODO: &str = "(No current to-dos.)";
+/// The USER block for a Guest (unidentified) turn — neutral, no personal data,
+/// and never another user's profile.
+const GUEST_PROFILE: &str =
+    "(No identified user for this turn — a guest. Do not record personal data here.)";
 
 // The static behavioural prompt, embedded at build time. Reconciled to the
 // actual tool surface (docs/tools.md); see `system_prompt`.
@@ -314,6 +318,9 @@ impl Storage {
                 "mobility": "unknown",
                 "site": "unknown",
                 "connectors": [{ "type": connector_type, "scope": "local" }],
+                "owner": Value::Null,
+                "users": [],
+                "shared": false,
             });
         }
         let now = SystemTime::now()
@@ -358,32 +365,185 @@ impl Storage {
         }
     }
 
-    /// Read agent-level core memory (ME/USER/TODO), creating defaults if missing,
-    /// as a single system-prompt block to inject each turn (`ME.md` defaults to Fleety).
-    pub fn core_memory(&self) -> Result<String> {
+    /// Read agent-level core memory for the acting user: ME and TODO are
+    /// agent-global, but the USER block is the **acting user's** profile (or a
+    /// neutral placeholder for a Guest), so each turn carries the right person.
+    pub fn core_memory_for(&self, acting: &crate::identity::ActingUser) -> Result<String> {
         let me = self.core_file("ME.md", DEFAULT_ME)?;
-        let user = self.core_file("USER.md", DEFAULT_USER)?;
+        let user = self.user_profile(acting)?;
         let todo = self.core_file("TODO.md", DEFAULT_TODO)?;
         Ok(format!(
             "You are operating with the following core memory.\n\n## ME (self)\n{me}\n\n## USER\n{user}\n\n## TODO\n{todo}"
         ))
     }
 
-    /// The full system prompt: the static behavioural docs (protocol → rules →
-    /// memory → policy, embedded at build time) followed by this agent's
-    /// editable core memory (ME/USER/TODO). This is the `system` message; the
-    /// run loop keeps it at index 0 and compaction preserves it, so it survives
-    /// a context summary without being re-sent as a separate reminder.
-    /// `FLEETY_SYSTEM_PROMPT=minimal` drops the static docs (core memory only)
-    /// for token-lean / debugging runs.
-    pub fn system_prompt(&self) -> Result<String> {
-        let core = self.core_memory()?;
+    /// The acting user resolved from a device's ownership alone (no assertion):
+    /// the device owner, else Guest. Used by unattended/device-scoped prompt
+    /// builds (recover, scheduler, subagent); the interactive turn additionally
+    /// honors an asserted user (see conn).
+    pub fn acting_for_device(&self, device_id: &str) -> crate::identity::ActingUser {
+        match self.device_ownership(device_id) {
+            Ok((owner, users, _shared)) => {
+                crate::identity::resolve_acting_user(owner.as_deref(), &users, None)
+            }
+            Err(_) => crate::identity::ActingUser::Guest,
+        }
+    }
+
+    /// The full system prompt for the acting user: the static behavioural docs
+    /// (protocol → rules → memory → policy, embedded at build time) followed by
+    /// the acting user's core memory. Kept at index 0 by the run loop and
+    /// preserved across compaction. `FLEETY_SYSTEM_PROMPT=minimal` drops the
+    /// static docs (core memory only) for token-lean / debugging runs.
+    pub fn system_prompt_for(&self, acting: &crate::identity::ActingUser) -> Result<String> {
+        let core = self.core_memory_for(acting)?;
         if std::env::var("FLEETY_SYSTEM_PROMPT").as_deref() == Ok("minimal") {
             return Ok(core);
         }
         Ok(format!(
             "{PROTOCOL_MD}\n\n---\n\n{RULES_MD}\n\n---\n\n{MEMORY_MD}\n\n---\n\n{POLICY_MD}\n\n---\n\n# Core Memory\n\n{core}"
         ))
+    }
+
+    /// Directory holding per-user state: `fleet/users/`.
+    fn users_dir(&self) -> PathBuf {
+        self.home.join("fleet").join("users")
+    }
+
+    /// The acting user's `USER.md` profile, creating a default if missing. For a
+    /// [`ActingUser::Guest`] this is a neutral placeholder with no personal data
+    /// (so a guest turn never carries another person's profile).
+    pub fn user_profile(&self, acting: &crate::identity::ActingUser) -> Result<String> {
+        match acting.user_id() {
+            Some(id) => {
+                validate_id("user_id", id)?;
+                let path = self.users_dir().join(id).join("USER.md");
+                match fs::read_to_string(&path) {
+                    Ok(content) => Ok(content),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        if let Some(parent) = path.parent() {
+                            fs::create_dir_all(parent).map_err(|e| {
+                                CoreError::Message(format!(
+                                    "cannot create {}: {e}",
+                                    parent.display()
+                                ))
+                            })?;
+                        }
+                        fs::write(&path, DEFAULT_USER).map_err(|e| {
+                            CoreError::Message(format!("cannot write {}: {e}", path.display()))
+                        })?;
+                        Ok(DEFAULT_USER.to_string())
+                    }
+                    Err(e) => Err(CoreError::Message(format!(
+                        "cannot read {}: {e}",
+                        path.display()
+                    ))),
+                }
+            }
+            None => Ok(GUEST_PROFILE.to_string()),
+        }
+    }
+
+    /// Write a user's `USER.md` profile. Part of the identity store API consumed
+    /// by the per-user memory write path (privacy-isolation) and tested here.
+    #[allow(dead_code)]
+    pub fn write_user_profile(&self, user_id: &str, content: &str) -> Result<()> {
+        validate_id("user_id", user_id)?;
+        let dir = self.users_dir().join(user_id);
+        fs::create_dir_all(&dir)
+            .map_err(|e| CoreError::Message(format!("cannot create user dir: {e}")))?;
+        fs::write(dir.join("USER.md"), content)
+            .map_err(|e| CoreError::Message(format!("write USER.md: {e}")))?;
+        Ok(())
+    }
+
+    /// List known user ids (the users index = the subdirectories of `users/`).
+    /// Identity store API consumed by interactive-config / admin surfaces.
+    #[allow(dead_code)]
+    pub fn list_users(&self) -> Result<Vec<String>> {
+        let dir = self.users_dir();
+        let mut out = Vec::new();
+        match fs::read_dir(&dir) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    if entry.path().is_dir() {
+                        if let Some(name) = entry.file_name().to_str() {
+                            out.push(name.to_string());
+                        }
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(CoreError::Message(format!("read users dir: {e}"))),
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// Read a device's ownership: `(owner, authorized users, shared)`. Missing
+    /// fields default to `(None, [], false)` so legacy device records still load.
+    pub fn device_ownership(&self, device_id: &str) -> Result<(Option<String>, Vec<String>, bool)> {
+        validate_id("device_id", device_id)?;
+        let path = self.devices_dir().join(device_id).join("device.json");
+        let record: Value = match fs::read_to_string(&path) {
+            Ok(text) => serde_json::from_str(&text).unwrap_or(Value::Null),
+            Err(_) => Value::Null,
+        };
+        let owner = record
+            .get("owner")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        let users = record
+            .get("users")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let shared = record
+            .get("shared")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        Ok((owner, users, shared))
+    }
+
+    /// Set a device's ownership fields, preserving the rest of the record.
+    /// Identity store API consumed by device configuration (interactive-config).
+    #[allow(dead_code)]
+    pub fn set_device_ownership(
+        &self,
+        device_id: &str,
+        owner: Option<&str>,
+        users: &[String],
+        shared: bool,
+    ) -> Result<()> {
+        validate_id("device_id", device_id)?;
+        let path = self.devices_dir().join(device_id).join("device.json");
+        let mut record: Value = match fs::read_to_string(&path) {
+            Ok(text) => serde_json::from_str(&text).unwrap_or(Value::Null),
+            Err(_) => Value::Null,
+        };
+        if !record.is_object() {
+            record = serde_json::json!({ "id": device_id });
+        }
+        record["owner"] = match owner {
+            Some(o) => Value::String(o.to_string()),
+            None => Value::Null,
+        };
+        record["users"] = Value::Array(users.iter().map(|u| Value::String(u.clone())).collect());
+        record["shared"] = Value::Bool(shared);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| CoreError::Message(format!("cannot create device dir: {e}")))?;
+        }
+        let pretty = serde_json::to_string_pretty(&record)
+            .map_err(|e| CoreError::Message(format!("serialize device record: {e}")))?;
+        fs::write(&path, pretty)
+            .map_err(|e| CoreError::Message(format!("write device record: {e}")))?;
+        Ok(())
     }
 
     /// A compact summary of one audit log line — what the CLI shows in
@@ -680,6 +840,98 @@ mod tests {
         assert_eq!(after.len(), 2);
         assert_eq!(after[0].seq, 2);
 
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn user_profile_per_user_and_guest() {
+        use crate::identity::ActingUser;
+        let home = temp_home();
+        let storage = Storage::new(home.clone());
+        // Missing → created with the default; round-trips after a write.
+        let alice = ActingUser::User("alice".to_string());
+        assert!(storage
+            .user_profile(&alice)
+            .expect("p")
+            .contains("Unknown so far"));
+        storage
+            .write_user_profile("alice", "Alice likes tea.")
+            .expect("w");
+        assert_eq!(
+            storage.user_profile(&alice).expect("p2"),
+            "Alice likes tea."
+        );
+        // A second user is independent.
+        let bob = ActingUser::User("bob".to_string());
+        storage
+            .write_user_profile("bob", "Bob likes coffee.")
+            .expect("wb");
+        assert_eq!(storage.user_profile(&bob).expect("pb"), "Bob likes coffee.");
+        assert_eq!(
+            storage.user_profile(&alice).expect("pa"),
+            "Alice likes tea."
+        );
+        // Guest → neutral placeholder, no personal data.
+        let guest = storage.user_profile(&ActingUser::Guest).expect("pg");
+        assert!(guest.contains("guest"));
+        assert!(!guest.contains("tea") && !guest.contains("coffee"));
+        // Index lists the known users.
+        let mut users = storage.list_users().expect("list");
+        users.sort();
+        assert_eq!(users, vec!["alice".to_string(), "bob".to_string()]);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn core_memory_uses_the_acting_users_profile() {
+        use crate::identity::ActingUser;
+        let home = temp_home();
+        let storage = Storage::new(home.clone());
+        storage
+            .write_user_profile("alice", "Alice's profile")
+            .unwrap();
+        let cm = storage
+            .core_memory_for(&ActingUser::User("alice".into()))
+            .expect("cm");
+        assert!(cm.contains("Alice's profile"), "USER block is alice's");
+        assert!(
+            cm.contains("## ME") && cm.contains("## TODO"),
+            "ME/TODO stay global"
+        );
+        // Guest → neutral USER, no personal data.
+        let guest = storage.core_memory_for(&ActingUser::Guest).expect("g");
+        assert!(guest.contains("guest"));
+        assert!(!guest.contains("Alice's profile"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn device_ownership_defaults_and_roundtrip() {
+        let home = temp_home();
+        let storage = Storage::new(home.clone());
+        // ensure_device creates a record; ownership defaults to (None, [], false).
+        storage.ensure_device("laptop", "local").expect("ensure");
+        assert_eq!(
+            storage.device_ownership("laptop").expect("own"),
+            (None, Vec::<String>::new(), false)
+        );
+        // Set and read back; ensure_device must not clobber it afterwards.
+        storage
+            .set_device_ownership("laptop", Some("alice"), &["alice".to_string()], false)
+            .expect("set");
+        storage.ensure_device("laptop", "local").expect("ensure2");
+        assert_eq!(
+            storage.device_ownership("laptop").expect("own2"),
+            (Some("alice".to_string()), vec!["alice".to_string()], false)
+        );
+        // A legacy device.json without ownership fields → defaults.
+        let legacy = storage.devices_dir().join("old").join("device.json");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, r#"{"id":"old","status":"active"}"#).unwrap();
+        assert_eq!(
+            storage.device_ownership("old").expect("own3"),
+            (None, Vec::<String>::new(), false)
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 

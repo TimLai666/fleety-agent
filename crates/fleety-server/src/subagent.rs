@@ -145,7 +145,10 @@ impl SubagentHost for FleetyHost {
         context: &str,
         prompt: &str,
     ) -> Vec<Message> {
-        let system = self.storage.system_prompt().unwrap_or_default();
+        let system = self
+            .storage
+            .system_prompt_for(&self.storage.acting_for_device(&self.device_id))
+            .unwrap_or_default();
         match mode {
             SubagentMode::Spawn => vec![Message::system(system), Message::user(prompt)],
             SubagentMode::Fork => {
@@ -224,6 +227,7 @@ impl SubagentHost for FleetyHost {
             true,
             // Background wake turns are non-voice.
             false,
+            &self.storage.acting_for_device(&self.device_id),
         )
         .await
         {

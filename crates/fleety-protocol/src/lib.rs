@@ -98,6 +98,12 @@ pub enum ClientMsg {
         /// turn may carry a spoken reply. Defaults to false.
         #[serde(default)]
         voice: bool,
+        /// An explicitly asserted acting user (shared devices today; a comms
+        /// sender later). Additive and optional: absent → the server resolves
+        /// the acting user from the device owner, else Guest. Identifies only;
+        /// it does not by itself authorize access to another user's data.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        acting_user: Option<String>,
     },
     /// Reconnect to an existing conversation; the server replays events after
     /// `after_seq`.
@@ -343,6 +349,7 @@ mod tests {
             origin: Default::default(),
             attachments: vec![],
             voice: true,
+            acting_user: None,
         };
         let json = serde_json::to_string(&msg).expect("serialize");
         assert_eq!(msg, serde_json::from_str(&json).expect("deserialize"));
@@ -353,9 +360,45 @@ mod tests {
             origin: Default::default(),
             attachments: vec![],
             voice: false,
+            acting_user: None,
         };
         let json = serde_json::to_string(&no_voice).expect("serialize");
         assert_eq!(no_voice, serde_json::from_str(&json).expect("deserialize"));
+    }
+
+    #[test]
+    fn user_message_acting_user_roundtrips_and_is_backward_compatible() {
+        // With an asserted acting user → round-trips.
+        let asserted = ClientMsg::UserMessage {
+            conversation_id: None,
+            text: "hi".into(),
+            origin: Default::default(),
+            attachments: vec![],
+            voice: false,
+            acting_user: Some("bob".into()),
+        };
+        let json = serde_json::to_string(&asserted).expect("serialize");
+        assert!(json.contains("acting_user"));
+        assert_eq!(asserted, serde_json::from_str(&json).expect("deserialize"));
+
+        // When absent, the field is omitted from the wire (skip_serializing_if),
+        // so the on-wire shape matches an older client; it parses back to None.
+        let absent = ClientMsg::UserMessage {
+            conversation_id: None,
+            text: "hi".into(),
+            origin: Default::default(),
+            attachments: vec![],
+            voice: false,
+            acting_user: None,
+        };
+        let json = serde_json::to_string(&absent).expect("serialize");
+        assert!(!json.contains("acting_user"), "omitted when None");
+        match serde_json::from_str::<ClientMsg>(&json).expect("parses") {
+            ClientMsg::UserMessage { acting_user, .. } => assert_eq!(acting_user, None),
+            _ => panic!("expected UserMessage"),
+        }
+        // Protocol version unchanged (additive field).
+        assert_eq!(PROTOCOL_VERSION, 0);
     }
 
     #[test]

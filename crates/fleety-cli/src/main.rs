@@ -236,6 +236,7 @@ async fn run_tui() -> Result<()> {
                             origin: OriginContext::default(),
                             attachments,
                             voice: false,
+                            acting_user: None,
                         }).await {
                             app.status = format!("send failed: {}", e.report().message);
                         }
@@ -579,6 +580,7 @@ async fn ask(text: String, attachments: Vec<WireAttachment>) -> Result<()> {
             origin: origin(),
             attachments,
             voice: false,
+            acting_user: None,
         },
     )
     .await?;
@@ -677,6 +679,7 @@ async fn voice_chat() -> Result<()> {
                 origin: origin(),
                 attachments: Vec::new(),
                 voice: true,
+                acting_user: None,
             },
         )
         .await?;

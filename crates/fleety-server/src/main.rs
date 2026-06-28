@@ -14,6 +14,7 @@ mod builtin_mcp;
 mod builtin_skills;
 mod conn;
 mod gc;
+mod identity;
 mod mdns;
 mod sidecar;
 mod sse;

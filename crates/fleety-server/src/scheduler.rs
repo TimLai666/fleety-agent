@@ -87,7 +87,9 @@ pub async fn tick(
         let user_msg = Message::user(item.prompt);
         storage.append(SCHED_DEVICE, &conversation, &user_msg)?;
         storage.journal_begin(SCHED_DEVICE, &conversation, &user_msg)?;
-        let mut messages = vec![Message::system(storage.system_prompt()?)];
+        let mut messages = vec![Message::system(
+            storage.system_prompt_for(&storage.acting_for_device(SCHED_DEVICE))?,
+        )];
         messages.extend(storage.load(SCHED_DEVICE, &conversation)?);
         // Journal each event so a crash mid-run is recoverable on the next tick.
         let mut events = storage.journaling_log(SCHED_DEVICE, &conversation);
@@ -134,7 +136,9 @@ async fn recover_schedule_turn(
     }
     tracing::info!(%conversation, events = events.len(), "recovering interrupted scheduled turn");
     let config = LoopConfig::default();
-    let mut messages = vec![Message::system(storage.system_prompt()?)];
+    let mut messages = vec![Message::system(
+        storage.system_prompt_for(&storage.acting_for_device(SCHED_DEVICE))?,
+    )];
     messages.extend(storage.load(SCHED_DEVICE, conversation)?);
     messages.extend(reconstruct_messages(&events, config.max_tool_result_chars));
     let mut log = storage.journaling_log(SCHED_DEVICE, conversation);

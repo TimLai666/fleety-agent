@@ -233,8 +233,20 @@ async fn serve(
                 origin,
                 attachments,
                 voice,
+                acting_user,
             } => {
                 let conversation = conversation_id.unwrap_or_else(|| default_conversation.clone());
+                // Resolve who this turn is for: the device owner by default, an
+                // asserted (and device-authorized) user otherwise, else Guest.
+                let acting = {
+                    let (owner, users, _shared) =
+                        storage.device_ownership(device_id).unwrap_or_default();
+                    crate::identity::resolve_acting_user(
+                        owner.as_deref(),
+                        &users,
+                        acting_user.as_deref(),
+                    )
+                };
                 tracing::info!(
                     %device_id,
                     conversation = %conversation,
@@ -302,6 +314,7 @@ async fn serve(
                     &goal_state,
                     goal_max_continues,
                     voice,
+                    &acting,
                 )
                 .await?;
                 // Learning loop: after a sufficiently complex message, prompt the
@@ -604,6 +617,7 @@ pub(crate) async fn drive_to_goal(
     goal_state: &Arc<tokio::sync::Mutex<GoalState>>,
     max_continues: u32,
     voice: bool,
+    acting: &crate::identity::ActingUser,
 ) -> Result<usize> {
     // Fresh goal state for this user message.
     *goal_state.lock().await = GoalState::new();
@@ -626,6 +640,7 @@ pub(crate) async fn drive_to_goal(
             gate,
             false,
             voice,
+            acting,
         )
         .await?;
         total_steps += turn.steps;
@@ -691,12 +706,13 @@ pub(crate) async fn drive_turn(
     gate: &mut dyn agent_core::ApprovalGate,
     emit_terminal: bool,
     voice: bool,
+    acting: &crate::identity::ActingUser,
 ) -> Result<TurnReply> {
     storage.append(device_id, conversation, &user_msg)?;
     storage.journal_begin(device_id, conversation, &user_msg)?;
     // Inject agent-level core memory (ME/USER/TODO) as the system preamble each
     // turn; it is ephemeral, not persisted to the conversation.
-    let mut messages = vec![Message::system(storage.system_prompt()?)];
+    let mut messages = vec![Message::system(storage.system_prompt_for(acting)?)];
     messages.extend(storage.load(device_id, conversation)?);
     let mut events = storage.journaling_log(device_id, conversation);
     let delta_out = out.clone();
@@ -801,6 +817,7 @@ pub(crate) async fn maybe_reflect(
         // and never voice.
         true,
         false,
+        &storage.acting_for_device(device_id),
     )
     .await?;
     Ok(())
@@ -983,7 +1000,9 @@ async fn recover_one_interactive(
         device_tools,
     );
     let config = LoopConfig::default();
-    let mut messages = vec![Message::system(storage.system_prompt()?)];
+    let mut messages = vec![Message::system(
+        storage.system_prompt_for(&storage.acting_for_device(device_id))?,
+    )];
     messages.extend(storage.load(device_id, conversation)?);
     messages.extend(reconstruct_messages(&events, config.max_tool_result_chars));
     let mut log = storage.journaling_log(device_id, conversation);
@@ -1031,7 +1050,9 @@ async fn recover_incomplete_turn(
     tracing::info!(%device_id, %conversation, events = events.len(), "recovering interrupted turn");
 
     let config = LoopConfig::default();
-    let mut messages = vec![Message::system(storage.system_prompt()?)];
+    let mut messages = vec![Message::system(
+        storage.system_prompt_for(&storage.acting_for_device(device_id))?,
+    )];
     messages.extend(storage.load(device_id, conversation)?);
     messages.extend(reconstruct_messages(&events, config.max_tool_result_chars));
 
@@ -1262,6 +1283,7 @@ mod tests {
             &goal_state,
             5,
             false,
+            &crate::identity::ActingUser::Guest,
         )
         .await
         .unwrap();
@@ -1301,6 +1323,7 @@ mod tests {
             &goal_state,
             5,
             false,
+            &crate::identity::ActingUser::Guest,
         )
         .await
         .unwrap();
@@ -1334,6 +1357,7 @@ mod tests {
             &goal_state,
             5,
             false,
+            &crate::identity::ActingUser::Guest,
         )
         .await
         .unwrap();
@@ -1369,6 +1393,7 @@ mod tests {
             &goal_state,
             2,
             false,
+            &crate::identity::ActingUser::Guest,
         )
         .await
         .unwrap();
@@ -1435,6 +1460,7 @@ mod tests {
             &goal_state,
             5,
             true,
+            &crate::identity::ActingUser::Guest,
         )
         .await
         .unwrap();
@@ -1465,6 +1491,7 @@ mod tests {
             &goal_state,
             5,
             false,
+            &crate::identity::ActingUser::Guest,
         )
         .await
         .unwrap();
@@ -1505,6 +1532,7 @@ mod tests {
             &goal_state,
             5,
             false,
+            &crate::identity::ActingUser::Guest,
         )
         .await
         .unwrap();
@@ -1615,6 +1643,7 @@ mod tests {
             &goal_state,
             5,
             true,
+            &crate::identity::ActingUser::Guest,
         )
         .await
         .unwrap();
@@ -1645,6 +1674,7 @@ mod tests {
             &goal_state,
             5,
             false,
+            &crate::identity::ActingUser::Guest,
         )
         .await
         .unwrap();
@@ -1943,6 +1973,7 @@ mod tests {
                 origin: Default::default(),
                 attachments: Vec::new(),
                 voice: false,
+                acting_user: None,
             },
         )
         .await;
@@ -2087,6 +2118,7 @@ mod tests {
                 origin: Default::default(),
                 attachments: Vec::new(),
                 voice: false,
+                acting_user: None,
             },
         )
         .await;
