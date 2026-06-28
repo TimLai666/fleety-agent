@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 agent-core = { workspace = true }
+agent-workflow = { workspace = true }
 fleety-protocol = { workspace = true }
 fleety-tools = { workspace = true }
 async-trait = { workspace = true }

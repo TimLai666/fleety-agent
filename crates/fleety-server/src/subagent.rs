@@ -348,6 +348,8 @@ mod tests {
         let child = host.child_registry(None).await;
         assert!(child.contains("device_exec"));
         assert!(!child.contains("spawn_subagent"));
+        // Leaf cap also excludes the workflow tool, so a subagent can't nest one.
+        assert!(!child.contains("run_workflow"));
         let _ = std::fs::remove_dir_all(home);
     }
 

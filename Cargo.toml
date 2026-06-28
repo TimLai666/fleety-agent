@@ -13,6 +13,7 @@ publish = false
 [workspace.dependencies]
 # internal crates
 agent-core = { path = "crates/agent-core" }
+agent-workflow = { path = "crates/agent-workflow" }
 fleety-protocol = { path = "crates/fleety-protocol" }
 fleety-tools = { path = "crates/fleety-tools" }
 fleety-vec = { path = "crates/fleety-vec" }

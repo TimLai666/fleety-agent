@@ -290,6 +290,7 @@ waking a coordinator turn when it finishes. See
 | `stop_subagent` | Stop a subagent (by `task_id` or `name`); a background task is aborted, state becomes `stopped`. | `task_id` | mutate |
 | `subagent_status` | Report a subagent's state and (when finished) its output. By `task_id` or `name`. | `task_id` | read |
 | `subagent_list` | List your team — every subagent you spawned with its `task_id`, `name`, and `state`. The roster for coordinating an **agent team** (lead routes between named workers via `send_subagent_message`). | — | read |
+| `run_workflow` | **Dynamic workflow.** Run a JS script that deterministically orchestrates your own subagents — `agent({prompt,...})` runs one subagent, plus `parallel`/`pipeline`/`phase`/`log`. The script body uses top-level `await` and `return`s its result. For when the orchestration shape is dynamic and worth pinning down as code. Runs on an embedded engine (`agent-workflow` crate); subagents it launches are leaves (no nesting). | `script` | mutate |
 
 ## Skills
 

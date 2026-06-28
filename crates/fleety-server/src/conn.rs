@@ -211,7 +211,10 @@ async fn serve(
         crate::subagent::max_concurrent_from_env(),
     );
     subagent_host.set_manager(Arc::downgrade(&subagent_mgr));
-    agent_core::register_orchestration(&mut tools, subagent_mgr);
+    agent_core::register_orchestration(&mut tools, Arc::clone(&subagent_mgr));
+    // Dynamic workflow: a top-level tool that runs a JS script orchestrating
+    // these same subagents. Subagent child registries omit it (one-level cap).
+    agent_workflow::register_workflow(&mut tools, subagent_mgr);
 
     while let Some(msg) = read_client(rx).await? {
         match msg {

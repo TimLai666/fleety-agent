@@ -2,7 +2,7 @@
 
 ### Requirement: Run a model-written workflow script
 
-The system SHALL provide a `run_workflow` tool that takes a JavaScript `script` and executes it to completion on an embedded engine, returning the script's result. The script declares a `meta` object and orchestrates work with injected globals. The engine and bindings SHALL live in a dedicated `agent-workflow` crate so the agent framework core does not depend on the engine.
+The system SHALL provide a `run_workflow` tool that takes a JavaScript `script` and executes it to completion on an embedded engine, returning the script's result. The script body runs inside an async wrapper, so it MAY use top-level `await` and SHALL `return` its result; it orchestrates work with injected globals. The engine and bindings SHALL live in a dedicated `agent-workflow` crate so the agent framework core does not depend on the engine.
 
 #### Scenario: a workflow script runs and returns its result
 
@@ -29,7 +29,7 @@ The runtime SHALL inject `parallel(thunks)` (run thunks concurrently, await all)
 
 ### Requirement: Never-panic failure handling
 
-A missing `script`, a missing `meta`, a script that throws uncaught, or a failed `agent()` step SHALL surface as an actionable error from `run_workflow`; the embedded engine SHALL NOT panic the server process. A `agent()` step failure SHALL reject that step's promise so the script MAY catch it.
+A missing or empty `script`, a parse error, a script that throws uncaught, or a failed `agent()` step SHALL surface as an actionable error from `run_workflow`; the embedded engine SHALL NOT panic the server process. A `agent()` step failure SHALL reject that step's promise so the script MAY catch it.
 
 #### Scenario: an uncaught script error is reported, not fatal
 
