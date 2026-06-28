@@ -15,6 +15,7 @@ Grouped by which binary cares about it. Anything unset uses the default.
 | `FLEETY_REQUIRE_AUTH` | `0` | Set to `1` to require a valid token / pairing code on every `Hello`. |
 | `FLEETY_TOKEN` | (unset) | Bootstrap admin token. Use it once to pair the first device. |
 | `FLEETY_SCHED_TICK` | `60` | Seconds between scheduler fire-loop ticks. |
+| `FLEETY_SYSTEM_PROMPT` | (unset → full) | `minimal` drops the embedded behavioural docs (protocol/rules/memory/policy) from the system message, leaving only core memory (ME/USER/TODO) — for token-lean / debugging runs. |
 
 ## Model provider
 

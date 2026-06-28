@@ -69,9 +69,9 @@ The full v0 spec surface is implemented and verified (CI green).
 | Client runtime updater + version consistency + history_* restore tools | partial | high |
 | M6 interactive TUI (ratatui): multi-pane UI + ServerMsg UI events | missing | high |
 | Model layer: SSE streaming, GET /models discovery, models.cache.json, provider CLI | partial | medium |
-| Skills + MCP runtime: loaders, hot reload, builtin/installed, not_enabled stubs | missing | medium |
-| Scheduling/cron (M8): schedule_* tools, mandate enforcement, fire loop | missing | high (post-v0) |
-| Browser automation (M9) + computer-use (M10) | missing | high (post-v0) |
+| Skills + MCP runtime: loaders, builtin/installed/authored, lifecycle tools | **done** | — |
+| Scheduling/cron (M8): schedule_* tools, mandate enforcement, fire loop | **done** | — |
+| Browser automation (M9, CDP, any-device) + computer-use (M10, native `computer_*`) | **done** | — |
 
 ## Next work (prioritized)
 
@@ -195,7 +195,7 @@ is on `main`; see commit history for the exact change.
 - **Connectors beyond client_session** — SSH first (v0.1), then HTTP and daemon; connector priority (`client_session > client_daemon > SSH > HTTP > unreachable`), device online/offline tracking, reconnect backoff. Keep `connectors[]` schema + protocol design in place.
 - **fleetyd daemon** — Agent connection, heartbeat, on-device local-tool execution, autostart/install (systemd/launchd/Windows). Out of v0 scope.
 - **M8 scheduling/cron** — `schedule_*` tools, `Scheduler` seam, fire loop, mandate-at-creation + strict fire-time enforcement, offline "report don't catch up", per-job failure isolation.
-- **M9 browser (CDP)** + **M10 computer-use (computer-use-mcp)** — device-side capabilities; co-location + critical gating.
+- **M9 browser (CDP)** + **M10 computer-use** — both native in `fleety-tools`, so they run on any device via `device_exec` (browser auto-provisions Chrome; computer-use is `computer_*` via enigo+xcap, **not** an MCP); co-location + critical gating.
 - **M11 knowledge wiki** — Obsidian vault + `wiki_*` tools + classification (type folders + tags + MOC).
 - **Skills + MCP runtime** — loaders, hot reload, builtin/installed; `not_enabled` stubs for now.
 - **fleety-updater** — atomic same-package runtime update + rollback; version-consistency `degraded` detection.
