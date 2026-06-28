@@ -141,7 +141,7 @@ if none is found it installs one (OS package manager, then a chrome-for-testing
 
 | Var | Default | Meaning |
 |---|---|---|
-| `FLEETY_INSTALL_DIR` | `~/.fleety/bin` (or `/usr/local/bin` for root) | Where `scripts/install-server.sh` lands the binary. |
+| `FLEETY_INSTALL_DIR` | `/usr/local/bin` if writable, else `~/.local/bin` (Windows: `%LOCALAPPDATA%\Programs\fleety`) | Where `scripts/install.sh` / `install-server.sh` (and `install.ps1`) land the binary. Explicit value always wins. |
 
 ---
 
