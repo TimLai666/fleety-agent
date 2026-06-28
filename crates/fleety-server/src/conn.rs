@@ -255,6 +255,36 @@ async fn serve(
                     "user message"
                 );
 
+                // Privacy boundary: claim a new/unowned conversation for the
+                // acting user, then gate access. A conversation owned by someone
+                // else (and not granted) is refused with a uniform, non-revealing
+                // message that does not distinguish "no such conversation" from
+                // "exists but forbidden".
+                let _ = storage.register_conversation_owner(&conversation, &acting);
+                if !storage
+                    .conversation_access(&acting, &conversation, &storage.grants())
+                    .is_allow()
+                {
+                    tracing::warn!(%device_id, conversation = %conversation, "cross-user conversation access denied");
+                    let _ = emit(
+                        out,
+                        &ServerMsg::Assistant {
+                            conversation_id: conversation.clone(),
+                            text: "That conversation isn't available to you.".to_string(),
+                            seq: 0,
+                            speech: None,
+                            attention: None,
+                        },
+                    );
+                    let _ = emit(
+                        out,
+                        &ServerMsg::Done {
+                            conversation_id: conversation.clone(),
+                        },
+                    );
+                    continue;
+                }
+
                 // Hold the per-connection turn lock across BOTH recovery and this
                 // turn so a background subagent's wake turn can't interleave
                 // storage appends; record the active conversation so a `fork`

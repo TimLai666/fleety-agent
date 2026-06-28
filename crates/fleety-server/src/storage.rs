@@ -144,12 +144,194 @@ impl Storage {
     }
 
     fn conversation_path(&self, device_id: &str, conversation_id: &str) -> PathBuf {
+        // User-primary when the conversation has a registered owner; otherwise
+        // the legacy device path (unattributed / pre-identity conversations).
+        if let Some(owner) = self.conversation_owner(conversation_id) {
+            return self
+                .home
+                .join("fleet")
+                .join("users")
+                .join(owner)
+                .join("conversations")
+                .join(format!("{conversation_id}.jsonl"));
+        }
         self.home
             .join("fleet")
             .join("devices")
             .join(device_id)
             .join("conversations")
             .join(format!("{conversation_id}.jsonl"))
+    }
+
+    fn conversations_index_path(&self) -> PathBuf {
+        self.home.join("fleet").join("conversations.json")
+    }
+
+    /// The cross-user grants store (`fleet/grants.json`).
+    pub fn grants(&self) -> crate::privacy::Grants {
+        crate::privacy::Grants::load(&self.home.join("fleet").join("grants.json"))
+    }
+
+    /// The owning user of a conversation (from the conversation→owner index), or
+    /// `None` if it has no registered owner (legacy / unattributed / guest).
+    pub fn conversation_owner(&self, conversation_id: &str) -> Option<String> {
+        let text = fs::read_to_string(self.conversations_index_path()).ok()?;
+        let v: Value = serde_json::from_str(&text).ok()?;
+        v.get(conversation_id)
+            .and_then(Value::as_str)
+            .map(String::from)
+    }
+
+    /// Record the owner of a conversation (idempotent — set once, on first use).
+    /// A Guest leaves it unowned (unattributed); only a real user becomes owner.
+    pub fn register_conversation_owner(
+        &self,
+        conversation_id: &str,
+        acting: &crate::identity::ActingUser,
+    ) -> Result<()> {
+        let Some(owner) = acting.user_id() else {
+            return Ok(());
+        };
+        validate_id("conversation_id", conversation_id)?;
+        validate_id("user_id", owner)?;
+        let _guard = self
+            .append_lock
+            .lock()
+            .map_err(|_| CoreError::Message("storage index lock poisoned".to_string()))?;
+        let path = self.conversations_index_path();
+        let mut map: serde_json::Map<String, Value> = fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+        if !map.contains_key(conversation_id) {
+            map.insert(
+                conversation_id.to_string(),
+                Value::String(owner.to_string()),
+            );
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).map_err(|e| {
+                    CoreError::Message(format!("cannot create {}: {e}", parent.display()))
+                })?;
+            }
+            let text = serde_json::to_string_pretty(&Value::Object(map))
+                .map_err(|e| CoreError::Message(format!("serialize index: {e}")))?;
+            fs::write(&path, text)
+                .map_err(|e| CoreError::Message(format!("write conversation index: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// The privacy decision for an acting user reaching a conversation: an
+    /// unowned conversation is open (it will be claimed on first append); an
+    /// owned one is gated by the [`crate::privacy`] guard. Keyed to the acting
+    /// user — the data-layer boundary the turn path must consult.
+    pub fn conversation_access(
+        &self,
+        acting: &crate::identity::ActingUser,
+        conversation_id: &str,
+        grants: &crate::privacy::Grants,
+    ) -> crate::privacy::Decision {
+        match self.conversation_owner(conversation_id) {
+            None => crate::privacy::Decision::Allow,
+            Some(owner) => crate::privacy::can_access(acting, &owner, "conversation", grants),
+        }
+    }
+
+    /// One-time, idempotent, lossless migration of legacy per-device
+    /// conversations to the user-primary layout: for each device that has an
+    /// owner, move its conversations under that user (registering the owner in
+    /// the index and stamping each event with the device it happened on).
+    /// Conversations on a device with no owner are left in place (the
+    /// unattributed bucket). Verify-before-delete: the source is removed only
+    /// after the destination is written and matches, so a crash never loses
+    /// data; an already-migrated conversation is skipped. Returns how many moved.
+    pub fn migrate_conversations(&self) -> Result<usize> {
+        let devices_dir = self.devices_dir();
+        let device_entries = match fs::read_dir(&devices_dir) {
+            Ok(e) => e,
+            Err(_) => return Ok(0),
+        };
+        let mut moved = 0usize;
+        for dev in device_entries.flatten() {
+            if !dev.path().is_dir() {
+                continue;
+            }
+            let device_id = dev.file_name().to_string_lossy().into_owned();
+            let (owner, _users, _shared) = self.device_ownership(&device_id).unwrap_or_default();
+            let Some(owner) = owner else { continue };
+            let conv_dir = dev.path().join("conversations");
+            let convs = match fs::read_dir(&conv_dir) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            for c in convs.flatten() {
+                let src = c.path();
+                if src.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                let Some(conv_id) = src.file_stem().and_then(|s| s.to_str()).map(String::from)
+                else {
+                    continue;
+                };
+                // Idempotent: an already-owned conversation has been migrated.
+                if self.conversation_owner(&conv_id).is_some() {
+                    continue;
+                }
+                // Stamp device_id into each event and write to the user path.
+                let content = match fs::read_to_string(&src) {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+                let mut out_lines = Vec::new();
+                let mut src_lines = 0usize;
+                for line in content.lines() {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    src_lines += 1;
+                    let mut v: Value = match serde_json::from_str(line) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            out_lines.push(line.to_string());
+                            continue;
+                        }
+                    };
+                    if let Some(obj) = v.as_object_mut() {
+                        obj.entry("device_id")
+                            .or_insert_with(|| Value::String(device_id.clone()));
+                    }
+                    out_lines.push(v.to_string());
+                }
+                // Registering the owner makes conversation_path route user-primary.
+                self.register_conversation_owner(
+                    &conv_id,
+                    &crate::identity::ActingUser::User(owner.clone()),
+                )?;
+                let dest = self.conversation_path(&device_id, &conv_id);
+                if let Some(parent) = dest.parent() {
+                    fs::create_dir_all(parent).map_err(|e| {
+                        CoreError::Message(format!("cannot create {}: {e}", parent.display()))
+                    })?;
+                }
+                let body = if out_lines.is_empty() {
+                    String::new()
+                } else {
+                    format!("{}\n", out_lines.join("\n"))
+                };
+                if fs::write(&dest, &body).is_err() {
+                    continue;
+                }
+                // Verify-before-delete: dest must have the same event count.
+                let dest_ok = fs::read_to_string(&dest)
+                    .map(|t| t.lines().filter(|l| !l.trim().is_empty()).count() == src_lines)
+                    .unwrap_or(false);
+                if dest_ok {
+                    let _ = fs::remove_file(&src);
+                    moved += 1;
+                }
+            }
+        }
+        Ok(moved)
     }
 
     /// Append a message to a conversation's event stream; returns its `seq`
@@ -169,7 +351,9 @@ impl Storage {
             .lock()
             .map_err(|_| CoreError::Message("storage append lock poisoned".to_string()))?;
         let seq = read_events(&path)?.len() as u64 + 1;
-        let record = serde_json::json!({ "seq": seq, "message": message });
+        // Record the device the event happened on (privacy model stores
+        // conversations user-primary; the device is "where", kept per event).
+        let record = serde_json::json!({ "seq": seq, "device_id": device_id, "message": message });
         let line = serde_json::to_string(&record)
             .map_err(|e| CoreError::Message(format!("serialize message failed: {e}")))?;
         let mut file = OpenOptions::new()
@@ -879,6 +1063,111 @@ mod tests {
         let mut users = storage.list_users().expect("list");
         users.sort();
         assert_eq!(users, vec!["alice".to_string(), "bob".to_string()]);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn conversations_are_user_primary_and_access_guarded() {
+        use crate::identity::ActingUser;
+        use crate::privacy::{Decision, Grants};
+        let home = temp_home();
+        let storage = Storage::new(home.clone());
+        let alice = ActingUser::User("alice".into());
+        storage.register_conversation_owner("c1", &alice).unwrap();
+        storage
+            .append("laptop", "c1", &Message::user("hi"))
+            .unwrap();
+        // Stored under users/alice, not devices/laptop.
+        let user_path = home
+            .join("fleet")
+            .join("users")
+            .join("alice")
+            .join("conversations")
+            .join("c1.jsonl");
+        let dev_path = home
+            .join("fleet")
+            .join("devices")
+            .join("laptop")
+            .join("conversations")
+            .join("c1.jsonl");
+        assert!(user_path.exists(), "conversation is user-primary");
+        assert!(!dev_path.exists(), "not at the device path");
+        // load resolves via the index regardless of the device passed.
+        assert_eq!(storage.load("laptop", "c1").unwrap().len(), 1);
+        // Guard: owner Allow; other user / guest Deny; an unowned conv is open.
+        let grants = Grants::default();
+        assert_eq!(
+            storage.conversation_access(&alice, "c1", &grants),
+            Decision::Allow
+        );
+        assert_eq!(
+            storage.conversation_access(&ActingUser::User("bob".into()), "c1", &grants),
+            Decision::Deny
+        );
+        assert_eq!(
+            storage.conversation_access(&ActingUser::Guest, "c1", &grants),
+            Decision::Deny
+        );
+        assert_eq!(
+            storage.conversation_access(&alice, "unowned", &grants),
+            Decision::Allow
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn migrate_moves_owned_conversations_losslessly_and_idempotently() {
+        let home = temp_home();
+        let storage = Storage::new(home.clone());
+        // Legacy: a conversation under the device, before any owner is set.
+        storage
+            .append("laptop", "leg", &Message::user("one"))
+            .unwrap();
+        storage
+            .append("laptop", "leg", &Message::assistant("two"))
+            .unwrap();
+        let dev_path = home
+            .join("fleet")
+            .join("devices")
+            .join("laptop")
+            .join("conversations")
+            .join("leg.jsonl");
+        let user_path = home
+            .join("fleet")
+            .join("users")
+            .join("alice")
+            .join("conversations")
+            .join("leg.jsonl");
+        assert!(dev_path.exists() && !user_path.exists());
+        // Give the device an owner, then migrate.
+        storage
+            .set_device_ownership("laptop", Some("alice"), &[], false)
+            .unwrap();
+        assert_eq!(storage.migrate_conversations().unwrap(), 1);
+        assert!(
+            user_path.exists() && !dev_path.exists(),
+            "moved to the owner"
+        );
+        assert_eq!(storage.load("laptop", "leg").unwrap().len(), 2, "lossless");
+        assert_eq!(storage.conversation_owner("leg").as_deref(), Some("alice"));
+        assert!(
+            std::fs::read_to_string(&user_path)
+                .unwrap()
+                .contains("\"device_id\":\"laptop\""),
+            "device recorded per event"
+        );
+        // Idempotent re-run is a no-op.
+        assert_eq!(storage.migrate_conversations().unwrap(), 0);
+        // A device with no owner is left in place (unattributed).
+        storage.append("kiosk", "k1", &Message::user("x")).unwrap();
+        assert_eq!(storage.migrate_conversations().unwrap(), 0);
+        assert!(home
+            .join("fleet")
+            .join("devices")
+            .join("kiosk")
+            .join("conversations")
+            .join("k1.jsonl")
+            .exists());
         let _ = std::fs::remove_dir_all(&home);
     }
 

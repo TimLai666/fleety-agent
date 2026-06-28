@@ -16,6 +16,7 @@ mod conn;
 mod gc;
 mod identity;
 mod mdns;
+mod privacy;
 mod sidecar;
 mod sse;
 mod websocket;
@@ -227,6 +228,16 @@ async fn run_server(shutdown: Option<tokio::sync::watch::Receiver<bool>>) {
     tracing::info!(version = agent_core::VERSION, %addr, home = %home.display(), "fleety-server starting");
 
     let storage = Arc::new(Storage::new(home));
+    // One-time, idempotent, lossless migration of legacy per-device conversations
+    // to the user-primary layout (privacy model). Best-effort: a failure leaves
+    // the legacy layout in place and never stops the server.
+    match storage.migrate_conversations() {
+        Ok(n) if n > 0 => {
+            tracing::info!(migrated = n, "migrated conversations to user-primary layout")
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(report = ?e.report(), "conversation migration skipped"),
+    }
     // Seed built-in skills shipped in the binary (best-effort; a failure here
     // must not stop the server from serving).
     if let Err(e) = builtin_skills::seed(&storage.skills_builtin_dir()) {
