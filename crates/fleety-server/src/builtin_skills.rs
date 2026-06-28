@@ -21,12 +21,23 @@ Pass one DSL line as `command`, a multi-line `.isr` program as `script`, and a `
 The upstream reference below describes a CLI/REPL — ignore the install/REPL parts; the **`.isr` DSL command reference applies verbatim**.\n\n\
 ---\n\n";
 
-/// `(skill_name, header, upstream_body)`.
-const SKILLS: &[(&str, &str, &str)] = &[(
-    "use-insyra-cli",
-    INSYRA_HEADER,
-    include_str!("../builtin-skills/use-insyra-cli/SKILL.upstream.md"),
-)];
+/// `(skill_name, header, body)`. The `header` (if any) is prepended to the body
+/// at seed time and its first line becomes the `list_skills` description; with an
+/// empty header the body's own first line is used.
+const SKILLS: &[(&str, &str, &str)] = &[
+    (
+        "use-insyra-cli",
+        INSYRA_HEADER,
+        include_str!("../builtin-skills/use-insyra-cli/SKILL.upstream.md"),
+    ),
+    (
+        // Fleety-native adaptation of the upstream skill-creator: build/improve
+        // authored skills via the `skill_*` tools (no eval-viewer / packaging).
+        "skill-creator",
+        "",
+        include_str!("../builtin-skills/skill-creator/SKILL.md"),
+    ),
+];
 
 /// Write the embedded built-in skills into `builtin_dir` (overwriting built-ins
 /// so an updated binary ships an updated skill).
@@ -60,6 +71,20 @@ mod tests {
         assert!(content.contains("insyra_exec"));
         // ...followed by the upstream DSL reference.
         assert!(content.contains(".isr"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn seed_writes_skill_creator() {
+        let dir = std::env::temp_dir().join(format!("fleety-bskill-{}", uuid::Uuid::new_v4()));
+        seed(&dir).expect("seed");
+        let content =
+            std::fs::read_to_string(dir.join("skill-creator").join("SKILL.md")).expect("read");
+        // First line is the (triggering) description; body teaches the Fleety
+        // skill_* workflow, not the upstream eval-viewer machinery.
+        assert!(content.starts_with("# Skill Creator"));
+        assert!(content.contains("skill_write_file"));
+        assert!(content.contains("authored"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
