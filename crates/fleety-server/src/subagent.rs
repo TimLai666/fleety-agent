@@ -222,6 +222,8 @@ impl SubagentHost for FleetyHost {
             &mut gate,
             // A wake turn is single-shot: emit its reply normally.
             true,
+            // Background wake turns are non-voice.
+            false,
         )
         .await
         {

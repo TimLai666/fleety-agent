@@ -26,6 +26,12 @@ pub struct LoopConfig {
     pub compact_threshold_chars: usize,
     /// Number of most-recent messages kept verbatim during compaction.
     pub recent_keep_messages: usize,
+    /// Voice mode: when on, the turn produces a second spoken channel. The loop
+    /// injects the dual-channel contract into the system prompt and splits the
+    /// final reply at [`SPEECH_SENTINEL`] into display + speech. When off (the
+    /// default) nothing is injected and no speech is produced, so it costs no
+    /// extra tokens.
+    pub voice: bool,
 }
 
 impl Default for LoopConfig {
@@ -35,6 +41,7 @@ impl Default for LoopConfig {
             max_tool_result_chars: 8000,
             compact_threshold_chars: 24_000,
             recent_keep_messages: 8,
+            voice: false,
         }
     }
 }
@@ -43,7 +50,63 @@ impl Default for LoopConfig {
 #[derive(Debug, Clone)]
 pub struct TurnOutcome {
     pub output: String,
+    /// The spoken (voice) version of the reply, set only when voice mode is on
+    /// and the model emitted a [`SPEECH_SENTINEL`]-delimited spoken part.
+    pub speech: Option<String>,
     pub steps: usize,
+}
+
+/// Marker the model emits in a voice-mode turn to separate the display reply
+/// from the spoken version: text before it is display, text after it is speech.
+/// Chosen as an unusual string so ordinary replies never collide with it.
+pub const SPEECH_SENTINEL: &str = "⟦SPEECH⟧";
+
+/// The system addendum injected when voice mode is on, teaching the model the
+/// dual-channel output contract.
+fn voice_instruction() -> String {
+    format!(
+        "Voice mode is ON for this turn. In your FINAL reply (the message with no \
+         tool calls), output two channels: first your normal display reply, then on \
+         its own line the exact marker {SPEECH_SENTINEL} followed by a short, plain \
+         spoken version of the same reply — no markdown, natural spoken sentences, \
+         the way you would say it aloud. Use the marker only in the final reply, \
+         never in intermediate tool-call turns. If there is nothing to say aloud, \
+         omit the marker entirely."
+    )
+}
+
+/// Ensure the leading system message carries the voice contract, so it survives
+/// compaction (which always keeps the head system message). Inserts a system
+/// message if there is no leading one. Ephemeral: this mutates the in-context
+/// `messages`, never persisted history.
+fn apply_voice_prompt(messages: &mut Vec<Message>) {
+    let addendum = voice_instruction();
+    match messages.first_mut() {
+        Some(first) if first.role == Role::System => {
+            let base = first.content.take().unwrap_or_default();
+            first.content = Some(format!("{base}\n\n{addendum}"));
+        }
+        _ => messages.insert(0, Message::system(addendum)),
+    }
+}
+
+/// Split a final reply into (display, speech) at [`SPEECH_SENTINEL`]. No marker
+/// → the whole text is display and speech is `None`; an empty spoken part also
+/// yields `None`.
+fn split_speech(output: &str) -> (String, Option<String>) {
+    match output.find(SPEECH_SENTINEL) {
+        Some(idx) => {
+            let display = output[..idx].trim_end().to_string();
+            let spoken = output[idx + SPEECH_SENTINEL.len()..].trim();
+            let speech = if spoken.is_empty() {
+                None
+            } else {
+                Some(spoken.to_string())
+            };
+            (display, speech)
+        }
+        None => (output.to_string(), None),
+    }
 }
 
 /// Run the tool-calling loop for one user turn.
@@ -92,6 +155,12 @@ pub async fn run_turn_streaming(
 ) -> Result<TurnOutcome> {
     let specs = tools.specs();
 
+    // Voice mode: teach the model the dual-channel contract via the system
+    // prompt before the loop. Off → nothing injected, no extra tokens.
+    if config.voice {
+        apply_voice_prompt(messages);
+    }
+
     for step in 1..=config.max_steps {
         compact_if_needed(provider, messages, config).await?;
         let response = provider
@@ -102,8 +171,16 @@ pub async fn run_turn_streaming(
         messages.push(assistant.clone());
 
         if assistant.tool_calls.is_empty() {
+            let raw = assistant.content.unwrap_or_default();
+            // Voice on: split the final reply into display + spoken channel.
+            let (output, speech) = if config.voice {
+                split_speech(&raw)
+            } else {
+                (raw, None)
+            };
             return Ok(TurnOutcome {
-                output: assistant.content.unwrap_or_default(),
+                output,
+                speech,
                 steps: step,
             });
         }
@@ -453,6 +530,7 @@ mod tests {
             max_tool_result_chars: 8000,
             compact_threshold_chars: 50,
             recent_keep_messages: 4,
+            voice: false,
         };
 
         let outcome = run_turn(
@@ -710,5 +788,96 @@ mod tests {
             .as_deref()
             .map(|c| c.contains("\"executed\""))
             .unwrap_or(false)));
+    }
+
+    #[tokio::test]
+    async fn voice_off_produces_no_speech_and_no_injection() {
+        // voice=false: speech is None and the dual-channel contract is never
+        // injected into the system prompt (zero extra tokens).
+        let provider = MockProvider::new(vec![final_response()]);
+        let tools = ToolRegistry::new();
+        let mut messages = vec![Message::system("base"), Message::user("hi")];
+        let mut events = EventLog::new();
+        let outcome = run_turn(
+            &provider,
+            &tools,
+            &mut messages,
+            &mut events,
+            &LoopConfig::default(),
+            Policy::FullAccess,
+            &mut AutoApprove,
+        )
+        .await
+        .expect("turn ok");
+        assert_eq!(outcome.output, "done");
+        assert_eq!(outcome.speech, None);
+        assert!(!messages.iter().any(|m| m
+            .content
+            .as_deref()
+            .map(|c| c.contains(SPEECH_SENTINEL))
+            .unwrap_or(false)));
+    }
+
+    #[tokio::test]
+    async fn voice_on_splits_display_and_speech() {
+        // Spec Example row 1: text before the sentinel is display, after is speech.
+        let raw = format!("Here is the diff.\n{SPEECH_SENTINEL}\nDone — check the diff.");
+        let provider = MockProvider::new(vec![ModelResponse {
+            message: Message::assistant(raw),
+        }]);
+        let tools = ToolRegistry::new();
+        let mut messages = vec![Message::system("base"), Message::user("show diff")];
+        let mut events = EventLog::new();
+        let cfg = LoopConfig {
+            voice: true,
+            ..LoopConfig::default()
+        };
+        let outcome = run_turn(
+            &provider,
+            &tools,
+            &mut messages,
+            &mut events,
+            &cfg,
+            Policy::FullAccess,
+            &mut AutoApprove,
+        )
+        .await
+        .expect("turn ok");
+        assert_eq!(outcome.output, "Here is the diff.");
+        assert_eq!(outcome.speech.as_deref(), Some("Done — check the diff."));
+        // The voice contract was merged into the leading system message.
+        assert!(messages[0]
+            .content
+            .as_deref()
+            .map(|c| c.contains(SPEECH_SENTINEL))
+            .unwrap_or(false));
+    }
+
+    #[tokio::test]
+    async fn voice_on_without_sentinel_yields_no_speech() {
+        // Spec Example row 2: no sentinel → whole text is display, speech None.
+        let provider = MockProvider::new(vec![ModelResponse {
+            message: Message::assistant("All set, no sentinel here."),
+        }]);
+        let tools = ToolRegistry::new();
+        let mut messages = vec![Message::system("base"), Message::user("status")];
+        let mut events = EventLog::new();
+        let cfg = LoopConfig {
+            voice: true,
+            ..LoopConfig::default()
+        };
+        let outcome = run_turn(
+            &provider,
+            &tools,
+            &mut messages,
+            &mut events,
+            &cfg,
+            Policy::FullAccess,
+            &mut AutoApprove,
+        )
+        .await
+        .expect("turn ok");
+        assert_eq!(outcome.output, "All set, no sentinel here.");
+        assert_eq!(outcome.speech, None);
     }
 }

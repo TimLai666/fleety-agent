@@ -231,6 +231,7 @@ async fn serve(
                 text,
                 origin,
                 attachments,
+                voice,
             } => {
                 let conversation = conversation_id.unwrap_or_else(|| default_conversation.clone());
                 tracing::info!(
@@ -299,6 +300,7 @@ async fn serve(
                     &mut gate,
                     &goal_state,
                     goal_max_continues,
+                    voice,
                 )
                 .await?;
             }
@@ -517,6 +519,9 @@ fn authenticate(
 pub(crate) struct TurnReply {
     pub reply: String,
     pub seq: u64,
+    /// Spoken-version text when voice mode is on and the model produced one;
+    /// emitted only on the terminal turn.
+    pub speech: Option<String>,
 }
 
 /// Default cap on automatic goal continuations per user message; override with
@@ -553,6 +558,7 @@ pub(crate) async fn drive_to_goal(
     gate: &mut dyn agent_core::ApprovalGate,
     goal_state: &Arc<tokio::sync::Mutex<GoalState>>,
     max_continues: u32,
+    voice: bool,
 ) -> Result<()> {
     // Fresh goal state for this user message.
     *goal_state.lock().await = GoalState::new();
@@ -560,6 +566,8 @@ pub(crate) async fn drive_to_goal(
     let mut continues: u32 = 0;
     loop {
         // Run silently; whether this turn is terminal is only known afterward.
+        // Each turn runs with the message's voice flag so the terminal turn can
+        // carry a spoken reply; intermediate turns' speech is discarded.
         let turn = drive_turn(
             out,
             storage,
@@ -571,6 +579,7 @@ pub(crate) async fn drive_to_goal(
             next_msg,
             gate,
             false,
+            voice,
         )
         .await?;
         let (active, terminal) = {
@@ -597,6 +606,7 @@ pub(crate) async fn drive_to_goal(
                     conversation_id: conversation.to_string(),
                     text,
                     seq: turn.seq,
+                    speech: turn.speech,
                 },
             )?;
             emit(
@@ -632,6 +642,7 @@ pub(crate) async fn drive_turn(
     user_msg: Message,
     gate: &mut dyn agent_core::ApprovalGate,
     emit_terminal: bool,
+    voice: bool,
 ) -> Result<TurnReply> {
     storage.append(device_id, conversation, &user_msg)?;
     storage.journal_begin(device_id, conversation, &user_msg)?;
@@ -656,7 +667,10 @@ pub(crate) async fn drive_turn(
         tools,
         &mut messages,
         &mut events,
-        &LoopConfig::default(),
+        &LoopConfig {
+            voice,
+            ..LoopConfig::default()
+        },
         policy,
         gate,
         on_delta.as_mut(),
@@ -666,6 +680,7 @@ pub(crate) async fn drive_turn(
         storage.append_history(device_id, event)?;
     }
     let reply = outcome.output;
+    let speech = outcome.speech;
     let seq = storage.append(device_id, conversation, &Message::assistant(reply.clone()))?;
     storage.journal_end(device_id, conversation)?;
     if emit_terminal {
@@ -675,6 +690,7 @@ pub(crate) async fn drive_turn(
                 conversation_id: conversation.to_string(),
                 text: reply.clone(),
                 seq,
+                speech: speech.clone(),
             },
         )?;
         emit(
@@ -684,7 +700,7 @@ pub(crate) async fn drive_turn(
             },
         )?;
     }
-    Ok(TurnReply { reply, seq })
+    Ok(TurnReply { reply, seq, speech })
 }
 
 fn emit(out: &Out, msg: &ServerMsg) -> Result<()> {
@@ -959,6 +975,8 @@ async fn recover_incomplete_turn(
             conversation_id: conversation.to_string(),
             text: reply,
             seq,
+            // Recovery turns are non-voice: no spoken channel.
+            speech: None,
         },
     )?;
     emit(
@@ -1139,6 +1157,7 @@ mod tests {
             &mut gate,
             &goal_state,
             5,
+            false,
         )
         .await
         .unwrap();
@@ -1177,6 +1196,7 @@ mod tests {
             &mut gate,
             &goal_state,
             5,
+            false,
         )
         .await
         .unwrap();
@@ -1209,6 +1229,7 @@ mod tests {
             &mut gate,
             &goal_state,
             5,
+            false,
         )
         .await
         .unwrap();
@@ -1243,6 +1264,7 @@ mod tests {
             &mut gate,
             &goal_state,
             2,
+            false,
         )
         .await
         .unwrap();
@@ -1262,6 +1284,91 @@ mod tests {
     fn goal_cap_env_floor_is_one() {
         // Unset → default; the floor is enforced by `.max(1)`.
         assert_eq!(goal_max_continues_from_env(), DEFAULT_GOAL_MAX_CONTINUES);
+    }
+
+    /// All `Assistant` frames with their speech, in order.
+    fn assistant_frames(msgs: &[ServerMsg]) -> Vec<(String, Option<String>)> {
+        msgs.iter()
+            .filter_map(|m| match m {
+                ServerMsg::Assistant { text, speech, .. } => Some((text.clone(), speech.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn voice_on_emits_speech_only_on_terminal_turn() {
+        // A voice-on goal loop runs intermediate continuation turns, then
+        // completes. Only the terminal turn emits an Assistant frame, and it
+        // carries the spoken channel split from the model's sentinel.
+        let (storage, tools, goal_state, home, out, mut rx) = goal_env();
+        let terminal = format!(
+            "All finished.\n{}\nAll done, take a look.",
+            agent_core::SPEECH_SENTINEL
+        );
+        let provider = MockProvider::new(vec![
+            call_resp("a", "set_goal", serde_json::json!({ "goal": "finish" })),
+            text_resp("working"), // ends turn 1 (intermediate, not emitted)
+            text_resp("still working"), // ends turn 2 (intermediate, not emitted)
+            call_resp(
+                "b",
+                "complete_goal",
+                serde_json::json!({ "summary": "done" }),
+            ),
+            text_resp(&terminal), // terminal turn carries the spoken channel
+        ]);
+        let mut gate = agent_core::AutoApprove;
+        drive_to_goal(
+            &out,
+            &storage,
+            &provider,
+            &tools,
+            Policy::FullAccess,
+            "dev",
+            "c1",
+            Message::user("do the work"),
+            &mut gate,
+            &goal_state,
+            5,
+            true,
+        )
+        .await
+        .unwrap();
+        let frames = assistant_frames(&drain(&mut rx));
+        assert_eq!(frames.len(), 1, "only the terminal turn emits an Assistant");
+        assert_eq!(frames[0].0, "All finished.");
+        assert_eq!(frames[0].1.as_deref(), Some("All done, take a look."));
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn voice_off_terminal_turn_has_no_speech() {
+        // Same single-shot turn with voice off: the Assistant frame carries no
+        // spoken channel.
+        let (storage, tools, goal_state, home, out, mut rx) = goal_env();
+        let provider = MockProvider::new(vec![text_resp("hi")]);
+        let mut gate = agent_core::AutoApprove;
+        drive_to_goal(
+            &out,
+            &storage,
+            &provider,
+            &tools,
+            Policy::FullAccess,
+            "dev",
+            "c1",
+            Message::user("hello"),
+            &mut gate,
+            &goal_state,
+            5,
+            false,
+        )
+        .await
+        .unwrap();
+        let frames = assistant_frames(&drain(&mut rx));
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].0, "hi");
+        assert_eq!(frames[0].1, None);
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[tokio::test]
@@ -1554,6 +1661,7 @@ mod tests {
                 text: "please write".into(),
                 origin: Default::default(),
                 attachments: Vec::new(),
+                voice: false,
             },
         )
         .await;
@@ -1697,6 +1805,7 @@ mod tests {
                 text: "run on pi".into(),
                 origin: Default::default(),
                 attachments: Vec::new(),
+                voice: false,
             },
         )
         .await;

@@ -83,6 +83,10 @@ pub enum ClientMsg {
         origin: OriginContext,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<WireAttachment>,
+        /// Whether this message was spoken (voice mode); when on, the terminal
+        /// turn may carry a spoken reply. Defaults to false.
+        #[serde(default)]
+        voice: bool,
     },
     /// Reconnect to an existing conversation; the server replays events after
     /// `after_seq`.
@@ -151,6 +155,10 @@ pub enum ServerMsg {
         conversation_id: String,
         text: String,
         seq: u64,
+        /// Spoken-version text for voice mode; present only on the terminal turn
+        /// when voice is on.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        speech: Option<String>,
     },
     /// A replayed past event (sent in response to `Resume`).
     Replay {
@@ -309,6 +317,82 @@ mod tests {
         };
         let json = serde_json::to_string(&rb).expect("ser");
         assert_eq!(rb, serde_json::from_str(&json).expect("de"));
+    }
+
+    #[test]
+    fn user_message_voice_roundtrips() {
+        let msg = ClientMsg::UserMessage {
+            conversation_id: None,
+            text: "hi".into(),
+            origin: Default::default(),
+            attachments: vec![],
+            voice: true,
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert_eq!(msg, serde_json::from_str(&json).expect("deserialize"));
+
+        let no_voice = ClientMsg::UserMessage {
+            conversation_id: None,
+            text: "hi".into(),
+            origin: Default::default(),
+            attachments: vec![],
+            voice: false,
+        };
+        let json = serde_json::to_string(&no_voice).expect("serialize");
+        assert_eq!(no_voice, serde_json::from_str(&json).expect("deserialize"));
+    }
+
+    #[test]
+    fn assistant_speech_roundtrips() {
+        let msg = ServerMsg::Assistant {
+            conversation_id: "c1".into(),
+            text: "t".into(),
+            seq: 1,
+            speech: Some("spoken".into()),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert_eq!(msg, serde_json::from_str(&json).expect("deserialize"));
+
+        let no_speech = ServerMsg::Assistant {
+            conversation_id: "c1".into(),
+            text: "t".into(),
+            seq: 1,
+            speech: None,
+        };
+        let json = serde_json::to_string(&no_speech).expect("serialize");
+        assert_eq!(no_speech, serde_json::from_str(&json).expect("deserialize"));
+    }
+
+    #[test]
+    fn user_message_without_voice_field_defaults_false() {
+        let json = r#"{"type":"user_message","text":"hi"}"#;
+        let msg: ClientMsg = serde_json::from_str(json).expect("deserialize");
+        match msg {
+            ClientMsg::UserMessage { voice, .. } => assert!(!voice),
+            other => panic!("expected UserMessage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assistant_without_speech_field_is_none() {
+        let json = r#"{"type":"assistant","conversation_id":"c1","text":"t","seq":1}"#;
+        let msg: ServerMsg = serde_json::from_str(json).expect("deserialize");
+        match msg {
+            ServerMsg::Assistant { speech, .. } => assert_eq!(speech, None),
+            other => panic!("expected Assistant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assistant_omits_speech_when_none() {
+        let msg = ServerMsg::Assistant {
+            conversation_id: "c1".into(),
+            text: "t".into(),
+            seq: 1,
+            speech: None,
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert!(!json.contains("speech"));
     }
 
     #[test]

@@ -33,7 +33,7 @@
 - Codex OAuth backend
 - Web UI、多使用者、RBAC
 - 裝置判重 / 合併、degraded 偵測
-- 語音對話的 STT / TTS 引擎與音訊處理（在終端做，不在 server）。**協定先留 speech 輸出通道 + voice mode 旗標**，引擎延後（見 §11 M7）
+- 語音對話的 STT / TTS 引擎與音訊處理（在終端做，不在 server）。**已於 voice-conversation 變更落地**：協定 speech 輸出通道 + voice mode 旗標 + 終端 OS 原生引擎（見 §11 M7；非 v0 milestone，事後補上）
 - headroom 的 ML prose 壓縮模型（階段二）。v0 只做 §10.1 階段一的演算法類原生壓縮（已內建 agent-core，非外掛）
 - 自管排程 / cron（§10.2）。設計與工具先定，scheduler 實作 post-v0（M8）
 - 瀏覽器自動化（§12）。以 skill 在目標裝置本機用該機 Chrome（CDP）驅動，post-v0（M9）
@@ -340,13 +340,13 @@ v0 範圍：前綴指紋 + 檔案 hash 失效屬 M1／M3；skills/MCP 熱重載�
 - **M4 斷線恢復**：task record、event_id 回放、CLI 重連帶 last_seen_event_id。→ 命中 demo #3。
 - **M5 Enrollment + 裝置模型 + 記憶**：`fleety init`、pairing code（console + 已配對裝置代發）、device.yaml（connectors[]/mobility/site）、per-device 記憶 + NOTES.md 自動維護。→ 命中 demo #1。
 - **M6 精美 TUI（ratatui）**：把 plain CLI 升級成 header／conversation／activity／approval／input／status 的精美 TUI。
-- **M7 語音對話（post-v0）**：終端做 STT／TTS（server 仍只進出文字）；啟用 speech 輸出通道 + device deixis；voice mode 旗標。協定欄位 M0–M2 就先留，引擎這裡才接。
+- **M7 語音對話（post-v0，已於 voice-conversation 變更落地核心）**：終端做 STT／TTS（server 仍只進出文字）；speech 輸出通道 + voice mode 旗標已實作（協定 `UserMessage.voice` + `Assistant.speech`、core 雙通道哨符切分、conn 終止回合 emit、fleety-cli OS 原生 TTS + best-effort STT + `fleety voice` 子命令）。已知限制：headless OS 原生 STT 僅 Windows best-effort，macOS/Linux 退回打字；TTS 三平台皆可。device deixis 與真正的 mac/Linux 語音輸入（如改 whisper.cpp）仍待後續。
 - **M8 自管排程 / cron（post-v0）**：agent-core scheduler（cron/at/every、fire→spawn run）、`schedule_*` 工具、無人值守政策（critical 停泊回報）、離線不補跑。學 openclaw、補安全層（§10.2）。
 - **M9 瀏覽器自動化（post-v0）**：browser skill，目標裝置本機 CDP 驅動該機 Chrome（managed/user profile）、snapshot-ref 動作、SSRF 防護、user-profile 綁 co-location/核准、登入態敏感 act＝critical（§12）。
 - **M10 電腦操作 computer-use（post-v0）**：**已改原生 `computer_*` 工具（fleety-tools、`enigo`+`xcap`、跨裝置 via device_exec），非 MCP（見 §13 更新）**；screenshot 自由用、UI 控制節制使用且使用者活躍時先提醒；偏好順序 API/MCP > browser > computer-use（§13）。
 - **M11 知識 Wiki（post-v0，輕量）**：agent-core wiki 子系統、`<agent-home>/wiki/` Obsidian vault、三層結構、`wiki_*` 工具（強制寫進 vault）、dedup/index/log/lint 管理機制、矛盾不靜默覆寫（§14）。
 
-順序刻意把最難、最該驗證的（loop、永不崩潰、工具橋）放前面；enrollment 與 TUI 美化放後面。M7 語音是 post-v0。Skills/MCP v0 stub，不列 milestone。`speech` 輸出欄位與 voice mode 旗標在 fleety-protocol 從 M2 就先定義（不實作引擎），避免日後改協定。
+順序刻意把最難、最該驗證的（loop、永不崩潰、工具橋）放前面；enrollment 與 TUI 美化放後面。M7 語音原列 post-v0；`speech` 輸出欄位與 voice mode 旗標原規劃「M2 先定義、引擎延後」，實際上協定欄位並未在 M2 落下，而是在 voice-conversation 變更才一併加入並接上 OS 原生引擎（見上 M7 條目）。Skills/MCP v0 stub，不列 milestone。
 
 ## 12. 瀏覽器自動化（裝置能力，post-v0，學 openclaw）
 

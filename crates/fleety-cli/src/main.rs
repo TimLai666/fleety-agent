@@ -8,6 +8,7 @@
 
 mod clipboard;
 mod tui;
+mod voice;
 
 use std::path::{Path, PathBuf};
 
@@ -160,6 +161,15 @@ async fn main() {
                 eprintln!("error: {}", e.report().message);
             }
         }
+        Some("voice") => {
+            if let Err(e) = voice_chat().await {
+                let report = e.report();
+                eprintln!("error: {}", report.message);
+                if let Some(hint) = report.remediation {
+                    eprintln!("hint: {hint}");
+                }
+            }
+        }
         Some("pair") => {
             let code = args.get(2).cloned().unwrap_or_default();
             if code.is_empty() {
@@ -174,7 +184,7 @@ async fn main() {
         }
         _ => {
             println!(
-                "fleety {} — try: fleety ask \"hello\"  |  fleety tui  |  fleety pair <code>",
+                "fleety {} — try: fleety ask \"hello\"  |  fleety voice  |  fleety tui  |  fleety pair <code>",
                 agent_core::VERSION
             );
         }
@@ -225,6 +235,7 @@ async fn run_tui() -> Result<()> {
                             text,
                             origin: OriginContext::default(),
                             attachments,
+                            voice: false,
                         }).await {
                             app.status = format!("send failed: {}", e.report().message);
                         }
@@ -567,6 +578,7 @@ async fn ask(text: String, attachments: Vec<WireAttachment>) -> Result<()> {
             text,
             origin: origin(),
             attachments,
+            voice: false,
         },
     )
     .await?;
@@ -607,6 +619,105 @@ async fn ask(text: String, attachments: Vec<WireAttachment>) -> Result<()> {
         }
     }
     // Close the connection gracefully so the server sees a clean disconnect.
+    let _ = tx.close().await;
+    Ok(())
+}
+
+/// Voice mode: a spoken conversation. Each turn captures input via OS dictation
+/// (falling back to typing where the OS has no headless STT), sends it with the
+/// `voice` flag on, prints the reply, and speaks the spoken channel aloud. The
+/// agent only produces a spoken version on the terminal turn, so one summary is
+/// read per completed request, not one per intermediate step.
+async fn voice_chat() -> Result<()> {
+    let url = agent_url();
+    let (ws, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .map_err(|e| CoreError::Provider(format!("cannot connect to {url}: {e}")))?;
+    let (mut tx, mut rx) = ws.split();
+
+    send(&mut tx, &hello(None)).await?;
+    let conversation = match recv(&mut rx).await? {
+        Some(ServerMsg::Welcome {
+            conversation_id, ..
+        }) => conversation_id,
+        other => {
+            return Err(CoreError::Provider(format!(
+                "expected welcome, got {other:?}"
+            )))
+        }
+    };
+
+    println!("Voice mode — speak your message (say or type 'quit' to exit).");
+    loop {
+        // Capture input: OS dictation if available, else fall back to typing.
+        let input = match voice::listen() {
+            Some(spoken) => {
+                println!("you: {spoken}");
+                spoken
+            }
+            None => {
+                print!("(dictation unavailable — type your message) > ");
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+                let mut line = String::new();
+                if std::io::stdin().read_line(&mut line).is_err() {
+                    break;
+                }
+                line.trim().to_string()
+            }
+        };
+        if input.is_empty() || input.eq_ignore_ascii_case("quit") {
+            break;
+        }
+
+        send(
+            &mut tx,
+            &ClientMsg::UserMessage {
+                conversation_id: Some(conversation.clone()),
+                text: input,
+                origin: origin(),
+                attachments: Vec::new(),
+                voice: true,
+            },
+        )
+        .await?;
+
+        loop {
+            match recv(&mut rx).await? {
+                Some(ServerMsg::Assistant { text, speech, .. }) => {
+                    println!("{text}");
+                    // Read the spoken channel aloud; falls back to silence if no
+                    // engine or no spoken version was produced.
+                    if let Some(spoken) = speech {
+                        voice::speak(&spoken);
+                    }
+                }
+                Some(ServerMsg::Done { .. }) | None => break,
+                Some(ServerMsg::Error { error }) => {
+                    eprintln!("agent error: {}", error.message);
+                    break;
+                }
+                Some(ServerMsg::ApprovalRequested {
+                    approval_id,
+                    tool,
+                    risk,
+                    summary,
+                }) => {
+                    eprintln!("Approve tool '{tool}' (risk: {risk})? {summary}");
+                    eprint!("[y/N] ");
+                    let _ = std::io::Write::flush(&mut std::io::stderr());
+                    let mut line = String::new();
+                    let _ = std::io::stdin().read_line(&mut line);
+                    let decision = if line.trim().eq_ignore_ascii_case("y") {
+                        ClientMsg::Approve { approval_id }
+                    } else {
+                        ClientMsg::Deny { approval_id }
+                    };
+                    send(&mut tx, &decision).await?;
+                }
+                _ => {}
+            }
+        }
+    }
     let _ = tx.close().await;
     Ok(())
 }
