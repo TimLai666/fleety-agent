@@ -19,7 +19,7 @@ A skill is a **directory** with a `SKILL.md` plus optional bundled files. You cr
 
 - **The user asks you to make or install a skill for them** → it's a USER skill, so put it in the **installed** tier: create it with `skill_install` (pass the SKILL.md body as `content`; `from_url`/`from_path` also work), then add any extra files (scripts/references) with `skill_write_file` for that same name (now that it exists in `installed`, writes go there). Edit or remove an installed skill only when the user asks.
 - **You're capturing something for your own future use** (the learning loop nudged you, or you noticed a repeatable workflow worth keeping) → it's an **authored** skill: just `skill_write_file` a new name and it lands in `authored` automatically.
-- **builtin** skills are read-only; to change one, author or install a skill of the same name to shadow it.
+- **builtin** skills are read-only. Two ways to build on one: to *replace or override* a built-in's own behaviour, author or install a skill of the **same name** (it shadows the built-in); to *add to, specialise, or combine* what it does, just make a **new skill with a different name** that complements it — you don't have to shadow it, and the built-in stays available.
 
 Either way the SKILL.md format and the writing guidance below are identical — only the tier and the initial tool differ.
 
