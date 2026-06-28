@@ -3,3 +3,5 @@
 *.pdb
 # docker-compose bind-mount workspace (runtime)
 /workspace
+.spectra/
+openspec/.vector-search.db*
