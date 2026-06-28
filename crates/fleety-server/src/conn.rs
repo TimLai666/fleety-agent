@@ -224,6 +224,13 @@ async fn serve(
                     "user message"
                 );
 
+                // Hold the per-connection turn lock across BOTH recovery and this
+                // turn so a background subagent's wake turn can't interleave
+                // storage appends; record the active conversation so a `fork`
+                // subagent inherits it.
+                let _turn_guard = subagent_rt.lock_turn().await;
+                subagent_rt.set_active_conversation(&conversation).await;
+
                 // First finish any turn left interrupted by a crash/redeploy, so
                 // it isn't lost and doesn't interleave with this message. Best
                 // effort: on failure the journal stays for a later retry.
@@ -259,11 +266,6 @@ async fn serve(
                 } else {
                     Message::user_with_attachments(text, attachments)
                 };
-                // Hold the per-connection turn lock so a background subagent's
-                // wake turn can't interleave storage appends with this one, and
-                // record the active conversation so a `fork` subagent inherits it.
-                let _turn_guard = subagent_rt.lock_turn().await;
-                subagent_rt.set_active_conversation(&conversation).await;
                 let mut gate = ConnGate {
                     out: out.clone(),
                     rx,

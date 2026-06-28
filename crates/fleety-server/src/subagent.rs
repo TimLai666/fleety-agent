@@ -325,15 +325,39 @@ fn resolve_workspace(
     }
 }
 
-/// Remove a worktree created for a subagent (best effort; only when unchanged).
-fn cleanup_worktree(base: &Path, dir: &Path) {
-    let _ = std::process::Command::new("git")
+/// Clean up a subagent's worktree. Removes it only when it is **clean** (no
+/// changes) so the subagent's work is never silently discarded; a worktree with
+/// changes is kept and `false` is returned so the caller can surface its path.
+fn cleanup_worktree(base: &Path, dir: &Path) -> bool {
+    // Is the worktree dirty? `git status --porcelain` prints a line per change.
+    let dirty = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .arg("status")
+        .arg("--porcelain")
+        .output()
+        .map(|o| !o.stdout.is_empty())
+        .unwrap_or(true); // on error, assume dirty and keep it
+    if dirty {
+        return false;
+    }
+    let removed = std::process::Command::new("git")
         .arg("-C")
         .arg(base)
         .arg("worktree")
         .arg("remove")
         .arg(dir)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    // Drop any now-stale administrative entry either way.
+    let _ = std::process::Command::new("git")
+        .arg("-C")
+        .arg(base)
+        .arg("worktree")
+        .arg("prune")
         .output();
+    removed
 }
 
 fn require_str<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
@@ -515,11 +539,20 @@ async fn run_once(
     let messages = rt
         .initial_messages(req.mode, &req.conversation, &req.prompt)
         .await;
-    let (state, output, final_messages) = rt
+    let (state, mut output, final_messages) = rt
         .run_loop(messages, &req.tier, &req.allowed_tools, &workspace)
         .await;
-    if let Some(dir) = &worktree {
-        cleanup_worktree(&rt.workspace, dir);
+    // Remove the worktree only if clean; if the subagent left changes, keep it
+    // and tell the caller where, so the work is never silently discarded.
+    let kept_worktree = match &worktree {
+        Some(dir) if !cleanup_worktree(&rt.workspace, dir) => Some(dir.clone()),
+        _ => None,
+    };
+    if let Some(dir) = &kept_worktree {
+        output.push_str(&format!(
+            "\n\n[worktree kept with uncommitted changes at {}]",
+            dir.display()
+        ));
     }
     if let Some(rec) = rt.tasks.lock().await.get_mut(task_id) {
         // A stop request may have already moved it to Stopped; don't overwrite.
@@ -527,7 +560,7 @@ async fn run_once(
             rec.state = state;
             rec.output = Some(output.clone());
             rec.messages = final_messages;
-            rec.worktree = worktree;
+            rec.worktree = kept_worktree;
         }
     }
     (state, output)
