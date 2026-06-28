@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 agent-core = { workspace = true }
 fleety-protocol = { workspace = true }
+fleety-tools = { workspace = true }
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures = { workspace = true }

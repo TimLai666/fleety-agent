@@ -31,6 +31,7 @@ use agent_core::{CoreError, Result, RiskLevel, Tool, ToolRegistry, ToolSpec};
 mod browser;
 mod chrome;
 mod computer;
+pub mod config;
 pub mod deps;
 mod insyra;
 pub mod restart;

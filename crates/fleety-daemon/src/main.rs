@@ -74,6 +74,11 @@ fn clear_saved_token() {
 
 fn main() {
     obs::init();
+    // Seed env from ~/.fleety/config.toml before reading env (env still wins;
+    // only unset keys are filled). Best-effort.
+    fleety_tools::config::seed_env_from_config(&fleety_tools::config::load(
+        &fleety_tools::config::config_path(),
+    ));
     let cmd = std::env::args().nth(1);
 
     // On Windows, `run-service` is the SCM entry point: it must talk the service

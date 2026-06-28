@@ -93,6 +93,12 @@ fn policy_from_env() -> agent_core::Policy {
 
 fn main() {
     obs::init();
+    // Seed env from ~/.fleety/config.toml before anything reads env: an explicit
+    // env var always wins (we only fill what's unset), so existing deployments
+    // are unaffected. Best-effort (a missing/corrupt file is ignored).
+    fleety_tools::config::seed_env_from_config(&fleety_tools::config::load(
+        &fleety_tools::config::config_path(),
+    ));
     let cmd = std::env::args().nth(1);
 
     // On Windows, `run-service` is the SCM entry point and must speak the service

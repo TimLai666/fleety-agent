@@ -7,6 +7,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod clipboard;
+mod config;
 mod tui;
 mod voice;
 
@@ -168,6 +169,11 @@ async fn main() {
                 if let Some(hint) = report.remediation {
                     eprintln!("hint: {hint}");
                 }
+            }
+        }
+        Some("config") => {
+            if let Err(e) = config::run(&args[2..]) {
+                eprintln!("error: {}", e.report().message);
             }
         }
         Some("pair") => {

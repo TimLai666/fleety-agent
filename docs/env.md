@@ -1,5 +1,14 @@
 # Fleety environment variables
 
+> **Config file.** Every `FLEETY_*` setting below is also a **config key** you can
+> set without exporting env: `fleety config list` / `get` / `set <KEY> <VALUE>` /
+> `unset`, or `fleety config edit` interactively. Values persist to
+> `~/.fleety/config.toml` (override with `FLEETY_CONFIG`), sectioned by scope
+> (`[server]` / `[daemon]` / `[cli]` / `[shared]`). **Read precedence is env →
+> config → default**: an explicit environment variable always wins, so config
+> only fills what env leaves unset; the server and daemon load it at boot.
+> Secret-flagged keys (tokens/model keys) are masked in `list`/`edit`.
+
 The complete reference for every `FLEETY_*` variable the runtime reads.
 Grouped by which binary cares about it. Anything unset uses the default.
 
