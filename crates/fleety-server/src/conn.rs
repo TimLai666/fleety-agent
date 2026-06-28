@@ -13,9 +13,9 @@ use tokio_tungstenite::WebSocketStream;
 use tokio::sync::mpsc;
 
 use agent_core::{
-    reconstruct_messages, run_turn, run_turn_streaming, ApprovalDecision, ApprovalGate, AutoDeny,
-    CoreError, GoalState, LoopConfig, Message, ModelProvider, Policy, Result, RiskLevel, Role,
-    Terminal, ToolRegistry,
+    reconstruct_messages, run_turn, run_turn_streaming, run_turn_streaming_cached,
+    ApprovalDecision, ApprovalGate, AutoDeny, CoreError, GoalState, LoopConfig, Message,
+    ModelProvider, Policy, Result, RiskLevel, Role, Terminal, ToolRegistry,
 };
 use fleety_protocol::{AttentionHint, ClientMsg, ServerMsg, WireError, PROTOCOL_VERSION};
 
@@ -976,7 +976,12 @@ pub(crate) async fn drive_turn(
             let _ = delta_out.send(WsMessage::Text(json));
         }
     });
-    let outcome = run_turn_streaming(
+    // Incremental compaction: reuse this conversation's persisted rolling summary
+    // so a long conversation only summarizes new messages (not the whole middle
+    // every turn/reload). A missing/stale cache safely falls back to a full
+    // summary. Saved back after the turn; a save failure is non-fatal.
+    let mut compaction = storage.load_compaction(device_id, conversation);
+    let outcome = run_turn_streaming_cached(
         provider,
         tools,
         &mut messages,
@@ -988,8 +993,14 @@ pub(crate) async fn drive_turn(
         policy,
         gate,
         on_delta.as_mut(),
+        &mut compaction,
     )
     .await?;
+    if let Some(cache) = &compaction {
+        if let Err(e) = storage.save_compaction(device_id, conversation, cache) {
+            tracing::warn!(%conversation, error = %e, "could not persist compaction cache");
+        }
+    }
     for event in events.events() {
         storage.append_history_tagged(device_id, conversation, event)?;
     }

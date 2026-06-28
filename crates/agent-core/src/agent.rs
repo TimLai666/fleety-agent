@@ -215,6 +215,29 @@ pub async fn run_turn_streaming(
     gate: &mut dyn ApprovalGate,
     on_delta: &mut (dyn for<'a> FnMut(&'a str) + Send),
 ) -> Result<TurnOutcome> {
+    // No compaction cache: each call summarizes from scratch (today's behavior).
+    run_turn_streaming_cached(
+        provider, tools, messages, events, config, policy, gate, on_delta, &mut None,
+    )
+    .await
+}
+
+/// Like [`run_turn_streaming`], but threads a [`CompactionCache`] through so a
+/// long conversation reuses its rolling summary and only summarizes new messages.
+/// The caller (which persists the cache) passes it in and reads it back out; the
+/// core itself does no I/O.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_turn_streaming_cached(
+    provider: &dyn ModelProvider,
+    tools: &ToolRegistry,
+    messages: &mut Vec<Message>,
+    events: &mut EventLog,
+    config: &LoopConfig,
+    policy: Policy,
+    gate: &mut dyn ApprovalGate,
+    on_delta: &mut (dyn for<'a> FnMut(&'a str) + Send),
+    cache: &mut Option<CompactionCache>,
+) -> Result<TurnOutcome> {
     let specs = tools.specs();
 
     // Voice mode: teach the model the dual-channel contract via the system
@@ -224,7 +247,7 @@ pub async fn run_turn_streaming(
     }
 
     for step in 1..=config.max_steps {
-        compact_if_needed(provider, messages, config).await?;
+        compact_if_needed(provider, messages, config, cache).await?;
         let response = provider
             .complete_streaming(messages, &specs, on_delta)
             .await?;
@@ -328,14 +351,53 @@ fn render_message(m: &Message) -> String {
     format!("{role}: {}", m.content.clone().unwrap_or_default())
 }
 
+/// A persisted, reusable rolling summary so compaction is incremental instead of
+/// re-summarizing the whole middle every turn/reload. `summarized_up_to_seq` is
+/// the count of leading conversation messages already folded into `summary` (the
+/// conversation is append-only, so this count is a stable watermark). `recent_keep`
+/// and `threshold` record the config the summary was built under, so a config
+/// change invalidates it. It is a derived optimization — the event stream stays
+/// the source of truth; a missing/stale cache just falls back to a full summary.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CompactionCache {
+    pub summary: String,
+    pub summarized_up_to_seq: u64,
+    pub recent_keep: usize,
+    pub threshold: usize,
+}
+
+/// Whether a cache can be reused: its watermark must lie within the current
+/// middle (`history_len` messages) and the config it was built under must match.
+pub fn is_cache_usable(cache: &CompactionCache, history_len: usize, config: &LoopConfig) -> bool {
+    (cache.summarized_up_to_seq as usize) <= history_len
+        && cache.recent_keep == config.recent_keep_messages
+        && cache.threshold == config.compact_threshold_chars
+}
+
+/// The slice of the middle that still needs summarizing, given how many leading
+/// messages (`covered`) are already in the summary. `None` means nothing new (the
+/// cached summary already covers the whole middle). Indices are into `messages`.
+fn new_middle_range(keep_head: usize, covered: usize, split: usize) -> Option<(usize, usize)> {
+    let middle_len = split.saturating_sub(keep_head);
+    if covered >= middle_len {
+        None
+    } else {
+        Some((keep_head + covered, split))
+    }
+}
+
 /// If the context is over budget, summarize the older middle messages via the
 /// provider, keeping a leading system message and the most recent ones verbatim.
 /// Reversible: the full history lives in the event log; only the in-context view
-/// shrinks.
+/// shrinks. Incremental: with a usable `cache`, only the messages added since the
+/// cache's watermark are summarized and folded into the cached summary; otherwise
+/// a full summary is produced and the cache (re)seeded. `cache` is updated in
+/// place for the caller to persist; this function performs no I/O.
 async fn compact_if_needed(
     provider: &dyn ModelProvider,
     messages: &mut Vec<Message>,
     config: &LoopConfig,
+    cache: &mut Option<CompactionCache>,
 ) -> Result<()> {
     if estimate_chars(messages) <= config.compact_threshold_chars {
         return Ok(());
@@ -357,16 +419,42 @@ async fn compact_if_needed(
     while split > keep_head && messages[split].role == Role::Tool {
         split -= 1;
     }
-    let middle_text = messages[keep_head..split]
-        .iter()
-        .map(render_message)
-        .collect::<Vec<_>>()
-        .join("\n");
-    let prompt = format!(
-        "Summarize the following earlier conversation concisely, preserving user intent, decisions, file changes, errors, and pending tasks:\n\n{middle_text}"
-    );
-    let response = provider.complete(&[Message::user(prompt)], &[]).await?;
-    let summary = response.message.content.unwrap_or_default();
+    let middle_len = split - keep_head;
+
+    // Reuse the cache only when its config matches and its watermark lies within
+    // the current middle; otherwise summarize the whole middle afresh.
+    let covered = match cache.as_ref() {
+        Some(c) if is_cache_usable(c, middle_len, config) => c.summarized_up_to_seq as usize,
+        _ => 0,
+    };
+
+    let summary = match new_middle_range(keep_head, covered, split) {
+        // Nothing new to summarize: reuse the cached summary verbatim (no LLM).
+        None => match cache.as_ref() {
+            Some(c) if covered > 0 => c.summary.clone(),
+            _ => return Ok(()),
+        },
+        Some((start, end)) => {
+            let middle_text = messages[start..end]
+                .iter()
+                .map(render_message)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let prompt = if covered > 0 {
+                // Incremental: fold only the new messages into the running summary.
+                let base = cache.as_ref().map(|c| c.summary.as_str()).unwrap_or("");
+                format!(
+                    "Here is a running summary of an earlier conversation:\n\n{base}\n\nExtend it to incorporate these additional later messages, staying concise and preserving user intent, decisions, file changes, errors, and pending tasks:\n\n{middle_text}"
+                )
+            } else {
+                format!(
+                    "Summarize the following earlier conversation concisely, preserving user intent, decisions, file changes, errors, and pending tasks:\n\n{middle_text}"
+                )
+            };
+            let response = provider.complete(&[Message::user(prompt)], &[]).await?;
+            response.message.content.unwrap_or_default()
+        }
+    };
 
     let mut rebuilt = Vec::with_capacity(keep_head + 1 + config.recent_keep_messages);
     rebuilt.extend_from_slice(&messages[..keep_head]);
@@ -375,6 +463,12 @@ async fn compact_if_needed(
     )));
     rebuilt.extend_from_slice(&messages[split..]);
     *messages = rebuilt;
+    *cache = Some(CompactionCache {
+        summary,
+        summarized_up_to_seq: middle_len as u64,
+        recent_keep: config.recent_keep_messages,
+        threshold: config.compact_threshold_chars,
+    });
     Ok(())
 }
 
@@ -656,7 +750,7 @@ mod tests {
             ..LoopConfig::default()
         };
 
-        compact_if_needed(&provider, &mut messages, &config)
+        compact_if_needed(&provider, &mut messages, &config, &mut None)
             .await
             .expect("compact");
 
@@ -714,7 +808,7 @@ mod tests {
             ..LoopConfig::default()
         };
 
-        compact_if_needed(&provider, &mut messages, &config)
+        compact_if_needed(&provider, &mut messages, &config, &mut None)
             .await
             .expect("compact");
 
@@ -731,6 +825,181 @@ mod tests {
                     .any(|p| p.role == Role::Assistant && p.tool_calls.iter().any(|c| c.id == id)));
             }
         }
+    }
+
+    #[test]
+    fn cache_usable_checks_watermark_and_config() {
+        let config = LoopConfig {
+            compact_threshold_chars: 10,
+            recent_keep_messages: 2,
+            ..LoopConfig::default()
+        };
+        let cache = CompactionCache {
+            summary: "s".to_string(),
+            summarized_up_to_seq: 4,
+            recent_keep: 2,
+            threshold: 10,
+        };
+        // Watermark within history + matching config → usable.
+        assert!(is_cache_usable(&cache, 6, &config));
+        assert!(is_cache_usable(&cache, 4, &config));
+        // Watermark past the available history (shrunk/edited) → stale.
+        assert!(!is_cache_usable(&cache, 3, &config));
+        // Config drift → stale.
+        let other_keep = CompactionCache {
+            recent_keep: 3,
+            ..cache.clone()
+        };
+        assert!(!is_cache_usable(&other_keep, 6, &config));
+        let other_thresh = CompactionCache {
+            threshold: 11,
+            ..cache.clone()
+        };
+        assert!(!is_cache_usable(&other_thresh, 6, &config));
+    }
+
+    #[test]
+    fn new_middle_range_selects_only_the_delta() {
+        // keep_head=1, split=7. covered=4 → new middle is messages[5..7].
+        assert_eq!(new_middle_range(1, 4, 7), Some((5, 7)));
+        // covered=0 → whole middle messages[1..7].
+        assert_eq!(new_middle_range(1, 0, 7), Some((1, 7)));
+        // covered == middle_len → nothing new.
+        assert_eq!(new_middle_range(1, 6, 7), None);
+        // covered beyond middle_len → nothing new (caller treats as recompute).
+        assert_eq!(new_middle_range(1, 9, 7), None);
+    }
+
+    /// Records the last prompt the provider was asked to complete, and returns
+    /// scripted summaries, so a test can assert what the fold actually summarized.
+    struct RecordingProvider {
+        last_prompt: std::sync::Arc<std::sync::Mutex<String>>,
+        responses: std::sync::Mutex<std::collections::VecDeque<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::model::ModelProvider for RecordingProvider {
+        async fn complete(
+            &self,
+            messages: &[Message],
+            _tools: &[crate::model::ToolSpec],
+        ) -> Result<crate::model::ModelResponse> {
+            if let Some(m) = messages.first() {
+                *self.last_prompt.lock().unwrap() = m.content.clone().unwrap_or_default();
+            }
+            let next = self
+                .responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_default();
+            Ok(crate::model::ModelResponse {
+                message: Message::assistant(next),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn compaction_is_incremental_with_cache() {
+        let last_prompt = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let provider = RecordingProvider {
+            last_prompt: std::sync::Arc::clone(&last_prompt),
+            responses: std::sync::Mutex::new(
+                ["S1".to_string(), "S2".to_string()].into_iter().collect(),
+            ),
+        };
+        let config = LoopConfig {
+            compact_threshold_chars: 10,
+            recent_keep_messages: 2,
+            ..LoopConfig::default()
+        };
+        let mut cache: Option<CompactionCache> = None;
+
+        // Turn 1: middle = [alpha, beta, charlie, delta]; full summarize, seed cache.
+        let mut messages = vec![
+            Message::system("sys"),
+            Message::user("alpha"),
+            Message::assistant("beta"),
+            Message::user("charlie"),
+            Message::assistant("delta"),
+            Message::user("echo"),
+            Message::assistant("foxtrot"),
+        ];
+        compact_if_needed(&provider, &mut messages, &config, &mut cache)
+            .await
+            .expect("compact 1");
+        let c1 = cache.clone().expect("seeded");
+        assert_eq!(c1.summary, "S1");
+        assert_eq!(c1.summarized_up_to_seq, 4); // middle_len
+        let p1 = last_prompt.lock().unwrap().clone();
+        assert!(p1.contains("alpha") && p1.contains("delta"));
+        assert!(!p1.contains("running summary")); // first pass is a full summary
+
+        // Turn 2: a fresh reload — same prefix plus two new messages. Only the
+        // delta (echo/foxtrot, now in the middle) should be folded in.
+        let mut messages2 = vec![
+            Message::system("sys"),
+            Message::user("alpha"),
+            Message::assistant("beta"),
+            Message::user("charlie"),
+            Message::assistant("delta"),
+            Message::user("echo"),
+            Message::assistant("foxtrot"),
+            Message::user("golf"),
+            Message::assistant("hotel"),
+        ];
+        compact_if_needed(&provider, &mut messages2, &config, &mut cache)
+            .await
+            .expect("compact 2");
+        let c2 = cache.clone().expect("updated");
+        assert_eq!(c2.summary, "S2");
+        assert_eq!(c2.summarized_up_to_seq, 6); // watermark advanced
+        let p2 = last_prompt.lock().unwrap().clone();
+        // Incremental: folds the running summary + only the new middle...
+        assert!(p2.contains("running summary"));
+        assert!(p2.contains("S1"));
+        assert!(p2.contains("echo") && p2.contains("foxtrot"));
+        // ...and does NOT re-summarize the already-covered prefix.
+        assert!(!p2.contains("alpha"));
+    }
+
+    #[tokio::test]
+    async fn compaction_recomputes_on_config_change() {
+        let last_prompt = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let provider = RecordingProvider {
+            last_prompt: std::sync::Arc::clone(&last_prompt),
+            responses: std::sync::Mutex::new(["S2".to_string()].into_iter().collect()),
+        };
+        let config = LoopConfig {
+            compact_threshold_chars: 10,
+            recent_keep_messages: 2,
+            ..LoopConfig::default()
+        };
+        // A cache built under a different recent_keep → invalid → full recompute.
+        let mut cache = Some(CompactionCache {
+            summary: "STALE".to_string(),
+            summarized_up_to_seq: 2,
+            recent_keep: 5,
+            threshold: 10,
+        });
+        let mut messages = vec![
+            Message::system("sys"),
+            Message::user("alpha"),
+            Message::assistant("beta"),
+            Message::user("charlie"),
+            Message::assistant("delta"),
+            Message::user("echo"),
+            Message::assistant("foxtrot"),
+        ];
+        compact_if_needed(&provider, &mut messages, &config, &mut cache)
+            .await
+            .expect("compact");
+        let p = last_prompt.lock().unwrap().clone();
+        // Full re-summary (not a fold): the stale summary is not used as a base.
+        assert!(!p.contains("running summary"));
+        assert!(!p.contains("STALE"));
+        assert!(p.contains("alpha"));
+        assert_eq!(cache.unwrap().summary, "S2");
     }
 
     struct StreamingMock;

@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use agent_core::{CoreError, Event, EventLog, Message, Result};
+use agent_core::{CompactionCache, CoreError, Event, EventLog, Message, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -1089,6 +1089,44 @@ impl Storage {
         hint_match.or(any_match)
     }
 
+    /// Path to a conversation's compaction cache, alongside its `.jsonl`.
+    fn compaction_path(&self, device_id: &str, conversation_id: &str) -> PathBuf {
+        self.conversation_path(device_id, conversation_id)
+            .with_extension("compaction.json")
+    }
+
+    /// Load a conversation's compaction cache (the persisted rolling summary +
+    /// watermark). Missing or corrupt → `None`, so compaction safely falls back
+    /// to a full summary — the cache is only ever an optimization.
+    pub fn load_compaction(
+        &self,
+        device_id: &str,
+        conversation_id: &str,
+    ) -> Option<CompactionCache> {
+        let text = fs::read_to_string(self.compaction_path(device_id, conversation_id)).ok()?;
+        serde_json::from_str(&text).ok()
+    }
+
+    /// Persist a conversation's compaction cache.
+    pub fn save_compaction(
+        &self,
+        device_id: &str,
+        conversation_id: &str,
+        cache: &CompactionCache,
+    ) -> Result<()> {
+        let path = self.compaction_path(device_id, conversation_id);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| {
+                CoreError::Message(format!("cannot create {}: {e}", parent.display()))
+            })?;
+        }
+        let text = serde_json::to_string(cache)
+            .map_err(|e| CoreError::Message(format!("serialize compaction cache failed: {e}")))?;
+        fs::write(&path, text)
+            .map_err(|e| CoreError::Message(format!("write {} failed: {e}", path.display())))?;
+        Ok(())
+    }
+
     /// Path to a conversation's in-flight turn journal (durable record of the
     /// current turn's events, removed once the turn completes).
     fn journal_path(&self, device_id: &str, conversation_id: &str) -> PathBuf {
@@ -1247,6 +1285,27 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fleety-storage-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("mk temp");
         dir
+    }
+
+    #[test]
+    fn compaction_cache_round_trips() {
+        let home = temp_home();
+        let storage = Storage::new(home.clone());
+        assert!(storage.load_compaction("dev", "conv").is_none()); // missing → None
+        let cache = agent_core::CompactionCache {
+            summary: "rolling summary".to_string(),
+            summarized_up_to_seq: 6,
+            recent_keep: 8,
+            threshold: 24_000,
+        };
+        storage
+            .save_compaction("dev", "conv", &cache)
+            .expect("save");
+        assert_eq!(storage.load_compaction("dev", "conv"), Some(cache));
+        // Corrupt file → None (safe fallback to a full summary).
+        std::fs::write(storage.compaction_path("dev", "conv"), "not json").expect("clobber");
+        assert!(storage.load_compaction("dev", "conv").is_none());
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

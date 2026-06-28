@@ -147,6 +147,19 @@ that delegation is a follow-up.
 Example editor config: run `fleety acp` as the agent command (a fleety-server
 must be reachable).
 
+## Context compaction
+
+When a conversation's in-context size exceeds the budget, older middle messages
+are summarized into a rolling summary (system prompt + summary + recent messages
+kept). This is now **incremental and cached**: the summary plus a watermark (how
+many leading messages it covers) is persisted per conversation
+(`<id>.compaction.json`, beside the conversation), so a follow-up turn or a reload
+reuses it and only summarizes the messages added since the watermark — not the
+whole middle from scratch every time. The cache is a derived optimization: it is
+ignored (and a full summary recomputed) when the conversation was edited/shrank
+or the compaction config changed, so it can only speed things up, never change
+correctness. The full history always stays in the event log.
+
 ## Retrieving truncated tool results
 
 Large tool results are truncated for the model (structural crush + a character
