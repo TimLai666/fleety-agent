@@ -16,6 +16,7 @@ Grouped by which binary cares about it. Anything unset uses the default.
 | `FLEETY_TOKEN` | (unset) | Bootstrap admin token. Use it once to pair the first device. |
 | `FLEETY_SCHED_TICK` | `60` | Seconds between scheduler fire-loop ticks. |
 | `FLEETY_SYSTEM_PROMPT` | (unset → full) | `minimal` drops the embedded behavioural docs (protocol/rules/memory/policy) from the system message, leaving only core memory (ME/USER/TODO) — for token-lean / debugging runs. |
+| `FLEETY_SUBAGENT_MAX_CONCURRENT` | `4` | Max background subagents running at once per connection. A spawn past the cap errors rather than queueing. Clamped to a floor of 1. |
 
 ## Model provider
 
@@ -25,6 +26,21 @@ Grouped by which binary cares about it. Anything unset uses the default.
 | `FLEETY_MODEL` | (unset → echo) | Model name to request. |
 | `FLEETY_MODEL_KEY` | (unset) | Bearer token, when the endpoint needs one. |
 | `FLEETY_MODEL_STREAM` | `0` | Set to `1` to use the SSE streaming endpoint (token-by-token TUI display). |
+
+### Economy model (optional second tier for subagents)
+
+A subagent can run on the **main** model or a cheaper **economy** model, chosen
+per spawn. The cheap tier is its own independent provider (different
+provider/model is fine). When unset, the cheap tier aliases the main model, so
+selecting `cheap` always works. Same shape as `FLEETY_MODEL_*`: the model name
+is the bare var, base URL / key / stream are suffixed.
+
+| Var | Default | Meaning |
+|---|---|---|
+| `FLEETY_CHEAP_MODEL` | (unset → cheap = main) | Economy model name. A second provider is built only when this **and** `FLEETY_CHEAP_MODEL_BASE_URL` are set. |
+| `FLEETY_CHEAP_MODEL_BASE_URL` | (unset) | OpenAI-compatible `/v1` root for the economy model. |
+| `FLEETY_CHEAP_MODEL_KEY` | (unset) | Bearer token for the economy endpoint. |
+| `FLEETY_CHEAP_MODEL_STREAM` | `0` | `1` to stream the economy model. |
 
 ## Retention / GC (server background loop)
 

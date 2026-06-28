@@ -42,3 +42,4 @@ fleety-vec = { workspace = true }
 
 [dev-dependencies]
 filetime = "0.2"
+serial_test = "3"

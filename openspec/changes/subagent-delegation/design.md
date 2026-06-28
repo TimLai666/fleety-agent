@@ -39,7 +39,7 @@ agent-core 不得依賴任何 Fleety crate。因此 orchestration 的執行器�
 
 6. **通知與主動回報(比照 Claude Code 的主動重新喚醒)。** 新增 NotificationQueue。背景子 agent 完成/失敗時:(a) 立即發一則使用者向 ServerMsg(SubagentDone)告知;(b) **主動喚醒**一個父 coordinator turn —— 把完成通知當成新輸入,seed 進父的 messages 後跑一個正常 turn,讓 coordinator 立即綜整或再派工,不等使用者下一句。這就是 Claude Code 的 `<task-notification>` 重新喚醒模型。去重:以 task_id 為鍵帶 delivered 旗標,投遞一次即標記;近乎同時的多個完成**可批次成一次喚醒**。防 runaway 不靠「不喚醒」,而靠:被喚醒的是一個正常受限 turn(coordinator 自行判斷是否續跑)、並行有上限(見決策 9)、使用者可隨時中斷。
 
-7. **背景子 agent 的審批閘。** 背景執行無法互動式審批。決策:背景子 agent 用非互動 gate。full_access(預設)→ 放行;require_approval → 背景子 agent 僅限 read 工具,除非 spawn 時以 allowed_tools 預先授權。前景子 agent 沿用父的 gate。所有子 agent 動作照常進稽核(掛在父裝置的 audit log,標注 subagent task_id)。**tier 不影響任何權限**:cheap 與 main 只差在 provider,policy / gate / audit 完全相同,便宜模型的子 agent 不會因為便宜而被放寬或收緊。
+7. **背景子 agent 的審批閘。** 背景執行無法互動式審批。決策:背景子 agent 用非互動 gate。full_access(預設)→ 放行;require_approval → 子 agent 僅限 read 工具,除非 spawn 時以 allowed_tools 預先授權。前景子 agent 也用同一套非互動 gate(`Tool::call` 拿不到父的互動式 gate,且預設 full_access 下兩者一致;子 agent 內不對使用者互動式詢問)。所有子 agent 動作照常進稽核(掛在父裝置的 audit log)。**tier 不影響任何權限**:cheap 與 main 只差在 provider,policy / gate / audit 完全相同,便宜模型的子 agent 不會因為便宜而被放寬或收緊。
 
 8. **隔離 worktree。** isolation=worktree 時,在子 agent 啟動前對工作區建一個 git worktree,把子 agent 的檔案根指向該 worktree;結束後若無變更則自動移除。需工作區為 git repo;若否,回報可行動錯誤並不靜默改用 none。isolation=none 則共用父工作區。
 

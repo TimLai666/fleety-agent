@@ -269,6 +269,25 @@ agent run with the stored prompt under `RequireApproval` + `MandateGate` (only
 | `schedule_list` | List the agent's schedules with `next_fire_secs` annotated per record. | — | read |
 | `schedule_delete` | Remove a schedule by id. | `id` | mutate |
 
+## Subagents (delegation)
+
+**Runs on:** server only (these orchestration tools). The parent agent delegates
+a task to a **subagent** — a nested agent loop with the same tools MINUS these
+orchestration tools, so a subagent cannot spawn its own subagents (one-level
+cap). A subagent keeps every other tool, including `device_exec`, so it can
+still act on other devices. It runs on the `main` or `cheap` model tier (see
+`FLEETY_CHEAP_MODEL_*` in [env.md](env.md)); the tier changes only the provider,
+never the policy/gate/audit. A background subagent reports back by proactively
+waking a coordinator turn when it finishes. See
+`crates/fleety-server/src/subagent.rs`.
+
+| Tool | Purpose | Key inputs | Risk |
+|---|---|---|---|
+| `spawn_subagent` | Delegate a task. `mode` `spawn` (fresh context + briefing) / `fork` (inherits the current conversation). `model` `main`/`cheap`. `run_in_background` returns a `task_id` immediately and wakes a turn on completion; otherwise awaits and returns the `output`. `isolation` `none`/`worktree` (a dedicated git worktree; errors if the workspace isn't a git repo). `allowed_tools` whitelists tools under require-approval. | `prompt`, `mode?`, `model?`, `run_in_background?`, `isolation?`, `allowed_tools?`, `name?` | mutate |
+| `send_subagent_message` | Continue an existing (finished, not running) subagent, preserving its context. | `task_id`, `prompt` | mutate |
+| `stop_subagent` | Stop a subagent; a background task is aborted, state becomes `stopped`. | `task_id` | mutate |
+| `subagent_status` | Report a subagent's state and (when finished) its output. | `task_id` | read |
+
 ## Skills
 
 **Runs on:** server only. Skills live in `{FLEETY_AGENT_HOME}/skills/` across

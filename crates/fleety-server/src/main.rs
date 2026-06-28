@@ -27,12 +27,14 @@ pub(crate) fn server_start() -> std::time::Instant {
 }
 mod echo;
 mod mcp;
+mod providers;
 mod scheduler;
 mod schedules;
 mod sites;
 mod skills;
 mod ssh;
 mod storage;
+mod subagent;
 mod tools;
 mod web;
 mod wiki;
@@ -41,10 +43,9 @@ mod wiki_embed;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use agent_core::{obs, Gemini, ModelProvider, OpenAiCompat};
+use agent_core::{obs, ModelProvider};
 use tokio::net::TcpListener;
 
-use crate::echo::EchoProvider;
 use crate::storage::Storage;
 
 /// Resolve the Agent home (durable store), separate from any workspace.
@@ -69,70 +70,7 @@ fn workspace_root() -> PathBuf {
 /// Choose the model provider: an OpenAI-compatible endpoint if configured via
 /// `FLEETY_MODEL_BASE_URL` + `FLEETY_MODEL`, otherwise the offline echo stub.
 fn build_provider() -> Arc<dyn ModelProvider> {
-    match (
-        std::env::var("FLEETY_MODEL_BASE_URL"),
-        std::env::var("FLEETY_MODEL"),
-    ) {
-        (Ok(base_url), Ok(model)) => {
-            let key = std::env::var("FLEETY_MODEL_KEY").ok();
-            let stream = std::env::var("FLEETY_MODEL_STREAM").as_deref() == Ok("1");
-            if !looks_multimodal(&model) {
-                tracing::warn!(
-                    %model,
-                    "the configured model name doesn't match any known multimodal family — \
-                     image/audio/video attachments may be rejected or silently ignored by the \
-                     provider. If your model supports them, this is just a heuristic miss; \
-                     otherwise set FLEETY_MODEL to a multimodal one (e.g. gpt-4o, \
-                     claude-sonnet-4*, gemini-1.5-*)."
-                );
-            }
-            if agent_core::gemini::looks_like_gemini_model(&model) {
-                tracing::info!(%base_url, %model, stream, "using native Gemini provider");
-                Arc::new(Gemini::new(base_url, model, key).with_streaming(stream))
-            } else {
-                tracing::info!(%base_url, %model, stream, "using OpenAI-compatible provider");
-                Arc::new(OpenAiCompat::new(base_url, model, key).with_streaming(stream))
-            }
-        }
-        _ => {
-            tracing::info!("no FLEETY_MODEL_BASE_URL/FLEETY_MODEL set; using echo provider");
-            Arc::new(EchoProvider)
-        }
-    }
-}
-
-/// Light heuristic for "this model name belongs to a family that handles
-/// images / audio / video". Used only for a startup warning — it's a hint, not
-/// a gate, so a miss is fine: the user can ignore the warning if they know
-/// their endpoint translates differently.
-fn looks_multimodal(model: &str) -> bool {
-    let m = model.to_ascii_lowercase();
-    // Known multimodal families. Best-effort: extend as new releases land.
-    const HINTS: &[&str] = &[
-        "gpt-4o",
-        "gpt-4-vision",
-        "gpt-4-turbo",
-        "gpt-5",
-        "o1",
-        "o3",
-        "claude-3",
-        "claude-sonnet-4",
-        "claude-opus-4",
-        "claude-haiku-4",
-        "claude-fable",
-        "gemini-1.5",
-        "gemini-2",
-        "gemini-pro-vision",
-        "llava",
-        "llama-3-vision",
-        "llama-3.2-vision",
-        "pixtral",
-        "qwen2-vl",
-        "qwen2.5-vl",
-        "molmo",
-        "internvl",
-    ];
-    HINTS.iter().any(|h| m.contains(h))
+    providers::build_main()
 }
 
 /// Approval policy from `FLEETY_POLICY` (`require_approval` → gate non-read

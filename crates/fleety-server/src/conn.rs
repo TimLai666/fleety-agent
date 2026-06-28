@@ -23,7 +23,7 @@ use crate::bridge::{self, DeviceTools, Handles, Hub, Pending};
 use crate::storage::Storage;
 
 /// Outbound frame sender (drained by the connection's writer task).
-type Out = mpsc::UnboundedSender<WsMessage>;
+pub(crate) type Out = mpsc::UnboundedSender<WsMessage>;
 
 type Tx = SplitSink<WebSocketStream<TcpStream>, WsMessage>;
 type Rx = SplitStream<WebSocketStream<TcpStream>>;
@@ -178,7 +178,7 @@ async fn serve(
         },
     )?;
 
-    let tools = build_full_registry(
+    let mut tools = build_full_registry(
         storage,
         workspace,
         device_id,
@@ -188,6 +188,24 @@ async fn serve(
         auth,
         device_tools,
     );
+    // Subagent orchestration: one runtime per connection, with the orchestration
+    // tools registered ONLY at this top level. Subagent registries are built
+    // from `build_full_registry` alone, so they omit these tools — that is what
+    // caps nesting at one level.
+    let subagent_rt = crate::subagent::SubagentRuntime::new(
+        crate::providers::ProviderTiers::from_env(),
+        policy,
+        Arc::clone(storage),
+        workspace.to_path_buf(),
+        device_id.to_string(),
+        Arc::clone(hub),
+        Arc::clone(pending),
+        Arc::clone(handles),
+        Arc::clone(auth),
+        Arc::clone(device_tools),
+        out.clone(),
+    );
+    crate::subagent::register(&mut tools, Arc::clone(&subagent_rt));
 
     while let Some(msg) = read_client(rx).await? {
         match msg {
@@ -241,70 +259,27 @@ async fn serve(
                 } else {
                     Message::user_with_attachments(text, attachments)
                 };
-                storage.append(device_id, &conversation, &user_msg)?;
-                storage.journal_begin(device_id, &conversation, &user_msg)?;
-                // Inject agent-level core memory (ME/USER/TODO) as the system
-                // preamble each turn; it is ephemeral, not persisted to the convo.
-                let mut messages = vec![Message::system(storage.system_prompt()?)];
-                messages.extend(storage.load(device_id, &conversation)?);
-                // Journal every loop event the instant it happens, so a crash
-                // mid-turn is recoverable.
-                let mut events = storage.journaling_log(device_id, &conversation);
-                // Stream content chunks to the client for token-by-token display;
-                // the full reply still arrives as `Assistant` below.
-                let delta_out = out.clone();
-                let delta_conv = conversation.clone();
-                let mut on_delta: Box<dyn FnMut(&str) + Send> = Box::new(move |chunk: &str| {
-                    let frame = ServerMsg::AssistantDelta {
-                        conversation_id: delta_conv.clone(),
-                        chunk: chunk.to_string(),
-                    };
-                    if let Ok(json) = serde_json::to_string(&frame) {
-                        let _ = delta_out.send(WsMessage::Text(json));
-                    }
-                });
-                let outcome = {
-                    let mut gate = ConnGate {
-                        out: out.clone(),
-                        rx,
-                    };
-                    run_turn_streaming(
-                        provider,
-                        &tools,
-                        &mut messages,
-                        &mut events,
-                        &LoopConfig::default(),
-                        policy,
-                        &mut gate,
-                        on_delta.as_mut(),
-                    )
-                    .await?
+                // Hold the per-connection turn lock so a background subagent's
+                // wake turn can't interleave storage appends with this one, and
+                // record the active conversation so a `fork` subagent inherits it.
+                let _turn_guard = subagent_rt.lock_turn().await;
+                subagent_rt.set_active_conversation(&conversation).await;
+                let mut gate = ConnGate {
+                    out: out.clone(),
+                    rx,
                 };
-
-                // Audit: persist the turn's events (tool calls, results, replies).
-                for event in events.events() {
-                    storage.append_history(device_id, event)?;
-                }
-
-                let reply = outcome.output;
-                let seq =
-                    storage.append(device_id, &conversation, &Message::assistant(reply.clone()))?;
-                // Turn done: clear the journal (the reply now lives in the stream).
-                storage.journal_end(device_id, &conversation)?;
-                emit(
+                drive_turn(
                     out,
-                    &ServerMsg::Assistant {
-                        conversation_id: conversation.clone(),
-                        text: reply,
-                        seq,
-                    },
-                )?;
-                emit(
-                    out,
-                    &ServerMsg::Done {
-                        conversation_id: conversation,
-                    },
-                )?;
+                    storage,
+                    provider,
+                    &tools,
+                    policy,
+                    device_id,
+                    &conversation,
+                    user_msg,
+                    &mut gate,
+                )
+                .await?;
             }
             ClientMsg::Resume {
                 conversation_id,
@@ -516,6 +491,74 @@ fn authenticate(
 }
 
 /// Send a frame to this connection's writer task.
+/// Run one turn over a conversation given a seed `user_msg` and an approval
+/// `gate`, streaming deltas and persisting the result. Shared by live user
+/// turns (interactive `ConnGate`) and a subagent's proactive wake turn
+/// (`AutoApprove`), so both take the identical journal / audit / emit path.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn drive_turn(
+    out: &Out,
+    storage: &Arc<Storage>,
+    provider: &dyn ModelProvider,
+    tools: &ToolRegistry,
+    policy: Policy,
+    device_id: &str,
+    conversation: &str,
+    user_msg: Message,
+    gate: &mut dyn agent_core::ApprovalGate,
+) -> Result<()> {
+    storage.append(device_id, conversation, &user_msg)?;
+    storage.journal_begin(device_id, conversation, &user_msg)?;
+    // Inject agent-level core memory (ME/USER/TODO) as the system preamble each
+    // turn; it is ephemeral, not persisted to the conversation.
+    let mut messages = vec![Message::system(storage.system_prompt()?)];
+    messages.extend(storage.load(device_id, conversation)?);
+    let mut events = storage.journaling_log(device_id, conversation);
+    let delta_out = out.clone();
+    let delta_conv = conversation.to_string();
+    let mut on_delta: Box<dyn FnMut(&str) + Send> = Box::new(move |chunk: &str| {
+        let frame = ServerMsg::AssistantDelta {
+            conversation_id: delta_conv.clone(),
+            chunk: chunk.to_string(),
+        };
+        if let Ok(json) = serde_json::to_string(&frame) {
+            let _ = delta_out.send(WsMessage::Text(json));
+        }
+    });
+    let outcome = run_turn_streaming(
+        provider,
+        tools,
+        &mut messages,
+        &mut events,
+        &LoopConfig::default(),
+        policy,
+        gate,
+        on_delta.as_mut(),
+    )
+    .await?;
+    for event in events.events() {
+        storage.append_history(device_id, event)?;
+    }
+    let reply = outcome.output;
+    let seq = storage.append(device_id, conversation, &Message::assistant(reply.clone()))?;
+    storage.journal_end(device_id, conversation)?;
+    emit(
+        out,
+        &ServerMsg::Assistant {
+            conversation_id: conversation.to_string(),
+            text: reply,
+            seq,
+        },
+    )?;
+    emit(
+        out,
+        &ServerMsg::Done {
+            conversation_id: conversation.to_string(),
+        },
+    )?;
+    Ok(())
+}
+
 fn emit(out: &Out, msg: &ServerMsg) -> Result<()> {
     let json = serde_json::to_string(msg)
         .map_err(|e| CoreError::Message(format!("serialize server frame: {e}")))?;

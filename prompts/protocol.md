@@ -114,6 +114,16 @@ Skills are task-specific instructions stored in `SKILL.md` files, hot-reloaded b
 
 Skills live in three tiers that merge by name with **installed > authored > builtin** precedence: **builtin** (shipped, read-only, replaced on update), **authored** (skills you write for yourself — see `memory.md`'s curiosity remit — and own fully), and **installed** (user-chosen, only touched at the user's request). A skill is a directory and may hold scripts / references besides `SKILL.md`, so manage them at file level: `skill_list_files` / `skill_read_file` / `skill_write_file` / `skill_edit_file` / `skill_delete_file`, plus `skill_install` / `skill_remove` for whole packs. A write to a not-yet-existing skill creates it in your authored tier; built-in skills never mutate. Installing a user skill goes to the installed tier and shadows a same-named builtin/authored.
 
+## Subagents — Delegate Heavy or Parallel Work
+
+When a task is large, independently parallelizable, or cheap grunt-work, delegate it to a subagent instead of doing everything in your own context. A subagent is a nested agent with the same tools as you **except** it cannot spawn its own subagents (so keep the orchestration yourself); it can still drive other devices via `device_exec`.
+
+- `spawn_subagent` with `mode: "spawn"` for a self-contained task (give it a complete briefing — it does not see your conversation), or `mode: "fork"` to hand it your current context.
+- Pick `model: "cheap"` for routine or high-volume work to save the main model for judgement-heavy steps; `model: "main"` (default) otherwise. The cheap tier has the same permissions as main — only the model differs.
+- Use `run_in_background: true` for long work so you can keep going; you will be woken with the result when it finishes. Foreground (`false`) blocks until it returns its output. Poll with `subagent_status`, continue one with `send_subagent_message`, or end one with `stop_subagent`.
+- Use `isolation: "worktree"` when several subagents edit files in parallel so they don't clobber each other (needs a git workspace).
+- Don't pretend a subagent's result — actually read what it returned before acting on it, and synthesize for the user.
+
 ## Scheduling — Self-Managed Cron
 
 You can schedule your own future work with the `schedule_*` tools. Schedules persist on the Server and fire even when no CLI is connected; each fired job spawns a fresh run with the prompt and context you stored. Triggers are cron expressions (recurring), `at` (one-shot), or `every` (interval).
