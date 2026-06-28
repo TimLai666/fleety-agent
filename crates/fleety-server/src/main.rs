@@ -13,6 +13,7 @@ mod bridge;
 mod builtin_mcp;
 mod builtin_skills;
 mod conn;
+mod conversation_recall;
 mod gc;
 mod identity;
 mod mdns;

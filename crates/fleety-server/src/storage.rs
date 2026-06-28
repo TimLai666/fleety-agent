@@ -72,10 +72,12 @@ fn summarise_event(value: &Value) -> (String, Option<String>) {
     (kind, tool)
 }
 
-/// A persisted conversation event with its monotonic sequence number.
+/// A persisted conversation event with its monotonic sequence number and the
+/// wall-clock time it was written (`ts_secs == 0` for legacy lines without it).
 #[derive(Debug, Clone)]
 pub struct StoredEvent {
     pub seq: u64,
+    pub ts_secs: u64,
     pub message: Message,
 }
 
@@ -103,10 +105,15 @@ fn read_events(path: &Path) -> Result<Vec<StoredEvent>> {
             .get("seq")
             .and_then(Value::as_u64)
             .ok_or_else(|| CoreError::Message("conversation line missing 'seq'".to_string()))?;
+        let ts_secs = value.get("ts_secs").and_then(Value::as_u64).unwrap_or(0);
         let message: Message =
             serde_json::from_value(value.get("message").cloned().unwrap_or(Value::Null))
                 .map_err(|e| CoreError::Message(format!("corrupt conversation message: {e}")))?;
-        events.push(StoredEvent { seq, message });
+        events.push(StoredEvent {
+            seq,
+            ts_secs,
+            message,
+        });
     }
     Ok(events)
 }
@@ -254,6 +261,40 @@ impl Storage {
         v.get(conversation_id)
             .and_then(Value::as_str)
             .map(String::from)
+    }
+
+    /// List a user's conversation ids (the `.jsonl` stems under their dir).
+    pub fn user_conversation_ids(&self, user_id: &str) -> Vec<String> {
+        let dir = self
+            .home
+            .join("fleet")
+            .join("users")
+            .join(user_id)
+            .join("conversations");
+        let mut out = Vec::new();
+        if let Ok(entries) = fs::read_dir(&dir) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.extension().and_then(|x| x.to_str()) == Some("jsonl") {
+                    if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                        out.push(stem.to_string());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Read a user's conversation events directly from their user-primary path.
+    pub fn load_user_conversation(&self, user_id: &str, conversation_id: &str) -> Vec<StoredEvent> {
+        let path = self
+            .home
+            .join("fleet")
+            .join("users")
+            .join(user_id)
+            .join("conversations")
+            .join(format!("{conversation_id}.jsonl"));
+        read_events(&path).unwrap_or_default()
     }
 
     /// Record the owner of a conversation (idempotent — set once, on first use).
@@ -425,9 +466,14 @@ impl Storage {
             .lock()
             .map_err(|_| CoreError::Message("storage append lock poisoned".to_string()))?;
         let seq = read_events(&path)?.len() as u64 + 1;
+        let ts_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         // Record the device the event happened on (privacy model stores
-        // conversations user-primary; the device is "where", kept per event).
-        let record = serde_json::json!({ "seq": seq, "device_id": device_id, "message": message });
+        // conversations user-primary; the device is "where", kept per event) and
+        // the write time (for recall ordering / display; storage stays UTC).
+        let record = serde_json::json!({ "seq": seq, "ts_secs": ts_secs, "device_id": device_id, "message": message });
         let line = serde_json::to_string(&record)
             .map_err(|e| CoreError::Message(format!("serialize message failed: {e}")))?;
         let mut file = OpenOptions::new()
@@ -1242,6 +1288,35 @@ mod tests {
             .join("conversations")
             .join("k1.jsonl")
             .exists());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn conversation_events_carry_a_timestamp_backward_compatibly() {
+        let home = temp_home();
+        let storage = Storage::new(home.clone());
+        // New append carries a ts_secs > 0.
+        storage.append("dev", "c", &Message::user("hi")).unwrap();
+        let events = storage.load_after("dev", "c", 0).unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].ts_secs > 0, "new events are timestamped");
+        // A legacy line without ts_secs loads as 0 and replay stays in order.
+        let path = home
+            .join("fleet")
+            .join("devices")
+            .join("dev")
+            .join("conversations")
+            .join("c.jsonl");
+        let legacy = format!(
+            "{}\n{{\"seq\":2,\"message\":{}}}\n",
+            std::fs::read_to_string(&path).unwrap().trim(),
+            serde_json::to_string(&Message::assistant("old")).unwrap()
+        );
+        std::fs::write(&path, legacy).unwrap();
+        let events = storage.load_after("dev", "c", 0).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].seq, 2);
+        assert_eq!(events[1].ts_secs, 0, "legacy line → ts_secs 0");
         let _ = std::fs::remove_dir_all(&home);
     }
 

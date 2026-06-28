@@ -123,6 +123,16 @@ tools (`computer_*` GUI control / screenshots, a visible browser) only work when
 user is actually logged in — headless they fail with an actionable message rather
 than hanging.
 
+## Conversation recall
+
+The agent can search its **own user's** past conversations (per-user; conversations
+are user-primary). `conversation_search` (keyword) and `conversation_list` work
+with no model. `conversation_semantic_search` falls back to keyword in this build;
+embedding-ranked recall (a per-user vector index reusing the wiki's embedding
+model + sqlite-vec, gated by `FLEETY_WIKI_EMBED`, under `~/.fleety/agent/fleet/users/<id>/`)
+is a planned follow-up and upgrades that tool in place. Every result carries a
+timestamp (`ts_secs`, UTC) so time order is clear.
+
 ## Time & timezone
 
 Timestamps are **stored as Unix epoch (UTC)** everywhere — this never changes.

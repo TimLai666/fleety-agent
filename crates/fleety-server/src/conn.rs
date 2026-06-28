@@ -53,6 +53,7 @@ fn build_connection_stack(
     device_tools: &DeviceTools,
     policy: Policy,
     out: &Out,
+    acting: &crate::identity::ActingUser,
 ) -> (
     agent_core::ToolRegistry,
     Arc<crate::subagent::FleetyHost>,
@@ -67,6 +68,12 @@ fn build_connection_stack(
         handles,
         auth,
         device_tools,
+    );
+    // Conversation recall, scoped to the acting user (per-user history).
+    crate::conversation_recall::register(
+        &mut tools,
+        Arc::clone(storage),
+        acting.user_id().map(String::from),
     );
     let subagent_host = crate::subagent::FleetyHost::new(
         crate::providers::ProviderTiers::from_env(),
@@ -251,6 +258,9 @@ async fn serve(
     // level (subagent child registries omit them, capping nesting at one level).
     let server_host = server_hostname();
     let mut current_root: std::path::PathBuf = workspace.to_path_buf();
+    // Before the first message we don't yet know the acting user; default recall
+    // scope to the device owner (rebuilt with the resolved user on first message).
+    let connect_acting = storage.acting_for_device(device_id);
     let (mut tools, mut subagent_host, mut goal_state) = build_connection_stack(
         storage,
         &current_root,
@@ -262,6 +272,7 @@ async fn serve(
         device_tools,
         policy,
         out,
+        &connect_acting,
     );
     let mut workspace_bound = false;
     let goal_max_continues = goal_max_continues_from_env();
@@ -348,22 +359,25 @@ async fn serve(
                     if binding.device.is_none() && binding.root != current_root {
                         tracing::info!(root = %binding.root.display(), "rooting conversation workspace at the CLI's cwd");
                         current_root = binding.root.clone();
-                        let (t, h, g) = build_connection_stack(
-                            storage,
-                            &current_root,
-                            device_id,
-                            hub,
-                            pending,
-                            handles,
-                            auth,
-                            device_tools,
-                            policy,
-                            out,
-                        );
-                        tools = t;
-                        subagent_host = h;
-                        goal_state = g;
                     }
+                    // Rebuild the stack once with the resolved acting user (so
+                    // recall is scoped to them) and the chosen root.
+                    let (t, h, g) = build_connection_stack(
+                        storage,
+                        &current_root,
+                        device_id,
+                        hub,
+                        pending,
+                        handles,
+                        auth,
+                        device_tools,
+                        policy,
+                        out,
+                        &acting,
+                    );
+                    tools = t;
+                    subagent_host = h;
+                    goal_state = g;
                     workspace_bound = true;
                 }
 
