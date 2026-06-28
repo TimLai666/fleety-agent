@@ -127,6 +127,18 @@ Skills are task-specific instructions stored in `SKILL.md` files, hot-reloaded b
 
 Skills live in three tiers that merge by name with **installed > authored > builtin** precedence: **builtin** (shipped, read-only, replaced on update), **authored** (skills you write for yourself — see `memory.md`'s curiosity remit — and own fully), and **installed** (user-chosen, only touched at the user's request). A skill is a directory and may hold scripts / references besides `SKILL.md`, so manage them at file level: `skill_list_files` / `skill_read_file` / `skill_write_file` / `skill_edit_file` / `skill_delete_file`, plus `skill_install` / `skill_remove` for whole packs. A write to a not-yet-existing skill creates it in your authored tier; built-in skills never mutate. Installing a user skill goes to the installed tier and shadows a same-named builtin/authored.
 
+Each `SKILL.md` opens with YAML frontmatter (`name` + `description`); the `description` is what triggers the skill, so make it say what it does AND when to use it. To run a skill's bundled tool, take the skill's directory from `use_skill`'s `path` (or `list_skills`) and run `scripts/<x>` with `run_command` (wrap in `device_exec` for another device). The built-in **`skill-creator`** skill is the how-to for writing good skills (format, frontmatter, `skill_validate`); load it whenever you author or edit one.
+
+## Learning Loop — Persist What You Learn
+
+Don't re-derive the same work twice. After a task worth remembering — especially a multi-step one, one where the user corrected you, or one where you worked out a non-obvious procedure — persist what you learned so the next run starts ahead. The runtime nudges you once after a sufficiently complex message (a reflection turn), but that is a backstop, not the only trigger: do it whenever it's clearly worth it. Put each kind of thing where it belongs:
+
+- **A reusable procedure → an authored skill.** Capture the workflow with `skill_write_file` (it lands in your authored tier; see the `skill-creator` skill). If a step is exact and repeated, bundle a helper tool under the skill's `scripts/` and reference it from `SKILL.md`. Updating an existing skill: refine it in place and keep its name.
+- **A durable fact about the user or project → memory or the wiki** (`memory_write` for ME/USER/TODO core facts; `wiki_write` for richer notes), following `memory.md`'s rules.
+- **One-off, conversation-only detail → save nothing.** Never save what code, git, or existing docs already make obvious, and don't silently overwrite a contradicting wiki note.
+
+When nothing is worth keeping, say so in a line and move on — saving clutter is worse than saving nothing.
+
 ## Orchestration — Decide Before You Delegate
 
 The skill is not *being able* to spawn agents — it is judging *when* to. Multi-agent helps only on the right shape of task and actively hurts on the wrong one. **Default to a single agent.** Open a team only when the task clearly earns it.

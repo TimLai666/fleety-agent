@@ -389,7 +389,9 @@ impl Tool for UseSkill {
         ToolSpec {
             name: "use_skill".to_string(),
             description: "Load a skill's SKILL.md instructions by name; follow them for the \
-                 current task. (Read other files in the skill with skill_read_file.)"
+                 current task. Also returns the skill's `path` (its directory), so you can run a \
+                 bundled `scripts/` tool via run_command on an absolute path. (Read other files in \
+                 the skill with skill_read_file.)"
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -409,7 +411,14 @@ impl Tool for UseSkill {
             .ok_or_else(|| CoreError::ToolNotFound(format!("skill '{name}'")))?;
         let content = std::fs::read_to_string(&info.path)
             .map_err(|e| CoreError::Message(format!("cannot read skill '{name}': {e}")))?;
-        Ok(json!({ "name": name, "source": info.source, "content": content }))
+        // The skill's directory (SKILL.md's parent), so the agent can run a
+        // bundled `scripts/` tool via run_command using an absolute path.
+        let dir = info
+            .path
+            .parent()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        Ok(json!({ "name": name, "source": info.source, "path": dir, "content": content }))
     }
 }
 
@@ -1259,6 +1268,33 @@ mod tests {
         // Neither name nor content is an actionable error.
         assert!(reg.call("skill_validate", json!({})).await.is_err());
 
+        for d in [&b, &a, &i] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[tokio::test]
+    async fn use_skill_returns_path() {
+        let (b, a, i) = (temp(), temp(), temp());
+        write_skill(
+            &a,
+            "demo",
+            "---\nname: demo\ndescription: A demo skill that does a thing; use when demoing.\n---\n\n# Demo\n\nsteps\n",
+        );
+        let mut reg = ToolRegistry::new();
+        register(&mut reg, &b, &a, &i);
+        let used = reg
+            .call("use_skill", json!({ "name": "demo" }))
+            .await
+            .expect("use");
+        // New `path` field points at the skill's directory, alongside the
+        // unchanged name/source/content.
+        assert_eq!(used["source"], json!("authored"));
+        assert!(used["path"].as_str().unwrap_or_default().contains("demo"));
+        assert!(used["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("# Demo"));
         for d in [&b, &a, &i] {
             let _ = std::fs::remove_dir_all(d);
         }

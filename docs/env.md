@@ -18,6 +18,7 @@ Grouped by which binary cares about it. Anything unset uses the default.
 | `FLEETY_SYSTEM_PROMPT` | (unset → full) | `minimal` drops the embedded behavioural docs (protocol/rules/memory/policy) from the system message, leaving only core memory (ME/USER/TODO) — for token-lean / debugging runs. |
 | `FLEETY_SUBAGENT_MAX_CONCURRENT` | `4` | Max background subagents running at once per connection. A spawn past the cap errors rather than queueing. Clamped to a floor of 1. |
 | `FLEETY_GOAL_MAX_CONTINUES` | `8` | Max automatic goal continuations per user message. When the agent sets a goal (`set_goal`) and a turn ends without `complete_goal`/`ask_user`, the drive-to-goal loop re-engages it; this caps how many extra turns it may run before stopping and reporting the goal may be incomplete. Clamped to a floor of 1. |
+| `FLEETY_SKILL_REFLECT_MIN_STEPS` | `5` | Tool-step threshold above which a completed user message triggers one learning-loop reflection turn (the agent is prompted to save a reusable procedure as an authored skill and durable facts to memory/wiki). Below the threshold nothing runs; `0` disables reflection entirely. |
 
 ## Model provider
 

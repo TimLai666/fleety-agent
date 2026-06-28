@@ -223,6 +223,7 @@ async fn serve(
     let goal_state = Arc::new(tokio::sync::Mutex::new(GoalState::new()));
     agent_core::register_goal_tools(&mut tools, Arc::clone(&goal_state));
     let goal_max_continues = goal_max_continues_from_env();
+    let skill_reflect_min_steps = skill_reflect_min_steps_from_env();
 
     while let Some(msg) = read_client(rx).await? {
         match msg {
@@ -288,7 +289,7 @@ async fn serve(
                     out: out.clone(),
                     rx,
                 };
-                drive_to_goal(
+                let steps = drive_to_goal(
                     out,
                     storage,
                     provider,
@@ -301,6 +302,21 @@ async fn serve(
                     &goal_state,
                     goal_max_continues,
                     voice,
+                )
+                .await?;
+                // Learning loop: after a sufficiently complex message, prompt the
+                // agent once to persist a skill / memory of what it learned.
+                maybe_reflect(
+                    out,
+                    storage,
+                    provider,
+                    &tools,
+                    policy,
+                    device_id,
+                    &conversation,
+                    &mut gate,
+                    steps,
+                    skill_reflect_min_steps,
                 )
                 .await?;
             }
@@ -522,6 +538,8 @@ pub(crate) struct TurnReply {
     /// Spoken-version text when voice mode is on and the model produced one;
     /// emitted only on the terminal turn.
     pub speech: Option<String>,
+    /// Provider steps taken this turn (a complexity proxy for the learning loop).
+    pub steps: usize,
 }
 
 /// Default cap on automatic goal continuations per user message; override with
@@ -535,6 +553,20 @@ pub fn goal_max_continues_from_env() -> u32 {
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(DEFAULT_GOAL_MAX_CONTINUES)
         .max(1)
+}
+
+/// Default tool-step threshold above which a completed user message triggers one
+/// learning-loop reflection turn; override with `FLEETY_SKILL_REFLECT_MIN_STEPS`
+/// (0 disables reflection).
+pub const DEFAULT_SKILL_REFLECT_MIN_STEPS: usize = 5;
+
+/// Read the configured reflection step threshold (0 disables; a parse failure
+/// falls back to the default).
+pub fn skill_reflect_min_steps_from_env() -> usize {
+    std::env::var("FLEETY_SKILL_REFLECT_MIN_STEPS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_SKILL_REFLECT_MIN_STEPS)
 }
 
 /// Drive a single user message to its goal: run a turn, and while a goal is
@@ -559,11 +591,12 @@ pub(crate) async fn drive_to_goal(
     goal_state: &Arc<tokio::sync::Mutex<GoalState>>,
     max_continues: u32,
     voice: bool,
-) -> Result<()> {
+) -> Result<usize> {
     // Fresh goal state for this user message.
     *goal_state.lock().await = GoalState::new();
     let mut next_msg = user_msg;
     let mut continues: u32 = 0;
+    let mut total_steps: usize = 0;
     loop {
         // Run silently; whether this turn is terminal is only known afterward.
         // Each turn runs with the message's voice flag so the terminal turn can
@@ -582,6 +615,7 @@ pub(crate) async fn drive_to_goal(
             voice,
         )
         .await?;
+        total_steps += turn.steps;
         let (active, terminal) = {
             let mut g = goal_state.lock().await;
             (g.is_active(), g.take_terminal())
@@ -615,7 +649,7 @@ pub(crate) async fn drive_to_goal(
                     conversation_id: conversation.to_string(),
                 },
             )?;
-            return Ok(());
+            return Ok(total_steps);
         }
         // Premature stop under the cap: nudge and run another turn.
         continues += 1;
@@ -679,6 +713,7 @@ pub(crate) async fn drive_turn(
     for event in events.events() {
         storage.append_history(device_id, event)?;
     }
+    let steps = outcome.steps;
     let reply = outcome.output;
     let speech = outcome.speech;
     let seq = storage.append(device_id, conversation, &Message::assistant(reply.clone()))?;
@@ -700,7 +735,58 @@ pub(crate) async fn drive_turn(
             },
         )?;
     }
-    Ok(TurnReply { reply, seq, speech })
+    Ok(TurnReply {
+        reply,
+        seq,
+        speech,
+        steps,
+    })
+}
+
+/// Run one reflection turn after a sufficiently complex user message: prompt the
+/// agent to persist a reusable procedure as an authored skill and durable facts
+/// to memory/wiki. Runs at most once, only when `min_steps > 0 && steps >=
+/// min_steps`; it is a plain single turn (no goal, voice off, `emit_terminal`),
+/// so it never recurses into another reflection. A no-op otherwise.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn maybe_reflect(
+    out: &Out,
+    storage: &Arc<Storage>,
+    provider: &dyn ModelProvider,
+    tools: &ToolRegistry,
+    policy: Policy,
+    device_id: &str,
+    conversation: &str,
+    gate: &mut dyn agent_core::ApprovalGate,
+    steps: usize,
+    min_steps: usize,
+) -> Result<()> {
+    if min_steps == 0 || steps < min_steps {
+        return Ok(());
+    }
+    let seed = "[learning-loop] That was a multi-step task. If it contained a reusable procedure \
+        worth keeping, save or update an authored skill for it (skill_write_file; put any helper \
+        tool in scripts/ and reference it from SKILL.md). If you learned durable facts about the \
+        user or project, record them with memory_write or the wiki. Skip anything one-off or \
+        already obvious from code/git. Reply in one short line with what you saved, or that there \
+        was nothing worth saving — do not redo the task.";
+    drive_turn(
+        out,
+        storage,
+        provider,
+        tools,
+        policy,
+        device_id,
+        conversation,
+        Message::user(seed),
+        gate,
+        // Emit the one-line result (it may write skills/memory — surface that),
+        // and never voice.
+        true,
+        false,
+    )
+    .await?;
+    Ok(())
 }
 
 fn emit(out: &Out, msg: &ServerMsg) -> Result<()> {
@@ -1368,6 +1454,113 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].0, "hi");
         assert_eq!(frames[0].1, None);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    // ---- learning-loop reflection tests ---------------------------------------
+
+    #[test]
+    fn reflect_threshold_env_default() {
+        // Unset → default; 0 disables (read by the env helper).
+        assert_eq!(
+            skill_reflect_min_steps_from_env(),
+            DEFAULT_SKILL_REFLECT_MIN_STEPS
+        );
+    }
+
+    #[tokio::test]
+    async fn drive_to_goal_returns_step_count() {
+        // A single-shot message reports at least one provider step.
+        let (storage, tools, goal_state, home, out, mut rx) = goal_env();
+        let provider = MockProvider::new(vec![text_resp("hi")]);
+        let mut gate = agent_core::AutoApprove;
+        let steps = drive_to_goal(
+            &out,
+            &storage,
+            &provider,
+            &tools,
+            Policy::FullAccess,
+            "dev",
+            "c1",
+            Message::user("hello"),
+            &mut gate,
+            &goal_state,
+            5,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(steps >= 1, "a completed turn reports its step count");
+        let _ = drain(&mut rx);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn reflection_fires_once_when_over_threshold() {
+        // steps >= min_steps → exactly one reflection turn (the provider has only
+        // one scripted reply, so a second turn would exhaust it and error).
+        let (storage, tools, _goal, home, out, mut rx) = goal_env();
+        let provider = MockProvider::new(vec![text_resp("saved skill: triage")]);
+        let mut gate = agent_core::AutoApprove;
+        maybe_reflect(
+            &out,
+            &storage,
+            &provider,
+            &tools,
+            Policy::FullAccess,
+            "dev",
+            "c1",
+            &mut gate,
+            5,
+            5,
+        )
+        .await
+        .unwrap();
+        let (dones, texts) = terminal_frames(&drain(&mut rx));
+        assert_eq!(dones, 1, "exactly one reflection turn ran");
+        assert_eq!(texts, vec!["saved skill: triage".to_string()]);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn reflection_skipped_under_threshold_or_disabled() {
+        // No scripted replies: if any reflection turn ran it would error, so the
+        // calls succeeding proves nothing ran.
+        let (storage, tools, _goal, home, out, mut rx) = goal_env();
+        let provider = MockProvider::new(vec![]);
+        let mut gate = agent_core::AutoApprove;
+        // Below threshold.
+        maybe_reflect(
+            &out,
+            &storage,
+            &provider,
+            &tools,
+            Policy::FullAccess,
+            "dev",
+            "c1",
+            &mut gate,
+            3,
+            5,
+        )
+        .await
+        .unwrap();
+        // Disabled (min_steps == 0), even with a high step count.
+        maybe_reflect(
+            &out,
+            &storage,
+            &provider,
+            &tools,
+            Policy::FullAccess,
+            "dev",
+            "c1",
+            &mut gate,
+            99,
+            0,
+        )
+        .await
+        .unwrap();
+        let (dones, _) = terminal_frames(&drain(&mut rx));
+        assert_eq!(dones, 0, "no reflection turn ran");
         let _ = std::fs::remove_dir_all(home);
     }
 

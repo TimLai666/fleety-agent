@@ -339,7 +339,7 @@ it; a write to a skill that doesn't exist yet lands in **authored**.
 | Tool | Purpose | Key inputs | Risk |
 |---|---|---|---|
 | `list_skills` | List skills; each carries `source: "builtin" \| "authored" \| "installed"` and its `path`. | — | read |
-| `use_skill` | Load a skill's `SKILL.md`; follow it for the current task. | `name` | read |
+| `use_skill` | Load a skill's `SKILL.md`; follow it for the current task. Also returns the skill's `path` (its directory) — run a bundled `scripts/<x>` tool with `run_command` on that absolute path (wrap in `device_exec` for another device). | `name` | read |
 | `skill_validate` | Check a SKILL.md against the Agent Skills format — pass `content` (a draft) or `name` (existing). Returns `ok` + `issues` (error/warning): missing YAML frontmatter, missing/invalid `name` (≤64, lowercase/digits/hyphens, no `anthropic`/`claude`) or `description` (non-empty, ≤1024), over-long body, or a `name` not matching the directory. | one of `name`/`content` | read |
 | `skill_install` | Install/replace a **user** skill into the installed tier (only when the user asks). Body from `content`, `from_url` (public hosts, SSRF-guarded), or `from_path` (local SKILL.md / whole skill dir). | `name`, one of `content`/`from_url`/`from_path` | mutate |
 | `skill_remove` | Remove a whole skill. Authored: free. Installed: only at user request. Builtin: refused (shadow it instead). | `name` | mutate |
