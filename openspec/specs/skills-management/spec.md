@@ -8,51 +8,31 @@ TBD - created by archiving change 'baseline-tool-surface-specs'. Update Purpose 
 
 ### Requirement: Three-tier skill store
 
-The system SHALL load `SKILL.md` skill packs from three tiers — builtin (shipped, read-only), authored (written by the agent itself), and installed (user-chosen) — merging by name with precedence installed over authored over builtin. `list_skills` SHALL report each skill's `source` and on-disk `path`; `use_skill` SHALL return a skill's full contents.
+The system SHALL load `SKILL.md` skill packs from three tiers — builtin (shipped, read-only), authored (written by the agent itself), and installed (user-chosen) — merging by name with precedence installed over authored over builtin. `list_skills` SHALL report each skill's `source` and on-disk `path`; `use_skill` SHALL return a skill's full contents AND its on-disk `path` (the skill's directory), so the agent can run a tool script the skill stores under `scripts/` via the command-execution tool.
 
 #### Scenario: installed shadows builtin
 
 - **WHEN** an installed skill and a builtin skill share a name and `list_skills` is called
 - **THEN** the entry's `source` is `installed` and its `path` points at the installed copy
 
+#### Scenario: use_skill returns the skill path
+
+- **WHEN** `use_skill` loads a skill
+- **THEN** the result includes the skill's directory `path` alongside its contents
+
 
 <!-- @trace
-source: baseline-tool-surface-specs
+source: skill-learning-loop
 updated: 2026-06-28
 code:
-  - .agents/skills/spectra-commit/SKILL.md
-  - .opencode/skills/spectra-commit/SKILL.md
-  - CLAUDE.md
-  - .agents/skills/spectra-ingest/SKILL.md
-  - .agents/skills/spectra-debug/SKILL.md
-  - .opencode/skills/spectra-audit/SKILL.md
-  - .spectra.yaml
-  - .opencode/skills/spectra-ask/SKILL.md
-  - .opencode/commands/spectra-drift.md
-  - .opencode/skills/spectra-propose/SKILL.md
-  - AGENTS.md
-  - .opencode/skills/spectra-discuss/SKILL.md
-  - .agents/skills/spectra-propose/SKILL.md
-  - .agents/skills/spectra-archive/SKILL.md
-  - .agents/skills/spectra-apply/SKILL.md
-  - .agents/skills/spectra-ask/SKILL.md
-  - .opencode/commands/spectra-discuss.md
-  - .opencode/commands/spectra-ingest.md
-  - .opencode/skills/spectra-apply/SKILL.md
-  - .opencode/skills/spectra-archive/SKILL.md
-  - .opencode/commands/spectra-propose.md
-  - .opencode/skills/spectra-drift/SKILL.md
-  - .opencode/commands/spectra-archive.md
-  - .agents/skills/spectra-audit/SKILL.md
-  - .opencode/commands/spectra-audit.md
-  - .opencode/commands/spectra-apply.md
-  - .opencode/skills/spectra-ingest/SKILL.md
-  - .opencode/commands/spectra-ask.md
-  - .opencode/commands/spectra-debug.md
-  - .agents/skills/spectra-discuss/SKILL.md
-  - .opencode/skills/spectra-debug/SKILL.md
-  - .opencode/commands/spectra-commit.md
-  - .agents/skills/spectra-drift/SKILL.md
+  - docs/env.md
+  - prompts/protocol.md
+  - prompts/rules.md
+  - crates/fleety-server/builtin-skills/skill-creator/SKILL.md
+  - crates/fleety-server/src/skills.rs
+  - crates/fleety-server/src/conn.rs
+  - docs/tools.md
+  - crates/fleety-server/src/builtin_skills.rs
 -->
 
 ---
