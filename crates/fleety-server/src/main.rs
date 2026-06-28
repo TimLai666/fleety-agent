@@ -30,6 +30,7 @@ mod mcp;
 mod providers;
 mod scheduler;
 mod schedules;
+mod service;
 mod sites;
 mod skills;
 mod ssh;
@@ -39,6 +40,8 @@ mod tools;
 mod web;
 mod wiki;
 mod wiki_embed;
+#[cfg(windows)]
+mod winsvc;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -82,9 +85,114 @@ fn policy_from_env() -> agent_core::Policy {
     }
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     obs::init();
+    let cmd = std::env::args().nth(1);
+
+    // On Windows, `run-service` is the SCM entry point and must speak the service
+    // control protocol on this thread, before any tokio runtime exists.
+    #[cfg(windows)]
+    if cmd.as_deref() == Some("run-service") {
+        if let Err(e) = winsvc::dispatch() {
+            tracing::error!(
+                %e,
+                "windows service dispatcher failed; `run-service` only works when started by \
+                 the Service Control Manager (use `fleety-server start` after `install`)"
+            );
+        }
+        return;
+    }
+
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            tracing::error!(%e, "cannot start tokio runtime");
+            return;
+        }
+    };
+    rt.block_on(async_main(cmd));
+}
+
+/// Log the outcome of a one-shot lifecycle verb.
+fn log_action(name: &str, res: agent_core::Result<()>) {
+    if let Err(e) = res {
+        tracing::error!(report = ?e.report(), "{name} failed");
+    }
+}
+
+/// Resolve when the server should stop cleanly: Ctrl+C anywhere, plus SIGTERM on
+/// Unix (service stop) or the external `shutdown` watch on Windows (SCM Stop).
+async fn wait_stop(shutdown: Option<tokio::sync::watch::Receiver<bool>>) {
+    #[cfg(unix)]
+    {
+        let _ = &shutdown;
+        let mut term =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = async {
+                match term.as_mut() {
+                    Some(t) => { t.recv().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        match shutdown {
+            Some(mut rx) => {
+                if *rx.borrow() {
+                    return;
+                }
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    changed = rx.changed() => { let _ = changed; }
+                }
+            }
+            None => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+}
+
+async fn async_main(cmd: Option<String>) {
+    // Service lifecycle subcommands (install/uninstall/start/stop/restart/
+    // enable/disable/status/up/down) act on the manager and exit.
+    if let Some(action) = cmd.as_deref().and_then(service::action_from_arg) {
+        log_action(cmd.as_deref().unwrap_or("?"), service::run(action));
+        return;
+    }
+
+    // Service mode (non-Windows run-service) claims the single-instance pidfile;
+    // foreground dev runs do not. On Windows the service path goes through winsvc.
+    let service_mode = cmd.as_deref() == Some("run-service");
+    let _pid_guard = if service_mode {
+        match fleety_tools::service::acquire("fleety-server") {
+            Ok(fleety_tools::service::Acquire::Started(g)) => Some(g),
+            Ok(fleety_tools::service::Acquire::AlreadyRunning(pid)) => {
+                tracing::error!(pid, "another fleety-server is already running; exiting");
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(report = ?e.report(), "pidfile check failed; continuing without it");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    run_server(None).await;
+}
+
+/// Run the server until a stop signal. `shutdown` is the optional external stop
+/// (Windows SCM); Ctrl+C and Unix SIGTERM are always honored (see [`wait_stop`]).
+async fn run_server(shutdown: Option<tokio::sync::watch::Receiver<bool>>) {
     // Stamp the start time once so uptime reflects boot, not first status query.
     let _ = server_start();
     let addr = std::env::var("FLEETY_ADDR").unwrap_or_else(|_| "127.0.0.1:8787".to_string());
@@ -189,7 +297,7 @@ async fn main() {
 
     loop {
         let accept = listener.accept();
-        let stop = tokio::signal::ctrl_c();
+        let stop = wait_stop(shutdown.clone());
         tokio::select! {
             accepted = accept => {
                 let (stream, peer) = match accepted {
@@ -230,7 +338,7 @@ async fn main() {
                 });
             }
             _ = stop => {
-                tracing::info!("Ctrl+C received; closing listener and shutting down");
+                tracing::info!("stop signal received; closing listener and shutting down");
                 // Drop the listener so no new connections come in. In-flight
                 // connections finish their current turn (the journal protects
                 // anything they're mid-step on if they don't).

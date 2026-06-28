@@ -86,10 +86,37 @@ last fallback when no URL is configured.
 | `FLEETY_TOKEN` | (unset, then `~/.fleety/fleetyd.token`) | Auth token. fleetyd persists a freshly-paired one to `~/.fleety/fleetyd.token`; this env var overrides. |
 | `FLEETY_PAIRING_CODE` | (unset) | Pass once to enroll a new device; server mints a token in `Welcome`, fleetyd writes it to disk. |
 
+## Background service lifecycle (`fleetyd` and `fleety-server`)
+
+Both binaries run as a background OS service (no window, survive the terminal
+closing, single-instance) via the platform service manager — **systemd `--user`**
+(Linux), **launchd LaunchAgent** (macOS), the **Service Control Manager**
+(Windows). CLI verbs map to the manager:
+
+| Verb | Meaning |
+|---|---|
+| `install` / `uninstall` | register / remove the service. `fleety-server install` also enables boot autostart by default; `fleetyd install` leaves autostart off until `enable`. On Windows, install/uninstall need a one-time **Administrator** terminal. |
+| `start` / `stop` / `restart` | run now / stop now / restart. `restart` (and self-update) is **deferred until idle** so it never interrupts an in-flight turn (fleety-server) or a running on-device tool (fleetyd); a deadline (~300 s) and cooldown (~30 s) bound the wait. |
+| `enable` / `disable` | turn boot/login autostart on / off (without uninstalling or stopping the current run). |
+| `status` | report whether it is running and whether autostart is on. |
+| `up` / `down` (`fleety-server` only) | `up` = install + enable + start (one command, `docker compose up -d` style); `down` = stop. |
+| `run-service` | internal: the entry point the manager starts (SCM service mode on Windows). Not for manual use. |
+
+Running with no subcommand keeps the old foreground behavior (dev): runs in the
+terminal, stops on Ctrl+C.
+
+**Windows notes:** the service runs even with **no user logged in** (`start= auto`,
+boot-start). But it runs in **session 0 (no interactive desktop)**, so desktop-bound
+tools (`computer_*` GUI control / screenshots, a visible browser) only work when a
+user is actually logged in — headless they fail with an actionable message rather
+than hanging.
+
 ## Self-update polling (`fleetyd` background loop)
 
 24h periodic check of the release manifest. Only spawns when a manifest URL is
-set; without `FLEETY_AUTO_UPDATE=apply` it's notify-only (log a warning).
+set; without `FLEETY_AUTO_UPDATE=apply` it's notify-only (log a warning). When
+`apply` installs a new binary, the service restarts itself (deferred until idle)
+to run it; `fleetyd update` (one-shot) restarts the installed service the same way.
 
 | Var | Default | Meaning |
 |---|---|---|

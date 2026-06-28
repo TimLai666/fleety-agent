@@ -1,18 +1,24 @@
 //! fleetyd — the Fleety device background service.
 //!
-//! Connects to the Agent on startup (registering this device) and holds the
-//! connection open. `fleetyd install`/`uninstall` set up OS autostart. Heartbeat
-//! is handled by WebSocket control frames; reconnect/backoff and on-device tool
-//! execution are later milestones.
+//! Connects to the Agent on startup (registering this device) and stays
+//! connected across drops and device sleep via an exponential-backoff reconnect
+//! loop. Runs as a background OS service (systemd `--user` / launchd / Windows
+//! SCM) controlled by the `install`/`start`/`stop`/`restart`/`enable`/`disable`/
+//! `status` subcommands; single-instance via a pidfile in service mode. A clean
+//! stop (Ctrl+C, SIGTERM, or SCM Stop) shuts down gracefully between frames, and
+//! a self-update restarts the service when idle.
 #![forbid(unsafe_code)]
 #![warn(clippy::unwrap_used, clippy::expect_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+mod backoff;
 mod ondevice;
 mod poll_updates;
 mod provision;
 mod service;
 mod update;
+#[cfg(windows)]
+mod winsvc;
 
 use std::path::PathBuf;
 
@@ -66,11 +72,43 @@ fn clear_saved_token() {
     }
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     obs::init();
-    // Subcommands: `install` / `uninstall` configure OS autostart, then exit.
-    match std::env::args().nth(1).as_deref() {
+    let cmd = std::env::args().nth(1);
+
+    // On Windows, `run-service` is the SCM entry point: it must talk the service
+    // control protocol on this thread (not under a tokio runtime), so handle it
+    // before building one. The dispatcher blocks until the service stops and runs
+    // the daemon on its own runtime (see winsvc).
+    #[cfg(windows)]
+    if cmd.as_deref() == Some("run-service") {
+        if let Err(e) = winsvc::dispatch() {
+            tracing::error!(
+                %e,
+                "windows service dispatcher failed; `run-service` only works when started \
+                 by the Service Control Manager (use `fleetyd start` after `fleetyd install`)"
+            );
+        }
+        return;
+    }
+
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            tracing::error!(%e, "cannot start tokio runtime");
+            return;
+        }
+    };
+    rt.block_on(async_main(cmd));
+}
+
+async fn async_main(cmd: Option<String>) {
+    // Lifecycle subcommands act on the OS service manager and exit; `run-service`
+    // and no subcommand fall through to actually run the daemon.
+    match cmd.as_deref() {
         Some("install") => {
             if let Err(e) = service::install() {
                 tracing::error!(report = ?e.report(), "install failed");
@@ -87,9 +125,28 @@ async fn main() {
             }
             return;
         }
+        Some("start") => return log_verb("start", service::start()),
+        Some("stop") => return log_verb("stop", service::stop()),
+        Some("restart") => return log_verb("restart", service::restart()),
+        Some("enable") => return log_verb("enable", service::enable()),
+        Some("disable") => return log_verb("disable", service::disable()),
+        Some("status") => return log_verb("status", service::status()),
         Some("update") => {
-            if let Err(e) = update::update().await {
-                tracing::error!(report = ?e.report(), "update failed");
+            match update::update().await {
+                Ok(true) => {
+                    // We swapped the binary; restart the installed service (best
+                    // effort) so it runs the new exe. The manager stop is graceful
+                    // (SIGTERM / SCM Stop handled between frames).
+                    if let Err(e) = service::restart() {
+                        tracing::warn!(
+                            report = ?e.report(),
+                            "updated, but could not restart the service automatically — \
+                             restart fleetyd to apply"
+                        );
+                    }
+                }
+                Ok(false) => {}
+                Err(e) => tracing::error!(report = ?e.report(), "update failed"),
             }
             // Refresh the data-analysis sidecar alongside fleetyd (best-effort).
             if let Err(e) = provision::ensure_insyra(true).await {
@@ -99,13 +156,83 @@ async fn main() {
         }
         _ => {}
     }
+
+    // Service mode (non-Windows run-service) claims the single-instance pidfile
+    // (defense-in-depth on top of the manager); foreground dev runs do not, so a
+    // developer can run one alongside an installed service. On Windows the
+    // service path goes through winsvc, which claims the pidfile itself.
+    let service_mode = cmd.as_deref() == Some("run-service");
+    let _pid_guard = if service_mode {
+        match fleety_tools::service::acquire("fleetyd") {
+            Ok(fleety_tools::service::Acquire::Started(g)) => Some(g),
+            Ok(fleety_tools::service::Acquire::AlreadyRunning(pid)) => {
+                tracing::error!(pid, "another fleetyd is already running; exiting");
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(report = ?e.report(), "pidfile check failed; continuing without it");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     tracing::info!(version = agent_core::VERSION, "fleetyd starting");
     // Best-effort background update poller (no-op when the user hasn't set
     // FLEETY_UPDATE_MANIFEST — keeps the existing dev/install posture).
     poll_updates::spawn();
-    if let Err(e) = run().await {
+    if let Err(e) = run(None).await {
         tracing::error!(report = ?e.report(), "fleetyd exited with error");
     }
+}
+
+/// Log the outcome of a one-shot lifecycle verb (used by the CLI arms).
+fn log_verb(verb: &str, res: Result<()>) {
+    if let Err(e) = res {
+        tracing::error!(report = ?e.report(), "{verb} failed");
+    }
+}
+
+/// Process-wide pending restart (set by the auto-update poller). The serve loop
+/// checks it at each frame boundary — where the daemon is idle — and carries it
+/// out via [`fleety_tools::restart`]'s defer-until-idle policy, so a self-update
+/// never interrupts a running on-device tool.
+fn pending_restart() -> &'static std::sync::Mutex<Option<fleety_tools::restart::PendingRestart>> {
+    static P: std::sync::OnceLock<std::sync::Mutex<Option<fleety_tools::restart::PendingRestart>>> =
+        std::sync::OnceLock::new();
+    P.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Record a deferred self-restart (idempotent while one is already pending).
+pub(crate) fn request_self_restart(reason: &str) {
+    if let Ok(mut g) = pending_restart().lock() {
+        if g.is_none() {
+            *g = Some(fleety_tools::restart::PendingRestart::new(
+                reason,
+                false,
+                std::time::Instant::now(),
+            ));
+            tracing::info!(reason, "self-restart requested; will restart when idle");
+        }
+    }
+}
+
+/// At an idle frame boundary, decide whether a pending restart is due. Consumes
+/// it and returns true when the daemon should restart now.
+fn restart_due_at_idle() -> bool {
+    use fleety_tools::restart::{decide, Decision};
+    let Ok(mut g) = pending_restart().lock() else {
+        return false;
+    };
+    if let Some(p) = g.as_ref() {
+        // We're between frames here, so the daemon is idle.
+        if decide(p, true, None, std::time::Instant::now()) == Decision::RestartNow {
+            *g = None;
+            return true;
+        }
+    }
+    false
 }
 
 fn agent_url() -> String {
@@ -156,11 +283,110 @@ fn device_id() -> String {
         .unwrap_or_else(|_| "fleetyd-device".to_string())
 }
 
-async fn run() -> Result<()> {
-    let url = agent_url();
-    let (ws, _) = tokio_tungstenite::connect_async(&url)
+/// What ended one connected session.
+enum Outcome {
+    /// A clean shutdown signal (Ctrl+C / service Stop) — exit the process.
+    Shutdown,
+    /// The link dropped (disconnect/sleep) — the caller should reconnect.
+    Disconnected,
+}
+
+type WsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Outer reconnect loop: stay connected across transient drops and device
+/// sleep. Exits only on a clean shutdown signal; everything else reconnects
+/// with exponential backoff (reset after a successful connect). `shutdown` is an
+/// optional external stop (set by the Windows service control handler); a clean
+/// stop is also delivered by Ctrl+C and, on Unix, SIGTERM (so `systemctl stop`
+/// is graceful).
+async fn run(shutdown: Option<tokio::sync::watch::Receiver<bool>>) -> Result<()> {
+    let mut bo = backoff::Backoff::new();
+    loop {
+        let url = agent_url();
+        match connect_once(&url).await {
+            Ok(ws) => {
+                bo.reset();
+                match serve(&url, ws, shutdown.clone()).await {
+                    Outcome::Shutdown => return Ok(()),
+                    Outcome::Disconnected => {
+                        tracing::info!("fleetyd disconnected; will reconnect");
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(report = ?e.report(), "connect failed; will retry");
+            }
+        }
+        let delay =
+            backoff::with_jitter(bo.next_base(), backoff::JITTER_FRAC, backoff::jitter_unit());
+        tracing::info!(?delay, "waiting before reconnect");
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => {}
+            _ = wait_stop(shutdown.clone()) => {
+                tracing::info!("stop signal received during backoff; shutting down fleetyd");
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Resolve when the process should stop cleanly: Ctrl+C on any platform, plus
+/// SIGTERM on Unix (service stop) or the external `shutdown` watch on Windows
+/// (SCM Stop). Used in every place the daemon waits.
+async fn wait_stop(shutdown: Option<tokio::sync::watch::Receiver<bool>>) {
+    #[cfg(unix)]
+    {
+        let _ = &shutdown;
+        let mut term =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = async {
+                match term.as_mut() {
+                    Some(t) => {
+                        t.recv().await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        match shutdown {
+            Some(mut rx) => {
+                if *rx.borrow() {
+                    return;
+                }
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    changed = rx.changed() => {
+                        let _ = changed;
+                    }
+                }
+            }
+            None => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+}
+
+async fn connect_once(url: &str) -> Result<WsStream> {
+    let (ws, _) = tokio_tungstenite::connect_async(url)
         .await
         .map_err(|e| CoreError::Provider(format!("cannot connect to {url}: {e}")))?;
+    Ok(ws)
+}
+
+/// Run one connected session: send Hello, then serve frames until the link
+/// drops or a shutdown signal arrives.
+async fn serve(
+    url: &str,
+    ws: WsStream,
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Outcome {
     let (mut tx, mut rx) = ws.split();
 
     // Token precedence: env override > on-disk persisted token > pairing flow.
@@ -177,32 +403,55 @@ async fn run() -> Result<()> {
     // invoke here — without this, the server has to guess (or hardcode).
     let local_tools_json = serde_json::to_string(&registry.specs()).ok();
 
-    let hello = serde_json::to_string(&ClientMsg::Hello {
+    let hello = match serde_json::to_string(&ClientMsg::Hello {
         device_id: device_id(),
         protocol: PROTOCOL_VERSION,
         token,
         pairing_code,
         local_tools_json,
-    })
-    .map_err(|e| CoreError::Message(format!("serialize hello: {e}")))?;
-    tx.send(WsMessage::Text(hello))
-        .await
-        .map_err(|e| CoreError::Provider(format!("send hello failed: {e}")))?;
+    }) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!(%e, "could not serialize hello; will reconnect");
+            return Outcome::Disconnected;
+        }
+    };
+    if let Err(e) = tx.send(WsMessage::Text(hello)).await {
+        tracing::warn!(%e, "send hello failed; will reconnect");
+        return Outcome::Disconnected;
+    }
     tracing::info!(%url, "connected; holding connection");
     loop {
+        // Idle frame boundary: carry out a deferred self-restart (auto-update)
+        // here so it never interrupts a tool that's mid-execution.
+        if restart_due_at_idle() {
+            tracing::info!("applying deferred restart now (idle); restarting service");
+            let _ = tx.close().await;
+            if let Err(e) = service::restart() {
+                tracing::warn!(report = ?e.report(), "could not restart service for update");
+            }
+            return Outcome::Shutdown;
+        }
         let next = tokio::select! {
             frame = rx.next() => frame,
-            _ = tokio::signal::ctrl_c() => {
-                tracing::info!("Ctrl+C received; sending Close and shutting down fleetyd");
+            _ = wait_stop(shutdown.clone()) => {
+                tracing::info!("stop signal received; sending Close and shutting down fleetyd");
                 let _ = tx.close().await;
-                return Ok(());
+                return Outcome::Shutdown;
             }
         };
-        let Some(frame) = next else { break };
-        let frame =
-            frame.map_err(|e| CoreError::Provider(format!("websocket read failed: {e}")))?;
+        let Some(frame) = next else {
+            return Outcome::Disconnected;
+        };
+        let frame = match frame {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!(%e, "websocket read failed; will reconnect");
+                return Outcome::Disconnected;
+            }
+        };
         if frame.is_close() {
-            break;
+            return Outcome::Disconnected;
         }
         if !frame.is_text() {
             continue;
@@ -231,7 +480,7 @@ async fn run() -> Result<()> {
                     error.message
                 );
                 clear_saved_token();
-                break;
+                return Outcome::Disconnected;
             }
             ServerMsg::RunTool {
                 call_id,
@@ -258,15 +507,19 @@ async fn run() -> Result<()> {
                         }
                     }
                 };
-                let out = serde_json::to_string(&reply)
-                    .map_err(|e| CoreError::Message(format!("serialize reply: {e}")))?;
-                tx.send(WsMessage::Text(out))
-                    .await
-                    .map_err(|e| CoreError::Provider(format!("send reply failed: {e}")))?;
+                let out = match serde_json::to_string(&reply) {
+                    Ok(o) => o,
+                    Err(e) => {
+                        tracing::warn!(%e, "could not serialize tool reply; dropping");
+                        continue;
+                    }
+                };
+                if let Err(e) = tx.send(WsMessage::Text(out)).await {
+                    tracing::warn!(%e, "send tool reply failed; will reconnect");
+                    return Outcome::Disconnected;
+                }
             }
             _ => {}
         }
     }
-    tracing::info!("fleetyd disconnected");
-    Ok(())
 }

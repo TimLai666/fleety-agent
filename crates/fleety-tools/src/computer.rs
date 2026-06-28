@@ -33,11 +33,21 @@ pub fn register_computer(registry: &mut ToolRegistry) {
     registry.register(Box::new(ComputerScroll));
 }
 
+/// Why desktop control may be unavailable, and what to do — shared by the input
+/// and capture paths so the agent always gets the same actionable guidance.
+/// Notably covers the background-service case: a Windows service runs in session
+/// 0 with no interactive desktop, so a user must be logged in for these tools.
+pub(crate) fn headless_remediation() -> &'static str {
+    "this device needs an interactive desktop session: headless hosts, \
+     Wayland-restricted input, or a background service running in Windows session 0 \
+     (no desktop) can't be driven this way — log in to an interactive session and retry"
+}
+
 fn enigo() -> Result<Enigo> {
     Enigo::new(&Settings::default()).map_err(|e| {
         CoreError::Message(format!(
-            "cannot access the desktop for input ({e}); this device needs a real display session \
-             (headless / Wayland-restricted hosts can't be driven this way)"
+            "cannot access the desktop for input ({e}); {}",
+            headless_remediation()
         ))
     })
 }
@@ -142,8 +152,12 @@ impl Tool for ComputerScreenshot {
     async fn call(&self, args: Value) -> Result<Value> {
         let idx = args.get("monitor").and_then(Value::as_u64).unwrap_or(0) as usize;
         tokio::task::spawn_blocking(move || {
-            let monitors = Monitor::all()
-                .map_err(|e| CoreError::Message(format!("cannot enumerate monitors ({e}); needs a display session")))?;
+            let monitors = Monitor::all().map_err(|e| {
+                CoreError::Message(format!(
+                    "cannot enumerate monitors ({e}); {}",
+                    headless_remediation()
+                ))
+            })?;
             let monitor = monitors
                 .get(idx)
                 .or_else(|| monitors.first())
@@ -402,6 +416,14 @@ mod tests {
         assert!(matches!(modifier_key("ctrl").expect("m"), Key::Control));
         assert!(matches!(modifier_key("cmd").expect("m"), Key::Meta));
         assert!(modifier_key("bogus").is_err());
+    }
+
+    #[test]
+    fn headless_remediation_is_actionable() {
+        let msg = headless_remediation();
+        // Names the background-service (session 0) case and tells the user what to do.
+        assert!(msg.contains("session 0"));
+        assert!(msg.contains("log in"));
     }
 
     #[test]

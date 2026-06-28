@@ -72,8 +72,9 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 /// Fetch the manifest, and if a newer version is available, download + verify +
-/// install it.
-pub async fn update() -> Result<()> {
+/// install it. Returns `true` if a new binary was installed (caller restarts the
+/// service — deferred until idle — to run it), `false` if already up to date.
+pub async fn update() -> Result<bool> {
     let manifest_url = std::env::var("FLEETY_UPDATE_MANIFEST").map_err(|_| {
         CoreError::Message("set FLEETY_UPDATE_MANIFEST to the update manifest URL".to_string())
     })?;
@@ -91,7 +92,7 @@ pub async fn update() -> Result<()> {
     let current = agent_core::VERSION;
     if !needs_update(current, &manifest.version) {
         println!("fleetyd is already up to date (version {current}).");
-        return Ok(());
+        return Ok(false);
     }
     println!("Updating fleetyd {current} -> {} ...", manifest.version);
 
@@ -125,8 +126,11 @@ pub async fn update() -> Result<()> {
         let _ = std::fs::rename(&backup, &current_exe);
         return Err(CoreError::Message(format!("cannot install new exe: {e}")));
     }
-    println!("Updated to {}. Restart fleetyd to apply.", manifest.version);
-    Ok(())
+    println!(
+        "Updated to {}. The service will restart (when idle) to apply.",
+        manifest.version
+    );
+    Ok(true)
 }
 
 #[cfg(test)]

@@ -41,6 +41,9 @@ fastembed = "5"
 rusqlite = { version = "0.32", features = ["bundled"] }
 fleety-vec = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8"
+
 [dev-dependencies]
 filetime = "0.2"
 serial_test = "3"

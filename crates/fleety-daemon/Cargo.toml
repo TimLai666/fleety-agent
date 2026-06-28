@@ -24,3 +24,6 @@ tracing = { workspace = true }
 reqwest = { workspace = true }
 sha2 = "0.10"
 mdns-sd = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8"

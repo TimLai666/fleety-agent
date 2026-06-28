@@ -68,8 +68,12 @@ pub fn spawn() {
 async fn tick(auto_apply: bool) -> Result<()> {
     if auto_apply {
         // Reuse the on-demand path verbatim — it logs version transitions and
-        // returns Ok when already up to date.
-        update::update().await?;
+        // returns Ok(false) when already up to date. If it installed a new
+        // binary, request a self-restart that the serve loop carries out at the
+        // next idle frame boundary (so an update never interrupts a running tool).
+        if update::update().await? {
+            crate::request_self_restart("self-update");
+        }
         return Ok(());
     }
     // Notify-only path: check the manifest, print a one-line summary, never
