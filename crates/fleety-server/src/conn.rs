@@ -743,6 +743,21 @@ pub(crate) async fn drive_turn(
     // Inject agent-level core memory (ME/USER/TODO) as the system preamble each
     // turn; it is ephemeral, not persisted to the conversation.
     let mut messages = vec![Message::system(storage.system_prompt_for(acting)?)];
+    // Tell the agent the current time in the acting user's timezone (profile →
+    // FLEETY_TZ → UTC) so it reasons about "today"/"tonight" correctly; storage
+    // stays UTC.
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let tz = crate::tz::resolve_tz(
+        storage.user_timezone(acting).as_deref(),
+        std::env::var("FLEETY_TZ").ok().as_deref(),
+    );
+    messages.push(Message::system(format!(
+        "Current time: {}",
+        crate::tz::format_for_user(now_secs, tz)
+    )));
     messages.extend(storage.load(device_id, conversation)?);
     let mut events = storage.journaling_log(device_id, conversation);
     let delta_out = out.clone();

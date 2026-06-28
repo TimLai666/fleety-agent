@@ -172,6 +172,31 @@ impl Storage {
         crate::privacy::Grants::load(&self.home.join("fleet").join("grants.json"))
     }
 
+    /// The acting user's configured IANA timezone (`users/<id>/timezone`), if any.
+    /// `None` for a Guest or when unset (caller falls back to `FLEETY_TZ`/UTC).
+    pub fn user_timezone(&self, acting: &crate::identity::ActingUser) -> Option<String> {
+        let id = acting.user_id()?;
+        let text = fs::read_to_string(self.users_dir().join(id).join("timezone")).ok()?;
+        let trimmed = text.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    }
+
+    /// Set a user's IANA timezone. Config API consumed by the settings surface.
+    #[allow(dead_code)]
+    pub fn set_user_timezone(&self, user_id: &str, tz: &str) -> Result<()> {
+        validate_id("user_id", user_id)?;
+        let dir = self.users_dir().join(user_id);
+        fs::create_dir_all(&dir)
+            .map_err(|e| CoreError::Message(format!("cannot create user dir: {e}")))?;
+        fs::write(dir.join("timezone"), tz)
+            .map_err(|e| CoreError::Message(format!("write timezone: {e}")))?;
+        Ok(())
+    }
+
     /// The owning user of a conversation (from the conversation→owner index), or
     /// `None` if it has no registered owner (legacy / unattributed / guest).
     pub fn conversation_owner(&self, conversation_id: &str) -> Option<String> {

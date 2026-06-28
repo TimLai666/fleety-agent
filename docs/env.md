@@ -111,6 +111,22 @@ tools (`computer_*` GUI control / screenshots, a visible browser) only work when
 user is actually logged in — headless they fail with an actionable message rather
 than hanging.
 
+## Time & timezone
+
+Timestamps are **stored as Unix epoch (UTC)** everywhere — this never changes.
+Timezone is a **rendering** concern only: the agent is told the current time, and
+presents timestamps, in the **acting user's** timezone. Resolution precedence:
+
+1. the acting user's configured IANA zone (`users/<id>/timezone`),
+2. else the global `FLEETY_TZ` (an IANA name like `Asia/Taipei`),
+3. else UTC.
+
+An invalid zone string falls through to the next source (never errors).
+
+| Var | Default | Meaning |
+|---|---|---|
+| `FLEETY_TZ` | (unset → UTC) | Fallback IANA timezone for rendering when a user has no configured zone. Storage stays UTC regardless. |
+
 ## Startup dependencies (auto-install on boot)
 
 On startup, fleetyd and fleety-server each ensure the external dependencies their

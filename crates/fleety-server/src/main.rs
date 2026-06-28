@@ -19,6 +19,7 @@ mod mdns;
 mod privacy;
 mod sidecar;
 mod sse;
+mod tz;
 mod websocket;
 
 /// Process-wide moment fleety-server started. Used by `fleety status` to
@@ -233,7 +234,10 @@ async fn run_server(shutdown: Option<tokio::sync::watch::Receiver<bool>>) {
     // the legacy layout in place and never stops the server.
     match storage.migrate_conversations() {
         Ok(n) if n > 0 => {
-            tracing::info!(migrated = n, "migrated conversations to user-primary layout")
+            tracing::info!(
+                migrated = n,
+                "migrated conversations to user-primary layout"
+            )
         }
         Ok(_) => {}
         Err(e) => tracing::warn!(report = ?e.report(), "conversation migration skipped"),
