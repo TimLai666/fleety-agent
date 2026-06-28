@@ -34,6 +34,7 @@ pub fn register(registry: &mut ToolRegistry, builtin: &Path, authored: &Path, in
     };
     registry.register(Box::new(ListSkills(tiers())));
     registry.register(Box::new(UseSkill(tiers())));
+    registry.register(Box::new(SkillValidate(tiers())));
     registry.register(Box::new(SkillInstall {
         installed: installed.to_path_buf(),
     }));
@@ -137,7 +138,7 @@ fn collect(t: &Tiers) -> BTreeMap<String, SkillInfo> {
                 map.insert(
                     name,
                     SkillInfo {
-                        description: first_line(&skill_md),
+                        description: skill_description_of(&skill_md),
                         path: skill_md,
                         source,
                     },
@@ -148,15 +149,172 @@ fn collect(t: &Tiers) -> BTreeMap<String, SkillInfo> {
     map
 }
 
-fn first_line(skill_md: &Path) -> String {
-    std::fs::read_to_string(skill_md)
-        .ok()
-        .and_then(|text| {
-            text.lines()
-                .map(|l| l.trim_start_matches('#').trim().to_string())
-                .find(|l| !l.is_empty())
-        })
+/// Parse a leading YAML frontmatter block (`---` … `---`) into simple
+/// `key: value` pairs, returning the pairs and the body after the block. Skills
+/// follow the Agent Skills standard: SKILL.md opens with frontmatter carrying
+/// `name` and `description`. If there is no well-formed frontmatter the map is
+/// empty and the body is the whole text (legacy first-line skills still work).
+fn split_frontmatter(text: &str) -> (BTreeMap<String, String>, &str) {
+    let t = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let rest = match t
+        .strip_prefix("---\n")
+        .or_else(|| t.strip_prefix("---\r\n"))
+    {
+        Some(r) => r,
+        None => return (BTreeMap::new(), text),
+    };
+    let mut map = BTreeMap::new();
+    let mut search = rest;
+    let mut consumed = 0usize;
+    loop {
+        let (line, advance, last) = match search.find('\n') {
+            Some(i) => (&search[..i], i + 1, false),
+            None => (search, search.len(), true),
+        };
+        let trimmed = line.trim_end_matches('\r');
+        if trimmed.trim() == "---" {
+            return (map, &rest[consumed + advance..]);
+        }
+        if let Some((k, v)) = trimmed.split_once(':') {
+            let k = k.trim();
+            if !k.is_empty() {
+                map.insert(k.to_string(), v.trim().to_string());
+            }
+        }
+        if last {
+            // No closing fence — treat as no frontmatter.
+            return (BTreeMap::new(), text);
+        }
+        consumed += advance;
+        search = &search[advance..];
+    }
+}
+
+/// The first non-empty line of a body with any leading `#` stripped — the legacy
+/// description source for skills without frontmatter.
+fn description_line(text: &str) -> String {
+    text.lines()
+        .map(|l| l.trim_start_matches('#').trim().to_string())
+        .find(|l| !l.is_empty())
         .unwrap_or_default()
+}
+
+/// A skill's description for `list_skills`/triggering: the frontmatter
+/// `description` (Agent Skills standard), falling back to the first body line.
+fn skill_description(text: &str) -> String {
+    let (fm, body) = split_frontmatter(text);
+    if let Some(d) = fm.get("description") {
+        let d = d.trim();
+        if !d.is_empty() {
+            return d.to_string();
+        }
+    }
+    description_line(body)
+}
+
+fn skill_description_of(skill_md: &Path) -> String {
+    std::fs::read_to_string(skill_md)
+        .map(|text| skill_description(&text))
+        .unwrap_or_default()
+}
+
+/// One validation finding (`severity` is "error" or "warning").
+fn issue(severity: &str, message: String) -> Value {
+    json!({ "severity": severity, "message": message })
+}
+
+/// Check a SKILL.md body against the Agent Skills format (YAML frontmatter with
+/// `name` + `description`), returning findings (severity error/warning).
+fn validate_body(text: &str) -> Vec<Value> {
+    let mut issues = Vec::new();
+    if text.trim().is_empty() {
+        issues.push(issue(
+            "error",
+            "SKILL.md is empty; it needs YAML frontmatter with `name` and `description`"
+                .to_string(),
+        ));
+        return issues;
+    }
+    let (fm, body) = split_frontmatter(text);
+    if fm.is_empty() {
+        issues.push(issue(
+            "error",
+            "missing YAML frontmatter: SKILL.md must open with a `---` block containing `name` \
+             and `description`"
+                .to_string(),
+        ));
+    } else {
+        validate_name_field(fm.get("name"), &mut issues);
+        validate_description_field(fm.get("description"), &mut issues);
+    }
+    let body_lines = body.lines().count();
+    if body_lines > 500 {
+        issues.push(issue(
+            "warning",
+            format!("SKILL.md body is {body_lines} lines; keep it lean and move detail into separate reference files (progressive disclosure)"),
+        ));
+    }
+    issues
+}
+
+/// Validate the frontmatter `name` field per the Agent Skills rules.
+fn validate_name_field(name: Option<&String>, issues: &mut Vec<Value>) {
+    let Some(name) = name.map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+        issues.push(issue(
+            "error",
+            "frontmatter is missing a non-empty `name`".to_string(),
+        ));
+        return;
+    };
+    if name.chars().count() > 64 {
+        issues.push(issue(
+            "error",
+            format!("`name` is {} chars; the limit is 64", name.chars().count()),
+        ));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
+        issues.push(issue(
+            "error",
+            "`name` may contain only lowercase letters, digits, and hyphens".to_string(),
+        ));
+    }
+    let lower = name.to_ascii_lowercase();
+    if lower.contains("anthropic") || lower.contains("claude") {
+        issues.push(issue(
+            "error",
+            "`name` may not contain the reserved words 'anthropic' or 'claude'".to_string(),
+        ));
+    }
+}
+
+/// Validate the frontmatter `description` field per the Agent Skills rules.
+fn validate_description_field(description: Option<&String>, issues: &mut Vec<Value>) {
+    let Some(desc) = description.map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+        issues.push(issue(
+            "error",
+            "frontmatter is missing a non-empty `description`".to_string(),
+        ));
+        return;
+    };
+    if desc.chars().count() > 1024 {
+        issues.push(issue(
+            "error",
+            format!(
+                "`description` is {} chars; the limit is 1024",
+                desc.chars().count()
+            ),
+        ));
+    }
+    if desc.chars().count() < 20 {
+        issues.push(issue(
+            "warning",
+            "`description` is very short; it should say what the skill does AND when to use it"
+                .to_string(),
+        ));
+    }
 }
 
 fn require_str<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
@@ -252,6 +410,95 @@ impl Tool for UseSkill {
         let content = std::fs::read_to_string(&info.path)
             .map_err(|e| CoreError::Message(format!("cannot read skill '{name}': {e}")))?;
         Ok(json!({ "name": name, "source": info.source, "content": content }))
+    }
+}
+
+struct SkillValidate(Tiers);
+
+#[async_trait]
+impl Tool for SkillValidate {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "skill_validate".to_string(),
+            description:
+                "Check a skill's SKILL.md against the Agent Skills format. Pass `content` \
+                 to validate a draft before writing, or `name` to validate an existing skill. \
+                 Returns `ok` (no errors) plus `issues` (each with severity error/warning). \
+                 Rules: SKILL.md opens with YAML frontmatter holding `name` and `description`. \
+                 `name` ≤64 chars, lowercase letters/digits/hyphens only, no 'anthropic'/'claude', \
+                 and should match the skill's directory name. `description` is non-empty, ≤1024 \
+                 chars, and should say what the skill does AND when to use it. Keep the body lean \
+                 (move detail into reference files). Directory names and in-skill file paths must \
+                 also stay inside the skills store (no '..', no absolute paths)."
+                    .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "validate an existing skill by name" },
+                    "content": { "type": "string", "description": "validate a draft SKILL.md body instead" }
+                }
+            }),
+            risk: RiskLevel::Read,
+        }
+    }
+
+    async fn call(&self, args: Value) -> Result<Value> {
+        let content = args.get("content").and_then(Value::as_str);
+        let name = args.get("name").and_then(Value::as_str);
+        if content.is_none() && name.is_none() {
+            return Err(CoreError::Message(
+                "provide 'name' (validate an existing skill) or 'content' (validate a draft)"
+                    .to_string(),
+            ));
+        }
+        let mut issues = Vec::new();
+        // Resolve the SKILL.md body to check: a provided draft, or an existing skill.
+        let body = match content {
+            Some(c) => c.to_string(),
+            None => {
+                let name = name.unwrap_or_default();
+                if let Err(e) = valid_name(name) {
+                    issues.push(issue("error", e.report().message));
+                    String::new()
+                } else {
+                    match self.0.locate(name) {
+                        Some((dir, _)) => match std::fs::read_to_string(dir.join("SKILL.md")) {
+                            Ok(t) => t,
+                            Err(e) => {
+                                issues.push(issue("error", format!("cannot read SKILL.md: {e}")));
+                                String::new()
+                            }
+                        },
+                        None => {
+                            issues.push(issue("error", format!("no such skill '{name}'")));
+                            String::new()
+                        }
+                    }
+                }
+            }
+        };
+        // Only run body checks when we actually have a body (no prior resolve error).
+        if issues.is_empty() {
+            issues.extend(validate_body(&body));
+            // For an existing skill, the frontmatter name should match its dir.
+            if content.is_none() {
+                if let Some(dir_name) = name {
+                    if let Some(fm_name) = split_frontmatter(&body).0.get("name") {
+                        if fm_name.trim() != dir_name {
+                            issues.push(issue(
+                                "warning",
+                                format!(
+                                    "frontmatter `name` ('{}') doesn't match the skill's directory name ('{dir_name}')",
+                                    fm_name.trim()
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        let ok = !issues.iter().any(|i| i["severity"] == "error");
+        Ok(json!({ "ok": ok, "issues": issues }))
     }
 }
 
@@ -912,5 +1159,122 @@ mod tests {
         for d in [&b, &a, &i] {
             let _ = std::fs::remove_dir_all(d);
         }
+    }
+
+    #[tokio::test]
+    async fn validate_draft_content() {
+        let (b, a, i) = (temp(), temp(), temp());
+        let mut reg = ToolRegistry::new();
+        register(&mut reg, &b, &a, &i);
+
+        // A well-formed draft (proper frontmatter) passes with no errors.
+        let good = reg
+            .call(
+                "skill_validate",
+                json!({ "content": "---\nname: triage\ndescription: Diagnose flaky CI runs; use when a build fails intermittently.\n---\n\n# Triage\n\nDo the thing.\n" }),
+            )
+            .await
+            .expect("validate");
+        assert_eq!(good["ok"], json!(true));
+
+        // Empty body is an error.
+        let empty = reg
+            .call("skill_validate", json!({ "content": "   \n" }))
+            .await
+            .expect("validate");
+        assert_eq!(empty["ok"], json!(false));
+
+        // Missing frontmatter is an error (the Agent Skills format requires it).
+        let no_fm = reg
+            .call(
+                "skill_validate",
+                json!({ "content": "# just a heading\n\nbody\n" }),
+            )
+            .await
+            .expect("validate");
+        assert_eq!(no_fm["ok"], json!(false));
+        assert!(no_fm["issues"]
+            .as_array()
+            .expect("issues")
+            .iter()
+            .any(|m| m["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("frontmatter")));
+
+        // An invalid name (uppercase) is an error.
+        let bad_name = reg
+            .call(
+                "skill_validate",
+                json!({ "content": "---\nname: BadName\ndescription: A long enough description of what and when.\n---\nbody\n" }),
+            )
+            .await
+            .expect("validate");
+        assert_eq!(bad_name["ok"], json!(false));
+
+        // A too-short description warns but is not an error.
+        let short = reg
+            .call(
+                "skill_validate",
+                json!({ "content": "---\nname: tiny\ndescription: short\n---\nbody\n" }),
+            )
+            .await
+            .expect("validate");
+        assert_eq!(short["ok"], json!(true));
+        assert!(short["issues"]
+            .as_array()
+            .expect("arr")
+            .iter()
+            .any(|m| m["severity"] == "warning"));
+
+        for d in [&b, &a, &i] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_existing_and_missing_skill() {
+        let (b, a, i) = (temp(), temp(), temp());
+        write_skill(
+            &a,
+            "good",
+            "---\nname: good\ndescription: Does a useful thing; use when the user needs that thing.\n---\n\n# Good\n\nsteps\n",
+        );
+        let mut reg = ToolRegistry::new();
+        register(&mut reg, &b, &a, &i);
+
+        let ok = reg
+            .call("skill_validate", json!({ "name": "good" }))
+            .await
+            .expect("validate");
+        assert_eq!(ok["ok"], json!(true));
+
+        // Unknown skill is an error.
+        let missing = reg
+            .call("skill_validate", json!({ "name": "nope" }))
+            .await
+            .expect("validate");
+        assert_eq!(missing["ok"], json!(false));
+
+        // Neither name nor content is an actionable error.
+        assert!(reg.call("skill_validate", json!({})).await.is_err());
+
+        for d in [&b, &a, &i] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[test]
+    fn frontmatter_description_used_over_first_line() {
+        let text = "---\nname: x\ndescription: real description here\n---\n# Heading\nbody\n";
+        let (fm, body) = split_frontmatter(text);
+        assert_eq!(
+            fm.get("description").map(String::as_str),
+            Some("real description here")
+        );
+        assert!(body.starts_with("# Heading"));
+        assert_eq!(skill_description(text), "real description here");
+        // Legacy (no frontmatter) falls back to the first body line.
+        assert_eq!(skill_description("# legacy desc\nbody"), "legacy desc");
     }
 }

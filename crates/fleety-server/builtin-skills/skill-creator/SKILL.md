@@ -1,4 +1,9 @@
-# Skill Creator — create, edit, and improve Fleety skills (use whenever building or refining a skill, or capturing a repeatable workflow as a reusable skill)
+---
+name: skill-creator
+description: Create, edit, and improve Fleety skills. Use whenever the user asks to build, edit, or optimise a skill, when capturing a repeatable workflow you just did as a reusable skill, or when the learning loop nudges you to save what you learned after a complex task.
+---
+
+# Skill Creator
 
 A skill for making your own skills and iteratively improving them. Reach for it when the user asks to build/edit/optimise a skill, when you want to capture a workflow you just did so you never have to re-derive it, or when the learning loop nudges you after a complex task to save what you learned.
 
@@ -12,8 +17,8 @@ A skill is a **directory** with a `SKILL.md` plus optional bundled files. You cr
   - **builtin** — shipped in the binary, read-only.
   - **authored** — skills *you* write for yourself. A `skill_write_file` to a name that doesn't exist yet lands here automatically. You own these; edit them freely.
   - **installed** — user-chosen packs. Only create/edit/remove these when the user asks.
-- **The description is the first non-empty line of `SKILL.md`** (Fleety strips a leading `#` and shows it in `list_skills`). There is **no YAML frontmatter** here — do not add a `---` block; it would just become body text. Put the "what + when" on that first line.
-- **The skill name is the directory name** (the `name` you pass to the `skill_*` tools).
+- **SKILL.md opens with YAML frontmatter** holding `name` and `description` (the Agent Skills standard). Fleety shows the `description` in `list_skills` and triggers off it, so it must say what the skill does AND when to use it. (A skill with no frontmatter still loads — Fleety falls back to the first body line — but always write proper frontmatter.)
+- **The directory name is the skill name** (what you pass to the `skill_*` tools); the frontmatter `name` should match it.
 
 **Which tier — who is the skill for? Decide this before you start.** It changes which tool you use and where the skill lands:
 
@@ -42,16 +47,22 @@ Understand what the user actually wants before drafting. The current conversatio
 
 Write it with `skill_write_file` (name = the skill, file = `SKILL.md`). Structure:
 
-- **First line = the description.** Cover what it does AND when to use it, on one line. Agents tend to *under*-trigger skills, so make it a little pushy: name the concrete situations, not just the capability. E.g. not "Build a dashboard." but "Build a fast dashboard for fleet metrics — use whenever the user mentions dashboards, metrics, or wants to visualise device data, even if they don't say 'dashboard'."
+- **The frontmatter `description` is the trigger.** In the `---` block write a `description` covering what it does AND when to use it. Agents tend to *under*-trigger skills, so make it a little pushy: name the concrete situations, not just the capability. E.g. not "Build a dashboard." but "Build a fast dashboard for fleet metrics. Use whenever the user mentions dashboards, metrics, or wants to visualise device data, even if they don't say 'dashboard'." Keep `description` ≤1024 chars; `name` is lowercase letters/digits/hyphens, ≤64 chars, no `anthropic`/`claude`, matching the directory name.
 - **Body = imperative instructions.** Tell the agent what to do, and **explain the why** behind each instruction — today's models have good theory of mind and follow reasoning far better than rote `ALWAYS`/`NEVER`. If you catch yourself writing rigid all-caps rules, that's a yellow flag: reframe and explain instead.
 - Keep it general, not overfit to one example. Draft it, then reread with fresh eyes and tighten.
 
 #### SKILL.md format — copy this shape
 
-No frontmatter. Line 1 is the description; everything after is imperative instructions. The skeleton:
+SKILL.md opens with YAML frontmatter (`name` + `description`), then the instructions. The skeleton:
 
 ````
-# <skill-name> — <what it does>; use when <concrete trigger situations>
+---
+name: <skill-name>
+description: <what it does> — use when <concrete trigger situations>
+---
+
+# <Skill Name>
+
 <one or two sentences: what this skill is for and the rough approach>
 
 ## <First step or section, written as a verb>
@@ -65,7 +76,12 @@ No frontmatter. Line 1 is the description; everything after is imperative instru
 A complete, valid minimal example you can pattern-match against:
 
 ````
-# device-health-check — snapshot a device's disk, memory, and failed services; use when the user asks whether a box is healthy, why it's slow, or before deploying to it
+---
+name: device-health-check
+description: Snapshot a device's disk, memory, and failed services. Use when the user asks whether a box is healthy, why it's slow, or before deploying to it.
+---
+
+# Device Health Check
 
 Gather a quick health picture of one device and report problems first, healthy signals second.
 
@@ -77,13 +93,13 @@ Gather a quick health picture of one device and report problems first, healthy s
 - Lead with anything wrong (disk >90%, failed units), then the all-clear items. Name the device on every line so nothing gets confused across machines.
 ````
 
-That example is self-contained; a real skill adds `references/triage.md` (read on demand) or a `scripts/` helper only if they earn their place. Keep the whole SKILL.md under ~500 lines — push depth into `references/`.
+That example is self-contained; a real skill adds `references/triage.md` (read on demand) or a `scripts/` helper only if they earn their place. Keep the SKILL.md body lean — push depth into `references/`.
 
 ### Anatomy and progressive disclosure
 
 ```
 skill-name/
-├── SKILL.md            (required; first line = description, then instructions)
+├── SKILL.md            (required; YAML frontmatter, then instructions)
 └── (optional)
     ├── scripts/        executable helpers for deterministic/repeated work
     ├── references/     docs the agent reads only when SKILL.md points to them
@@ -91,7 +107,7 @@ skill-name/
 ```
 
 Loading is layered, so spend the context budget wisely:
-1. The first-line description is always in context — keep it tight.
+1. The frontmatter description is always in context — keep it tight.
 2. The SKILL.md body loads when the skill is used — aim under ~500 lines.
 3. Bundled files load only when referenced — push detail into `references/` and point to it from SKILL.md ("for the X format, read `references/x.md`"). For a long reference (>~300 lines) give it a table of contents. When a skill spans several variants, split by variant so the agent reads only the relevant file.
 
@@ -119,6 +135,21 @@ To pin an output shape, show the exact template the agent should fill in rather 
 ### Principle of lack of surprise
 
 A skill must do what its description says and nothing sneaky. Never put malware, exploit code, credential exfiltration, or detection-evasion into a skill, and don't build skills meant to mislead the user or enable unauthorised access. (Benign roleplay-style skills are fine.)
+
+## Format limits and validation
+
+Path rules Fleety enforces (a write that breaks these is rejected):
+- The skill's **directory name** is non-empty and contains no `/`, `\`, `..`, or leading `.`.
+- In-skill **file paths** stay inside the skill — no absolute paths, no `..`.
+- `SKILL.md` must exist and be a real file (not a symlink).
+
+Agent Skills format rules (checked by `skill_validate`):
+- SKILL.md opens with YAML frontmatter containing `name` and `description`.
+- `name`: ≤64 chars, lowercase letters/digits/hyphens only, no `anthropic`/`claude`, and should match the directory name.
+- `description`: non-empty, ≤1024 chars, and says what + when.
+- Keep the body lean; move detail into reference files.
+
+Before you call a skill done, run `skill_validate` — pass `content` to check a draft before writing, or `name` to check what you wrote. It returns `ok` plus `issues`: errors (no frontmatter, missing/invalid `name` or `description`) block; warnings (very short description, an over-long body, a `name` that doesn't match the directory) advise. Fix the errors and weigh the warnings.
 
 ## Testing a skill
 

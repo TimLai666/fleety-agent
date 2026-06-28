@@ -12,9 +12,15 @@ use std::path::Path;
 
 use agent_core::{CoreError, Result};
 
-/// A Fleety adapter note prepended to the upstream Insyra skill. Its first line
-/// also becomes the skill's `list_skills` description.
-const INSYRA_HEADER: &str = "# use-insyra-cli\n\n\
+/// A Fleety adapter note prepended to the upstream Insyra skill. It opens with
+/// the Agent Skills YAML frontmatter (`name` + `description`), so `list_skills`
+/// uses that `description`, followed by the Fleety usage note and the upstream
+/// DSL reference.
+const INSYRA_HEADER: &str = "---\n\
+name: use-insyra-cli\n\
+description: Wrangle and analyse data with the Insyra DSL through the insyra_exec tool — DataList/DataTable transforms, CSV/Excel/Parquet I/O, column formulas, and charts. Use when the user wants data analysis, cleaning, transforms, or charts, especially in Go or when no stack is specified.\n\
+---\n\n\
+# use-insyra-cli\n\n\
 > **In Fleety, run the Insyra DSL through the `insyra_exec` tool — there is no `insyra` shell command here.** \
 Pass one DSL line as `command`, a multi-line `.isr` program as `script`, and a `session` name to keep variables/data across calls; \
 `save <var> <file>` writes results into the workspace (read them back with `read_file`). \
@@ -66,8 +72,9 @@ mod tests {
         seed(&dir).expect("seed");
         let content =
             std::fs::read_to_string(dir.join("use-insyra-cli").join("SKILL.md")).expect("read");
-        // Fleety adapter header is present...
-        assert!(content.starts_with("# use-insyra-cli"));
+        // Opens with Agent Skills frontmatter (name + description)...
+        assert!(content.starts_with("---"));
+        assert!(content.contains("name: use-insyra-cli"));
         assert!(content.contains("insyra_exec"));
         // ...followed by the upstream DSL reference.
         assert!(content.contains(".isr"));
@@ -80,9 +87,10 @@ mod tests {
         seed(&dir).expect("seed");
         let content =
             std::fs::read_to_string(dir.join("skill-creator").join("SKILL.md")).expect("read");
-        // First line is the (triggering) description; body teaches the Fleety
-        // skill_* workflow, not the upstream eval-viewer machinery.
-        assert!(content.starts_with("# Skill Creator"));
+        // Opens with Agent Skills frontmatter; body teaches the Fleety skill_*
+        // workflow, not the upstream eval-viewer machinery.
+        assert!(content.starts_with("---"));
+        assert!(content.contains("name: skill-creator"));
         assert!(content.contains("skill_write_file"));
         assert!(content.contains("authored"));
         let _ = std::fs::remove_dir_all(&dir);
