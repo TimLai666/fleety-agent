@@ -617,6 +617,7 @@ async fn ask(text: String, attachments: Vec<WireAttachment>) -> Result<()> {
             | Some(ServerMsg::AuditShowResult { .. })
             | Some(ServerMsg::RollbackListResult { .. })
             | Some(ServerMsg::RollbackResult { .. })
+            | Some(ServerMsg::ConversationRolled { .. })
             | Some(ServerMsg::ServerStatusResult { .. }) => {}
         }
     }

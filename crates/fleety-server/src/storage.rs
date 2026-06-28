@@ -263,6 +263,57 @@ impl Storage {
             .map(String::from)
     }
 
+    fn conversation_successor_path(&self) -> PathBuf {
+        self.home.join("fleet").join("conversation-successor.json")
+    }
+
+    /// Mark a conversation ended, recording its successor (rollover). The old
+    /// conversation is preserved (still loadable / recall-able); future messages
+    /// to it transparently redirect to the successor via [`Self::active_conversation`].
+    pub fn mark_conversation_ended(&self, old: &str, successor: &str) -> Result<()> {
+        validate_id("conversation_id", old)?;
+        validate_id("conversation_id", successor)?;
+        let _guard = self
+            .append_lock
+            .lock()
+            .map_err(|_| CoreError::Message("storage index lock poisoned".to_string()))?;
+        let path = self.conversation_successor_path();
+        let mut map: serde_json::Map<String, Value> = fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+        map.insert(old.to_string(), Value::String(successor.to_string()));
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| {
+                CoreError::Message(format!("cannot create {}: {e}", parent.display()))
+            })?;
+        }
+        let text = serde_json::to_string_pretty(&Value::Object(map))
+            .map_err(|e| CoreError::Message(format!("serialize successor index: {e}")))?;
+        fs::write(&path, text)
+            .map_err(|e| CoreError::Message(format!("write successor index: {e}")))?;
+        Ok(())
+    }
+
+    /// Follow the rollover chain from `conversation_id` to the currently active
+    /// conversation (the end of the successor chain). Cycle-guarded; returns the
+    /// input unchanged when there is no successor.
+    pub fn active_conversation(&self, conversation_id: &str) -> String {
+        let map: serde_json::Map<String, Value> =
+            match fs::read_to_string(self.conversation_successor_path()) {
+                Ok(t) => serde_json::from_str(&t).unwrap_or_default(),
+                Err(_) => return conversation_id.to_string(),
+            };
+        let mut current = conversation_id.to_string();
+        for _ in 0..64 {
+            match map.get(&current).and_then(Value::as_str) {
+                Some(next) if next != current => current = next.to_string(),
+                _ => break,
+            }
+        }
+        current
+    }
+
     /// List a user's conversation ids (the `.jsonl` stems under their dir).
     pub fn user_conversation_ids(&self, user_id: &str) -> Vec<String> {
         let dir = self
@@ -1288,6 +1339,27 @@ mod tests {
             .join("conversations")
             .join("k1.jsonl")
             .exists());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn rollover_successor_chain_resolves_and_preserves_old() {
+        let home = temp_home();
+        let storage = Storage::new(home.clone());
+        // Old conversation has content; rolling over preserves it.
+        storage
+            .append("dev", "c1", &Message::user("old work"))
+            .unwrap();
+        storage.mark_conversation_ended("c1", "c2").unwrap();
+        storage.mark_conversation_ended("c2", "c3").unwrap();
+        // Active conversation follows the chain to the end.
+        assert_eq!(storage.active_conversation("c1"), "c3");
+        assert_eq!(storage.active_conversation("c2"), "c3");
+        assert_eq!(storage.active_conversation("c3"), "c3");
+        // No successor → unchanged.
+        assert_eq!(storage.active_conversation("fresh"), "fresh");
+        // Old conversation still loadable (recall-able).
+        assert_eq!(storage.load("dev", "c1").unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(&home);
     }
 

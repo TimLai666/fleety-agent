@@ -37,6 +37,42 @@ fn server_hostname() -> String {
         .unwrap_or_default()
 }
 
+/// Apply a rollover requested during a turn: set the old conversation aside with
+/// the new as its successor (old stays recall-able), claim the new for the acting
+/// user, and tell the client via `ConversationRolled`. Drains the shared slot, so
+/// calling it twice is safe (the second is a no-op).
+async fn apply_rollover(
+    storage: &Arc<Storage>,
+    out: &Out,
+    conversation: &str,
+    acting: &crate::identity::ActingUser,
+    state: &crate::conversation_lifecycle::RolloverState,
+) {
+    let req = { state.lock().await.take() };
+    let Some(req) = req else { return };
+    if let Err(e) = storage.mark_conversation_ended(conversation, &req.new_id) {
+        tracing::warn!(report = ?e.report(), "rollover: could not record successor");
+        return;
+    }
+    let _ = storage.register_conversation_owner(&req.new_id, acting);
+    tracing::info!(old = %conversation, new = %req.new_id, distill = req.distill, note = ?req.note, "conversation rolled over");
+    let _ = emit(
+        out,
+        &ServerMsg::ConversationRolled {
+            old: conversation.to_string(),
+            new: req.new_id,
+        },
+    );
+}
+
+/// Per-conversation single-flight set for background housekeeping (process-wide,
+/// so the same conversation never reflects twice concurrently).
+fn housekeeping_inflight() -> &'static tokio::sync::Mutex<std::collections::HashSet<String>> {
+    static S: std::sync::OnceLock<tokio::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    S.get_or_init(|| tokio::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
 /// Build the per-connection tool stack rooted at `root`: the full registry plus
 /// the subagent orchestration, dynamic-workflow, and goal tools (registered only
 /// at this top level). Returns the registry, the subagent host, and the shared
@@ -54,6 +90,7 @@ fn build_connection_stack(
     policy: Policy,
     out: &Out,
     acting: &crate::identity::ActingUser,
+    rollover_state: &crate::conversation_lifecycle::RolloverState,
 ) -> (
     agent_core::ToolRegistry,
     Arc<crate::subagent::FleetyHost>,
@@ -98,6 +135,7 @@ fn build_connection_stack(
     agent_workflow::register_workflow(&mut tools, subagent_mgr);
     let goal_state = Arc::new(tokio::sync::Mutex::new(GoalState::new()));
     agent_core::register_goal_tools(&mut tools, Arc::clone(&goal_state));
+    crate::conversation_lifecycle::register(&mut tools, Arc::clone(rollover_state));
     (tools, subagent_host, goal_state)
 }
 
@@ -261,6 +299,7 @@ async fn serve(
     // Before the first message we don't yet know the acting user; default recall
     // scope to the device owner (rebuilt with the resolved user on first message).
     let connect_acting = storage.acting_for_device(device_id);
+    let rollover_state = crate::conversation_lifecycle::new_state();
     let (mut tools, mut subagent_host, mut goal_state) = build_connection_stack(
         storage,
         &current_root,
@@ -273,6 +312,7 @@ async fn serve(
         policy,
         out,
         &connect_acting,
+        &rollover_state,
     );
     let mut workspace_bound = false;
     let goal_max_continues = goal_max_continues_from_env();
@@ -289,6 +329,10 @@ async fn serve(
                 acting_user,
             } => {
                 let conversation = conversation_id.unwrap_or_else(|| default_conversation.clone());
+                // Transparent redirect: if this conversation has rolled over,
+                // follow the successor chain to the active one (clients that
+                // ignored ConversationRolled still land in the right place).
+                let conversation = storage.active_conversation(&conversation);
                 // Resolve who this turn is for: the device owner by default, an
                 // asserted (and device-authorized) user otherwise, else Guest.
                 let acting = {
@@ -374,6 +418,7 @@ async fn serve(
                         policy,
                         out,
                         &acting,
+                        &rollover_state,
                     );
                     tools = t;
                     subagent_host = h;
@@ -443,21 +488,76 @@ async fn serve(
                     &acting,
                 )
                 .await?;
-                // Learning loop: after a sufficiently complex message, prompt the
-                // agent once to persist a skill / memory of what it learned.
-                maybe_reflect(
-                    out,
-                    storage,
-                    provider,
-                    &tools,
-                    policy,
-                    device_id,
-                    &conversation,
-                    &mut gate,
-                    steps,
-                    skill_reflect_min_steps,
-                )
-                .await?;
+                // Apply an explicit rollover the agent requested during the turn
+                // (fast, storage-only): set the old aside, switch active, tell the
+                // client. Transparent redirect handles clients that ignore it.
+                apply_rollover(storage, out, &conversation, &acting, &rollover_state).await;
+
+                // Learning loop + lifecycle distillation run as BACKGROUND
+                // housekeeping — off the connection loop so the user's next
+                // message is handled immediately — on the economy tier, single-
+                // flight per conversation, never user-facing. A rollover the
+                // reflection itself requests is applied at its end.
+                if skill_reflect_min_steps > 0 && steps >= skill_reflect_min_steps {
+                    let storage_bg = Arc::clone(storage);
+                    let out_bg = out.clone();
+                    let hub_bg = hub.clone();
+                    let pending_bg = pending.clone();
+                    let handles_bg = handles.clone();
+                    let auth_bg = Arc::clone(auth);
+                    let device_tools_bg = device_tools.clone();
+                    let device_bg = device_id.to_string();
+                    let conv_bg = conversation.clone();
+                    let acting_bg = acting.clone();
+                    let root_bg = current_root.clone();
+                    let rollover_bg = Arc::clone(&rollover_state);
+                    let min_steps = skill_reflect_min_steps;
+                    tokio::spawn(async move {
+                        // Single-flight per conversation: skip if one is running.
+                        {
+                            let mut inflight = housekeeping_inflight().lock().await;
+                            if inflight.contains(&conv_bg) {
+                                return;
+                            }
+                            inflight.insert(conv_bg.clone());
+                        }
+                        let cheap = crate::providers::ProviderTiers::from_env().resolve("cheap");
+                        let mut tools = build_full_registry(
+                            &storage_bg,
+                            &root_bg,
+                            &device_bg,
+                            &hub_bg,
+                            &pending_bg,
+                            &handles_bg,
+                            &auth_bg,
+                            &device_tools_bg,
+                        );
+                        crate::conversation_lifecycle::register(
+                            &mut tools,
+                            Arc::clone(&rollover_bg),
+                        );
+                        let mut bg_gate = agent_core::AutoApprove;
+                        if let Err(e) = maybe_reflect(
+                            &out_bg,
+                            &storage_bg,
+                            cheap.as_ref(),
+                            &tools,
+                            policy,
+                            &device_bg,
+                            &conv_bg,
+                            &mut bg_gate,
+                            steps,
+                            min_steps,
+                        )
+                        .await
+                        {
+                            tracing::warn!(report = ?e.report(), "background housekeeping failed (isolated)");
+                        }
+                        apply_rollover(&storage_bg, &out_bg, &conv_bg, &acting_bg, &rollover_bg)
+                            .await;
+                        housekeeping_inflight().lock().await.remove(&conv_bg);
+                    });
+                }
             }
             ClientMsg::Resume {
                 conversation_id,
@@ -938,12 +1038,18 @@ pub(crate) async fn maybe_reflect(
     if min_steps == 0 || steps < min_steps {
         return Ok(());
     }
-    let seed = "[learning-loop] That was a multi-step task. If it contained a reusable procedure \
-        worth keeping, save or update an authored skill for it (skill_write_file; put any helper \
-        tool in scripts/ and reference it from SKILL.md). If you learned durable facts about the \
-        user or project, record them with memory_write or the wiki. Skip anything one-off or \
-        already obvious from code/git. Reply in one short line with what you saved, or that there \
-        was nothing worth saving — do not redo the task.";
+    let seed = "[housekeeping] That was a multi-step task. Quietly do any worthwhile upkeep, then \
+        reply in one short line with what you did (or that there was nothing) — do NOT redo the \
+        task, and never address the user as if a system prompted you. \
+        (1) Reusable procedure? Save/update an authored skill (skill_write_file; helper tools in \
+        scripts/ referenced from SKILL.md). \
+        (2) Durable takeaways? Distil by type to the RIGHT place — lasting knowledge/insight → the \
+        wiki (wisdom, not transcripts); pending work → TODO; facts about the user → USER; \
+        device-operational facts → that device's NOTES; ephemeral recap → nowhere (recall already \
+        keeps it). \
+        (3) If a whole task or goal just finished and this thread is done, consider \
+        rollover_conversation to start fresh (after distilling). \
+        Skip anything one-off or already obvious from code/git.";
     drive_turn(
         out,
         storage,

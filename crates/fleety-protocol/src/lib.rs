@@ -205,6 +205,11 @@ pub enum ServerMsg {
     },
     /// The turn is complete.
     Done { conversation_id: String },
+    /// The active conversation rolled over: `old` was set aside (still searchable
+    /// via recall) and `new` is now active. Front-ends should switch to `new`;
+    /// those that ignore this still work (the server transparently redirects
+    /// messages on `old` to its successor). Additive; older clients ignore it.
+    ConversationRolled { old: String, new: String },
     /// Something went wrong (actionable).
     Error { error: WireError },
     /// Reply to `AuditList`: a JSON-encoded array of compact audit summaries.
@@ -364,6 +369,19 @@ mod tests {
         };
         let json = serde_json::to_string(&no_voice).expect("serialize");
         assert_eq!(no_voice, serde_json::from_str(&json).expect("deserialize"));
+    }
+
+    #[test]
+    fn conversation_rolled_roundtrips() {
+        let msg = ServerMsg::ConversationRolled {
+            old: "c-old".into(),
+            new: "c-new".into(),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert_eq!(msg, serde_json::from_str(&json).expect("deserialize"));
+        // Additive: an older stream without this variant still parses other
+        // ServerMsg variants, and the version is unchanged.
+        assert_eq!(PROTOCOL_VERSION, 0);
     }
 
     #[test]
