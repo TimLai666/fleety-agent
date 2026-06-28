@@ -12,8 +12,10 @@
 //! [`SubagentHost`] trait, so this module depends on no host crate. The
 //! [`SubagentManager`] owns the generic mechanism: the task registry, lifecycle
 //! states, concurrency cap, the spawn/fork/send/stop/status operations, and the
-//! `run_turn` orchestration. [`register_orchestration`] adds the four tools that
-//! drive it — only ever at the top level.
+//! `run_turn` orchestration. [`register_orchestration`] adds the orchestration
+//! tools that drive it (spawn / send / stop / status / list) — only ever at the
+//! top level. Workers can be addressed by their `task_id` or the readable `name`
+//! the lead gave them, which is the "agent team" usage pattern.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -310,12 +312,49 @@ impl SubagentManager {
         (state, output)
     }
 
-    /// Continue a finished (not running) subagent, preserving its messages.
-    pub async fn send(&self, task_id: &str, prompt: &str) -> Result<Value> {
+    /// Resolve a task id OR a worker name to the canonical task id. Lets the lead
+    /// agent address team members by the readable `name` it gave them.
+    async fn resolve(&self, key: &str) -> Result<String> {
+        let tasks = self.tasks.lock().await;
+        if tasks.contains_key(key) {
+            return Ok(key.to_string());
+        }
+        for (id, rec) in tasks.iter() {
+            if rec.name.as_deref() == Some(key) {
+                return Ok(id.clone());
+            }
+        }
+        Err(CoreError::Message(format!(
+            "unknown subagent '{key}' (not a task_id or name); use subagent_list to see the team"
+        )))
+    }
+
+    /// Roster of every subagent this manager owns — the lead's "team".
+    pub async fn list(&self) -> Value {
+        let tasks = self.tasks.lock().await;
+        let mut items: Vec<Value> = tasks
+            .iter()
+            .map(|(id, rec)| {
+                json!({
+                    "task_id": id,
+                    "name": rec.name,
+                    "state": rec.state.as_str(),
+                    "terminal": rec.state.is_terminal(),
+                })
+            })
+            .collect();
+        items.sort_by(|a, b| a["task_id"].as_str().cmp(&b["task_id"].as_str()));
+        json!({ "subagents": items })
+    }
+
+    /// Continue a finished (not running) subagent — addressed by task id or name —
+    /// preserving its messages.
+    pub async fn send(&self, key: &str, prompt: &str) -> Result<Value> {
+        let task_id = self.resolve(key).await?;
         let (mut messages, tier) = {
             let tasks = self.tasks.lock().await;
             let rec = tasks
-                .get(task_id)
+                .get(&task_id)
                 .ok_or_else(|| CoreError::Message(format!("unknown subagent task '{task_id}'")))?;
             if rec.state == SubagentState::Running {
                 return Err(CoreError::Message(format!(
@@ -325,11 +364,11 @@ impl SubagentManager {
             (rec.messages.clone(), rec.tier.clone())
         };
         messages.push(Message::user(prompt));
-        if let Some(rec) = self.tasks.lock().await.get_mut(task_id) {
+        if let Some(rec) = self.tasks.lock().await.get_mut(&task_id) {
             rec.state = SubagentState::Running;
         }
         let (state, output, final_messages) = self.run_loop(messages, &tier, &[], None).await;
-        if let Some(rec) = self.tasks.lock().await.get_mut(task_id) {
+        if let Some(rec) = self.tasks.lock().await.get_mut(&task_id) {
             rec.state = state;
             rec.output = Some(output.clone());
             rec.messages = final_messages;
@@ -337,11 +376,12 @@ impl SubagentManager {
         Ok(json!({ "task_id": task_id, "state": state.as_str(), "output": output }))
     }
 
-    /// Stop a subagent: abort a background task and mark it stopped.
-    pub async fn stop(&self, task_id: &str) -> Result<Value> {
+    /// Stop a subagent (by task id or name): abort a background task, mark stopped.
+    pub async fn stop(&self, key: &str) -> Result<Value> {
+        let task_id = self.resolve(key).await?;
         let mut tasks = self.tasks.lock().await;
         let rec = tasks
-            .get_mut(task_id)
+            .get_mut(&task_id)
             .ok_or_else(|| CoreError::Message(format!("unknown subagent task '{task_id}'")))?;
         if let Some(handle) = rec.handle.take() {
             handle.abort();
@@ -351,11 +391,12 @@ impl SubagentManager {
         Ok(json!({ "task_id": task_id, "state": "stopped" }))
     }
 
-    /// Report a subagent's state and, when finished, its output.
-    pub async fn status(&self, task_id: &str) -> Result<Value> {
+    /// Report a subagent's state (by task id or name) and, when finished, output.
+    pub async fn status(&self, key: &str) -> Result<Value> {
+        let task_id = self.resolve(key).await?;
         let tasks = self.tasks.lock().await;
         let rec = tasks
-            .get(task_id)
+            .get(&task_id)
             .ok_or_else(|| CoreError::Message(format!("unknown subagent task '{task_id}'")))?;
         Ok(json!({
             "task_id": task_id,
@@ -419,7 +460,29 @@ pub fn register_orchestration(registry: &mut ToolRegistry, manager: Arc<Subagent
     registry.register(Box::new(SpawnSubagent(Arc::clone(&manager))));
     registry.register(Box::new(SendSubagentMessage(Arc::clone(&manager))));
     registry.register(Box::new(StopSubagent(Arc::clone(&manager))));
-    registry.register(Box::new(SubagentStatus(manager)));
+    registry.register(Box::new(SubagentStatus(Arc::clone(&manager))));
+    registry.register(Box::new(SubagentList(manager)));
+}
+
+struct SubagentList(Arc<SubagentManager>);
+
+#[async_trait]
+impl Tool for SubagentList {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "subagent_list".to_string(),
+            description: "List your team — every subagent you spawned with its task_id, name, and \
+                state. Use the names/ids here to address a worker with send_subagent_message, \
+                stop_subagent, or subagent_status."
+                .to_string(),
+            parameters: json!({ "type": "object", "properties": {} }),
+            risk: RiskLevel::Read,
+        }
+    }
+
+    async fn call(&self, _args: Value) -> Result<Value> {
+        Ok(self.0.list().await)
+    }
 }
 
 struct SpawnSubagent(Arc<SubagentManager>);
@@ -445,7 +508,7 @@ impl Tool for SpawnSubagent {
                     "run_in_background": { "type": "boolean", "description": "Default false." },
                     "isolation": { "type": "string", "description": "e.g. \"none\" (default) or \"worktree\"." },
                     "allowed_tools": { "type": "array", "items": { "type": "string" } },
-                    "name": { "type": "string", "description": "Short task name (1-2 words)." }
+                    "name": { "type": "string", "description": "Short worker name (1-2 words); you can address it later by this name in send/stop/status/list." }
                 },
                 "required": ["prompt"]
             }),
@@ -473,7 +536,7 @@ impl Tool for SendSubagentMessage {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "task_id": { "type": "string" },
+                    "task_id": { "type": "string", "description": "The worker's task_id or name." },
                     "prompt": { "type": "string" }
                 },
                 "required": ["task_id", "prompt"]
@@ -501,7 +564,7 @@ impl Tool for StopSubagent {
                 .to_string(),
             parameters: json!({
                 "type": "object",
-                "properties": { "task_id": { "type": "string" } },
+                "properties": { "task_id": { "type": "string", "description": "The worker's task_id or name." } },
                 "required": ["task_id"]
             }),
             risk: RiskLevel::Mutate,
@@ -525,7 +588,7 @@ impl Tool for SubagentStatus {
                 .to_string(),
             parameters: json!({
                 "type": "object",
-                "properties": { "task_id": { "type": "string" } },
+                "properties": { "task_id": { "type": "string", "description": "The worker's task_id or name." } },
                 "required": ["task_id"]
             }),
             risk: RiskLevel::Read,
@@ -763,6 +826,41 @@ mod tests {
         assert_eq!(saw.0, SubagentState::Done);
         assert_eq!(saw.1, "bg-done");
         assert_eq!(completed.lock().unwrap().len(), 1, "reported exactly once");
+    }
+
+    #[tokio::test]
+    async fn addresses_workers_by_name_and_lists_team() {
+        // Agent-team layer: name a worker, see the roster, address it by name.
+        let main: Arc<dyn ModelProvider> = Arc::new(MockProvider::new(vec![
+            ModelResponse {
+                message: Message::assistant("v1"),
+            },
+            ModelResponse {
+                message: Message::assistant("v2"),
+            },
+        ]));
+        let (mgr, _h, _) = mk(main, one_shot("y"), 4);
+        let spawned = mgr
+            .spawn(SpawnRequest {
+                mode: SubagentMode::Spawn,
+                tier: "main".to_string(),
+                prompt: "p".to_string(),
+                allowed_tools: Vec::new(),
+                isolation: "none".to_string(),
+                name: Some("alice".to_string()),
+                background: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(spawned["output"], "v1");
+        let roster = mgr.list().await;
+        let arr = roster["subagents"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["name"], "alice");
+        // Address by name, not task_id.
+        let cont = mgr.send("alice", "again").await.unwrap();
+        assert_eq!(cont["output"], "v2");
+        assert!(mgr.status("nobody").await.is_err());
     }
 
     #[tokio::test]

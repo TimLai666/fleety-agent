@@ -286,9 +286,10 @@ waking a coordinator turn when it finishes. See
 | Tool | Purpose | Key inputs | Risk |
 |---|---|---|---|
 | `spawn_subagent` | Delegate a task. `mode` `spawn` (fresh context + briefing) / `fork` (inherits the current conversation). `model` `main`/`cheap`. `run_in_background` returns a `task_id` immediately and wakes a turn on completion; otherwise awaits and returns the `output`. `isolation` `none`/`worktree` (a dedicated git worktree; errors if the workspace isn't a git repo). `allowed_tools` whitelists tools under require-approval. | `prompt`, `mode?`, `model?`, `run_in_background?`, `isolation?`, `allowed_tools?`, `name?` | mutate |
-| `send_subagent_message` | Continue an existing (finished, not running) subagent, preserving its context. | `task_id`, `prompt` | mutate |
-| `stop_subagent` | Stop a subagent; a background task is aborted, state becomes `stopped`. | `task_id` | mutate |
-| `subagent_status` | Report a subagent's state and (when finished) its output. | `task_id` | read |
+| `send_subagent_message` | Continue an existing (finished, not running) subagent, preserving its context. Addressable by `task_id` **or** the worker's `name`. | `task_id`, `prompt` | mutate |
+| `stop_subagent` | Stop a subagent (by `task_id` or `name`); a background task is aborted, state becomes `stopped`. | `task_id` | mutate |
+| `subagent_status` | Report a subagent's state and (when finished) its output. By `task_id` or `name`. | `task_id` | read |
+| `subagent_list` | List your team — every subagent you spawned with its `task_id`, `name`, and `state`. The roster for coordinating an **agent team** (lead routes between named workers via `send_subagent_message`). | — | read |
 
 ## Skills
 
