@@ -58,37 +58,32 @@ The full v0 spec surface is implemented and verified (CI green).
 | Area | Status | Priority |
 |---|---|---|
 | Tool result envelope (status/device_id/connector/history_step_id) + risk class on ToolSpec | partial | high |
-| Safety: approval flow (status envelope, approval_id, approval_list), co-location guard, mandate enforcement | partial | high |
-| Device-scoping invariant: handle binding + cross-device rejection | partial | high |
-| Memory model: ME/USER/TODO auto-injection, NOTES.md, recall tools, wiki | partial | high |
-| Context compression: 75% compaction trigger, two-stage prune+summarize, ContextCompressor trait | partial | high |
-| M4 conversation resume: event_id replay, task records, waiting states | partial (storage seq landed) | high |
-| M5 enrollment + device model: fleety init, pairing codes, device.yaml, NOTES.md | missing | high |
-| Connectors beyond client_session: priority selection, device registry, SSH/HTTP/daemon | missing | high |
-| fleetyd daemon: connection, heartbeat, local tool bridge, autostart | missing | high |
-| Client runtime updater + version consistency + history_* restore tools | partial | high |
-| M6 interactive TUI (ratatui): multi-pane UI + ServerMsg UI events | missing | high |
-| Model layer: SSE streaming, GET /models discovery, models.cache.json, provider CLI | partial | medium |
+| Safety: approval flow (ApprovalRequested/Approve/Deny), co-location guard, mandate enforcement | **done** | — |
+| Device-scoping invariant: handle binding + cross-device rejection | **done** | — |
+| Memory model: ME/USER/TODO auto-injection, NOTES.md, recall tools, wiki | **done** | — |
+| Context compression: compaction trigger, two-stage prune+summarize, ContextCompressor trait | **done** | — |
+| M4 conversation resume: replay after seq, waiting states (task records unverified) | **done** | — |
+| M5 enrollment + device model: fleety init, pairing codes, device.json, NOTES.md | **done** | — |
+| Connectors beyond client_session: device registry, SSH/HTTP/daemon | **done** | — |
+| fleetyd daemon: connection, heartbeat, local tool bridge, autostart | **done** | — |
+| Client runtime updater + version consistency (history_* restore tools NOT shipped — restore is via CLI `audit`/`rollback`) | partial | medium |
+| M6 interactive TUI (ratatui): multi-pane UI + ServerMsg UI events | **done** | — |
+| Model layer: SSE streaming + GET /models discovery shipped; models.cache.json + provider CLI NOT | partial | medium |
 | Skills + MCP runtime: loaders, builtin/installed/authored, lifecycle tools | **done** | — |
 | Scheduling/cron (M8): schedule_* tools, mandate enforcement, fire loop | **done** | — |
 | Browser automation (M9, CDP, any-device) + computer-use (M10, native `computer_*`) | **done** | — |
+| Goal-completion + voice channel + skill learning-loop (set_goal/complete_goal, speech, reflection) | **done** | — |
 
 ## Next work (prioritized)
 
-Highest first. Data-model items (envelope, event_id, device.yaml) come before the features that depend on them, to avoid rework.
+Most of the original list has shipped (see the table above and "Shipped after the original audit" below). Genuinely remaining:
 
-1. **Tool result envelope + risk class** — extend tool results in `agent-core/src/tools.rs` (currently bare `Value`) to carry `status` (`ok|approval_required|error|waiting_for_device`), `device_id`, `connector`, `history_step_id`; add a `risk` field (`read|mutate|critical`) to `ToolSpec` in `agent-core/src/model.rs`. Prerequisite for approval, device-scoping, resume — land first.
-2. **Approval flow** — in `agent-core/src/agent.rs` gate `mutate`/`critical` tools to emit `approval_required`; add `ServerMsg::ApprovalRequested` + approve/deny `ClientMsg` in `fleety-protocol`; add `approval_list` tool + persist `Approval` records in `fleety-server/src/storage.rs`. Replace the always-execute critical guard in `fleety-server/src/tools.rs`.
-3. **Resume protocol + replay (M4)** — storage `seq` + `load_after` are in. Add `last_seen_event_id` / `active_conversation_id` to `ClientMsg::Hello` (or a `Resume` frame) in `fleety-protocol`; rework `handle_conn()` in `fleety-server/src/conn.rs` to detect a resumable session instead of minting a new `session_id` per connection, then replay events after the seq from storage. Send `seq` on `ServerMsg::Assistant`.
-4. **Task records (M4)** — `TaskRecord` + `tasks/{id}.json` persistence in `storage.rs` with states `running|done|failed|waiting_for_origin_device`; have the loop drive tasks rather than one synchronous `run_turn` per message.
-5. **Device-scoping enforcement** — add a `device_id` param + validation to `ToolRegistry.call()` in `agent-core/src/tools.rs`; reject cross-device handle use with the actionable `ErrorReport` (owning device + two remediation paths).
-6. **Memory core files + auto-injection** — read/write `ME.md`/`USER.md`/`TODO.md` (default `ME.md` = Fleety) + `memory_read`/`memory_write` tools; hook `run_turn` to prepend core memory before the provider call (spec §5.2).
-7. **Enrollment + device.yaml (M5)** — `fleety init <agent-url>` in `fleety-cli`; server assigns `device_id` + token, writes `devices/{id}/device.yaml` (`id`, `mobility`, `site`, `connectors[]`) + initial `NOTES.md`; `DeviceRegistry`, `device_list`/`device_show` tools, pairing-code gen/validate, secure token storage.
-8. **Context compaction** — `ContextCompressor` trait in `agent-core`; 75% trigger in `agent.rs`; stage A (prune old tool outputs) then stage B (summarize old rounds, keep recent ~20 verbatim, originals by handle in the log). Per spec §10.1, modelled on TimLai666/agent `compaction.py`.
-9. **history_* tools + protocol-version check** — `history_list`/`history_show`/`history_restore_preview`/`history_restore` over `history.jsonl`; validate the `protocol` field from `Hello` in `conn.rs` against `PROTOCOL_VERSION`.
-10. **client_session tool bridge** — execute tools on the origin CLI device (not a fixed server workspace); the real M3 client_session model; unblocks connectors/daemon.
-11. **GET /models discovery** — HTTP route beside the WS server + `models.cache.json`, so users select models without env-var hacking.
-12. **SSE streaming** — token streaming in `OpenAiCompat` + stream assistant deltas over the protocol (pairs with the TUI).
+1. **Tool result envelope** — tool results in `agent-core/src/tools.rs` are still a bare `Value`. The `risk` class on `ToolSpec` shipped, but the structured envelope (`status`/`device_id`/`connector`/`history_step_id`) and a `device_id` param on `ToolRegistry::call()` are not.
+2. **Task records (M4)** — `TaskRecord` + `tasks/{id}.json` with states `running|done|failed|waiting_for_origin_device` (unverified; resume/replay itself shipped).
+3. **history_* restore tools** — `history_show`/`history_restore_preview`/`history_restore` over `history.jsonl`; today only `history_list` exists and restore is served via the CLI `audit`/`rollback` commands.
+4. **Model selection surface** — `models.cache.json` + a GET `/models` HTTP route / provider-selection CLI (SSE streaming and `list_models` discovery already shipped).
+
+Voice follow-ups (real mac/Linux STT, device deixis) are tracked as their own change, not here.
 
 ## Shipped after the original audit (2026-06)
 

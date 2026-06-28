@@ -30,7 +30,7 @@ Either way the SKILL.md format and the writing guidance below are identical — 
 
 Tools you use:
 - `skill_write_file` (create/overwrite a file — SKILL.md, a script, a reference), `skill_edit_file` (precise substring / line-range edit), `skill_read_file`, `skill_list_files`, `skill_delete_file`, `skill_remove` (whole pack).
-- `list_skills` reports each skill's `source` and on-disk `path` — you need that `path` to run a bundled script (see below).
+- `use_skill` and `list_skills` both report a skill's on-disk `path` — you need that `path` to run a bundled script (see below).
 
 ## Creating a skill
 
@@ -115,7 +115,7 @@ Loading is layered, so spend the context budget wisely:
 
 When a skill needs a deterministic or repetitive step, don't make the agent re-derive code every time — bundle a script under `scripts/` (write it with `skill_write_file`) and tell the skill how to run it. Fleety has no dedicated "run skill script" tool; run it through `run_command`:
 
-1. Get the skill's directory from `list_skills` (its `path` field).
+1. Get the skill's directory `path` — `use_skill` returns it (so does `list_skills`).
 2. Run `run_command` with the interpreter and the absolute path, e.g. `python "<path>/scripts/foo.py" …`.
 3. To run it on another device, wrap that in `device_exec`.
 
