@@ -69,16 +69,16 @@ root (the old `..`/absolute/symlink-tight sandbox).
 
 | Tool | Purpose | Key inputs | Risk |
 |---|---|---|---|
-| `read_file` | Read a UTF-8 text file. | `path` | read |
+| `read_file` | Read a UTF-8 text file. Returns raw `content` + line-numbered `numbered` + `line_count`; slice with `start_line`/`end_line`. | `path`, `start_line?`, `end_line?` | read |
 | `list_dir` | List a directory. | `path?` (default `.`) | read |
 | `search_files` | ripgrep over the workspace (respects `.gitignore`, skips binaries). | `query`, `path?`, `max_results?` | read |
 | `write_file` | Write a whole file (overwrite). Returns `backup` + unified `diff`. | `path`, `content` | mutate |
-| `edit_file` | Replace an exact, unique substring. Returns `backup` + `diff`. | `path`, `old`, `new` | mutate |
+| `edit_file` | Precise edit — substring mode (`old`→`new`, unique) or line-range mode (`start_line`..`end_line`→`new`). Returns `backup` + `diff` + `applied` (numbered post-edit region). | `path`, `new`, and `old?` or `start_line?`/`end_line?` | mutate |
 | `delete_file` | Delete a file (backup first). | `path` | mutate |
 | `move_file` | Move / rename (backs up destination if it exists). | `from`, `to` | mutate |
 | `make_dir` | Create a directory (and any missing parents). | `path` | mutate |
 | `rollback` | Restore a file from a `backup_id` returned by a prior mutation. | `backup_id` | mutate |
-| `run_command` | Run one command in the workspace; returns `stdout`/`stderr`/`exit_code`. Pass `track: [paths]` to get a unified before/after diff of files it touched. The critical-command guard rejects irreversible shapes (wipe / mkfs / dd / `rm -rf /` / etc.). | `command`, `track?`, `timeout_secs?` | mutate, or **critical** when the critical-command guard matches |
+| `run_command` | Run one command in the workspace; returns `stdout`/`stderr`/`exit_code`. Pass `track: [paths]` to get a unified before/after diff of files it touched. The critical-command guard rejects irreversible shapes (wipe / mkfs / dd / `rm -rf /` / etc.). | `command`, `cwd?`, `track?` | mutate, or **critical** when the critical-command guard matches |
 
 > Read before you rely; re-read before each edit (line numbers / content
 > shift). Mutations all back up first, so `rollback` is always available.
@@ -90,9 +90,9 @@ root (the old `..`/absolute/symlink-tight sandbox).
 | Tool | Purpose | Key inputs | Risk |
 |---|---|---|---|
 | `git_status` | Working-tree status. | — | read |
-| `git_diff` | Working-tree (or staged) diff; **includes untracked new files**. | `staged?`, `path?` | read |
+| `git_diff` | Unstaged working-tree diff; **includes untracked new files**. | — | read |
 | `git_log` | Recent commit log. | `limit?` | read |
-| `git_show` | Show a commit / ref. | `ref` | read |
+| `git_show` | Show a commit / ref (default `HEAD`). | `ref?` | read |
 
 ## Web / HTTP / WebSocket / SSE
 
@@ -120,7 +120,7 @@ host using its own keychain / config / network egress.
 
 | Tool | Purpose | Key inputs | Risk |
 |---|---|---|---|
-| `ssh_exec` | Run a command on a remote host over SSH. The target is built defensively (no option injection in `host`); batch-mode only (no interactive password). | `host`, `command`, `port?`, `user?`, `identity_file?`, `timeout_secs?` | mutate (critical for irreversible commands) |
+| `ssh_exec` | Run a command on a remote host over SSH. The target is built defensively (no option injection in `host`); batch-mode only (no interactive password). | `host`, `command`, `user?`, `port?`, `identity?` (private-key path) | mutate (critical for irreversible commands) |
 
 ## Browser (CDP)
 
@@ -203,17 +203,16 @@ tool="insyra_exec", args={…})`.
 
 ## Agent memory
 
-**Runs on:** server only. Memory lives in `{FLEETY_AGENT_HOME}/fleet/` —
-agent's core (`ME.md` / `USER.md` / `TODO.md` / `TOOLS.md`) and per-device
-records (`NOTES.md`). The `device?` argument selects which **device's** notes
-file to read/write; it doesn't route the tool to that device — the file
-itself is always read from the server's storage.
+**Runs on:** server only. These tools operate on the agent's **core** memory
+files only (`ME.md` / `USER.md` / `TODO.md` / `TOOLS.md`) under
+`{FLEETY_AGENT_HOME}/fleet/`. A device's `NOTES.md` is read via `device_show`,
+not here (there is no `device` argument).
 
 | Tool | Purpose | Key inputs | Risk |
 |---|---|---|---|
-| `memory_read` | Read a core memory file (`ME.md` / `USER.md` / `TODO.md` / `TOOLS.md`). | `file` | read |
+| `memory_read` | Read a core memory file. Returns raw `content` + line-numbered `numbered` + `line_count`; slice with `start_line`/`end_line`. | `file`, `start_line?`, `end_line?` | read |
 | `memory_write` | Write a core memory file whole — `mode` `replace` (default) or `append`. | `file`, `content`, `mode?` | mutate |
-| `memory_edit` | Replace an exact substring in a core memory file — the precise alternative to a full rewrite. `old` must be unique unless `replace_all:true`. | `file`, `old`, `new`, `replace_all?` | mutate |
+| `memory_edit` | Precise edit — substring mode (`old`→`new`, unique unless `replace_all`) or line-range mode (`start_line`..`end_line`→`new`). Returns the post-edit `applied` region. | `file`, `new`, and `old?` or `start_line?`/`end_line?`, `replace_all?` | mutate |
 
 > The core files `ME.md` / `USER.md` / `TODO.md` are auto-injected into the
 > system prompt every turn. Use `memory_edit` for surgical updates and
