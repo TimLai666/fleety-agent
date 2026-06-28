@@ -952,4 +952,63 @@ mod tests {
         assert!(r.is_err(), "worktree in a non-git workspace must error");
         let _ = std::fs::remove_dir_all(home);
     }
+
+    #[tokio::test]
+    #[serial]
+    async fn background_completion_drives_a_coordinator_wake_turn() {
+        // "Background completion notification": a finished background subagent
+        // proactively drives a coordinator turn that streams the synthesis to
+        // the client sink — exactly once (this background task runs once).
+        std::env::remove_var("FLEETY_SUBAGENT_MAX_CONCURRENT");
+        let home = std::env::temp_dir().join(format!("fleety-sub-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&home).unwrap();
+        let storage = Arc::new(Storage::new(home.clone()));
+        let auth = Arc::new(crate::auth::AuthStore::load(home.join("auth.json"), None, false));
+        let (out, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        // One main provider, scripted: first the subagent's own reply, then the
+        // coordinator synthesis produced on the wake turn.
+        let main: Arc<dyn ModelProvider> = Arc::new(MockProvider::new(vec![
+            ModelResponse {
+                message: Message::assistant("sub-result"),
+            },
+            ModelResponse {
+                message: Message::assistant("coordinator-ack"),
+            },
+        ]));
+        let rt = SubagentRuntime::new(
+            ProviderTiers::new(main, None),
+            Policy::FullAccess,
+            storage,
+            home.clone(),
+            "dev".to_string(),
+            crate::bridge::new_hub(),
+            crate::bridge::new_pending(),
+            crate::bridge::new_handles(),
+            auth,
+            crate::bridge::new_device_tools(),
+            out,
+        );
+        rt.set_active_conversation("c1").await;
+        let spawn = SpawnSubagent(Arc::clone(&rt));
+        let r = spawn
+            .call(json!({ "prompt": "go", "run_in_background": true }))
+            .await
+            .unwrap();
+        assert_eq!(r["state"], "running");
+        // The wake turn streams the coordinator synthesis to `out`; wait for it.
+        let saw = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(frame) = rx.recv().await {
+                if let tokio_tungstenite::tungstenite::Message::Text(t) = frame {
+                    if t.contains("coordinator-ack") {
+                        return true;
+                    }
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+        assert!(saw, "background completion drove a coordinator wake turn");
+        let _ = std::fs::remove_dir_all(home);
+    }
 }
