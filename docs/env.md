@@ -180,11 +180,18 @@ specific user.
 
 The agent can search its **own user's** past conversations (per-user; conversations
 are user-primary). `conversation_search` (keyword) and `conversation_list` work
-with no model. `conversation_semantic_search` falls back to keyword in this build;
-embedding-ranked recall (a per-user vector index reusing the wiki's embedding
-model + sqlite-vec, gated by `FLEETY_WIKI_EMBED`, under `~/.fleety/agent/fleet/users/<id>/`)
-is a planned follow-up and upgrades that tool in place. Every result carries a
-timestamp (`ts_secs`, UTC) so time order is clear.
+with no model. `conversation_semantic_search` is **embedding-ranked**: it embeds
+the query and returns the user's most similar messages by cosine similarity
+(newest-first on ties, with a `score`), backed by a **per-user vector index**
+(sqlite-vec) that reuses the wiki's local embedding model (EmbeddingGemma via
+fastembed, one model shared by wiki + recall, gated by `FLEETY_WIKI_EMBED`). The
+index lives beside the user's conversations (`fleet/users/<id>/conversations/.index/conversations.db`),
+one embedding per message, and is updated **off the turn** (fire-and-forget after
+each turn, so it never adds latency) with a lazy build on first search. When
+embeddings are disabled (`FLEETY_WIKI_EMBED=0`) or the index is empty/unavailable
+it **falls back to keyword search** — never worse than before — and a guest (no
+identified user) gets nothing. Every result carries a timestamp (`ts_secs`, UTC)
+so time order is clear.
 
 ## Time & timezone
 

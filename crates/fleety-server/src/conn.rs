@@ -1010,6 +1010,39 @@ pub(crate) async fn drive_turn(
     let attention = outcome.attention;
     let seq = storage.append(device_id, conversation, &Message::assistant(reply.clone()))?;
     storage.journal_end(device_id, conversation)?;
+    // Off-turn: append this user's new messages to their semantic-recall index,
+    // fire-and-forget so the turn never waits on embedding. Best-effort — a
+    // failure (model unavailable, etc.) is logged and the next turn retries.
+    if crate::embed::enabled() {
+        if let Some(user) = acting.user_id().map(str::to_string) {
+            let storage = Arc::clone(storage);
+            let conversation = conversation.to_string();
+            tokio::task::spawn_blocking(move || {
+                let path = storage.conversation_index_path(&user);
+                let cache = storage.models_dir();
+                let msgs: Vec<crate::conversation_embed::IndexMsg> = storage
+                    .load_user_conversation(&user, &conversation)
+                    .into_iter()
+                    .filter_map(|e| {
+                        let content = e.message.content?;
+                        let role = match e.message.role {
+                            Role::System => "system",
+                            Role::User => "user",
+                            Role::Assistant => "assistant",
+                            Role::Tool => "tool",
+                        }
+                        .to_string();
+                        Some((e.seq, e.ts_secs, role, content))
+                    })
+                    .collect();
+                if let Err(e) =
+                    crate::conversation_embed::index_messages(&path, &cache, &conversation, &msgs)
+                {
+                    tracing::warn!(error = %e, "conversation index update failed");
+                }
+            });
+        }
+    }
     if emit_terminal {
         emit(
             out,

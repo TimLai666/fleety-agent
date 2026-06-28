@@ -188,6 +188,11 @@ impl Storage {
         self.home.join("fleet").join("conversation-workspace.json")
     }
 
+    /// The per-user conversation embedding index db (beside their conversations).
+    pub fn conversation_index_path(&self, user: &str) -> PathBuf {
+        crate::conversation_embed::index_path(&self.home, user)
+    }
+
     /// The persisted workspace binding for a conversation (root + optional
     /// device), set on its first message and reused on resume. `None` if unset.
     pub fn conversation_workspace(

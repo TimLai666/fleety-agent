@@ -25,30 +25,17 @@ use std::sync::{Mutex, OnceLock};
 
 use agent_core::{CoreError, Result, RiskLevel, Tool, ToolSpec};
 use async_trait::async_trait;
-use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 use rusqlite::Connection;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-/// EmbeddingGemma's documented retrieval prompts (improve query/document
-/// alignment). Applied manually — fastembed runs the tokenizer on raw text.
-const QUERY_PREFIX: &str = "task: search result | query: ";
-const DOC_PREFIX: &str = "title: none | text: ";
-/// Q8 (int8) build — the chosen quality/size balance (~300MB).
-const MODEL: EmbeddingModel = EmbeddingModel::EmbeddingGemma300MQ;
-const MODEL_TAG: &str = "embeddinggemma-300m-q8";
+// Shared embedding access (one model + one gate for wiki and conversation recall).
+use crate::embed::{
+    embed_texts, enabled, vec_bytes, with_model, DOC_PREFIX, MODEL_TAG, QUERY_PREFIX,
+};
+
 /// Rough chunk size in bytes; notes are split on blank lines and packed up to this.
 const CHUNK_BYTES: usize = 1200;
-
-pub fn enabled() -> bool {
-    std::env::var("FLEETY_WIKI_EMBED").as_deref() != Ok("0")
-}
-
-/// Process-global model handle. `embed` needs `&mut self`, so a Mutex, not Arc.
-fn model_cell() -> &'static Mutex<Option<TextEmbedding>> {
-    static M: OnceLock<Mutex<Option<TextEmbedding>>> = OnceLock::new();
-    M.get_or_init(|| Mutex::new(None))
-}
 
 /// Process-global SQLite connection (one wiki vault per server).
 fn conn_cell() -> &'static Mutex<Option<Connection>> {
@@ -95,43 +82,8 @@ fn chunk_note(content: &str) -> Vec<String> {
     chunks
 }
 
-fn vec_bytes(v: &[f32]) -> Vec<u8> {
-    v.iter().flat_map(|x| x.to_le_bytes()).collect()
-}
-
 /// `(note rel, content hash, [(chunk text, embedding)])` for one (re)embedded note.
 type EmbeddedNote = (String, String, Vec<(String, Vec<f32>)>);
-
-/// Initialise the model if needed. Blocking.
-fn with_model<T>(cache_dir: &Path, f: impl FnOnce(&mut TextEmbedding) -> Result<T>) -> Result<T> {
-    let mut guard = model_cell()
-        .lock()
-        .map_err(|_| CoreError::Message("embedding model lock poisoned".to_string()))?;
-    if guard.is_none() {
-        std::fs::create_dir_all(cache_dir).ok();
-        let opts = TextInitOptions::new(MODEL)
-            .with_cache_dir(cache_dir.to_path_buf())
-            .with_show_download_progress(false);
-        let model = TextEmbedding::try_new(opts).map_err(|e| {
-            CoreError::Message(format!(
-                "could not load the EmbeddingGemma model (first use downloads ~300MB from \
-                 huggingface; needs network). Set FLEETY_WIKI_EMBED=0 to disable semantic \
-                 search and use wiki_search instead. Cause: {e}"
-            ))
-        })?;
-        *guard = Some(model);
-    }
-    let model = guard
-        .as_mut()
-        .ok_or_else(|| CoreError::Message("embedding model unavailable".to_string()))?;
-    f(model)
-}
-
-fn embed_texts(model: &mut TextEmbedding, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
-    model
-        .embed(texts, None)
-        .map_err(|e| CoreError::Message(format!("embedding failed: {e}")))
-}
 
 /// Open the DB (creating base tables); reset everything if the model changed.
 fn open_db(vault: &Path) -> Result<Connection> {

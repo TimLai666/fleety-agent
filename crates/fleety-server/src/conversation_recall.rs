@@ -146,9 +146,10 @@ impl Tool for ConversationSemanticSearch {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "conversation_semantic_search".to_string(),
-            description: "Semantic search of your past conversations (this user's only). v1 falls \
-                back to keyword matching (embedding-ranked recall is a planned follow-up); results \
-                carry timestamps so you know their order."
+            description: "Semantic (embedding-ranked) search of your past conversations (this \
+                user's only): finds messages by meaning, ranked by similarity, newest-first on \
+                ties; results carry timestamps so you know their order. Falls back to keyword \
+                matching when embeddings are unavailable."
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -163,15 +164,45 @@ impl Tool for ConversationSemanticSearch {
     }
 
     async fn call(&self, args: Value) -> Result<Value> {
-        let query = args.get("query").and_then(Value::as_str).unwrap_or("");
-        let hits = match &self.user {
-            Some(u) => keyword_search(&self.storage, u, query, limit_arg(&args)),
-            None => Vec::new(),
+        let query = args
+            .get("query")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let limit = limit_arg(&args);
+        // Guest: no identified user → no access to anyone's history.
+        let Some(user) = self.user.clone() else {
+            return Ok(json!({ "hits": [] }));
         };
-        Ok(json!({
-            "hits": hits,
-            "note": "semantic ranking unavailable in this build; returned keyword matches"
-        }))
+        // Embedding-ranked when available; the model + sqlite are blocking.
+        if crate::embed::enabled() && !query.trim().is_empty() {
+            let path = self.storage.conversation_index_path(&user);
+            let cache = self.storage.models_dir();
+            let q = query.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                crate::conversation_embed::search(&path, &cache, &q, limit)
+            })
+            .await;
+            if let Ok(Ok(chunks)) = result {
+                if !chunks.is_empty() {
+                    let hits: Vec<RecallHit> = chunks
+                        .into_iter()
+                        .map(|c| RecallHit {
+                            conversation_id: c.conversation_id,
+                            seq: c.seq,
+                            ts_secs: c.ts_secs,
+                            role: c.role,
+                            snippet: c.snippet,
+                            score: Some(c.score),
+                        })
+                        .collect();
+                    return Ok(json!({ "hits": hits, "ranking": "embedding" }));
+                }
+            }
+            // disabled mid-flight / empty / error → fall through to keyword.
+        }
+        let hits = keyword_search(&self.storage, &user, &query, limit);
+        Ok(json!({ "hits": hits, "ranking": "keyword" }))
     }
 }
 
@@ -285,12 +316,36 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out["hits"].as_array().map(|a| a.len()), Some(0));
-        // semantic degrades with a note, never errors.
+        // semantic also returns nothing for a guest, never errors.
         let sem = reg
             .call("conversation_semantic_search", json!({ "query": "x" }))
             .await
             .unwrap();
-        assert!(sem["note"].is_string());
+        assert_eq!(sem["hits"].as_array().map(|a| a.len()), Some(0));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn semantic_falls_back_to_keyword_when_embeddings_off() {
+        std::env::set_var("FLEETY_WIKI_EMBED", "0");
+        let (storage, home) = temp_storage();
+        let alice = crate::identity::ActingUser::User("alice".into());
+        storage.register_conversation_owner("c1", &alice).unwrap();
+        storage
+            .append("dev", "c1", &Message::user("deploy the server tonight"))
+            .unwrap();
+        let storage = Arc::new(storage);
+        let mut reg = ToolRegistry::new();
+        register(&mut reg, Arc::clone(&storage), Some("alice".into()));
+        let out = reg
+            .call("conversation_semantic_search", json!({ "query": "deploy" }))
+            .await
+            .unwrap();
+        // Embeddings off → keyword fallback, never an error, never worse than before.
+        assert_eq!(out["ranking"], "keyword");
+        assert_eq!(out["hits"].as_array().map(|a| a.len()), Some(1));
+        std::env::remove_var("FLEETY_WIKI_EMBED");
         let _ = std::fs::remove_dir_all(&home);
     }
 }
