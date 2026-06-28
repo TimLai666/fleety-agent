@@ -19,6 +19,7 @@ pub mod model;
 pub mod obs;
 pub mod openai;
 pub mod panic;
+pub mod subagent;
 pub mod tools;
 
 pub use agent::{run_turn, run_turn_streaming, LoopConfig, TurnOutcome};
@@ -32,6 +33,10 @@ pub use model::{
     ToolSpec,
 };
 pub use openai::OpenAiCompat;
+pub use subagent::{
+    register_orchestration, SpawnRequest, SubagentHost, SubagentManager, SubagentMode,
+    SubagentState,
+};
 pub use tools::{Tool, ToolRegistry};
 
 /// Version of agent-core. In M0 this also stands in for the runtime version.

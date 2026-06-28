@@ -192,7 +192,7 @@ async fn serve(
     // tools registered ONLY at this top level. Subagent registries are built
     // from `build_full_registry` alone, so they omit these tools — that is what
     // caps nesting at one level.
-    let subagent_rt = crate::subagent::SubagentRuntime::new(
+    let subagent_host = crate::subagent::FleetyHost::new(
         crate::providers::ProviderTiers::from_env(),
         policy,
         Arc::clone(storage),
@@ -205,7 +205,13 @@ async fn serve(
         Arc::clone(device_tools),
         out.clone(),
     );
-    crate::subagent::register(&mut tools, Arc::clone(&subagent_rt));
+    let subagent_mgr = agent_core::SubagentManager::new(
+        Arc::clone(&subagent_host) as Arc<dyn agent_core::SubagentHost>,
+        policy,
+        crate::subagent::max_concurrent_from_env(),
+    );
+    subagent_host.set_manager(Arc::downgrade(&subagent_mgr));
+    agent_core::register_orchestration(&mut tools, subagent_mgr);
 
     while let Some(msg) = read_client(rx).await? {
         match msg {
@@ -228,8 +234,8 @@ async fn serve(
                 // turn so a background subagent's wake turn can't interleave
                 // storage appends; record the active conversation so a `fork`
                 // subagent inherits it.
-                let _turn_guard = subagent_rt.lock_turn().await;
-                subagent_rt.set_active_conversation(&conversation).await;
+                let _turn_guard = subagent_host.lock_turn().await;
+                subagent_host.set_active_conversation(&conversation).await;
 
                 // First finish any turn left interrupted by a crash/redeploy, so
                 // it isn't lost and doesn't interleave with this message. Best
