@@ -112,6 +112,15 @@ fn build_connection_stack(
         Arc::clone(storage),
         acting.user_id().map(String::from),
     );
+    // Tool-result retrieval + a privacy-filtered audit listing, scoped to the
+    // acting user (overrides the unscoped base `history_list`).
+    crate::tools::register_user_scoped(
+        &mut tools,
+        Arc::clone(storage),
+        device_id,
+        acting.clone(),
+        agent_core::LoopConfig::default().max_tool_result_chars,
+    );
     let subagent_host = crate::subagent::FleetyHost::new(
         crate::providers::ProviderTiers::from_env(),
         policy,
@@ -982,7 +991,7 @@ pub(crate) async fn drive_turn(
     )
     .await?;
     for event in events.events() {
-        storage.append_history(device_id, event)?;
+        storage.append_history_tagged(device_id, conversation, event)?;
     }
     let steps = outcome.steps;
     let reply = outcome.output;
@@ -1265,7 +1274,7 @@ async fn recover_one_interactive(
     )
     .await?;
     for event in log.events() {
-        storage.append_history(device_id, event)?;
+        storage.append_history_tagged(device_id, conversation, event)?;
     }
     storage.append(device_id, conversation, &Message::assistant(outcome.output))?;
     storage.journal_end(device_id, conversation)?;
@@ -1335,7 +1344,7 @@ async fn recover_incomplete_turn(
     };
 
     for event in log.events() {
-        storage.append_history(device_id, event)?;
+        storage.append_history_tagged(device_id, conversation, event)?;
     }
     let reply = outcome.output;
     let seq = storage.append(device_id, conversation, &Message::assistant(reply.clone()))?;

@@ -108,7 +108,7 @@ pub fn reconstruct_messages(events: &[Event], max_tool_result_chars: usize) -> V
         match event {
             Event::Assistant(msg) => messages.push(msg.clone()),
             Event::ToolResult { id, result } => {
-                let fed = crate::compress::compress_tool_result(result, max_tool_result_chars);
+                let fed = crate::compress::compress_tool_result(result, max_tool_result_chars, id);
                 messages.push(Message::tool_result(id.clone(), fed));
             }
             Event::ToolCall(_) => {} // carried inside the assistant message

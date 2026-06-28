@@ -20,6 +20,11 @@ use serde_json::Value;
 struct AuditRecord {
     #[serde(default)]
     ts_secs: u64,
+    /// The conversation this event belongs to, when known. Older lines and
+    /// non-conversation events (scheduler, subagents) omit it; retrieval treats
+    /// an absent conversation as un-attributable and therefore inaccessible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    conversation_id: Option<String>,
     #[serde(flatten)]
     event: Event,
 }
@@ -986,6 +991,27 @@ impl Storage {
     /// before this change) keep working: `ts_secs` is just one more field to
     /// ignore, and old lines without it parse with `ts_secs == 0`.
     pub fn append_history(&self, device_id: &str, event: &Event) -> Result<()> {
+        self.append_history_inner(device_id, None, event)
+    }
+
+    /// Like [`append_history`], but tags the entry with the conversation it
+    /// belongs to so a tool result can later be retrieved under that
+    /// conversation's owner (see [`tool_result_for`]).
+    pub fn append_history_tagged(
+        &self,
+        device_id: &str,
+        conversation_id: &str,
+        event: &Event,
+    ) -> Result<()> {
+        self.append_history_inner(device_id, Some(conversation_id), event)
+    }
+
+    fn append_history_inner(
+        &self,
+        device_id: &str,
+        conversation_id: Option<&str>,
+        event: &Event,
+    ) -> Result<()> {
         validate_id("device_id", device_id)?;
         let path = self.history_path(device_id);
         if let Some(parent) = path.parent() {
@@ -998,6 +1024,7 @@ impl Storage {
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
+            conversation_id: conversation_id.map(str::to_string),
             event: event.clone(),
         };
         let line = serde_json::to_string(&record)
@@ -1010,6 +1037,56 @@ impl Storage {
         writeln!(file, "{line}")
             .map_err(|e| CoreError::Message(format!("write audit failed: {e}")))?;
         Ok(())
+    }
+
+    /// Resolve the full result of a `tool_result` event by its id, restricted to
+    /// conversations the caller can access. Scans the device audit log and keeps
+    /// the most recent match, preferring one in `conversation_hint`. Entries with
+    /// no conversation tag (legacy, scheduler, subagents) are never returned —
+    /// ownership can't be verified, so access is denied. Returns the full result
+    /// and the conversation it belongs to.
+    pub fn tool_result_for(
+        &self,
+        device_id: &str,
+        id: &str,
+        conversation_hint: Option<&str>,
+        is_accessible: impl Fn(&str) -> bool,
+    ) -> Option<(Value, String)> {
+        let path = self.history_path(device_id);
+        let text = fs::read_to_string(&path).ok()?;
+        let mut hint_match: Option<(Value, String)> = None;
+        let mut any_match: Option<(Value, String)> = None;
+        for line in text.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            if v.get("event").and_then(Value::as_str) != Some("tool_result") {
+                continue;
+            }
+            if v.get("id").and_then(Value::as_str) != Some(id) {
+                continue;
+            }
+            let Some(conv) = v.get("conversation_id").and_then(Value::as_str) else {
+                continue; // untagged → unattributable → inaccessible
+            };
+            if !is_accessible(conv) {
+                continue;
+            }
+            let Some(result) = v.get("result") else {
+                continue;
+            };
+            let pair = (result.clone(), conv.to_string());
+            // Lines are oldest→newest; overwrite to keep the latest.
+            if Some(conv) == conversation_hint {
+                hint_match = Some(pair);
+            } else {
+                any_match = Some(pair);
+            }
+        }
+        hint_match.or(any_match)
     }
 
     /// Path to a conversation's in-flight turn journal (durable record of the
@@ -1170,6 +1247,62 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fleety-storage-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("mk temp");
         dir
+    }
+
+    #[test]
+    fn tool_result_for_resolves_within_access_only() {
+        use agent_core::Event;
+        use serde_json::json;
+        let home = temp_home();
+        let storage = Storage::new(home.clone());
+        let dev = "dev";
+        storage
+            .append_history_tagged(
+                dev,
+                "convA",
+                &Event::ToolResult {
+                    id: "x1".to_string(),
+                    result: json!({ "big": "data" }),
+                },
+            )
+            .expect("tag");
+
+        // Accessible → returns full result + its conversation.
+        assert_eq!(
+            storage.tool_result_for(dev, "x1", Some("convA"), |c| c == "convA"),
+            Some((json!({ "big": "data" }), "convA".to_string()))
+        );
+        // Not accessible (another user's conversation) → None, no hint it exists.
+        assert!(storage
+            .tool_result_for(dev, "x1", Some("convA"), |_| false)
+            .is_none());
+        // Unknown id → None.
+        assert!(storage
+            .tool_result_for(dev, "nope", None, |_| true)
+            .is_none());
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn tool_result_for_excludes_untagged() {
+        use agent_core::Event;
+        use serde_json::json;
+        let home = temp_home();
+        let storage = Storage::new(home.clone());
+        let dev = "dev";
+        // Untagged (plain append_history) → unattributable → never returned.
+        storage
+            .append_history(
+                dev,
+                &Event::ToolResult {
+                    id: "y1".to_string(),
+                    result: json!({ "secret": true }),
+                },
+            )
+            .expect("untagged");
+        assert!(storage.tool_result_for(dev, "y1", None, |_| true).is_none());
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

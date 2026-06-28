@@ -280,7 +280,11 @@ pub async fn run_turn_streaming(
                 id: call.id.clone(),
                 result: result.clone(),
             });
-            let fed = crate::compress::compress_tool_result(&result, config.max_tool_result_chars);
+            let fed = crate::compress::compress_tool_result(
+                &result,
+                config.max_tool_result_chars,
+                &call.id,
+            );
             messages.push(Message::tool_result(call.id.clone(), fed));
         }
     }

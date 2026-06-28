@@ -42,6 +42,7 @@ pub fn build_registry(
     }));
     registry.register(Box::new(HistoryList {
         path: history_path.to_path_buf(),
+        scope: None,
     }));
     registry.register(Box::new(DeviceList {
         devices_dir: devices_dir.to_path_buf(),
@@ -292,8 +293,19 @@ impl Tool for MemoryEdit {
     }
 }
 
+/// Per-acting-user scoping for the audit listing: only entries from
+/// conversations this user can access are shown.
+struct HistoryScope {
+    storage: std::sync::Arc<crate::storage::Storage>,
+    acting: crate::identity::ActingUser,
+}
+
 struct HistoryList {
     path: PathBuf,
+    /// When set, the listing is filtered to the acting user's accessible
+    /// conversations (closing the shared-device leak); `None` is the
+    /// unscoped base used by system contexts (scheduler, tests).
+    scope: Option<HistoryScope>,
 }
 
 #[async_trait]
@@ -324,11 +336,141 @@ impl Tool for HistoryList {
             .filter(|line| !line.trim().is_empty())
             .filter_map(|line| serde_json::from_str(line).ok())
             .collect();
+        // Privacy: when scoped to an acting user, drop entries from
+        // conversations they can't access, and untagged (unattributable)
+        // entries — never surface another user's tool output.
+        if let Some(scope) = &self.scope {
+            let grants = scope.storage.grants();
+            entries.retain(|e| {
+                e.get("conversation_id")
+                    .and_then(Value::as_str)
+                    .map(|c| {
+                        scope.storage.conversation_access(&scope.acting, c, &grants)
+                            == crate::privacy::Decision::Allow
+                    })
+                    .unwrap_or(false)
+            });
+        }
         let total = entries.len();
         if entries.len() > limit {
             entries = entries.split_off(entries.len() - limit);
         }
         Ok(json!({ "total": total, "returned": entries.len(), "entries": entries }))
+    }
+}
+
+/// Register the acting-user-scoped retrieval tools on top of the base registry
+/// (later registration wins, so this overrides the unscoped `history_list`):
+/// `fetch_tool_result` to pull a full tool result by id in bounded segments, and
+/// a privacy-filtered `history_list`. Both are confined to the acting user's
+/// accessible conversations.
+pub fn register_user_scoped(
+    tools: &mut ToolRegistry,
+    storage: std::sync::Arc<crate::storage::Storage>,
+    device_id: &str,
+    acting: crate::identity::ActingUser,
+    budget: usize,
+) {
+    tools.register(Box::new(HistoryList {
+        path: storage.history_path(device_id),
+        scope: Some(HistoryScope {
+            storage: std::sync::Arc::clone(&storage),
+            acting: acting.clone(),
+        }),
+    }));
+    tools.register(Box::new(FetchToolResult {
+        storage,
+        device_id: device_id.to_string(),
+        acting,
+        conversation_hint: None,
+        budget,
+    }));
+}
+
+/// Retrieve the full result of a truncated tool call by its id, in bounded,
+/// budgeted character windows so a large result can never re-blow the context.
+struct FetchToolResult {
+    storage: std::sync::Arc<crate::storage::Storage>,
+    device_id: String,
+    acting: crate::identity::ActingUser,
+    conversation_hint: Option<String>,
+    budget: usize,
+}
+
+#[async_trait]
+impl Tool for FetchToolResult {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "fetch_tool_result".to_string(),
+            description:
+                "Fetch the full result of an earlier tool call whose output was truncated. Pass \
+                the id from the truncation marker. Returns a character window (offset..offset+limit) \
+                plus total_chars and next_offset (null at the end) so you can page through a large \
+                result; a single fetch never exceeds the normal tool-result budget."
+                    .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "The tool-result id from the truncation marker." },
+                    "offset": { "type": "integer", "description": "Start character (default 0)." },
+                    "limit": { "type": "integer", "description": "Max characters (default = budget; capped at the budget)." }
+                },
+                "required": ["id"]
+            }),
+            risk: RiskLevel::Read,
+        }
+    }
+
+    async fn call(&self, args: Value) -> Result<Value> {
+        let id = require_str(&args, "id")?;
+        let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let limit = args
+            .get("limit")
+            .and_then(Value::as_u64)
+            .map(|n| n as usize)
+            .unwrap_or(self.budget)
+            .clamp(1, self.budget);
+
+        let grants = self.storage.grants();
+        let resolved = self.storage.tool_result_for(
+            &self.device_id,
+            id,
+            self.conversation_hint.as_deref(),
+            |conv| {
+                self.storage
+                    .conversation_access(&self.acting, conv, &grants)
+                    == crate::privacy::Decision::Allow
+            },
+        );
+        // Uniform not-found for unknown or out-of-scope ids — never reveal that an
+        // id exists in another user's conversation.
+        let Some((value, _conv)) = resolved else {
+            return Ok(json!({ "id": id, "found": false, "error": "not found" }));
+        };
+
+        // Render to canonical string, then window by characters.
+        let full = match &value {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        let total = full.chars().count();
+        let content: String = full.chars().skip(offset).take(limit).collect();
+        let returned = content.chars().count();
+        let next = offset + returned;
+        let next_offset = if next < total {
+            json!(next)
+        } else {
+            Value::Null
+        };
+        Ok(json!({
+            "id": id,
+            "found": true,
+            "total_chars": total,
+            "offset": offset,
+            "returned_chars": returned,
+            "next_offset": next_offset,
+            "content": content
+        }))
     }
 }
 
@@ -440,6 +582,127 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fleety-srvtools-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("mk temp");
         dir
+    }
+
+    fn fetch_tool(budget: usize) -> (FetchToolResult, PathBuf) {
+        use agent_core::Event;
+        let home = temp_dir();
+        let storage = std::sync::Arc::new(crate::storage::Storage::new(home.clone()));
+        // A long result, tagged to an unowned conversation (Guest can access).
+        storage
+            .append_history_tagged(
+                "dev",
+                "conv",
+                &Event::ToolResult {
+                    id: "big1".to_string(),
+                    result: json!("a".repeat(50)),
+                },
+            )
+            .expect("tag");
+        (
+            FetchToolResult {
+                storage,
+                device_id: "dev".to_string(),
+                acting: crate::identity::ActingUser::Guest,
+                conversation_hint: Some("conv".to_string()),
+                budget,
+            },
+            home,
+        )
+    }
+
+    #[tokio::test]
+    async fn fetch_tool_result_pages_and_clamps() {
+        let (tool, home) = fetch_tool(10);
+        // First window: 10 chars, more to come.
+        let r = tool.call(json!({ "id": "big1" })).await.expect("call");
+        assert_eq!(r["found"], true);
+        assert_eq!(r["total_chars"], 50);
+        assert_eq!(r["returned_chars"], 10);
+        assert_eq!(r["next_offset"], 10);
+        // limit above the budget is clamped to the budget (10), not 100.
+        let r = tool
+            .call(json!({ "id": "big1", "offset": 0, "limit": 100 }))
+            .await
+            .expect("call");
+        assert_eq!(r["returned_chars"], 10);
+        // Paging to the end yields next_offset = null.
+        let r = tool
+            .call(json!({ "id": "big1", "offset": 45 }))
+            .await
+            .expect("call");
+        assert_eq!(r["returned_chars"], 5);
+        assert!(r["next_offset"].is_null());
+        // Offset past the end: empty, null next, correct total.
+        let r = tool
+            .call(json!({ "id": "big1", "offset": 60 }))
+            .await
+            .expect("call");
+        assert_eq!(r["returned_chars"], 0);
+        assert!(r["next_offset"].is_null());
+        assert_eq!(r["total_chars"], 50);
+        // Unknown id → uniform not-found.
+        let r = tool.call(json!({ "id": "nope" })).await.expect("call");
+        assert_eq!(r["found"], false);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn fetch_and_history_are_user_scoped() {
+        use crate::identity::ActingUser;
+        use agent_core::Event;
+        let home = temp_dir();
+        let storage = std::sync::Arc::new(crate::storage::Storage::new(home.clone()));
+        let user_b = ActingUser::User("userB".to_string());
+        storage
+            .register_conversation_owner("convB", &user_b)
+            .expect("owner");
+        storage
+            .append_history_tagged(
+                "dev",
+                "convB",
+                &Event::ToolResult {
+                    id: "sb".to_string(),
+                    result: json!("secret of B"),
+                },
+            )
+            .expect("tag");
+
+        // User A cannot fetch B's result — uniform not-found, no existence hint.
+        let fetch_a = FetchToolResult {
+            storage: std::sync::Arc::clone(&storage),
+            device_id: "dev".to_string(),
+            acting: ActingUser::User("userA".to_string()),
+            conversation_hint: None,
+            budget: 100,
+        };
+        let r = fetch_a.call(json!({ "id": "sb" })).await.expect("call");
+        assert_eq!(r["found"], false);
+        assert!(r.get("content").is_none());
+
+        // A's scoped history listing shows none of B's entries.
+        let hist_a = HistoryList {
+            path: storage.history_path("dev"),
+            scope: Some(HistoryScope {
+                storage: std::sync::Arc::clone(&storage),
+                acting: ActingUser::User("userA".to_string()),
+            }),
+        };
+        let r = hist_a.call(json!({})).await.expect("hist");
+        assert_eq!(r["total"], 0);
+
+        // B can fetch B's own result.
+        let fetch_b = FetchToolResult {
+            storage: std::sync::Arc::clone(&storage),
+            device_id: "dev".to_string(),
+            acting: user_b,
+            conversation_hint: None,
+            budget: 100,
+        };
+        let r = fetch_b.call(json!({ "id": "sb" })).await.expect("call");
+        assert_eq!(r["found"], true);
+        assert_eq!(r["content"], "secret of B");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     // Workspace tools come from fleety-tools; these confirm the wiring works.

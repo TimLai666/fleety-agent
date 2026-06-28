@@ -145,21 +145,31 @@ impl ContextCompressor for SmartCrusher {
 /// Truncate `text` to at most `max_chars`, appending a marker noting how much
 /// was omitted. The full text lives in the event log, so this is reversible
 /// (the CCR property).
-pub(crate) fn budget_text(text: &str, max_chars: usize) -> String {
+pub(crate) fn budget_text(text: &str, max_chars: usize, id: Option<&str>) -> String {
     if text.chars().count() <= max_chars {
         return text.to_string();
     }
     let kept: String = text.chars().take(max_chars).collect();
     let omitted = text.chars().count() - max_chars;
-    format!("{kept}\n... [truncated {omitted} chars; full result retained in the event log]")
+    match id {
+        // The full result lives in the event log keyed by this id; the marker
+        // names exactly how to retrieve it (in bounded segments).
+        Some(id) => format!(
+            "{kept}\n... [truncated {omitted} chars; fetch the full result with fetch_tool_result id=\"{id}\"]"
+        ),
+        None => {
+            format!("{kept}\n... [truncated {omitted} chars; full result retained in the event log]")
+        }
+    }
 }
 
 /// Compress a tool result for the model: structurally crush the JSON, then
 /// enforce the character budget. The caller keeps the full result in the event
-/// log (reversible — CCR).
-pub(crate) fn compress_tool_result(value: &Value, max_chars: usize) -> String {
+/// log keyed by `id` (reversible — CCR), and the truncation marker names that id
+/// so the agent can fetch the full result on demand.
+pub(crate) fn compress_tool_result(value: &Value, max_chars: usize, id: &str) -> String {
     let crushed = SmartCrusher::default().crush(value).to_string();
-    budget_text(&crushed, max_chars)
+    budget_text(&crushed, max_chars, Some(id))
 }
 
 /// CacheAligner: assemble a prompt from labelled segments ordered **most stable
@@ -365,8 +375,23 @@ mod tests {
 
     #[test]
     fn budget_marks_truncation() {
-        let out = budget_text(&"a".repeat(100), 10);
+        let out = budget_text(&"a".repeat(100), 10, None);
         assert!(out.contains("truncated 90 chars"));
+        assert!(out.contains("retained in the event log"));
+    }
+
+    #[test]
+    fn budget_with_id_names_fetch() {
+        let out = budget_text(&"a".repeat(100), 10, Some("call_7"));
+        assert!(out.contains("truncated 90 chars"));
+        assert!(out.contains("fetch_tool_result id=\"call_7\""));
+    }
+
+    #[test]
+    fn compress_tool_result_carries_id() {
+        let big = serde_json::json!("a".repeat(100));
+        let out = compress_tool_result(&big, 10, "abc");
+        assert!(out.contains("fetch_tool_result id=\"abc\""));
     }
 
     #[test]

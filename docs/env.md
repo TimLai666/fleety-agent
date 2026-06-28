@@ -147,6 +147,22 @@ that delegation is a follow-up.
 Example editor config: run `fleety acp` as the agent command (a fleety-server
 must be reachable).
 
+## Retrieving truncated tool results
+
+Large tool results are truncated for the model (structural crush + a character
+budget); the full result is always kept in the event log. The truncation marker
+now names the result's id, and `fetch_tool_result(id, offset?, limit?)` returns
+that full result in **bounded character windows** — it reports `total_chars` and
+`next_offset` (null at the end) so the agent pages through a big result, and a
+single fetch never exceeds the tool-result budget (`limit` defaults to and is
+capped at it), so retrieval can't re-blow the context. Retrieval is **scoped to
+the acting user**: an id from another user's conversation is reported as not
+found, with no hint it exists. The audit listing (`history_list`) is filtered the
+same way — only the acting user's accessible entries — closing the shared-device
+leak. Tool-result audit entries are tagged with their conversation so this
+scoping is enforceable; untagged (legacy/system) entries are never returned to a
+specific user.
+
 ## Conversation recall
 
 The agent can search its **own user's** past conversations (per-user; conversations
