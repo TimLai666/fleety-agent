@@ -14,7 +14,8 @@ use tokio::sync::mpsc;
 
 use agent_core::{
     reconstruct_messages, run_turn, run_turn_streaming, ApprovalDecision, ApprovalGate, AutoDeny,
-    CoreError, LoopConfig, Message, ModelProvider, Policy, Result, RiskLevel, Role, ToolRegistry,
+    CoreError, GoalState, LoopConfig, Message, ModelProvider, Policy, Result, RiskLevel, Role,
+    Terminal, ToolRegistry,
 };
 use fleety_protocol::{ClientMsg, ServerMsg, WireError, PROTOCOL_VERSION};
 
@@ -215,6 +216,13 @@ async fn serve(
     // Dynamic workflow: a top-level tool that runs a JS script orchestrating
     // these same subagents. Subagent child registries omit it (one-level cap).
     agent_workflow::register_workflow(&mut tools, subagent_mgr);
+    // Goal mechanism: the five goal tools registered ONLY here at the top level
+    // (subagent child registries from `build_full_registry` omit them, so a
+    // subagent cannot touch its parent's goal). One shared state, reset per user
+    // message by the drive-to-goal loop.
+    let goal_state = Arc::new(tokio::sync::Mutex::new(GoalState::new()));
+    agent_core::register_goal_tools(&mut tools, Arc::clone(&goal_state));
+    let goal_max_continues = goal_max_continues_from_env();
 
     while let Some(msg) = read_client(rx).await? {
         match msg {
@@ -279,7 +287,7 @@ async fn serve(
                     out: out.clone(),
                     rx,
                 };
-                drive_turn(
+                drive_to_goal(
                     out,
                     storage,
                     provider,
@@ -289,6 +297,8 @@ async fn serve(
                     &conversation,
                     user_msg,
                     &mut gate,
+                    &goal_state,
+                    goal_max_continues,
                 )
                 .await?;
             }
@@ -501,11 +511,115 @@ fn authenticate(
     Err("this server requires authentication".to_string())
 }
 
-/// Send a frame to this connection's writer task.
+/// The terminal result of one turn: the assistant reply text and its persisted
+/// sequence number. Returned so a multi-turn driver can emit the user-facing
+/// frames itself only on the terminal turn.
+pub(crate) struct TurnReply {
+    pub reply: String,
+    pub seq: u64,
+}
+
+/// Default cap on automatic goal continuations per user message; override with
+/// `FLEETY_GOAL_MAX_CONTINUES` (floor 1).
+pub const DEFAULT_GOAL_MAX_CONTINUES: u32 = 8;
+
+/// Read the configured auto-continuation cap (floor 1).
+pub fn goal_max_continues_from_env() -> u32 {
+    std::env::var("FLEETY_GOAL_MAX_CONTINUES")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(DEFAULT_GOAL_MAX_CONTINUES)
+        .max(1)
+}
+
+/// Drive a single user message to its goal: run a turn, and while a goal is
+/// active and neither terminal signal (`complete_goal`/`ask_user`) fired, inject
+/// a continuation nudge and run another turn — bounded by `max_continues`. The
+/// goal state is reset for this message up front. Intermediate turns are silent
+/// (progress still streams as deltas); only the terminal turn emits the
+/// user-facing reply + `Done` (and, when voice is on, the spoken summary — the
+/// gate falls out of emitting only here). When no goal is ever set the first
+/// turn is terminal — behaviour identical to a single-shot turn.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn drive_to_goal(
+    out: &Out,
+    storage: &Arc<Storage>,
+    provider: &dyn ModelProvider,
+    tools: &ToolRegistry,
+    policy: Policy,
+    device_id: &str,
+    conversation: &str,
+    user_msg: Message,
+    gate: &mut dyn agent_core::ApprovalGate,
+    goal_state: &Arc<tokio::sync::Mutex<GoalState>>,
+    max_continues: u32,
+) -> Result<()> {
+    // Fresh goal state for this user message.
+    *goal_state.lock().await = GoalState::new();
+    let mut next_msg = user_msg;
+    let mut continues: u32 = 0;
+    loop {
+        // Run silently; whether this turn is terminal is only known afterward.
+        let turn = drive_turn(
+            out,
+            storage,
+            provider,
+            tools,
+            policy,
+            device_id,
+            conversation,
+            next_msg,
+            gate,
+            false,
+        )
+        .await?;
+        let (active, terminal) = {
+            let mut g = goal_state.lock().await;
+            (g.is_active(), g.take_terminal())
+        };
+        let premature = active && matches!(terminal, Terminal::None);
+        let hit_cap = continues >= max_continues;
+        if !premature || hit_cap {
+            // Terminal turn: emit the real reply (and Done). On a cap stop with an
+            // unmet goal, tell the user it may be incomplete.
+            let text = if premature && hit_cap {
+                format!(
+                    "{}\n\n[Reached the auto-continue cap of {max_continues}; the goal may be \
+                     incomplete.]",
+                    turn.reply
+                )
+            } else {
+                turn.reply
+            };
+            emit(
+                out,
+                &ServerMsg::Assistant {
+                    conversation_id: conversation.to_string(),
+                    text,
+                    seq: turn.seq,
+                },
+            )?;
+            emit(
+                out,
+                &ServerMsg::Done {
+                    conversation_id: conversation.to_string(),
+                },
+            )?;
+            return Ok(());
+        }
+        // Premature stop under the cap: nudge and run another turn.
+        continues += 1;
+        next_msg = Message::user(goal_state.lock().await.nudge_text());
+    }
+}
+
 /// Run one turn over a conversation given a seed `user_msg` and an approval
 /// `gate`, streaming deltas and persisting the result. Shared by live user
-/// turns (interactive `ConnGate`) and a subagent's proactive wake turn
-/// (`AutoApprove`), so both take the identical journal / audit / emit path.
+/// turns (via [`drive_to_goal`]) and a subagent's proactive wake turn
+/// (`AutoApprove`), so both take the identical journal / audit path. When
+/// `emit_terminal` is true the user-facing `Assistant` + `Done` frames are sent
+/// here; when false the turn is silent (the caller emits on the terminal turn)
+/// while progress still streams as `AssistantDelta`. Returns the reply + seq.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn drive_turn(
     out: &Out,
@@ -517,7 +631,8 @@ pub(crate) async fn drive_turn(
     conversation: &str,
     user_msg: Message,
     gate: &mut dyn agent_core::ApprovalGate,
-) -> Result<()> {
+    emit_terminal: bool,
+) -> Result<TurnReply> {
     storage.append(device_id, conversation, &user_msg)?;
     storage.journal_begin(device_id, conversation, &user_msg)?;
     // Inject agent-level core memory (ME/USER/TODO) as the system preamble each
@@ -553,21 +668,23 @@ pub(crate) async fn drive_turn(
     let reply = outcome.output;
     let seq = storage.append(device_id, conversation, &Message::assistant(reply.clone()))?;
     storage.journal_end(device_id, conversation)?;
-    emit(
-        out,
-        &ServerMsg::Assistant {
-            conversation_id: conversation.to_string(),
-            text: reply,
-            seq,
-        },
-    )?;
-    emit(
-        out,
-        &ServerMsg::Done {
-            conversation_id: conversation.to_string(),
-        },
-    )?;
-    Ok(())
+    if emit_terminal {
+        emit(
+            out,
+            &ServerMsg::Assistant {
+                conversation_id: conversation.to_string(),
+                text: reply.clone(),
+                seq,
+            },
+        )?;
+        emit(
+            out,
+            &ServerMsg::Done {
+                conversation_id: conversation.to_string(),
+            },
+        )?;
+    }
+    Ok(TurnReply { reply, seq })
 }
 
 fn emit(out: &Out, msg: &ServerMsg) -> Result<()> {
@@ -927,6 +1044,225 @@ mod tests {
     use tokio_tungstenite::MaybeTlsStream;
 
     type ClientWs = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+    // ---- drive-to-goal loop tests --------------------------------------------
+
+    /// A scripted assistant turn that calls one tool.
+    fn call_resp(id: &str, name: &str, args: serde_json::Value) -> ModelResponse {
+        ModelResponse {
+            message: Message {
+                role: CoreRole::Assistant,
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    arguments: args,
+                }],
+                tool_call_id: None,
+                attachments: Vec::new(),
+            },
+        }
+    }
+
+    /// A scripted assistant turn that just replies with text (ends the turn).
+    fn text_resp(text: &str) -> ModelResponse {
+        ModelResponse {
+            message: Message::assistant(text),
+        }
+    }
+
+    /// Storage + a registry holding only the goal tools + their shared state + a
+    /// frame sink/source. Self-contained: no websocket, no env vars.
+    #[allow(clippy::type_complexity)]
+    fn goal_env() -> (
+        Arc<Storage>,
+        ToolRegistry,
+        Arc<tokio::sync::Mutex<GoalState>>,
+        PathBuf,
+        Out,
+        mpsc::UnboundedReceiver<WsMessage>,
+    ) {
+        let home = std::env::temp_dir().join(format!("fleety-goal-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&home).expect("mk home");
+        let storage = Arc::new(Storage::new(home.clone()));
+        let goal_state = Arc::new(tokio::sync::Mutex::new(GoalState::new()));
+        let mut tools = ToolRegistry::new();
+        agent_core::register_goal_tools(&mut tools, Arc::clone(&goal_state));
+        let (out, rx) = mpsc::unbounded_channel::<WsMessage>();
+        (storage, tools, goal_state, home, out, rx)
+    }
+
+    /// Drain queued frames and decode the `ServerMsg`es.
+    fn drain(rx: &mut mpsc::UnboundedReceiver<WsMessage>) -> Vec<ServerMsg> {
+        let mut msgs = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            if let WsMessage::Text(t) = frame {
+                if let Ok(m) = serde_json::from_str::<ServerMsg>(&t) {
+                    msgs.push(m);
+                }
+            }
+        }
+        msgs
+    }
+
+    /// The terminal frames: count of `Done` and the texts of `Assistant` frames.
+    fn terminal_frames(msgs: &[ServerMsg]) -> (usize, Vec<String>) {
+        let dones = msgs
+            .iter()
+            .filter(|m| matches!(m, ServerMsg::Done { .. }))
+            .count();
+        let texts = msgs
+            .iter()
+            .filter_map(|m| match m {
+                ServerMsg::Assistant { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        (dones, texts)
+    }
+
+    #[tokio::test]
+    async fn no_goal_message_is_single_shot() {
+        // No set_goal → the first turn is terminal, exactly one reply emitted.
+        let (storage, tools, goal_state, home, out, mut rx) = goal_env();
+        let provider = MockProvider::new(vec![text_resp("hi")]);
+        let mut gate = agent_core::AutoApprove;
+        drive_to_goal(
+            &out,
+            &storage,
+            &provider,
+            &tools,
+            Policy::FullAccess,
+            "dev",
+            "c1",
+            Message::user("hello"),
+            &mut gate,
+            &goal_state,
+            5,
+        )
+        .await
+        .unwrap();
+        let (dones, texts) = terminal_frames(&drain(&mut rx));
+        assert_eq!(dones, 1, "single-shot emits exactly one Done");
+        assert_eq!(texts, vec!["hi".to_string()]);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn active_goal_continues_then_completes_emitting_once() {
+        // Three turns: set_goal, an idle continuation, then complete_goal. Only
+        // the terminal turn emits Assistant/Done.
+        let (storage, tools, goal_state, home, out, mut rx) = goal_env();
+        let provider = MockProvider::new(vec![
+            call_resp("a", "set_goal", serde_json::json!({ "goal": "finish" })),
+            text_resp("working"),
+            text_resp("still working"),
+            call_resp(
+                "b",
+                "complete_goal",
+                serde_json::json!({ "summary": "done" }),
+            ),
+            text_resp("All finished."),
+        ]);
+        let mut gate = agent_core::AutoApprove;
+        drive_to_goal(
+            &out,
+            &storage,
+            &provider,
+            &tools,
+            Policy::FullAccess,
+            "dev",
+            "c1",
+            Message::user("do the work"),
+            &mut gate,
+            &goal_state,
+            5,
+        )
+        .await
+        .unwrap();
+        let (dones, texts) = terminal_frames(&drain(&mut rx));
+        assert_eq!(dones, 1, "only the terminal turn emits Done");
+        assert_eq!(texts, vec!["All finished.".to_string()]);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn ask_user_stops_the_loop() {
+        // set_goal then, after one continuation, ask_user — a terminal signal.
+        let (storage, tools, goal_state, home, out, mut rx) = goal_env();
+        let provider = MockProvider::new(vec![
+            call_resp("a", "set_goal", serde_json::json!({ "goal": "x" })),
+            text_resp("t1"),
+            call_resp("b", "ask_user", serde_json::json!({ "question": "which?" })),
+            text_resp("Need your input."),
+        ]);
+        let mut gate = agent_core::AutoApprove;
+        drive_to_goal(
+            &out,
+            &storage,
+            &provider,
+            &tools,
+            Policy::FullAccess,
+            "dev",
+            "c1",
+            Message::user("go"),
+            &mut gate,
+            &goal_state,
+            5,
+        )
+        .await
+        .unwrap();
+        let (dones, texts) = terminal_frames(&drain(&mut rx));
+        assert_eq!(dones, 1);
+        assert_eq!(texts, vec!["Need your input.".to_string()]);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn cap_stops_non_converging_loop() {
+        // Goal set but never completed. cap=2 → 1 initial + 2 continuations = 3
+        // turns, then stop with an incomplete note. A 4th turn would exhaust the
+        // scripted provider and error, so reaching Ok proves the cap stopped it.
+        let (storage, tools, goal_state, home, out, mut rx) = goal_env();
+        let provider = MockProvider::new(vec![
+            call_resp("a", "set_goal", serde_json::json!({ "goal": "never done" })),
+            text_resp("t1"),
+            text_resp("t2"),
+            text_resp("t3"),
+        ]);
+        let mut gate = agent_core::AutoApprove;
+        drive_to_goal(
+            &out,
+            &storage,
+            &provider,
+            &tools,
+            Policy::FullAccess,
+            "dev",
+            "c1",
+            Message::user("go forever"),
+            &mut gate,
+            &goal_state,
+            2,
+        )
+        .await
+        .unwrap();
+        let (dones, texts) = terminal_frames(&drain(&mut rx));
+        assert_eq!(dones, 1, "cap stop emits exactly one Done");
+        assert_eq!(texts.len(), 1);
+        assert!(texts[0].contains("t3"), "carries the last turn's reply");
+        assert!(
+            texts[0].contains("auto-continue cap"),
+            "tells the user the cap was hit; was: {}",
+            texts[0]
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn goal_cap_env_floor_is_one() {
+        // Unset → default; the floor is enforced by `.max(1)`.
+        assert_eq!(goal_max_continues_from_env(), DEFAULT_GOAL_MAX_CONTINUES);
+    }
 
     #[tokio::test]
     async fn startup_recovers_interrupted_interactive_turn() {

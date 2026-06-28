@@ -17,6 +17,7 @@ Grouped by which binary cares about it. Anything unset uses the default.
 | `FLEETY_SCHED_TICK` | `60` | Seconds between scheduler fire-loop ticks. |
 | `FLEETY_SYSTEM_PROMPT` | (unset → full) | `minimal` drops the embedded behavioural docs (protocol/rules/memory/policy) from the system message, leaving only core memory (ME/USER/TODO) — for token-lean / debugging runs. |
 | `FLEETY_SUBAGENT_MAX_CONCURRENT` | `4` | Max background subagents running at once per connection. A spawn past the cap errors rather than queueing. Clamped to a floor of 1. |
+| `FLEETY_GOAL_MAX_CONTINUES` | `8` | Max automatic goal continuations per user message. When the agent sets a goal (`set_goal`) and a turn ends without `complete_goal`/`ask_user`, the drive-to-goal loop re-engages it; this caps how many extra turns it may run before stopping and reporting the goal may be incomplete. Clamped to a floor of 1. |
 
 ## Model provider
 

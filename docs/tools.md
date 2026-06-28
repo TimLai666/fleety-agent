@@ -7,7 +7,7 @@ it here first, then sync `prompts/protocol.md` and the runtime. The runtime
 still exposes each tool's real JSON Schema at call time — that schema wins
 over this doc for argument shape.
 
-Last reviewed against `crates/` on 2026-06-24.
+Last reviewed against `crates/` on 2026-06-28.
 
 ## Conventions
 
@@ -291,6 +291,30 @@ waking a coordinator turn when it finishes. See
 | `subagent_status` | Report a subagent's state and (when finished) its output. By `task_id` or `name`. | `task_id` | read |
 | `subagent_list` | List your team — every subagent you spawned with its `task_id`, `name`, and `state`. The roster for coordinating an **agent team** (lead routes between named workers via `send_subagent_message`). | — | read |
 | `run_workflow` | **Dynamic workflow.** Run a JS script that deterministically orchestrates your own subagents — `agent({prompt,...})` runs one subagent, plus `parallel`/`pipeline`/`phase`/`log`. The script body uses top-level `await` and `return`s its result. For when the orchestration shape is dynamic and worth pinning down as code. Runs on an embedded engine (`agent-workflow` crate); subagents it launches are leaves (no nesting). | `script` | mutate |
+
+## Goal (drive a request to completion)
+
+**Runs on:** server only (these are top-level tools). An always-on mechanism for
+finishing a whole request in one go instead of stopping halfway to ask "shall I
+continue?". When you set a goal, the server's drive-to-goal loop keeps
+re-engaging you each turn (injecting a continuation nudge that names the goal and
+the pending steps) until you signal a terminal state — `complete_goal` (done) or
+`ask_user` (a question only the user can answer) — or it hits the auto-continue
+cap (`FLEETY_GOAL_MAX_CONTINUES`, see [env.md](env.md)). Intermediate
+continuation turns are silent: only the terminal turn produces the user-facing
+reply (and, in voice mode, the spoken summary); progress still streams as deltas.
+Like the orchestration tools, these are registered ONLY at the top level — a
+subagent's registry omits them, so a subagent cannot touch its parent's goal. The
+generic state + tools live in `agent-core` (`crates/agent-core/src/goal.rs`); the
+loop and emission/voice gating live in `crates/fleety-server/src/conn.rs`.
+
+| Tool | Purpose | Key inputs | Risk |
+|---|---|---|---|
+| `set_goal` | Record the goal you are pursuing (derived from the user's request + context) plus an optional checklist. Engaging this is what turns on the drive-to-goal loop. Call again to revise the goal/plan (clears any terminal signal). | `goal`, `steps?` | read |
+| `complete_step` | Mark one checklist step done (matched by its text). Returns the updated checklist; errors listing current steps if the text matches none. | `step` | read |
+| `goal_status` | Report the current goal and which checklist steps are done or pending. | — | read |
+| `complete_goal` | **Terminal.** Declare the goal achieved — the loop stops and your reply goes to the user. Call only when the whole goal is genuinely done. | `summary?` | read |
+| `ask_user` | **Terminal.** Ask a question you genuinely cannot proceed without — the loop stops and the question goes to the user. Use sparingly; not for "shall I continue?". | `question` | read |
 
 ## Skills
 

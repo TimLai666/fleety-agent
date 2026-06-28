@@ -15,6 +15,7 @@ pub mod compress;
 pub mod error;
 pub mod event;
 pub mod gemini;
+pub mod goal;
 pub mod model;
 pub mod obs;
 pub mod openai;
@@ -28,6 +29,7 @@ pub use compress::{CacheAligner, CodeCompressor, ContextCompressor, Lang, SmartC
 pub use error::{CoreError, ErrorReport, Result};
 pub use event::{interrupted_tool_result, reconstruct_messages, Event, EventLog};
 pub use gemini::Gemini;
+pub use goal::{register_goal_tools, GoalState, Step, Terminal};
 pub use model::{
     Attachment, Message, MockProvider, ModelProvider, ModelResponse, RiskLevel, Role, ToolCall,
     ToolSpec,

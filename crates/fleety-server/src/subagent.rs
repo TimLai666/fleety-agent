@@ -220,6 +220,8 @@ impl SubagentHost for FleetyHost {
             &context,
             Message::user(seed),
             &mut gate,
+            // A wake turn is single-shot: emit its reply normally.
+            true,
         )
         .await
         {
