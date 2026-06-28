@@ -190,6 +190,32 @@ async fn async_main(cmd: Option<String>) {
     run_server(None).await;
 }
 
+/// Ensure this server's external dependencies (best-effort, non-blocking).
+/// Default subset python+ddgs+node+insyra; `FLEETY_DEPS` overrides the list,
+/// `FLEETY_AUTO_INSTALL_DEPS=0` disables installing.
+async fn ensure_dependencies() {
+    use fleety_tools::deps;
+    let names = deps::selected_dep_names(
+        std::env::var("FLEETY_DEPS").ok().as_deref(),
+        deps::server_default_deps(),
+    );
+    let chosen: Vec<deps::Dependency> = names
+        .iter()
+        .filter_map(|n| match n.as_str() {
+            "node" => Some(deps::node_dependency()),
+            "python" => Some(deps::python_dependency()),
+            "insyra" => Some(deps::insyra_dependency()),
+            "ddgs" => Some(builtin_mcp::ddgs_dependency()),
+            other => {
+                tracing::warn!(dep = %other, "unknown dependency in FLEETY_DEPS; ignoring");
+                None
+            }
+        })
+        .collect();
+    let outcomes = deps::ensure_all(&chosen).await;
+    deps::log_outcomes(&outcomes);
+}
+
 /// Run the server until a stop signal. `shutdown` is the optional external stop
 /// (Windows SCM); Ctrl+C and Unix SIGTERM are always honored (see [`wait_stop`]).
 async fn run_server(shutdown: Option<tokio::sync::watch::Receiver<bool>>) {
@@ -210,11 +236,11 @@ async fn run_server(shutdown: Option<tokio::sync::watch::Receiver<bool>>) {
     if let Err(e) = builtin_mcp::seed(&storage.mcp_builtin_config_path()) {
         tracing::warn!(error = %e, "could not seed built-in MCP servers");
     }
-    // Background: check whether ddgs is actually installed and optionally
-    // auto-install it (controlled by FLEETY_DDGS_AUTO_INSTALL). Also schedules
-    // an immediate background upgrade if it was already installed, so a
-    // fleety-server upgrade picks up the latest ddgs without operator action.
-    tokio::spawn(builtin_mcp::check_ddgs());
+    // Background: ensure this server's external dependencies (python+ddgs+node+
+    // insyra by default; override with FLEETY_DEPS, disable with
+    // FLEETY_AUTO_INSTALL_DEPS=0). Best-effort and non-blocking — a failure is
+    // logged but never stops the server from starting.
+    tokio::spawn(ensure_dependencies());
     // 24h background loop that keeps built-in MCPs at their latest upstream
     // version. Same opt-out as install (FLEETY_DDGS_AUTO_INSTALL=0).
     builtin_mcp::spawn_auto_upgrade_loop();

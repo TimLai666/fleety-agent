@@ -203,49 +203,30 @@ async fn try_install_ddgs() -> bool {
     false
 }
 
-/// Boot-time ddgs check. Three branches:
-/// 1. Already installed → kick off a best-effort background upgrade so the
-///    built-in tracks latest across `fleety-server` updates. Boot itself
-///    doesn't wait — the running ddgs stays usable while the upgrade runs.
-/// 2. Missing + auto-install on (default) → run the install path inline.
-/// 3. Missing + auto-install off (`FLEETY_DDGS_AUTO_INSTALL=0`) → log an
-///    actionable warning and move on. Air-gapped / hermetic deployments.
-pub async fn check_ddgs() {
-    let command = resolve_ddgs_command();
-    if ddgs_runs(&command).await {
-        tracing::info!(%command, "ddgs MCP available");
-        if auto_install_enabled() {
-            tokio::spawn(async {
-                if try_upgrade_ddgs().await {
-                    tracing::info!("ddgs MCP refreshed to latest at boot");
-                }
-            });
-        }
-        return;
-    }
-    if !auto_install_enabled() {
-        tracing::warn!(
-            "ddgs MCP binary not on PATH and FLEETY_DDGS_AUTO_INSTALL=0; the built-in \
-             `ddgs` MCP server won't work until you install it manually. \
-             Run `pip install -U ddgs[mcp]` (or `pipx install ddgs[mcp]`), or set \
-             FLEETY_DDGS_BIN to an absolute path."
-        );
-        return;
-    }
-    if try_install_ddgs().await {
-        // Refresh PATH lookup (pipx / --user may have just added a new dir).
-        let refreshed = resolve_ddgs_command();
-        if ddgs_runs(&refreshed).await {
-            tracing::info!(command = %refreshed, "ddgs MCP installed and reachable");
-            return;
-        }
-    }
-    tracing::warn!(
-        "ddgs auto-install failed (no pipx / pip / python on PATH, or the install itself errored). \
-         The built-in `ddgs` MCP server won't work until you install it manually: \
-         `pip install -U ddgs[mcp]` (or `pipx install ddgs[mcp]`). \
-         Set FLEETY_DDGS_AUTO_INSTALL=0 to silence this warning."
-    );
+/// ddgs as a startup-dependency framework entry (folded from the old inline
+/// boot check). Probe: `ddgs --version` runs; install: pipx / pip --user; per-dep
+/// opt-out via `FLEETY_DDGS_AUTO_INSTALL`. The "already present → keep fresh"
+/// behavior is handled by [`spawn_auto_upgrade_loop`]. The not-present/failed
+/// reporting is the framework's Skipped/Failed outcome.
+pub fn ddgs_dependency() -> fleety_tools::deps::Dependency {
+    use fleety_tools::deps::{Dependency, Strategy};
+    Dependency::new(
+        "ddgs",
+        Strategy::UserPackage,
+        Some(DDGS_AUTO_INSTALL_ENV),
+        || async { ddgs_runs(&resolve_ddgs_command()).await },
+        || async {
+            if try_install_ddgs().await && ddgs_runs(&resolve_ddgs_command()).await {
+                Ok(())
+            } else {
+                Err(agent_core::CoreError::Message(
+                    "no pipx / pip / python on PATH, or the install errored; \
+                     run `pip install -U ddgs[mcp]` (or `pipx install ddgs[mcp]`) manually"
+                        .to_string(),
+                ))
+            }
+        },
+    )
 }
 
 /// Default cadence for the background ddgs auto-upgrade loop (24h, matching

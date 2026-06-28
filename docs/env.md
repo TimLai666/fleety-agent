@@ -111,6 +111,32 @@ tools (`computer_*` GUI control / screenshots, a visible browser) only work when
 user is actually logged in — headless they fail with an actionable message rather
 than hanging.
 
+## Startup dependencies (auto-install on boot)
+
+On startup, fleetyd and fleety-server each ensure the external dependencies their
+features need — best-effort and **non-blocking** (a failure is logged with an
+actionable message and never stops the service). All installs are root-free and
+don't touch the user's system:
+
+- **Managed runtimes** (node, python) → a portable copy under `~/.fleety/runtimes/`,
+  with its bin dir prepended to the service process's own PATH (so spawned MCP
+  servers / skill scripts find it). node = official portable build; python = via
+  `uv`. Needs no admin.
+- **User packages** (ddgs) → pipx / pip --user (unchanged).
+- **Managed binaries** (insyra sidecar) → downloaded next to the executable.
+
+Default subsets: `fleety-server` → python, ddgs, node, insyra; `fleetyd` →
+insyra (add node/python via `FLEETY_DEPS` for device-side skills/MCP).
+
+| Var | Default | Meaning |
+|---|---|---|
+| `FLEETY_AUTO_INSTALL_DEPS` | (on) | Set to `0` to disable all auto-install (detect/report only) — for air-gapped / hermetic hosts. |
+| `FLEETY_DEPS` | (default subset) | Comma list overriding which dependencies this binary ensures, e.g. `insyra,node,python`. |
+| `FLEETY_RUNTIMES_DIR` | `~/.fleety/runtimes` | Where managed portable runtimes are installed. |
+| `FLEETY_NODE_VERSION` | pinned default | Portable node version to fetch. |
+| `FLEETY_DDGS_AUTO_INSTALL` | (on) | Per-dep opt-out for ddgs (`0` = don't auto-install ddgs). |
+| `FLEETY_INSYRA_URL` | release asset | Override the insyra sidecar download URL. |
+
 ## Self-update polling (`fleetyd` background loop)
 
 24h periodic check of the release manifest. Only spawns when a manifest URL is

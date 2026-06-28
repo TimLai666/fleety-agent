@@ -194,6 +194,31 @@ fn log_verb(verb: &str, res: Result<()>) {
     }
 }
 
+/// Ensure this device's external dependencies (best-effort, non-blocking).
+/// Default subset insyra; add node/python via `FLEETY_DEPS` for device-side
+/// skills/MCP. `FLEETY_AUTO_INSTALL_DEPS=0` disables installing.
+async fn ensure_dependencies() {
+    use fleety_tools::deps;
+    let names = deps::selected_dep_names(
+        std::env::var("FLEETY_DEPS").ok().as_deref(),
+        deps::daemon_default_deps(),
+    );
+    let chosen: Vec<deps::Dependency> = names
+        .iter()
+        .filter_map(|n| match n.as_str() {
+            "insyra" => Some(deps::insyra_dependency()),
+            "node" => Some(deps::node_dependency()),
+            "python" => Some(deps::python_dependency()),
+            other => {
+                tracing::warn!(dep = %other, "unknown dependency in FLEETY_DEPS; ignoring");
+                None
+            }
+        })
+        .collect();
+    let outcomes = deps::ensure_all(&chosen).await;
+    deps::log_outcomes(&outcomes);
+}
+
 /// Process-wide pending restart (set by the auto-update poller). The serve loop
 /// checks it at each frame boundary — where the daemon is idle — and carries it
 /// out via [`fleety_tools::restart`]'s defer-until-idle policy, so a self-update
@@ -301,6 +326,8 @@ type WsStream =
 /// stop is also delivered by Ctrl+C and, on Unix, SIGTERM (so `systemctl stop`
 /// is graceful).
 async fn run(shutdown: Option<tokio::sync::watch::Receiver<bool>>) -> Result<()> {
+    // Ensure device dependencies in the background (best-effort, non-blocking).
+    tokio::spawn(ensure_dependencies());
     let mut bo = backoff::Backoff::new();
     loop {
         let url = agent_url();
