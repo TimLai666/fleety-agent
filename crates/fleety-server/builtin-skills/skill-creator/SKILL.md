@@ -15,6 +15,14 @@ A skill is a **directory** with a `SKILL.md` plus optional bundled files. You cr
 - **The description is the first non-empty line of `SKILL.md`** (Fleety strips a leading `#` and shows it in `list_skills`). There is **no YAML frontmatter** here — do not add a `---` block; it would just become body text. Put the "what + when" on that first line.
 - **The skill name is the directory name** (the `name` you pass to the `skill_*` tools).
 
+**Which tier — who is the skill for? Decide this before you start.** It changes which tool you use and where the skill lands:
+
+- **The user asks you to make or install a skill for them** → it's a USER skill, so put it in the **installed** tier: create it with `skill_install` (pass the SKILL.md body as `content`; `from_url`/`from_path` also work), then add any extra files (scripts/references) with `skill_write_file` for that same name (now that it exists in `installed`, writes go there). Edit or remove an installed skill only when the user asks.
+- **You're capturing something for your own future use** (the learning loop nudged you, or you noticed a repeatable workflow worth keeping) → it's an **authored** skill: just `skill_write_file` a new name and it lands in `authored` automatically.
+- **builtin** skills are read-only; to change one, author or install a skill of the same name to shadow it.
+
+Either way the SKILL.md format and the writing guidance below are identical — only the tier and the initial tool differ.
+
 Tools you use:
 - `skill_write_file` (create/overwrite a file — SKILL.md, a script, a reference), `skill_edit_file` (precise substring / line-range edit), `skill_read_file`, `skill_list_files`, `skill_delete_file`, `skill_remove` (whole pack).
 - `list_skills` reports each skill's `source` and on-disk `path` — you need that `path` to run a bundled script (see below).
@@ -37,6 +45,39 @@ Write it with `skill_write_file` (name = the skill, file = `SKILL.md`). Structur
 - **First line = the description.** Cover what it does AND when to use it, on one line. Agents tend to *under*-trigger skills, so make it a little pushy: name the concrete situations, not just the capability. E.g. not "Build a dashboard." but "Build a fast dashboard for fleet metrics — use whenever the user mentions dashboards, metrics, or wants to visualise device data, even if they don't say 'dashboard'."
 - **Body = imperative instructions.** Tell the agent what to do, and **explain the why** behind each instruction — today's models have good theory of mind and follow reasoning far better than rote `ALWAYS`/`NEVER`. If you catch yourself writing rigid all-caps rules, that's a yellow flag: reframe and explain instead.
 - Keep it general, not overfit to one example. Draft it, then reread with fresh eyes and tighten.
+
+#### SKILL.md format — copy this shape
+
+No frontmatter. Line 1 is the description; everything after is imperative instructions. The skeleton:
+
+````
+# <skill-name> — <what it does>; use when <concrete trigger situations>
+<one or two sentences: what this skill is for and the rough approach>
+
+## <First step or section, written as a verb>
+- <do X — and, briefly, why it matters>
+- <do Y>
+
+## <Next section>
+- <…>
+````
+
+A complete, valid minimal example you can pattern-match against:
+
+````
+# device-health-check — snapshot a device's disk, memory, and failed services; use when the user asks whether a box is healthy, why it's slow, or before deploying to it
+
+Gather a quick health picture of one device and report problems first, healthy signals second.
+
+## Collect
+- Run `df -h`, `free -m`, and `systemctl --failed` on the target device (wrap each in device_exec for a remote box). These three cover the usual culprits — full disk, memory pressure, crashed services.
+- Only when something looks off, read `references/triage.md` for the deeper checklist.
+
+## Report
+- Lead with anything wrong (disk >90%, failed units), then the all-clear items. Name the device on every line so nothing gets confused across machines.
+````
+
+That example is self-contained; a real skill adds `references/triage.md` (read on demand) or a `scripts/` helper only if they earn their place. Keep the whole SKILL.md under ~500 lines — push depth into `references/`.
 
 ### Anatomy and progressive disclosure
 
