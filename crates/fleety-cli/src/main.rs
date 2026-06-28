@@ -6,6 +6,7 @@
 #![warn(clippy::unwrap_used, clippy::expect_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+mod acp;
 mod clipboard;
 mod config;
 mod tui;
@@ -173,6 +174,14 @@ async fn main() {
         }
         Some("config") => {
             if let Err(e) = config::run(&args[2..]) {
+                eprintln!("error: {}", e.report().message);
+            }
+        }
+        Some("acp") => {
+            // ACP agent over stdio: stdout carries only JSON-RPC; logs/errors go
+            // to stderr (tracing is already on stderr), so the editor's parser
+            // is never corrupted.
+            if let Err(e) = acp::run(agent_url()).await {
                 eprintln!("error: {}", e.report().message);
             }
         }

@@ -132,6 +132,21 @@ tools (`computer_*` GUI control / screenshots, a visible browser) only work when
 user is actually logged in — headless they fail with an actionable message rather
 than hanging.
 
+## ACP (editor integration)
+
+`fleety acp` makes Fleety an **Agent Client Protocol** agent: an ACP-capable
+editor (e.g. Zed) launches it as a subprocess and speaks JSON-RPC 2.0 over stdio
+(LSP-style `Content-Length` framing). It **bridges to the fleety-server** — it
+does not run its own model — connecting at `FLEETY_AGENT_URL` (else mDNS, else
+`ws://127.0.0.1:8787`), authenticating with `FLEETY_TOKEN` if set. The editor's
+working directory (`session/new` cwd) becomes the conversation's workspace root
+(via session-workspace-cwd). **stdout carries only JSON-RPC; logs go to stderr.**
+v1 does not use client-side `fs`/`terminal` (the server runs tools at the cwd);
+that delegation is a follow-up.
+
+Example editor config: run `fleety acp` as the agent command (a fleety-server
+must be reachable).
+
 ## Conversation recall
 
 The agent can search its **own user's** past conversations (per-user; conversations
