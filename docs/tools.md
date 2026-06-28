@@ -275,7 +275,9 @@ agent run with the stored prompt under `RequireApproval` + `MandateGate` (only
 a task to a **subagent** — a nested agent loop with the same tools MINUS these
 orchestration tools, so a subagent cannot spawn its own subagents (one-level
 cap). A subagent keeps every other tool, including `device_exec`, so it can
-still act on other devices. It runs on the `main` or `cheap` model tier (see
+still act on other devices. The mechanism is a generic agent-core capability —
+see [subagent-framework.md](subagent-framework.md) for the `SubagentHost`
+contract. It runs on the `main` or `cheap` model tier (see
 `FLEETY_CHEAP_MODEL_*` in [env.md](env.md)); the tier changes only the provider,
 never the policy/gate/audit. A background subagent reports back by proactively
 waking a coordinator turn when it finishes. See
