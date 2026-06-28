@@ -45,6 +45,7 @@ mod wiki;
 mod wiki_embed;
 #[cfg(windows)]
 mod winsvc;
+mod workspace;
 
 use std::path::PathBuf;
 use std::sync::Arc;

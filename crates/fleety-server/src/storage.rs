@@ -172,6 +172,55 @@ impl Storage {
         crate::privacy::Grants::load(&self.home.join("fleet").join("grants.json"))
     }
 
+    fn conversation_workspace_path(&self) -> PathBuf {
+        self.home.join("fleet").join("conversation-workspace.json")
+    }
+
+    /// The persisted workspace binding for a conversation (root + optional
+    /// device), set on its first message and reused on resume. `None` if unset.
+    pub fn conversation_workspace(
+        &self,
+        conversation_id: &str,
+    ) -> Option<crate::workspace::WorkspaceBinding> {
+        let text = fs::read_to_string(self.conversation_workspace_path()).ok()?;
+        let map: std::collections::HashMap<String, crate::workspace::WorkspaceBinding> =
+            serde_json::from_str(&text).ok()?;
+        map.get(conversation_id).cloned()
+    }
+
+    /// Persist a conversation's workspace binding (set-once; ignored if already
+    /// set, so the conversation stays anchored to one tree).
+    pub fn set_conversation_workspace(
+        &self,
+        conversation_id: &str,
+        binding: &crate::workspace::WorkspaceBinding,
+    ) -> Result<()> {
+        validate_id("conversation_id", conversation_id)?;
+        let _guard = self
+            .append_lock
+            .lock()
+            .map_err(|_| CoreError::Message("storage index lock poisoned".to_string()))?;
+        let path = self.conversation_workspace_path();
+        let mut map: std::collections::HashMap<String, crate::workspace::WorkspaceBinding> =
+            fs::read_to_string(&path)
+                .ok()
+                .and_then(|t| serde_json::from_str(&t).ok())
+                .unwrap_or_default();
+        if !map.contains_key(conversation_id) {
+            map.insert(conversation_id.to_string(), binding.clone());
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).map_err(|e| {
+                    CoreError::Message(format!("cannot create {}: {e}", parent.display()))
+                })?;
+            }
+            let text = serde_json::to_string_pretty(&map)
+                .map_err(|e| CoreError::Message(format!("serialize workspace index: {e}")))?;
+            fs::write(&path, text)
+                .map_err(|e| CoreError::Message(format!("write workspace index: {e}")))?;
+        }
+        Ok(())
+    }
+
     /// The acting user's configured IANA timezone (`users/<id>/timezone`), if any.
     /// `None` for a Guest or when unset (caller falls back to `FLEETY_TZ`/UTC).
     pub fn user_timezone(&self, acting: &crate::identity::ActingUser) -> Option<String> {
@@ -1193,6 +1242,28 @@ mod tests {
             .join("conversations")
             .join("k1.jsonl")
             .exists());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn conversation_workspace_persists_and_is_set_once() {
+        use crate::workspace::WorkspaceBinding;
+        let home = temp_home();
+        let storage = Storage::new(home.clone());
+        assert!(storage.conversation_workspace("c1").is_none());
+        let b = WorkspaceBinding {
+            root: std::path::PathBuf::from("/home/alice/proj"),
+            device: None,
+        };
+        storage.set_conversation_workspace("c1", &b).unwrap();
+        assert_eq!(storage.conversation_workspace("c1"), Some(b.clone()));
+        // Set-once: a second binding does not overwrite (conversation stays anchored).
+        let other = WorkspaceBinding {
+            root: std::path::PathBuf::from("/elsewhere"),
+            device: Some("dev2".into()),
+        };
+        storage.set_conversation_workspace("c1", &other).unwrap();
+        assert_eq!(storage.conversation_workspace("c1"), Some(b));
         let _ = std::fs::remove_dir_all(&home);
     }
 

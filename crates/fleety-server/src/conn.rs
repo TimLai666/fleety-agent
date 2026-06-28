@@ -29,6 +29,71 @@ pub(crate) type Out = mpsc::UnboundedSender<WsMessage>;
 type Tx = SplitSink<WebSocketStream<TcpStream>, WsMessage>;
 type Rx = SplitStream<WebSocketStream<TcpStream>>;
 
+/// The server's own hostname (for deciding whether an originating CLI is on the
+/// same machine as the server). Empty if unknown — then no client is "same host".
+fn server_hostname() -> String {
+    std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_default()
+}
+
+/// Build the per-connection tool stack rooted at `root`: the full registry plus
+/// the subagent orchestration, dynamic-workflow, and goal tools (registered only
+/// at this top level). Returns the registry, the subagent host, and the shared
+/// goal state. Rebuilt when a conversation binds to a different workspace root.
+#[allow(clippy::too_many_arguments)]
+fn build_connection_stack(
+    storage: &Arc<Storage>,
+    root: &Path,
+    device_id: &str,
+    hub: &Hub,
+    pending: &Pending,
+    handles: &Handles,
+    auth: &Arc<AuthStore>,
+    device_tools: &DeviceTools,
+    policy: Policy,
+    out: &Out,
+) -> (
+    agent_core::ToolRegistry,
+    Arc<crate::subagent::FleetyHost>,
+    Arc<tokio::sync::Mutex<GoalState>>,
+) {
+    let mut tools = build_full_registry(
+        storage,
+        root,
+        device_id,
+        hub,
+        pending,
+        handles,
+        auth,
+        device_tools,
+    );
+    let subagent_host = crate::subagent::FleetyHost::new(
+        crate::providers::ProviderTiers::from_env(),
+        policy,
+        Arc::clone(storage),
+        root.to_path_buf(),
+        device_id.to_string(),
+        Arc::clone(hub),
+        Arc::clone(pending),
+        Arc::clone(handles),
+        Arc::clone(auth),
+        Arc::clone(device_tools),
+        out.clone(),
+    );
+    let subagent_mgr = agent_core::SubagentManager::new(
+        Arc::clone(&subagent_host) as Arc<dyn agent_core::SubagentHost>,
+        policy,
+        crate::subagent::max_concurrent_from_env(),
+    );
+    subagent_host.set_manager(Arc::downgrade(&subagent_mgr));
+    agent_core::register_orchestration(&mut tools, Arc::clone(&subagent_mgr));
+    agent_workflow::register_workflow(&mut tools, subagent_mgr);
+    let goal_state = Arc::new(tokio::sync::Mutex::new(GoalState::new()));
+    agent_core::register_goal_tools(&mut tools, Arc::clone(&goal_state));
+    (tools, subagent_host, goal_state)
+}
+
 /// Handle one client connection to completion.
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_conn(
@@ -179,49 +244,26 @@ async fn serve(
         },
     )?;
 
-    let mut tools = build_full_registry(
+    // Build the tool stack rooted at the server's default workspace. A
+    // conversation may rebind it to the originating CLI's cwd on its first
+    // message (see the UserMessage arm), making Fleety a coding agent in that
+    // directory. The orchestration/workflow/goal tools live only at this top
+    // level (subagent child registries omit them, capping nesting at one level).
+    let server_host = server_hostname();
+    let mut current_root: std::path::PathBuf = workspace.to_path_buf();
+    let (mut tools, mut subagent_host, mut goal_state) = build_connection_stack(
         storage,
-        workspace,
+        &current_root,
         device_id,
         hub,
         pending,
         handles,
         auth,
         device_tools,
-    );
-    // Subagent orchestration: one runtime per connection, with the orchestration
-    // tools registered ONLY at this top level. Subagent registries are built
-    // from `build_full_registry` alone, so they omit these tools — that is what
-    // caps nesting at one level.
-    let subagent_host = crate::subagent::FleetyHost::new(
-        crate::providers::ProviderTiers::from_env(),
         policy,
-        Arc::clone(storage),
-        workspace.to_path_buf(),
-        device_id.to_string(),
-        Arc::clone(hub),
-        Arc::clone(pending),
-        Arc::clone(handles),
-        Arc::clone(auth),
-        Arc::clone(device_tools),
-        out.clone(),
+        out,
     );
-    let subagent_mgr = agent_core::SubagentManager::new(
-        Arc::clone(&subagent_host) as Arc<dyn agent_core::SubagentHost>,
-        policy,
-        crate::subagent::max_concurrent_from_env(),
-    );
-    subagent_host.set_manager(Arc::downgrade(&subagent_mgr));
-    agent_core::register_orchestration(&mut tools, Arc::clone(&subagent_mgr));
-    // Dynamic workflow: a top-level tool that runs a JS script orchestrating
-    // these same subagents. Subagent child registries omit it (one-level cap).
-    agent_workflow::register_workflow(&mut tools, subagent_mgr);
-    // Goal mechanism: the five goal tools registered ONLY here at the top level
-    // (subagent child registries from `build_full_registry` omit them, so a
-    // subagent cannot touch its parent's goal). One shared state, reset per user
-    // message by the drive-to-goal loop.
-    let goal_state = Arc::new(tokio::sync::Mutex::new(GoalState::new()));
-    agent_core::register_goal_tools(&mut tools, Arc::clone(&goal_state));
+    let mut workspace_bound = false;
     let goal_max_continues = goal_max_continues_from_env();
     let skill_reflect_min_steps = skill_reflect_min_steps_from_env();
 
@@ -283,6 +325,46 @@ async fn serve(
                         },
                     );
                     continue;
+                }
+
+                // Bind this conversation's workspace once (from its first
+                // message): when the originating CLI is on the server host, root
+                // the tools at its cwd so Fleety acts as a coding agent in that
+                // directory. Persisted and reused on later turns / resume.
+                if !workspace_bound {
+                    let binding = storage
+                        .conversation_workspace(&conversation)
+                        .unwrap_or_else(|| {
+                            let b = crate::workspace::resolve_binding(
+                                origin.cwd.as_deref(),
+                                origin.hostname.as_deref(),
+                                device_id,
+                                &server_host,
+                                workspace,
+                            );
+                            let _ = storage.set_conversation_workspace(&conversation, &b);
+                            b
+                        });
+                    if binding.device.is_none() && binding.root != current_root {
+                        tracing::info!(root = %binding.root.display(), "rooting conversation workspace at the CLI's cwd");
+                        current_root = binding.root.clone();
+                        let (t, h, g) = build_connection_stack(
+                            storage,
+                            &current_root,
+                            device_id,
+                            hub,
+                            pending,
+                            handles,
+                            auth,
+                            device_tools,
+                            policy,
+                            out,
+                        );
+                        tools = t;
+                        subagent_host = h;
+                        goal_state = g;
+                    }
+                    workspace_bound = true;
                 }
 
                 // Hold the per-connection turn lock across BOTH recovery and this

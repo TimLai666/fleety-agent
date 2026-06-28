@@ -9,7 +9,19 @@ Grouped by which binary cares about it. Anything unset uses the default.
 |---|---|---|
 | `FLEETY_ADDR` | `127.0.0.1:8787` | WebSocket listen address. Bind `0.0.0.0:8787` to expose on the LAN. |
 | `FLEETY_AGENT_HOME` | `$HOME/.fleety/agent` | Durable store root: conversations, history, backups, skills, MCP config, schedules, wiki. |
-| `FLEETY_WORKSPACE` | cwd | Base directory the workspace tools (`read_file`/`write_file`/etc.) resolve **relative** paths against. |
+| `FLEETY_WORKSPACE` | cwd | Base directory the workspace tools (`read_file`/`write_file`/etc.) resolve **relative** paths against — the *fallback* workspace root (see below). |
+
+**Per-conversation workspace root.** Each conversation roots its tools by this
+precedence: the originating CLI's working directory (`origin.cwd`, sent on every
+message) **when the CLI is on the same host as the server** → else `FLEETY_WORKSPACE`
+→ else the server's cwd. So opening the CLI inside a project directory on the box
+running the server makes Fleety a coding agent in that directory. The binding is
+resolved once per conversation and reused (and persisted across resume). `cwd` is
+treated as untrusted input (validated; the `FLEETY_FS_SCOPE` posture and the
+sensitive-path guard still apply). When the CLI runs on a *different* device, the
+server keeps the fallback root and records the originating device on the binding
+(running tools on that remote device at its cwd is a planned follow-up).
+
 | `FLEETY_FS_SCOPE` | (unset → `full`) | `full` (default): the structured file tools may read/write anywhere on the device (absolute paths allowed; still audited + rollback-backed; a sensitive-path guard refuses SSH keys/`/etc/shadow`/`/dev`/Windows system dirs/etc.). `workspace`: re-confine every path to the workspace/device root (`..`/absolute/symlink-tight sandbox). Set on `fleetyd` too for its `FLEETY_DEVICE_ROOT`. |
 | `FLEETY_POLICY` | `full_access` | `require_approval` gates every non-read tool through the approval flow. |
 | `FLEETY_REQUIRE_AUTH` | `0` | Set to `1` to require a valid token / pairing code on every `Hello`. |
