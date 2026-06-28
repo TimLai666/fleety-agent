@@ -39,6 +39,17 @@ pub struct WireAttachment {
     pub name: Option<String>,
 }
 
+/// A device-deixis attention hint carried on a voice-mode terminal reply: which
+/// device to look at, what to look at there, and an optional url/path the
+/// terminal can surface or open.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct AttentionHint {
+    pub device: String,
+    pub look_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
 /// Origin context the CLI attaches so the agent knows where a message came from.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct OriginContext {
@@ -159,6 +170,11 @@ pub enum ServerMsg {
         /// when voice is on.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         speech: Option<String>,
+        /// Device-deixis attention hint (which device + what to look at) for
+        /// voice mode; present only on the terminal turn when the agent points
+        /// the user at something. See [`AttentionHint`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attention: Option<AttentionHint>,
     },
     /// A replayed past event (sent in response to `Resume`).
     Replay {
@@ -349,6 +365,7 @@ mod tests {
             text: "t".into(),
             seq: 1,
             speech: Some("spoken".into()),
+            attention: None,
         };
         let json = serde_json::to_string(&msg).expect("serialize");
         assert_eq!(msg, serde_json::from_str(&json).expect("deserialize"));
@@ -358,6 +375,7 @@ mod tests {
             text: "t".into(),
             seq: 1,
             speech: None,
+            attention: None,
         };
         let json = serde_json::to_string(&no_speech).expect("serialize");
         assert_eq!(no_speech, serde_json::from_str(&json).expect("deserialize"));
@@ -370,6 +388,34 @@ mod tests {
         match msg {
             ClientMsg::UserMessage { voice, .. } => assert!(!voice),
             other => panic!("expected UserMessage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assistant_attention_roundtrips() {
+        let msg = ServerMsg::Assistant {
+            conversation_id: "c1".into(),
+            text: "look there".into(),
+            seq: 2,
+            speech: None,
+            attention: Some(AttentionHint {
+                device: "lab-pi-a".into(),
+                look_at: "the dashboard".into(),
+                url: Some("http://pi-a/grafana".into()),
+            }),
+        };
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert_eq!(msg, serde_json::from_str(&json).expect("deserialize"));
+    }
+
+    #[test]
+    fn assistant_without_attention_field_is_none() {
+        // Backward compatibility: an old frame without `attention` deserializes.
+        let json = r#"{"type":"assistant","conversation_id":"c1","text":"t","seq":1}"#;
+        let msg: ServerMsg = serde_json::from_str(json).expect("deserialize");
+        match msg {
+            ServerMsg::Assistant { attention, .. } => assert_eq!(attention, None),
+            other => panic!("expected Assistant, got {other:?}"),
         }
     }
 
@@ -390,9 +436,11 @@ mod tests {
             text: "t".into(),
             seq: 1,
             speech: None,
+            attention: None,
         };
         let json = serde_json::to_string(&msg).expect("serialize");
         assert!(!json.contains("speech"));
+        assert!(!json.contains("attention"));
     }
 
     #[test]

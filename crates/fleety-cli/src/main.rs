@@ -683,12 +683,24 @@ async fn voice_chat() -> Result<()> {
 
         loop {
             match recv(&mut rx).await? {
-                Some(ServerMsg::Assistant { text, speech, .. }) => {
+                Some(ServerMsg::Assistant {
+                    text,
+                    speech,
+                    attention,
+                    ..
+                }) => {
                     println!("{text}");
                     // Read the spoken channel aloud; falls back to silence if no
                     // engine or no spoken version was produced.
                     if let Some(spoken) = speech {
                         voice::speak(&spoken);
+                    }
+                    // Device-deixis: point the user at the named device/target.
+                    if let Some(a) = attention {
+                        match a.url {
+                            Some(url) => println!("→ look at {} on {}: {url}", a.look_at, a.device),
+                            None => println!("→ look at {} on {}", a.look_at, a.device),
+                        }
                     }
                 }
                 Some(ServerMsg::Done { .. }) | None => break,

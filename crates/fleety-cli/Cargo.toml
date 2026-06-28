@@ -25,6 +25,7 @@ base64 = { workspace = true }
 arboard = { workspace = true }
 png = { workspace = true }
 mdns-sd = { workspace = true }
+cpal = "0.15"
 
 [dev-dependencies]
 uuid = { workspace = true }

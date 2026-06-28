@@ -20,6 +20,16 @@ Grouped by which binary cares about it. Anything unset uses the default.
 | `FLEETY_GOAL_MAX_CONTINUES` | `8` | Max automatic goal continuations per user message. When the agent sets a goal (`set_goal`) and a turn ends without `complete_goal`/`ask_user`, the drive-to-goal loop re-engages it; this caps how many extra turns it may run before stopping and reporting the goal may be incomplete. Clamped to a floor of 1. |
 | `FLEETY_SKILL_REFLECT_MIN_STEPS` | `5` | Tool-step threshold above which a completed user message triggers one learning-loop reflection turn (the agent is prompted to save a reusable procedure as an authored skill and durable facts to memory/wiki). Below the threshold nothing runs; `0` disables reflection entirely. |
 
+## CLI (`fleety`) — voice input (speech-to-text)
+
+Read by the `fleety voice` terminal. Microphone capture is built in (via `cpal`); transcription runs a local engine you point these at (default whisper.cpp). Anything missing → the CLI falls back to OS dictation (Windows) or typing, never crashing.
+
+| Var | Default | Meaning |
+|---|---|---|
+| `FLEETY_STT_CMD` | (unset → whisper.cpp) | Transcription command template. `{wav}` and `{model}` are substituted. Unset uses the whisper.cpp default `whisper-cli -m <model> -f <wav> -nt` (which needs `FLEETY_STT_MODEL`). |
+| `FLEETY_STT_MODEL` | (unset) | Path to the transcription model (e.g. a whisper.cpp `ggml-*.bin`). Required when using the default command. |
+| `FLEETY_STT_SECONDS` | `5` | Seconds of microphone audio to record per spoken utterance. |
+
 ## Model provider
 
 | Var | Default | Meaning |

@@ -17,7 +17,7 @@ use agent_core::{
     CoreError, GoalState, LoopConfig, Message, ModelProvider, Policy, Result, RiskLevel, Role,
     Terminal, ToolRegistry,
 };
-use fleety_protocol::{ClientMsg, ServerMsg, WireError, PROTOCOL_VERSION};
+use fleety_protocol::{AttentionHint, ClientMsg, ServerMsg, WireError, PROTOCOL_VERSION};
 
 use crate::auth::{self, AuthStore};
 use crate::bridge::{self, DeviceTools, Handles, Hub, Pending};
@@ -540,6 +540,19 @@ pub(crate) struct TurnReply {
     pub speech: Option<String>,
     /// Provider steps taken this turn (a complexity proxy for the learning loop).
     pub steps: usize,
+    /// Device-deixis attention hint when voice is on and the model produced one;
+    /// emitted only on the terminal turn.
+    pub attention: Option<agent_core::AttentionHint>,
+}
+
+/// Map a core attention hint to its wire form (the two structs are identical but
+/// live in different crates so agent-core stays host-free).
+fn wire_attention(a: Option<agent_core::AttentionHint>) -> Option<AttentionHint> {
+    a.map(|a| AttentionHint {
+        device: a.device,
+        look_at: a.look_at,
+        url: a.url,
+    })
 }
 
 /// Default cap on automatic goal continuations per user message; override with
@@ -641,6 +654,7 @@ pub(crate) async fn drive_to_goal(
                     text,
                     seq: turn.seq,
                     speech: turn.speech,
+                    attention: wire_attention(turn.attention),
                 },
             )?;
             emit(
@@ -716,6 +730,7 @@ pub(crate) async fn drive_turn(
     let steps = outcome.steps;
     let reply = outcome.output;
     let speech = outcome.speech;
+    let attention = outcome.attention;
     let seq = storage.append(device_id, conversation, &Message::assistant(reply.clone()))?;
     storage.journal_end(device_id, conversation)?;
     if emit_terminal {
@@ -726,6 +741,7 @@ pub(crate) async fn drive_turn(
                 text: reply.clone(),
                 seq,
                 speech: speech.clone(),
+                attention: wire_attention(attention.clone()),
             },
         )?;
         emit(
@@ -740,6 +756,7 @@ pub(crate) async fn drive_turn(
         seq,
         speech,
         steps,
+        attention,
     })
 }
 
@@ -1061,8 +1078,9 @@ async fn recover_incomplete_turn(
             conversation_id: conversation.to_string(),
             text: reply,
             seq,
-            // Recovery turns are non-voice: no spoken channel.
+            // Recovery turns are non-voice: no spoken channel, no attention hint.
             speech: None,
+            attention: None,
         },
     )?;
     emit(
@@ -1561,6 +1579,76 @@ mod tests {
         .unwrap();
         let (dones, _) = terminal_frames(&drain(&mut rx));
         assert_eq!(dones, 0, "no reflection turn ran");
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// The attention hint on the (single) emitted Assistant frame, if any.
+    fn frame_attention(msgs: &[ServerMsg]) -> Option<AttentionHint> {
+        msgs.iter()
+            .find_map(|m| match m {
+                ServerMsg::Assistant { attention, .. } => Some(attention.clone()),
+                _ => None,
+            })
+            .flatten()
+    }
+
+    #[tokio::test]
+    async fn voice_on_terminal_turn_carries_attention() {
+        let (storage, tools, goal_state, home, out, mut rx) = goal_env();
+        let raw = format!(
+            "done\n{}\nspoken\n{}\ndevice=nas; look=the plex log; url=http://nas/log",
+            agent_core::SPEECH_SENTINEL,
+            agent_core::ATTENTION_SENTINEL
+        );
+        let provider = MockProvider::new(vec![text_resp(&raw)]);
+        let mut gate = agent_core::AutoApprove;
+        drive_to_goal(
+            &out,
+            &storage,
+            &provider,
+            &tools,
+            Policy::FullAccess,
+            "dev",
+            "c1",
+            Message::user("status"),
+            &mut gate,
+            &goal_state,
+            5,
+            true,
+        )
+        .await
+        .unwrap();
+        let a = frame_attention(&drain(&mut rx)).expect("attention on terminal turn");
+        assert_eq!(a.device, "nas");
+        assert_eq!(a.look_at, "the plex log");
+        assert_eq!(a.url.as_deref(), Some("http://nas/log"));
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn voice_off_terminal_turn_has_no_attention() {
+        let (storage, tools, goal_state, home, out, mut rx) = goal_env();
+        // Even if the text contains the marker, voice off → no parsing, no hint.
+        let raw = format!("hi\n{}\ndevice=x; look=y", agent_core::ATTENTION_SENTINEL);
+        let provider = MockProvider::new(vec![text_resp(&raw)]);
+        let mut gate = agent_core::AutoApprove;
+        drive_to_goal(
+            &out,
+            &storage,
+            &provider,
+            &tools,
+            Policy::FullAccess,
+            "dev",
+            "c1",
+            Message::user("status"),
+            &mut gate,
+            &goal_state,
+            5,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(frame_attention(&drain(&mut rx)), None);
         let _ = std::fs::remove_dir_all(home);
     }
 

@@ -53,13 +53,30 @@ pub struct TurnOutcome {
     /// The spoken (voice) version of the reply, set only when voice mode is on
     /// and the model emitted a [`SPEECH_SENTINEL`]-delimited spoken part.
     pub speech: Option<String>,
+    /// A device-deixis attention hint, set only when voice mode is on and the
+    /// model emitted an [`ATTENTION_SENTINEL`]-delimited block.
+    pub attention: Option<AttentionHint>,
     pub steps: usize,
+}
+
+/// A device-deixis attention hint parsed from a voice-mode reply: which device
+/// to look at, what to look at, and an optional url/path. Host-free — the server
+/// maps this to its own wire type.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AttentionHint {
+    pub device: String,
+    pub look_at: String,
+    pub url: Option<String>,
 }
 
 /// Marker the model emits in a voice-mode turn to separate the display reply
 /// from the spoken version: text before it is display, text after it is speech.
 /// Chosen as an unusual string so ordinary replies never collide with it.
 pub const SPEECH_SENTINEL: &str = "⟦SPEECH⟧";
+
+/// Marker the model emits in a voice-mode turn before an optional attention
+/// block (`device=…; look=…; url=…`). See [`AttentionHint`].
+pub const ATTENTION_SENTINEL: &str = "⟦ATTENTION⟧";
 
 /// The system addendum injected when voice mode is on, teaching the model the
 /// dual-channel output contract.
@@ -71,7 +88,11 @@ fn voice_instruction() -> String {
          spoken version of the same reply — no markdown, natural spoken sentences, \
          the way you would say it aloud. Use the marker only in the final reply, \
          never in intermediate tool-call turns. If there is nothing to say aloud, \
-         omit the marker entirely."
+         omit the marker entirely. Optionally, to point the user at something on a \
+         device, after the spoken version add a line with the exact marker \
+         {ATTENTION_SENTINEL} then on the next line \
+         `device=<id>; look=<what to look at>; url=<optional url or path>`. Omit \
+         this marker when you are not directing attention anywhere."
     )
 }
 
@@ -107,6 +128,47 @@ fn split_speech(output: &str) -> (String, Option<String>) {
         }
         None => (output.to_string(), None),
     }
+}
+
+/// Parse an attention block (`device=…; look=…; url=…`) into an [`AttentionHint`].
+/// Returns `None` unless both `device` and `look` are present and non-empty.
+fn parse_attention(block: &str) -> Option<AttentionHint> {
+    let (mut device, mut look_at, mut url) = (None, None, None);
+    for part in block.split(';') {
+        if let Some((k, v)) = part.split_once('=') {
+            let v = v.trim().to_string();
+            match k.trim() {
+                "device" => device = Some(v),
+                "look" => look_at = Some(v),
+                "url" if !v.is_empty() => url = Some(v),
+                _ => {}
+            }
+        }
+    }
+    match (device, look_at) {
+        (Some(d), Some(l)) if !d.is_empty() && !l.is_empty() => Some(AttentionHint {
+            device: d,
+            look_at: l,
+            url,
+        }),
+        _ => None,
+    }
+}
+
+/// Split a voice-mode final reply into (display, speech, attention): peel off an
+/// optional `⟦ATTENTION⟧` block first, then split the remainder at the speech
+/// marker. Missing markers / malformed attention yield `None` for that channel
+/// without affecting the others.
+fn split_channels(output: &str) -> (String, Option<String>, Option<AttentionHint>) {
+    let (rest, attention) = match output.find(ATTENTION_SENTINEL) {
+        Some(idx) => {
+            let block = output[idx + ATTENTION_SENTINEL.len()..].trim();
+            (&output[..idx], parse_attention(block))
+        }
+        None => (output, None),
+    };
+    let (display, speech) = split_speech(rest);
+    (display, speech, attention)
 }
 
 /// Run the tool-calling loop for one user turn.
@@ -172,15 +234,16 @@ pub async fn run_turn_streaming(
 
         if assistant.tool_calls.is_empty() {
             let raw = assistant.content.unwrap_or_default();
-            // Voice on: split the final reply into display + spoken channel.
-            let (output, speech) = if config.voice {
-                split_speech(&raw)
+            // Voice on: split the final reply into display + spoken + attention.
+            let (output, speech, attention) = if config.voice {
+                split_channels(&raw)
             } else {
-                (raw, None)
+                (raw, None, None)
             };
             return Ok(TurnOutcome {
                 output,
                 speech,
+                attention,
                 steps: step,
             });
         }
@@ -879,5 +942,100 @@ mod tests {
         .expect("turn ok");
         assert_eq!(outcome.output, "All set, no sentinel here.");
         assert_eq!(outcome.speech, None);
+    }
+
+    #[test]
+    fn split_channels_parses_speech_and_attention() {
+        // Spec Example row 1: device + look + url.
+        let raw = format!(
+            "Here is the diff.\n{SPEECH_SENTINEL}\nDone — check it.\n{ATTENTION_SENTINEL}\ndevice=lab-pi-a; look=the dashboard; url=http://pi-a/grafana"
+        );
+        let (display, speech, attention) = split_channels(&raw);
+        assert_eq!(display, "Here is the diff.");
+        assert_eq!(speech.as_deref(), Some("Done — check it."));
+        let a = attention.expect("attention");
+        assert_eq!(a.device, "lab-pi-a");
+        assert_eq!(a.look_at, "the dashboard");
+        assert_eq!(a.url.as_deref(), Some("http://pi-a/grafana"));
+    }
+
+    #[test]
+    fn split_channels_attention_without_url() {
+        // Spec Example row 2: device + look, no url.
+        let raw = format!(
+            "ok\n{SPEECH_SENTINEL}\nok aloud\n{ATTENTION_SENTINEL}\ndevice=nas; look=the plex transcode log"
+        );
+        let (_d, _s, attention) = split_channels(&raw);
+        let a = attention.expect("attention");
+        assert_eq!(a.device, "nas");
+        assert_eq!(a.look_at, "the plex transcode log");
+        assert_eq!(a.url, None);
+    }
+
+    #[test]
+    fn split_channels_no_attention_block() {
+        // Spec Example row 3: no attention block → none.
+        let raw = format!("hi\n{SPEECH_SENTINEL}\nhi aloud");
+        let (_d, speech, attention) = split_channels(&raw);
+        assert_eq!(speech.as_deref(), Some("hi aloud"));
+        assert_eq!(attention, None);
+    }
+
+    #[tokio::test]
+    async fn voice_on_parses_attention_from_final_reply() {
+        let raw = format!(
+            "All set.\n{SPEECH_SENTINEL}\nAll set, take a look.\n{ATTENTION_SENTINEL}\ndevice=nas; look=the plex log"
+        );
+        let provider = MockProvider::new(vec![ModelResponse {
+            message: Message::assistant(raw),
+        }]);
+        let tools = ToolRegistry::new();
+        let mut messages = vec![Message::system("base"), Message::user("status")];
+        let mut events = EventLog::new();
+        let cfg = LoopConfig {
+            voice: true,
+            ..LoopConfig::default()
+        };
+        let outcome = run_turn(
+            &provider,
+            &tools,
+            &mut messages,
+            &mut events,
+            &cfg,
+            Policy::FullAccess,
+            &mut AutoApprove,
+        )
+        .await
+        .expect("turn ok");
+        assert_eq!(outcome.output, "All set.");
+        assert_eq!(outcome.speech.as_deref(), Some("All set, take a look."));
+        let a = outcome.attention.expect("attention");
+        assert_eq!(a.device, "nas");
+        assert_eq!(a.look_at, "the plex log");
+    }
+
+    #[tokio::test]
+    async fn voice_off_yields_no_attention() {
+        // voice off: no parsing — attention is None and the text is untouched.
+        let raw = format!("hi\n{ATTENTION_SENTINEL}\ndevice=x; look=y");
+        let provider = MockProvider::new(vec![ModelResponse {
+            message: Message::assistant(raw.clone()),
+        }]);
+        let tools = ToolRegistry::new();
+        let mut messages = vec![Message::user("x")];
+        let mut events = EventLog::new();
+        let outcome = run_turn(
+            &provider,
+            &tools,
+            &mut messages,
+            &mut events,
+            &LoopConfig::default(),
+            Policy::FullAccess,
+            &mut AutoApprove,
+        )
+        .await
+        .expect("turn ok");
+        assert_eq!(outcome.attention, None);
+        assert_eq!(outcome.output, raw);
     }
 }

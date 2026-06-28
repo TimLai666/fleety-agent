@@ -23,7 +23,10 @@ pub mod panic;
 pub mod subagent;
 pub mod tools;
 
-pub use agent::{run_turn, run_turn_streaming, LoopConfig, TurnOutcome, SPEECH_SENTINEL};
+pub use agent::{
+    run_turn, run_turn_streaming, AttentionHint, LoopConfig, TurnOutcome, ATTENTION_SENTINEL,
+    SPEECH_SENTINEL,
+};
 pub use approval::{ApprovalDecision, ApprovalGate, AutoApprove, AutoDeny, MandateGate, Policy};
 pub use compress::{CacheAligner, CodeCompressor, ContextCompressor, Lang, SmartCrusher};
 pub use error::{CoreError, ErrorReport, Result};
