@@ -212,6 +212,79 @@ pub trait ModelProvider: Send + Sync {
     fn capabilities(&self) -> ModelCapabilities {
         ModelCapabilities::ALL
     }
+
+    /// Return a variant of this provider that applies `effort` to its model
+    /// calls, or `None` if this provider doesn't carry a reasoning effort (the
+    /// default — so existing impls/tests are unaffected). The caller applies the
+    /// agent's per-turn effort or a subagent's spawn-time effort here.
+    fn with_effort(&self, _effort: Option<Effort>) -> Option<std::sync::Arc<dyn ModelProvider>> {
+        None
+    }
+}
+
+/// A reasoning-effort level the agent or a parent can request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Effort {
+    Low,
+    Medium,
+    High,
+}
+
+impl Effort {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Effort::Low => "low",
+            Effort::Medium => "medium",
+            Effort::High => "high",
+        }
+    }
+
+    /// Parse `low`/`medium`/`high` (case-insensitive); anything else is `None`.
+    pub fn parse(s: &str) -> Option<Effort> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "low" => Some(Effort::Low),
+            "medium" => Some(Effort::Medium),
+            "high" => Some(Effort::High),
+            _ => None,
+        }
+    }
+}
+
+/// How a model family encodes reasoning effort in its request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffortScheme {
+    /// OpenAI-style top-level `reasoning_effort: "low|medium|high"`.
+    OpenAiReasoning,
+    /// Gemini-style `generationConfig.thinkingConfig.thinkingBudget`.
+    GeminiThinking,
+    /// The model doesn't accept an effort field — omit it.
+    None,
+}
+
+/// The request field (key + JSON value) to merge for `(scheme, effort)`, or
+/// `None` when nothing should be sent (no effort, or an effort-less scheme).
+/// Pure, so the mapping is unit-testable.
+pub fn effort_field(
+    scheme: EffortScheme,
+    effort: Option<Effort>,
+) -> Option<(&'static str, serde_json::Value)> {
+    let e = effort?;
+    match scheme {
+        EffortScheme::OpenAiReasoning => Some(("reasoning_effort", serde_json::json!(e.as_str()))),
+        EffortScheme::GeminiThinking => {
+            // Coarse low/medium/high → thinking-token budget (adjustable).
+            let budget = match e {
+                Effort::Low => 512,
+                Effort::Medium => 4096,
+                Effort::High => 24576,
+            };
+            Some((
+                "generationConfig",
+                serde_json::json!({ "thinkingConfig": { "thinkingBudget": budget } }),
+            ))
+        }
+        EffortScheme::None => None,
+    }
 }
 
 /// A non-text input modality an attachment can carry.
@@ -349,5 +422,27 @@ mod capability_tests {
         assert!(c.supports(Modality::Image));
         assert!(!c.supports(Modality::Audio));
         assert!(!c.supports(Modality::Other));
+    }
+
+    #[test]
+    fn effort_parses() {
+        assert_eq!(Effort::parse("HIGH"), Some(Effort::High));
+        assert_eq!(Effort::parse(" low "), Some(Effort::Low));
+        assert_eq!(Effort::parse("xl"), None);
+    }
+
+    #[test]
+    fn effort_field_per_scheme() {
+        // OpenAI reasoning: top-level string.
+        let (k, v) = effort_field(EffortScheme::OpenAiReasoning, Some(Effort::High)).unwrap();
+        assert_eq!(k, "reasoning_effort");
+        assert_eq!(v, serde_json::json!("high"));
+        // Gemini thinking: a generationConfig.thinkingConfig budget.
+        let (k, v) = effort_field(EffortScheme::GeminiThinking, Some(Effort::Medium)).unwrap();
+        assert_eq!(k, "generationConfig");
+        assert!(v["thinkingConfig"]["thinkingBudget"].as_i64().unwrap() > 0);
+        // None scheme, or no effort → no field.
+        assert!(effort_field(EffortScheme::None, Some(Effort::High)).is_none());
+        assert!(effort_field(EffortScheme::OpenAiReasoning, None).is_none());
     }
 }

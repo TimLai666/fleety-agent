@@ -108,6 +108,7 @@ fn build_connection_stack(
     agent_core::ToolRegistry,
     Arc<crate::subagent::FleetyHost>,
     Arc<tokio::sync::Mutex<GoalState>>,
+    crate::effort::SessionEffort,
 ) {
     let mut tools = build_full_registry(
         storage,
@@ -162,12 +163,15 @@ fn build_connection_stack(
     agent_workflow::register_workflow(&mut tools, subagent_mgr);
     let goal_state = Arc::new(tokio::sync::Mutex::new(GoalState::new()));
     agent_core::register_goal_tools(&mut tools, Arc::clone(&goal_state));
+    // The agent can adjust its own reasoning effort for subsequent turns.
+    let session_effort = crate::effort::new_session_effort();
+    crate::effort::register(&mut tools, Arc::clone(&session_effort));
     crate::conversation_lifecycle::register(&mut tools, Arc::clone(rollover_state));
     // Editor-backed tools (ACP delegation): when the connecting editor advertised
     // fs/terminal tools, the agent gets `editor_*` tools that route to this very
     // connection (its `out` sender) so file edits go through the user's editor.
     crate::editor_tools::register_editor(&mut tools, out, Arc::clone(pending), editor_specs);
-    (tools, subagent_host, goal_state)
+    (tools, subagent_host, goal_state, session_effort)
 }
 
 /// Handle one client connection over a raw-TCP WebSocket. Production serves
@@ -402,7 +406,7 @@ async fn serve(
                 .collect()
         })
         .unwrap_or_default();
-    let (mut tools, mut subagent_host, mut goal_state) = build_connection_stack(
+    let (mut tools, mut subagent_host, mut goal_state, mut session_effort) = build_connection_stack(
         storage,
         &current_root,
         device_id,
@@ -509,7 +513,7 @@ async fn serve(
                     }
                     // Rebuild the stack once with the resolved acting user (so
                     // recall is scoped to them) and the chosen root.
-                    let (t, h, g) = build_connection_stack(
+                    let (t, h, g, se) = build_connection_stack(
                         storage,
                         &current_root,
                         device_id,
@@ -527,6 +531,7 @@ async fn serve(
                     tools = t;
                     subagent_host = h;
                     goal_state = g;
+                    session_effort = se;
                     workspace_bound = true;
                 }
 
@@ -537,6 +542,13 @@ async fn serve(
                 let _turn_guard = subagent_host.lock_turn().await;
                 subagent_host.set_active_conversation(&conversation).await;
 
+                // Apply the agent's self-selected effort (set_effort) to this
+                // turn's model calls; None keeps the model's configured default.
+                let session_eff = *session_effort.lock().await;
+                let effort_provider = session_eff.and_then(|e| provider.with_effort(Some(e)));
+                let turn_provider: &dyn ModelProvider =
+                    effort_provider.as_deref().unwrap_or(provider);
+
                 // First finish any turn left interrupted by a crash/redeploy, so
                 // it isn't lost and doesn't interleave with this message. Best
                 // effort: on failure the journal stays for a later retry.
@@ -544,7 +556,7 @@ async fn serve(
                     inbound,
                     out,
                     storage,
-                    provider,
+                    turn_provider,
                     &tools,
                     policy,
                     device_id,
@@ -579,7 +591,7 @@ async fn serve(
                 let steps = drive_to_goal(
                     out,
                     storage,
-                    provider,
+                    turn_provider,
                     &tools,
                     policy,
                     device_id,

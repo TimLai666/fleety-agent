@@ -83,6 +83,9 @@ fn parse_request(opts: &JsValue, ctx: &mut Context) -> JsResult<SpawnRequest> {
         _ => SubagentMode::Spawn,
     };
     let tier = opt_string(&obj, "model", ctx).unwrap_or_else(|| "main".to_string());
+    let effort = opt_string(&obj, "effort", ctx)
+        .as_deref()
+        .and_then(agent_core::model::Effort::parse);
     let isolation = opt_string(&obj, "isolation", ctx).unwrap_or_else(|| "none".to_string());
     let name = opt_string(&obj, "name", ctx);
     let allowed_tools = obj
@@ -94,6 +97,7 @@ fn parse_request(opts: &JsValue, ctx: &mut Context) -> JsResult<SpawnRequest> {
     Ok(SpawnRequest {
         mode,
         tier,
+        effort,
         prompt,
         allowed_tools,
         isolation,

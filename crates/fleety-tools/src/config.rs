@@ -148,6 +148,20 @@ pub fn registry() -> &'static [Setting] {
             secret: false,
         },
         Setting {
+            key: "FLEETY_MODEL_EFFORT",
+            scope: Server,
+            default: "(none)",
+            description: "Default reasoning effort for the main model: low/medium/high (only models that support effort).",
+            secret: false,
+        },
+        Setting {
+            key: "FLEETY_CHEAP_MODEL_EFFORT",
+            scope: Server,
+            default: "(none)",
+            description: "Default reasoning effort for the economy model (low/medium/high).",
+            secret: false,
+        },
+        Setting {
             key: "FLEETY_CHEAP_MODEL",
             scope: Server,
             default: "",

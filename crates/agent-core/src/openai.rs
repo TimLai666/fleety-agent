@@ -7,8 +7,11 @@
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
+use std::sync::Arc;
+
 use crate::model::{
-    Message, ModelCapabilities, ModelProvider, ModelResponse, Role, ToolCall, ToolSpec,
+    Effort, EffortScheme, Message, ModelCapabilities, ModelProvider, ModelResponse, Role, ToolCall,
+    ToolSpec,
 };
 use crate::{CoreError, Result};
 
@@ -21,6 +24,8 @@ pub struct OpenAiCompat {
     stream: bool,
     retry: crate::retry::RetryConfig,
     caps: ModelCapabilities,
+    effort: Option<Effort>,
+    effort_scheme: EffortScheme,
 }
 
 impl OpenAiCompat {
@@ -38,6 +43,8 @@ impl OpenAiCompat {
             stream: false,
             retry: crate::retry::RetryConfig::from_env(),
             caps: ModelCapabilities::ALL,
+            effort: None,
+            effort_scheme: EffortScheme::None,
         }
     }
 
@@ -46,6 +53,27 @@ impl OpenAiCompat {
     pub fn with_capabilities(mut self, caps: ModelCapabilities) -> Self {
         self.caps = caps;
         self
+    }
+
+    /// Set how this model encodes reasoning effort and its default effort.
+    pub fn with_effort_config(mut self, scheme: EffortScheme, default: Option<Effort>) -> Self {
+        self.effort_scheme = scheme;
+        self.effort = default;
+        self
+    }
+
+    fn clone_with_effort(&self, effort: Option<Effort>) -> OpenAiCompat {
+        OpenAiCompat {
+            base_url: self.base_url.clone(),
+            model: self.model.clone(),
+            api_key: self.api_key.clone(),
+            client: self.client.clone(),
+            stream: self.stream,
+            retry: self.retry,
+            caps: self.caps,
+            effort,
+            effort_scheme: self.effort_scheme,
+        }
     }
 
     /// Request the streaming (`stream: true`) chat-completions API and assemble
@@ -250,6 +278,10 @@ impl ModelProvider for OpenAiCompat {
     fn capabilities(&self) -> ModelCapabilities {
         self.caps
     }
+
+    fn with_effort(&self, effort: Option<Effort>) -> Option<Arc<dyn ModelProvider>> {
+        Some(Arc::new(self.clone_with_effort(effort)))
+    }
 }
 
 impl OpenAiCompat {
@@ -271,6 +303,9 @@ impl OpenAiCompat {
         }
         if self.stream {
             body.insert("stream".to_string(), json!(true));
+        }
+        if let Some((key, value)) = crate::model::effort_field(self.effort_scheme, self.effort) {
+            body.insert(key.to_string(), value);
         }
         Value::Object(body)
     }

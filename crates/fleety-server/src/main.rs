@@ -17,6 +17,7 @@ mod conversation_embed;
 mod conversation_lifecycle;
 mod conversation_recall;
 mod editor_tools;
+mod effort;
 mod embed;
 mod gc;
 mod http;

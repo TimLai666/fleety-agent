@@ -20,8 +20,11 @@
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
+use std::sync::Arc;
+
 use crate::model::{
-    Message, ModelCapabilities, ModelProvider, ModelResponse, Role, ToolCall, ToolSpec,
+    effort_field, Effort, EffortScheme, Message, ModelCapabilities, ModelProvider, ModelResponse,
+    Role, ToolCall, ToolSpec,
 };
 use crate::{CoreError, Result};
 
@@ -36,6 +39,8 @@ pub struct Gemini {
     stream: bool,
     retry: crate::retry::RetryConfig,
     caps: ModelCapabilities,
+    effort: Option<Effort>,
+    effort_scheme: EffortScheme,
 }
 
 impl Gemini {
@@ -56,6 +61,8 @@ impl Gemini {
             stream: false,
             retry: crate::retry::RetryConfig::from_env(),
             caps: ModelCapabilities::ALL,
+            effort: None,
+            effort_scheme: EffortScheme::None,
         }
     }
 
@@ -69,6 +76,37 @@ impl Gemini {
     pub fn with_capabilities(mut self, caps: ModelCapabilities) -> Self {
         self.caps = caps;
         self
+    }
+
+    /// Set how this model encodes reasoning effort and its default effort.
+    pub fn with_effort_config(mut self, scheme: EffortScheme, default: Option<Effort>) -> Self {
+        self.effort_scheme = scheme;
+        self.effort = default;
+        self
+    }
+
+    fn clone_with_effort(&self, effort: Option<Effort>) -> Gemini {
+        Gemini {
+            base_url: self.base_url.clone(),
+            model: self.model.clone(),
+            api_key: self.api_key.clone(),
+            client: self.client.clone(),
+            stream: self.stream,
+            retry: self.retry,
+            caps: self.caps,
+            effort,
+            effort_scheme: self.effort_scheme,
+        }
+    }
+
+    /// Merge the reasoning-effort field into a request body, if any.
+    fn apply_effort(&self, mut body: Value) -> Value {
+        if let Some((key, value)) = effort_field(self.effort_scheme, self.effort) {
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert(key.to_string(), value);
+            }
+        }
+        body
     }
 
     fn endpoint(&self, streaming: bool) -> String {
@@ -93,7 +131,7 @@ impl Gemini {
 #[async_trait::async_trait]
 impl ModelProvider for Gemini {
     async fn complete(&self, messages: &[Message], tools: &[ToolSpec]) -> Result<ModelResponse> {
-        let body = build_request(messages, tools, &self.model, self.caps);
+        let body = self.apply_effort(build_request(messages, tools, &self.model, self.caps));
         let text = crate::retry::run_with_retry(&self.retry, || {
             let request = self.client.post(self.endpoint(false)).json(&body);
             async move {
@@ -151,6 +189,10 @@ impl ModelProvider for Gemini {
         self.caps
     }
 
+    fn with_effort(&self, effort: Option<Effort>) -> Option<Arc<dyn ModelProvider>> {
+        Some(Arc::new(self.clone_with_effort(effort)))
+    }
+
     async fn complete_streaming(
         &self,
         messages: &[Message],
@@ -160,7 +202,7 @@ impl ModelProvider for Gemini {
         if !self.stream {
             return self.complete(messages, tools).await;
         }
-        let body = build_request(messages, tools, &self.model, self.caps);
+        let body = self.apply_effort(build_request(messages, tools, &self.model, self.caps));
         // Retry only the connection + initial status, before any delta is emitted.
         let response = crate::retry::run_with_retry(&self.retry, || {
             let request = self.client.post(self.endpoint(true)).json(&body);

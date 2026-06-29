@@ -51,21 +51,45 @@ pub fn build(prefix: &str) -> Option<Arc<dyn ModelProvider>> {
             agent_core::model::ModelCapabilities::TEXT_ONLY
         }
     };
+    // Reasoning effort: a per-tier default (`{prefix}_EFFORT`) and the family's
+    // encoding scheme (derived from the model name). When the scheme is None or
+    // no effort is set, no effort field is sent.
+    let default_effort = std::env::var(format!("{prefix}_EFFORT"))
+        .ok()
+        .and_then(|s| agent_core::model::Effort::parse(&s));
+    let scheme = effort_scheme_for(&model);
     Some(if agent_core::gemini::looks_like_gemini_model(&model) {
         tracing::info!(%base_url, %model, stream, %prefix, "using native Gemini provider");
         Arc::new(
             Gemini::new(base_url, model, key)
                 .with_streaming(stream)
-                .with_capabilities(caps),
+                .with_capabilities(caps)
+                .with_effort_config(scheme, default_effort),
         )
     } else {
         tracing::info!(%base_url, %model, stream, %prefix, "using OpenAI-compatible provider");
         Arc::new(
             OpenAiCompat::new(base_url, model, key)
                 .with_streaming(stream)
-                .with_capabilities(caps),
+                .with_capabilities(caps)
+                .with_effort_config(scheme, default_effort),
         )
     })
+}
+
+/// Which reasoning-effort encoding (if any) a model family accepts. Conservative:
+/// only models known to take an effort field get a scheme, so an effort value is
+/// never sent to a model that would reject it.
+fn effort_scheme_for(model: &str) -> agent_core::model::EffortScheme {
+    use agent_core::model::EffortScheme;
+    let m = model.to_ascii_lowercase();
+    if m.contains("gemini-2.5") || m.contains("gemini-2-5") {
+        EffortScheme::GeminiThinking
+    } else if m.contains("o1") || m.contains("o3") || m.contains("o4") || m.contains("gpt-5") {
+        EffortScheme::OpenAiReasoning
+    } else {
+        EffortScheme::None
+    }
 }
 
 /// The main model provider (`FLEETY_MODEL_*`), falling back to the offline echo

@@ -443,6 +443,7 @@ mod tests {
             .spawn(SpawnRequest {
                 mode: SubagentMode::Spawn,
                 tier: "main".to_string(),
+                effort: None,
                 prompt: "go".to_string(),
                 allowed_tools: Vec::new(),
                 isolation: "none".to_string(),

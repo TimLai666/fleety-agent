@@ -25,6 +25,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
+use crate::model::Effort;
 use crate::{
     run_turn, ApprovalGate, AutoApprove, AutoDeny, CoreError, Event, EventLog, LoopConfig,
     MandateGate, Message, ModelProvider, Policy, Result, RiskLevel, Tool, ToolRegistry, ToolSpec,
@@ -73,6 +74,9 @@ pub struct SpawnRequest {
     pub mode: SubagentMode,
     /// Host-defined model tier (e.g. `"main"` / `"cheap"`). Resolved by the host.
     pub tier: String,
+    /// Reasoning effort chosen by the **spawning** agent for this subagent; the
+    /// subagent runs all its turns at this effort and cannot change it.
+    pub effort: Option<Effort>,
     pub prompt: String,
     pub allowed_tools: Vec<String>,
     /// Host-defined isolation token (e.g. `"none"` / `"worktree"`), opaque here.
@@ -146,6 +150,7 @@ struct TaskRecord {
     messages: Vec<Message>,
     output: Option<String>,
     tier: String,
+    effort: Option<Effort>,
     handle: Option<tokio::task::JoinHandle<()>>,
     workspace: Option<String>,
 }
@@ -201,11 +206,14 @@ impl SubagentManager {
         task_id: &str,
         mut messages: Vec<Message>,
         tier: &str,
+        effort: Option<Effort>,
         allowed_tools: &[String],
         workspace: Option<&str>,
     ) -> (SubagentState, String, Vec<Message>) {
         let registry = self.host.child_registry(workspace).await;
-        let provider = self.host.resolve_provider(tier);
+        let base = self.host.resolve_provider(tier);
+        // Apply the parent-chosen effort for this subagent's whole run.
+        let provider = base.with_effort(effort).unwrap_or(base);
         let mut gate = self.make_gate(allowed_tools);
         let mut events = EventLog::new();
         let cfg = LoopConfig::default();
@@ -255,6 +263,7 @@ impl SubagentManager {
                 messages: Vec::new(),
                 output: None,
                 tier: req.tier.clone(),
+                effort: req.effort,
                 handle: None,
                 workspace: workspace.clone(),
             },
@@ -307,6 +316,7 @@ impl SubagentManager {
                 task_id,
                 messages,
                 &req.tier,
+                req.effort,
                 &req.allowed_tools,
                 workspace.as_deref(),
             )
@@ -369,7 +379,7 @@ impl SubagentManager {
     /// preserving its messages.
     pub async fn send(&self, key: &str, prompt: &str) -> Result<Value> {
         let task_id = self.resolve(key).await?;
-        let (mut messages, tier) = {
+        let (mut messages, tier, effort) = {
             let tasks = self.tasks.lock().await;
             let rec = tasks
                 .get(&task_id)
@@ -379,14 +389,15 @@ impl SubagentManager {
                     "subagent '{task_id}' is still running; wait for it to finish before sending"
                 )));
             }
-            (rec.messages.clone(), rec.tier.clone())
+            (rec.messages.clone(), rec.tier.clone(), rec.effort)
         };
         messages.push(Message::user(prompt));
         if let Some(rec) = self.tasks.lock().await.get_mut(&task_id) {
             rec.state = SubagentState::Running;
         }
-        let (state, output, final_messages) =
-            self.run_loop(&task_id, messages, &tier, &[], None).await;
+        let (state, output, final_messages) = self
+            .run_loop(&task_id, messages, &tier, effort, &[], None)
+            .await;
         if let Some(rec) = self.tasks.lock().await.get_mut(&task_id) {
             rec.state = state;
             rec.output = Some(output.clone());
@@ -461,9 +472,14 @@ fn parse_request(args: &Value) -> Result<SpawnRequest> {
         .get("run_in_background")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let effort = args
+        .get("effort")
+        .and_then(Value::as_str)
+        .and_then(Effort::parse);
     Ok(SpawnRequest {
         mode,
         tier,
+        effort,
         prompt,
         allowed_tools,
         isolation,
@@ -754,6 +770,7 @@ mod tests {
                 SubagentMode::Spawn
             },
             tier: tier.to_string(),
+            effort: None,
             prompt: prompt.to_string(),
             allowed_tools: Vec::new(),
             isolation: isolation.to_string(),
@@ -863,6 +880,7 @@ mod tests {
             .spawn(SpawnRequest {
                 mode: SubagentMode::Spawn,
                 tier: "main".to_string(),
+                effort: None,
                 prompt: "p".to_string(),
                 allowed_tools: Vec::new(),
                 isolation: "none".to_string(),
