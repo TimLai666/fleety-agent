@@ -23,6 +23,15 @@ use ratatui::Frame;
 /// `fleetyd` expose the same `config` command; the CLI only overrides `edit` to
 /// open the ratatui screen when stdout is a TTY.
 pub fn run(args: &[String]) -> Result<()> {
+    // `config provider edit` on a TTY opens the interactive providers screen;
+    // without a TTY it falls through to the shared subcommand dispatch.
+    let head = (
+        args.first().map(String::as_str),
+        args.get(1).map(String::as_str),
+    );
+    if head == (Some("provider"), Some("edit")) && std::io::stdout().is_terminal() {
+        return crate::provider_tui::run(&fleety_tools::providers_config::providers_path());
+    }
     if matches!(config::parse(args), config::Command::Edit) && std::io::stdout().is_terminal() {
         run_tui_edit(&config::config_path())
     } else {

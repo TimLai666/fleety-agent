@@ -429,6 +429,14 @@ pub fn rows(map: &ConfigMap) -> Vec<(String, String, String, String)> {
 /// Run a `config` subcommand against the config file. `edit` is the line-based
 /// loop; the CLI overrides `edit` with a ratatui screen when stdout is a TTY.
 pub fn run(args: &[String]) -> Result<()> {
+    // `provider` / `group` / `role` manage the structured providers.toml (a
+    // separate file); everything else is the flat-key registry below.
+    if matches!(
+        args.first().map(String::as_str),
+        Some("provider" | "group" | "role")
+    ) {
+        return run_providers(args);
+    }
     let path = config_path();
     match parse(args) {
         Command::List => {
@@ -481,6 +489,376 @@ pub fn run(args: &[String]) -> Result<()> {
         Command::Edit => edit_line_based(&path),
         Command::Help => {
             println!("usage: config [list | get <KEY> | set <KEY> <VALUE> | unset <KEY> | edit]");
+            Ok(())
+        }
+    }
+}
+
+// ---- providers.toml subcommands (provider / group / role) ----
+
+use crate::providers_config::{self as pc, GroupSpec, ProviderSpec, Strategy};
+
+/// A parsed `provider` / `group` / `role` subcommand over `providers.toml`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderCmd {
+    ProviderAdd(ProviderSpec),
+    /// Update named provider's fields (only `Some` fields change).
+    ProviderSet {
+        name: String,
+        base_url: Option<String>,
+        model: Option<String>,
+        key: Option<String>,
+        stream: Option<bool>,
+        modalities: Option<String>,
+        effort: Option<String>,
+    },
+    ProviderRemove(String),
+    ProviderList,
+    GroupSet {
+        name: String,
+        members: Vec<String>,
+        strategy: Strategy,
+    },
+    GroupRemove(String),
+    GroupList,
+    RoleSet {
+        role: String,
+        target: String,
+    },
+    RoleUnset(String),
+    RoleList,
+}
+
+fn strategy_from(s: &str) -> Result<Strategy> {
+    match s {
+        "round_robin" => Ok(Strategy::RoundRobin),
+        "failover" => Ok(Strategy::Failover),
+        _ => Err(CoreError::Message(format!(
+            "invalid strategy '{s}' (expected round_robin or failover)"
+        ))),
+    }
+}
+
+/// Split `--flag value` / bare `--flag` tokens into a (key→value, bare-set)
+/// pair. A `--flag` that needs a value but has none is an error; a non-flag
+/// token here is unexpected.
+fn split_flags(
+    args: &[String],
+) -> Result<(HashMap<String, String>, std::collections::HashSet<String>)> {
+    let mut kv = HashMap::new();
+    let mut bare = std::collections::HashSet::new();
+    let mut i = 0;
+    while i < args.len() {
+        let Some(name) = args[i].strip_prefix("--") else {
+            return Err(CoreError::Message(format!(
+                "unexpected argument '{}'",
+                args[i]
+            )));
+        };
+        if name == "stream" {
+            bare.insert(name.to_string());
+            i += 1;
+        } else {
+            let v = args
+                .get(i + 1)
+                .ok_or_else(|| CoreError::Message(format!("flag --{name} needs a value")))?;
+            kv.insert(name.to_string(), v.clone());
+            i += 2;
+        }
+    }
+    Ok((kv, bare))
+}
+
+/// Error if any flags were given but not consumed (catches typos/unknown flags).
+fn no_unknown_flags(kv: &HashMap<String, String>) -> Result<()> {
+    if let Some(k) = kv.keys().next() {
+        return Err(CoreError::Message(format!("unknown flag --{k}")));
+    }
+    Ok(())
+}
+
+/// Parse a `provider` / `group` / `role` subcommand. Pure and unit-testable; an
+/// unknown verb, missing required field, bad strategy, or unknown flag is an
+/// error.
+pub fn parse_providers(args: &[String]) -> Result<ProviderCmd> {
+    let kind = args.first().map(String::as_str);
+    let verb = args.get(1).map(String::as_str);
+    let rest = if args.len() > 2 { &args[2..] } else { &[][..] };
+    let need = |o: Option<&String>, what: &str| -> Result<String> {
+        o.cloned()
+            .ok_or_else(|| CoreError::Message(format!("missing {what}")))
+    };
+    match (kind, verb) {
+        (Some("provider"), Some("list")) => Ok(ProviderCmd::ProviderList),
+        (Some("provider"), Some("remove")) => {
+            Ok(ProviderCmd::ProviderRemove(need(rest.first(), "provider name")?))
+        }
+        (Some("provider"), Some("add")) => {
+            let name = need(rest.first(), "provider name")?;
+            let (mut kv, bare) = split_flags(rest.get(1..).unwrap_or(&[]))?;
+            let base_url = kv
+                .remove("base-url")
+                .ok_or_else(|| CoreError::Message("missing --base-url".to_string()))?;
+            let model = kv
+                .remove("model")
+                .ok_or_else(|| CoreError::Message("missing --model".to_string()))?;
+            let key = kv.remove("key");
+            let modalities = kv.remove("modalities");
+            let effort = kv.remove("effort");
+            no_unknown_flags(&kv)?;
+            Ok(ProviderCmd::ProviderAdd(ProviderSpec {
+                name,
+                base_url,
+                model,
+                key,
+                stream: bare.contains("stream"),
+                modalities,
+                effort,
+            }))
+        }
+        (Some("provider"), Some("set")) => {
+            let name = need(rest.first(), "provider name")?;
+            let (mut kv, bare) = split_flags(rest.get(1..).unwrap_or(&[]))?;
+            let base_url = kv.remove("base-url");
+            let model = kv.remove("model");
+            let key = kv.remove("key");
+            let modalities = kv.remove("modalities");
+            let effort = kv.remove("effort");
+            no_unknown_flags(&kv)?;
+            let stream = if bare.contains("stream") {
+                Some(true)
+            } else {
+                None
+            };
+            Ok(ProviderCmd::ProviderSet {
+                name,
+                base_url,
+                model,
+                key,
+                stream,
+                modalities,
+                effort,
+            })
+        }
+        (Some("group"), Some("list")) => Ok(ProviderCmd::GroupList),
+        (Some("group"), Some("remove")) => {
+            Ok(ProviderCmd::GroupRemove(need(rest.first(), "group name")?))
+        }
+        (Some("group"), Some("set")) => {
+            let name = need(rest.first(), "group name")?;
+            let (mut kv, _bare) = split_flags(rest.get(1..).unwrap_or(&[]))?;
+            let members = kv
+                .remove("members")
+                .ok_or_else(|| CoreError::Message("missing --members".to_string()))?
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>();
+            let strategy = strategy_from(
+                &kv.remove("strategy")
+                    .ok_or_else(|| CoreError::Message("missing --strategy".to_string()))?,
+            )?;
+            no_unknown_flags(&kv)?;
+            Ok(ProviderCmd::GroupSet {
+                name,
+                members,
+                strategy,
+            })
+        }
+        (Some("role"), Some("list")) => Ok(ProviderCmd::RoleList),
+        (Some("role"), Some("unset")) => {
+            Ok(ProviderCmd::RoleUnset(need(rest.first(), "role name")?))
+        }
+        (Some("role"), Some("set")) => {
+            let role = need(rest.first(), "role name")?;
+            let target = need(rest.get(1), "target provider/group name")?;
+            Ok(ProviderCmd::RoleSet { role, target })
+        }
+        _ => Err(CoreError::Message(
+            "usage: config provider <add|set|remove|list> | group <set|remove|list> | role <set|unset|list>"
+                .to_string(),
+        )),
+    }
+}
+
+fn mask_key(key: &Option<String>) -> &'static str {
+    match key {
+        Some(k) if !k.is_empty() => "********",
+        _ => "(none)",
+    }
+}
+
+/// Execute a `provider` / `group` / `role` subcommand against `providers.toml`:
+/// load (empty when missing, error when present-but-broken), apply, validate,
+/// and write atomically.
+pub fn run_providers(args: &[String]) -> Result<()> {
+    run_providers_at(&pc::providers_path(), args)
+}
+
+/// Like [`run_providers`] but against an explicit `providers.toml` path (used by
+/// tests and the interactive editor's save path).
+pub fn run_providers_at(path: &std::path::Path, args: &[String]) -> Result<()> {
+    let cmd = parse_providers(args)?;
+    match cmd {
+        ProviderCmd::ProviderList => {
+            let cfg = pc::load_or_default(path)?;
+            if cfg.providers.is_empty() {
+                println!("(no providers defined in {})", path.display());
+            }
+            for p in &cfg.providers {
+                println!(
+                    "  {:<16} {} [{}] key={} stream={}",
+                    p.name,
+                    p.base_url,
+                    p.model,
+                    mask_key(&p.key),
+                    p.stream
+                );
+            }
+            Ok(())
+        }
+        ProviderCmd::ProviderAdd(spec) => {
+            let mut cfg = pc::load_or_default(path)?;
+            if cfg.provider(&spec.name).is_some() {
+                return Err(CoreError::Message(format!(
+                    "provider '{}' already exists (use `provider set` to change it)",
+                    spec.name
+                )));
+            }
+            let name = spec.name.clone();
+            cfg.providers.push(spec);
+            pc::write_providers(path, &cfg)?;
+            println!("added provider '{name}'");
+            Ok(())
+        }
+        ProviderCmd::ProviderSet {
+            name,
+            base_url,
+            model,
+            key,
+            stream,
+            modalities,
+            effort,
+        } => {
+            let mut cfg = pc::load_or_default(path)?;
+            let p = cfg
+                .providers
+                .iter_mut()
+                .find(|p| p.name == name)
+                .ok_or_else(|| CoreError::Message(format!("no such provider '{name}'")))?;
+            if let Some(v) = base_url {
+                p.base_url = v;
+            }
+            if let Some(v) = model {
+                p.model = v;
+            }
+            if key.is_some() {
+                p.key = key;
+            }
+            if let Some(v) = stream {
+                p.stream = v;
+            }
+            if modalities.is_some() {
+                p.modalities = modalities;
+            }
+            if effort.is_some() {
+                p.effort = effort;
+            }
+            pc::write_providers(path, &cfg)?;
+            println!("updated provider '{name}'");
+            Ok(())
+        }
+        ProviderCmd::ProviderRemove(name) => {
+            let mut cfg = pc::load_or_default(path)?;
+            if cfg.provider(&name).is_none() {
+                return Err(CoreError::Message(format!("no such provider '{name}'")));
+            }
+            if let Some(g) = cfg.groups.iter().find(|g| g.members.contains(&name)) {
+                return Err(CoreError::Message(format!(
+                    "cannot remove provider '{name}': group '{}' references it",
+                    g.name
+                )));
+            }
+            if let Some((r, _)) = cfg.roles.iter().find(|(_, t)| **t == name) {
+                return Err(CoreError::Message(format!(
+                    "cannot remove provider '{name}': role '{r}' references it"
+                )));
+            }
+            cfg.providers.retain(|p| p.name != name);
+            pc::write_providers(path, &cfg)?;
+            println!("removed provider '{name}'");
+            Ok(())
+        }
+        ProviderCmd::GroupList => {
+            let cfg = pc::load_or_default(path)?;
+            if cfg.groups.is_empty() {
+                println!("(no groups defined in {})", path.display());
+            }
+            for g in &cfg.groups {
+                println!(
+                    "  {:<16} [{:?}] {}",
+                    g.name,
+                    g.strategy,
+                    g.members.join(", ")
+                );
+            }
+            Ok(())
+        }
+        ProviderCmd::GroupSet {
+            name,
+            members,
+            strategy,
+        } => {
+            let mut cfg = pc::load_or_default(path)?;
+            cfg.groups.retain(|g| g.name != name);
+            cfg.groups.push(GroupSpec {
+                name: name.clone(),
+                members,
+                strategy,
+            });
+            pc::write_providers(path, &cfg)?;
+            println!("set group '{name}'");
+            Ok(())
+        }
+        ProviderCmd::GroupRemove(name) => {
+            let mut cfg = pc::load_or_default(path)?;
+            if cfg.group(&name).is_none() {
+                return Err(CoreError::Message(format!("no such group '{name}'")));
+            }
+            if let Some((r, _)) = cfg.roles.iter().find(|(_, t)| **t == name) {
+                return Err(CoreError::Message(format!(
+                    "cannot remove group '{name}': role '{r}' references it"
+                )));
+            }
+            cfg.groups.retain(|g| g.name != name);
+            pc::write_providers(path, &cfg)?;
+            println!("removed group '{name}'");
+            Ok(())
+        }
+        ProviderCmd::RoleSet { role, target } => {
+            let mut cfg = pc::load_or_default(path)?;
+            cfg.roles.insert(role.clone(), target.clone());
+            pc::write_providers(path, &cfg)?;
+            println!("bound role '{role}' → '{target}'");
+            Ok(())
+        }
+        ProviderCmd::RoleUnset(role) => {
+            let mut cfg = pc::load_or_default(path)?;
+            if cfg.roles.remove(&role).is_none() {
+                return Err(CoreError::Message(format!("no such role '{role}'")));
+            }
+            pc::write_providers(path, &cfg)?;
+            println!("unset role '{role}'");
+            Ok(())
+        }
+        ProviderCmd::RoleList => {
+            let cfg = pc::load_or_default(path)?;
+            if cfg.roles.is_empty() {
+                println!("(no roles defined in {})", path.display());
+            }
+            for (r, t) in &cfg.roles {
+                println!("  {r:<16} → {t}");
+            }
             Ok(())
         }
     }
@@ -642,5 +1020,136 @@ mod tests {
         assert_eq!(display_value(token, "supersecret"), "********");
         let addr = find("FLEETY_ADDR").unwrap();
         assert_eq!(display_value(addr, "1.2.3.4:5"), "1.2.3.4:5");
+    }
+
+    fn v(p: &[&str]) -> Vec<String> {
+        p.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn parse_providers_verbs_and_flags() {
+        // provider add → a fully-populated spec.
+        let cmd = parse_providers(&v(&[
+            "provider",
+            "add",
+            "codex-1",
+            "--base-url",
+            "https://x/v1",
+            "--model",
+            "gpt-5",
+            "--key",
+            "sk",
+            "--stream",
+            "--modalities",
+            "text,image",
+            "--effort",
+            "high",
+        ]))
+        .expect("add parses");
+        match cmd {
+            ProviderCmd::ProviderAdd(s) => {
+                assert_eq!(s.name, "codex-1");
+                assert_eq!(s.base_url, "https://x/v1");
+                assert!(s.stream);
+                assert_eq!(s.modalities.as_deref(), Some("text,image"));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+        // group set with a strategy.
+        assert_eq!(
+            parse_providers(&v(&[
+                "group",
+                "set",
+                "codex",
+                "--members",
+                "codex-1,codex-2",
+                "--strategy",
+                "round_robin",
+            ]))
+            .unwrap(),
+            ProviderCmd::GroupSet {
+                name: "codex".into(),
+                members: vec!["codex-1".into(), "codex-2".into()],
+                strategy: Strategy::RoundRobin,
+            }
+        );
+        // role set is two positionals.
+        assert_eq!(
+            parse_providers(&v(&["role", "set", "main", "codex"])).unwrap(),
+            ProviderCmd::RoleSet {
+                role: "main".into(),
+                target: "codex".into()
+            }
+        );
+        // Errors: unknown verb, bad strategy, unknown flag, missing required.
+        assert!(parse_providers(&v(&["provider", "frobnicate"])).is_err());
+        assert!(parse_providers(&v(&[
+            "group",
+            "set",
+            "g",
+            "--members",
+            "a",
+            "--strategy",
+            "random"
+        ]))
+        .is_err());
+        assert!(parse_providers(&v(&[
+            "provider",
+            "add",
+            "p",
+            "--base-url",
+            "u",
+            "--model",
+            "m",
+            "--bogus",
+            "x"
+        ]))
+        .is_err());
+        assert!(parse_providers(&v(&["provider", "add", "p", "--model", "m"])).is_err());
+    }
+
+    #[test]
+    fn run_providers_add_list_and_guard_removal() {
+        let path = std::env::temp_dir().join(format!("fleety-cfg-{}.toml", uuid::Uuid::new_v4()));
+        // Add two providers, then a group over them.
+        run_providers_at(
+            &path,
+            &v(&["provider", "add", "p1", "--base-url", "u1", "--model", "m"]),
+        )
+        .unwrap();
+        run_providers_at(
+            &path,
+            &v(&["provider", "add", "p2", "--base-url", "u2", "--model", "m"]),
+        )
+        .unwrap();
+        run_providers_at(
+            &path,
+            &v(&[
+                "group",
+                "set",
+                "g",
+                "--members",
+                "p1,p2",
+                "--strategy",
+                "failover",
+            ]),
+        )
+        .unwrap();
+        // Adding a duplicate name fails and leaves the file unchanged.
+        assert!(run_providers_at(
+            &path,
+            &v(&["provider", "add", "p1", "--base-url", "u", "--model", "m"])
+        )
+        .is_err());
+        // A referenced provider can't be removed (the group names it).
+        let err = run_providers_at(&path, &v(&["provider", "remove", "p1"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("group 'g'"), "got: {err}");
+        // The file still parses with both providers + the group.
+        let cfg = pc::load_from(&path).expect("re-read");
+        assert_eq!(cfg.providers.len(), 2);
+        assert_eq!(cfg.groups.len(), 1);
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -144,6 +144,31 @@ main = "codex"            # the main turn uses the pooled group
 cheap = "codex-1"         # subagents' cheap tier uses one account
 ```
 
+#### Managing it with `config` (no hand-editing required)
+
+`providers.toml` can be edited with `config` subcommands instead of by hand —
+available on all three binaries (`fleety`, `fleety-server`, `fleetyd`). Each
+change is validated (unique names, group members and role targets must exist)
+and written atomically; an invalid change is rejected with a message and nothing
+is written. Provider keys are masked in `list`.
+
+```
+config provider add codex-1 --base-url https://api.openai.com/v1 --model gpt-5 --key sk-aaa [--stream] [--modalities text,image] [--effort medium]
+config provider set codex-1 --model gpt-5.1        # change only the given fields
+config provider remove codex-1                     # blocked if a group/role still references it
+config provider list                               # keys masked
+config group set codex --members codex-1,codex-2 --strategy round_robin   # or failover
+config group remove codex
+config group list
+config role set main codex                         # bind main → the codex group
+config role unset main
+config role list
+```
+
+On a TTY, `config provider edit` (CLI only) opens an interactive screen to list
+and edit providers, groups, and roles; it saves through the same validation and
+atomic write. Without a TTY it falls back to the subcommands above.
+
 ## Retention / GC (server background loop)
 
 Six-hour periodic sweep that keeps audit + backup surfaces bounded.

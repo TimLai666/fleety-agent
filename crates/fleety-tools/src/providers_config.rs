@@ -6,7 +6,8 @@
 //! a pure [`parse`] and a fail-soft [`load_from`]/[`load`]: a missing or broken
 //! file is treated as absent (the caller falls back to the env-built tiers) and
 //! never crashes. `fleety-server` turns this data into runtime providers and
-//! group pools; `fleety-tools::config` (a later change) writes it back.
+//! group pools; [`write_providers`] / [`validate`] back the `config
+//! provider|group|role` subcommands and the interactive editor.
 //!
 //! Keys live here (not in `config.toml`) so secrets stay isolated.
 
@@ -123,6 +124,78 @@ pub fn load() -> Option<ProvidersConfig> {
     load_from(&providers_path())
 }
 
+/// Load for *editing*: a missing file yields an empty config, but a present
+/// file that fails to parse is an error (so editors never silently clobber a
+/// broken file). Distinct from [`load_from`], which fails soft for the runtime.
+pub fn load_or_default(path: &Path) -> Result<ProvidersConfig> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => parse(&text),
+        Err(_) => Ok(ProvidersConfig::default()),
+    }
+}
+
+/// Validate cross-references in a config. Pure. Rejects a duplicate provider
+/// name, a group member that isn't a defined provider, and a role whose target
+/// is neither a defined provider nor a defined group. (A group's strategy is an
+/// enum, so an invalid strategy can't be represented — it's rejected when a
+/// command flag is parsed.) Each error names the offending item.
+pub fn validate(cfg: &ProvidersConfig) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for p in &cfg.providers {
+        if !seen.insert(p.name.as_str()) {
+            return Err(CoreError::Message(format!(
+                "duplicate provider name '{}'",
+                p.name
+            )));
+        }
+    }
+    for g in &cfg.groups {
+        for m in &g.members {
+            if cfg.provider(m).is_none() {
+                return Err(CoreError::Message(format!(
+                    "group '{}' references undefined provider '{m}'",
+                    g.name
+                )));
+            }
+        }
+    }
+    for (role, target) in &cfg.roles {
+        if cfg.provider(target).is_none() && cfg.group(target).is_none() {
+            return Err(CoreError::Message(format!(
+                "role '{role}' targets undefined provider/group '{target}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Serialize `cfg` to TOML and write it to `path` atomically: write a temp file
+/// in the same directory, then rename it over `path` (so a crash or concurrent
+/// write never leaves a half-written file). The config is validated first; an
+/// invalid config is not written.
+pub fn write_providers(path: &Path, cfg: &ProvidersConfig) -> Result<()> {
+    validate(cfg)?;
+    let text = toml::to_string_pretty(cfg)
+        .map_err(|e| CoreError::Message(format!("serialize providers.toml: {e}")))?;
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
+    if let Some(d) = dir {
+        std::fs::create_dir_all(d)
+            .map_err(|e| CoreError::Message(format!("cannot create providers dir: {e}")))?;
+    }
+    let tmp_name = format!(".providers-{}.tmp", uuid::Uuid::new_v4());
+    let tmp = match dir {
+        Some(d) => d.join(tmp_name),
+        None => PathBuf::from(tmp_name),
+    };
+    std::fs::write(&tmp, text)
+        .map_err(|e| CoreError::Message(format!("write providers.toml: {e}")))?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(CoreError::Message(format!("replace providers.toml: {e}")));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,5 +268,86 @@ mod tests {
         std::fs::write(&p, "= = broken").expect("write");
         assert!(load_from(&p).is_none());
         let _ = std::fs::remove_file(&p);
+    }
+
+    fn sample() -> ProvidersConfig {
+        let mut roles = BTreeMap::new();
+        roles.insert("main".to_string(), "codex".to_string());
+        roles.insert("cheap".to_string(), "codex-1".to_string());
+        ProvidersConfig {
+            providers: vec![
+                ProviderSpec {
+                    name: "codex-1".to_string(),
+                    base_url: "https://api.openai.com/v1".to_string(),
+                    model: "gpt-5".to_string(),
+                    key: Some("sk-a".to_string()),
+                    stream: true,
+                    modalities: Some("text,image".to_string()),
+                    effort: Some("medium".to_string()),
+                },
+                ProviderSpec {
+                    name: "codex-2".to_string(),
+                    base_url: "https://api.openai.com/v1".to_string(),
+                    model: "gpt-5".to_string(),
+                    key: None,
+                    stream: false,
+                    modalities: None,
+                    effort: None,
+                },
+            ],
+            groups: vec![GroupSpec {
+                name: "codex".to_string(),
+                members: vec!["codex-1".to_string(), "codex-2".to_string()],
+                strategy: Strategy::RoundRobin,
+            }],
+            roles,
+        }
+    }
+
+    #[test]
+    fn write_then_parse_is_stable() {
+        let cfg = sample();
+        let p = std::env::temp_dir().join(format!("fleety-rt-{}.toml", uuid::Uuid::new_v4()));
+        write_providers(&p, &cfg).expect("write");
+        let back = load_from(&p).expect("re-read");
+        assert_eq!(back, cfg);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn write_rejects_invalid_config() {
+        // A role targeting an undefined name fails validation → no file written.
+        let mut cfg = ProvidersConfig::default();
+        cfg.roles.insert("main".to_string(), "ghost".to_string());
+        let p = std::env::temp_dir().join(format!("fleety-inv-{}.toml", uuid::Uuid::new_v4()));
+        assert!(write_providers(&p, &cfg).is_err());
+        assert!(!p.exists(), "no file should be written on invalid config");
+    }
+
+    #[test]
+    fn validate_rejects_inconsistencies_and_passes_clean() {
+        // Duplicate provider name.
+        let mut dup = sample();
+        dup.providers[1].name = "codex-1".to_string();
+        assert!(validate(&dup).unwrap_err().to_string().contains("codex-1"));
+
+        // Group member that isn't a provider.
+        let mut bad_member = sample();
+        bad_member.groups[0].members.push("ghost".to_string());
+        assert!(validate(&bad_member)
+            .unwrap_err()
+            .to_string()
+            .contains("ghost"));
+
+        // Role target that isn't a provider or group.
+        let mut bad_role = sample();
+        bad_role.roles.insert("x".to_string(), "nope".to_string());
+        assert!(validate(&bad_role)
+            .unwrap_err()
+            .to_string()
+            .contains("nope"));
+
+        // A consistent config passes.
+        assert!(validate(&sample()).is_ok());
     }
 }

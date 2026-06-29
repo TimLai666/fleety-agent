@@ -9,6 +9,7 @@
 mod acp;
 mod clipboard;
 mod config;
+mod provider_tui;
 mod tui;
 mod voice;
 
