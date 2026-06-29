@@ -68,7 +68,12 @@ pub async fn tick(
         &storage.mcp_builtin_config_path(),
         &storage.mcp_installed_config_path(),
     );
-    crate::wiki::register(&mut tools, &storage.wiki_dir(), &storage.models_dir());
+    crate::wiki::register(
+        &mut tools,
+        &storage.wiki_dir(),
+        &storage.models_dir(),
+        &storage.backups_dir(),
+    );
     crate::ssh::register(&mut tools);
     fleety_tools::register_browser(&mut tools);
     fleety_tools::register_computer(&mut tools);
