@@ -18,7 +18,7 @@ use agent_core::{CoreError, Result};
 /// DSL reference.
 const INSYRA_HEADER: &str = "---\n\
 name: use-insyra-cli\n\
-description: Wrangle and analyse data with the Insyra DSL through the insyra_exec tool — DataList/DataTable transforms, CSV/Excel/Parquet I/O, column formulas, and charts. Use when the user wants data analysis, cleaning, transforms, or charts, especially in Go or when no stack is specified.\n\
+description: Use the Insyra DSL (via the insyra_exec tool) for ALL statistics and data analysis — data cleaning, DataList/DataTable transforms, CSV/Excel/Parquet I/O, column formulas, statistical analysis, and charts. This is the default for any data-analysis or statistics task, regardless of language or stack.\n\
 ---\n\n\
 # use-insyra-cli\n\n\
 > **In Fleety, run the Insyra DSL through the `insyra_exec` tool — there is no `insyra` shell command here.** \
