@@ -71,6 +71,21 @@ pub fn open_index(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// Whether a user's index has no chunks yet (missing db or empty). Used to
+/// trigger a one-time lazy backfill of pre-existing conversations on first search.
+pub fn is_empty(path: &Path) -> bool {
+    if !path.exists() {
+        return true;
+    }
+    match open_index(path) {
+        Ok(conn) => conn
+            .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get::<_, i64>(0))
+            .map(|n| n == 0)
+            .unwrap_or(true),
+        Err(_) => true,
+    }
+}
+
 fn stored_dim(conn: &Connection) -> Option<usize> {
     conn.query_row("SELECT dim FROM meta WHERE id = 0", [], |r| {
         r.get::<_, Option<i64>>(0)
@@ -275,6 +290,22 @@ mod tests {
         insert_chunk(&conn, "c1", 9, 20, "assistant", "yo", &[0.0, 1.0]).expect("i");
         assert_eq!(max_indexed_seq(&conn, "c1"), 9);
         assert_eq!(max_indexed_seq(&conn, "other"), 0);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn is_empty_reflects_index_state() {
+        let path = temp_db();
+        // No db file yet → empty.
+        assert!(is_empty(&path));
+        let conn = open_index(&path).expect("open");
+        ensure_dim(&conn, 2).expect("dim");
+        // Created but no chunks → still empty.
+        assert!(is_empty(&path));
+        insert_chunk(&conn, "c1", 1, 10, "user", "hi", &[1.0, 0.0]).expect("i");
+        drop(conn);
+        // Has a chunk → not empty.
+        assert!(!is_empty(&path));
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

@@ -410,6 +410,20 @@ impl Storage {
         read_events(&path).unwrap_or_default()
     }
 
+    /// A user conversation's events with `seq` strictly greater than `after`.
+    /// Lets the off-turn indexer fetch only the messages added since the last
+    /// index pass instead of reloading the whole conversation each turn.
+    pub fn load_user_conversation_after(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        after: u64,
+    ) -> Vec<StoredEvent> {
+        let mut events = self.load_user_conversation(user_id, conversation_id);
+        events.retain(|e| e.seq > after);
+        events
+    }
+
     /// Record the owner of a conversation (idempotent — set once, on first use).
     /// A Guest leaves it unowned (unattributed); only a real user becomes owner.
     pub fn register_conversation_owner(

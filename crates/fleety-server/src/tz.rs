@@ -3,13 +3,78 @@
 //! → UTC) and renders an epoch for display / "now". Reuses `chrono-tz` (the same
 //! library schedules use for cron zones).
 
+use std::sync::Arc;
+
+use async_trait::async_trait;
 use chrono::TimeZone;
 use chrono_tz::Tz;
+use serde_json::{json, Value};
+
+use agent_core::{CoreError, Result, RiskLevel, Tool, ToolRegistry, ToolSpec};
+
+use crate::identity::ActingUser;
+use crate::storage::Storage;
 
 fn parse(s: Option<&str>) -> Option<Tz> {
     s.map(str::trim)
         .filter(|s| !s.is_empty())
         .and_then(|s| s.parse::<Tz>().ok())
+}
+
+/// Whether `s` is a valid IANA timezone.
+pub fn is_valid_tz(s: &str) -> bool {
+    s.trim().parse::<Tz>().is_ok()
+}
+
+/// Register the `set_timezone` tool, scoped to the acting user. Lets the agent
+/// record the user's IANA timezone so times are shown in it (the read side already
+/// exists via `user_timezone` → `resolve_tz`). A guest can't set one.
+pub fn register(tools: &mut ToolRegistry, storage: Arc<Storage>, acting: ActingUser) {
+    tools.register(Box::new(SetTimezone { storage, acting }));
+}
+
+struct SetTimezone {
+    storage: Arc<Storage>,
+    acting: ActingUser,
+}
+
+#[async_trait]
+impl Tool for SetTimezone {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "set_timezone".to_string(),
+            description: "Set the current user's timezone (IANA name, e.g. 'Asia/Taipei' or \
+                'Europe/Paris') so times and \"now\" are shown in it. Call this when the user \
+                tells you their timezone or location."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "tz": { "type": "string", "description": "IANA timezone, e.g. Asia/Taipei" } },
+                "required": ["tz"]
+            }),
+            risk: RiskLevel::Mutate,
+        }
+    }
+
+    async fn call(&self, args: Value) -> Result<Value> {
+        let tz = args
+            .get("tz")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .ok_or_else(|| CoreError::Message("set_timezone requires 'tz'".to_string()))?;
+        if !is_valid_tz(tz) {
+            return Err(CoreError::Message(format!(
+                "'{tz}' is not a valid IANA timezone (e.g. 'Asia/Taipei', 'America/New_York')"
+            )));
+        }
+        let Some(user) = self.acting.user_id() else {
+            return Err(CoreError::Message(
+                "no identified user for this turn; cannot set a per-user timezone".to_string(),
+            ));
+        };
+        self.storage.set_user_timezone(user, tz)?;
+        Ok(json!({ "ok": true, "timezone": tz }))
+    }
 }
 
 /// Resolve the timezone: the acting user's configured zone, else `FLEETY_TZ`,
@@ -48,6 +113,40 @@ mod tests {
         assert_eq!(resolve_tz(None, None), Tz::UTC);
         // Blank strings fall through.
         assert_eq!(resolve_tz(Some("  "), None), Tz::UTC);
+    }
+
+    #[tokio::test]
+    async fn set_timezone_stores_validates_and_guards_guest() {
+        let home = std::env::temp_dir().join(format!("fleety-tz-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&home).unwrap();
+        let storage = Arc::new(Storage::new(home.clone()));
+
+        // A real user can set a valid zone; it round-trips via user_timezone.
+        let alice = ActingUser::User("alice".to_string());
+        let tool = SetTimezone {
+            storage: Arc::clone(&storage),
+            acting: alice.clone(),
+        };
+        let ok = tool.call(json!({ "tz": "Asia/Taipei" })).await.unwrap();
+        assert_eq!(ok["ok"], true);
+        assert_eq!(
+            storage.user_timezone(&alice).as_deref(),
+            Some("Asia/Taipei")
+        );
+        // Now resolve_tz picks it up.
+        assert_eq!(
+            resolve_tz(storage.user_timezone(&alice).as_deref(), None),
+            Tz::Asia__Taipei
+        );
+        // Invalid zone → error, nothing stored.
+        assert!(tool.call(json!({ "tz": "Not/AZone" })).await.is_err());
+        // Guest → error.
+        let guest = SetTimezone {
+            storage,
+            acting: ActingUser::Guest,
+        };
+        assert!(guest.call(json!({ "tz": "Asia/Taipei" })).await.is_err());
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

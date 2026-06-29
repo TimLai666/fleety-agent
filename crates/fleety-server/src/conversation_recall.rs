@@ -3,11 +3,13 @@
 //! conversations user-primary), so a turn only ever recalls its own user's
 //! history.
 //!
-//! v1 ships keyword search + a conversation listing (both exact, no model). The
-//! semantic tool degrades to keyword with a note; embedding-ranked recall (a
-//! per-user vector index reusing the wiki's embedding/sqlite-vec layer) is a
-//! follow-up. Results carry `conversation_id`, `seq`, `ts_secs`, `role`, and a
-//! snippet so the agent knows what came before what.
+//! Tools: keyword search + a conversation listing (exact, no model), and an
+//! embedding-ranked semantic search backed by a per-user vector index
+//! (`conversation_embed`, reusing the wiki's embedding/sqlite-vec layer). Semantic
+//! search degrades to keyword when embeddings are unavailable, and lazily
+//! backfills pre-existing conversations on first use. Results carry
+//! `conversation_id`, `seq`, `ts_secs`, `role`, and a snippet so the agent knows
+//! what came before what.
 
 use std::sync::Arc;
 
@@ -179,7 +181,32 @@ impl Tool for ConversationSemanticSearch {
             let path = self.storage.conversation_index_path(&user);
             let cache = self.storage.models_dir();
             let q = query.clone();
+            let storage = Arc::clone(&self.storage);
+            let user_b = user.clone();
             let result = tokio::task::spawn_blocking(move || {
+                // Lazy backfill: conversations that predate the index aren't covered
+                // by the off-turn incremental indexer, so on first search (empty
+                // index) index all of this user's conversations once. index_messages
+                // skips anything already indexed, so this is one-time.
+                if crate::conversation_embed::is_empty(&path) {
+                    for conv in storage.user_conversation_ids(&user_b) {
+                        let msgs: Vec<crate::conversation_embed::IndexMsg> = storage
+                            .load_user_conversation(&user_b, &conv)
+                            .into_iter()
+                            .filter_map(|e| {
+                                let content = e.message.content?;
+                                Some((
+                                    e.seq,
+                                    e.ts_secs,
+                                    role_str(&e.message.role).to_string(),
+                                    content,
+                                ))
+                            })
+                            .collect();
+                        let _ =
+                            crate::conversation_embed::index_messages(&path, &cache, &conv, &msgs);
+                    }
+                }
                 crate::conversation_embed::search(&path, &cache, &q, limit)
             })
             .await;

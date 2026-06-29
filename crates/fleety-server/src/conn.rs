@@ -113,6 +113,8 @@ fn build_connection_stack(
         Arc::clone(storage),
         acting.user_id().map(String::from),
     );
+    // Let the user set their timezone (read side already feeds the system prompt).
+    crate::tz::register(&mut tools, Arc::clone(storage), acting.clone());
     // Tool-result retrieval + a privacy-filtered audit listing, scoped to the
     // acting user (overrides the unscoped base `history_list`).
     crate::tools::register_user_scoped(
@@ -1102,8 +1104,14 @@ pub(crate) async fn drive_turn(
             tokio::task::spawn_blocking(move || {
                 let path = storage.conversation_index_path(&user);
                 let cache = storage.models_dir();
+                // Load only messages added since the last index pass, not the whole
+                // conversation (which would be O(conversation length) every turn).
+                let watermark = crate::conversation_embed::open_index(&path)
+                    .ok()
+                    .map(|c| crate::conversation_embed::max_indexed_seq(&c, &conversation))
+                    .unwrap_or(0);
                 let msgs: Vec<crate::conversation_embed::IndexMsg> = storage
-                    .load_user_conversation(&user, &conversation)
+                    .load_user_conversation_after(&user, &conversation, watermark)
                     .into_iter()
                     .filter_map(|e| {
                         let content = e.message.content?;

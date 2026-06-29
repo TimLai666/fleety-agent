@@ -261,7 +261,10 @@ presents timestamps, in the **acting user's** timezone. Resolution precedence:
 2. else the global `FLEETY_TZ` (an IANA name like `Asia/Taipei`),
 3. else UTC.
 
-An invalid zone string falls through to the next source (never errors).
+An invalid zone string falls through to the next source (never errors). The
+per-user zone is set by the **`set_timezone`** tool (the agent calls it when the
+user states their timezone/location; validated as IANA, scoped to the acting user,
+unavailable to a guest).
 
 | Var | Default | Meaning |
 |---|---|---|
