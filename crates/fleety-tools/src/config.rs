@@ -284,9 +284,195 @@ pub fn display_value(setting: &Setting, value: &str) -> String {
     }
 }
 
+// ---- command dispatch, shared by `fleety`, `fleety-server`, and `fleetyd` ----
+
+/// A parsed `config` subcommand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Command {
+    List,
+    Get(String),
+    Set(String, String),
+    Unset(String),
+    Edit,
+    Help,
+}
+
+/// Parse `config <args...>`. Pure and unit-testable.
+pub fn parse(args: &[String]) -> Command {
+    match args.first().map(String::as_str) {
+        Some("list") | None => Command::List,
+        Some("get") => args
+            .get(1)
+            .map(|k| Command::Get(k.clone()))
+            .unwrap_or(Command::Help),
+        Some("set") => match (args.get(1), args.get(2)) {
+            (Some(k), Some(v)) => Command::Set(k.clone(), v.clone()),
+            _ => Command::Help,
+        },
+        Some("unset") => args
+            .get(1)
+            .map(|k| Command::Unset(k.clone()))
+            .unwrap_or(Command::Help),
+        Some("edit") => Command::Edit,
+        _ => Command::Help,
+    }
+}
+
+fn source_label(s: Source) -> &'static str {
+    match s {
+        Source::Env => "env",
+        Source::Config => "config",
+        Source::Default => "default",
+    }
+}
+
+/// Display rows for `list`: (key, scope, shown value [secrets masked], source).
+pub fn rows(map: &ConfigMap) -> Vec<(String, String, String, String)> {
+    registry()
+        .iter()
+        .filter_map(|s| {
+            let r = resolve(s.key, map)?;
+            Some((
+                s.key.to_string(),
+                s.scope.as_str().to_string(),
+                display_value(s, &r.value),
+                source_label(r.source).to_string(),
+            ))
+        })
+        .collect()
+}
+
+/// Run a `config` subcommand against the config file. `edit` is the line-based
+/// loop; the CLI overrides `edit` with a ratatui screen when stdout is a TTY.
+pub fn run(args: &[String]) -> Result<()> {
+    let path = config_path();
+    match parse(args) {
+        Command::List => {
+            let map = load(&path);
+            println!("Settings (env → config → default; secrets masked):\n");
+            for (key, scope, value, source) in rows(&map) {
+                println!("  [{scope:6}] {key:<26} = {value}  ({source})");
+            }
+            println!(
+                "\nEdit with: config set <KEY> <VALUE>   (file: {})",
+                path.display()
+            );
+            Ok(())
+        }
+        Command::Get(key) => {
+            let setting = find(&key)
+                .ok_or_else(|| CoreError::Message(format!("unknown setting '{key}'")))?;
+            let map = load(&path);
+            let Some(r) = resolve(&key, &map) else {
+                return Ok(());
+            };
+            println!(
+                "{key} = {}  ({})",
+                display_value(setting, &r.value),
+                source_label(r.source)
+            );
+            Ok(())
+        }
+        Command::Set(key, value) => {
+            let setting = find(&key).ok_or_else(|| {
+                CoreError::Message(format!(
+                    "unknown setting '{key}'. Run `config list` to see valid keys."
+                ))
+            })?;
+            let mut map = load(&path);
+            map.insert((setting.scope, key.clone()), value);
+            save(&path, &map)?;
+            println!("set {key} (scope {})", setting.scope.as_str());
+            Ok(())
+        }
+        Command::Unset(key) => {
+            let setting = find(&key)
+                .ok_or_else(|| CoreError::Message(format!("unknown setting '{key}'")))?;
+            let mut map = load(&path);
+            map.remove(&(setting.scope, key.clone()));
+            save(&path, &map)?;
+            println!("unset {key} (reverts to env/default)");
+            Ok(())
+        }
+        Command::Edit => edit_line_based(&path),
+        Command::Help => {
+            println!(
+                "usage: config [list | get <KEY> | set <KEY> <VALUE> | unset <KEY> | edit]"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Line-based interactive editor (the non-TTY fallback path).
+pub fn edit_line_based(path: &std::path::Path) -> Result<()> {
+    use std::io::Write;
+    let mut map = load(path);
+    loop {
+        println!("\nSettings (enter a number to edit, blank to finish):");
+        for (i, (key, scope, value, source)) in rows(&map).iter().enumerate() {
+            println!("  {i:>2}) [{scope:6}] {key:<26} = {value}  ({source})");
+        }
+        print!("> ");
+        std::io::stdout().flush().ok();
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_err() {
+            break;
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            break;
+        }
+        let Ok(idx) = line.parse::<usize>() else {
+            println!("not a number");
+            continue;
+        };
+        let Some(setting) = registry().get(idx) else {
+            println!("out of range");
+            continue;
+        };
+        print!("new value for {} (blank to cancel): ", setting.key);
+        std::io::stdout().flush().ok();
+        let mut val = String::new();
+        if std::io::stdin().read_line(&mut val).is_err() {
+            break;
+        }
+        let val = val.trim().to_string();
+        if val.is_empty() {
+            continue;
+        }
+        map.insert((setting.scope, setting.key.to_string()), val);
+        save(path, &map)?;
+        println!("saved {}", setting.key);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_commands() {
+        let v = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(parse(&v(&[])), Command::List);
+        assert_eq!(parse(&v(&["get", "FLEETY_ADDR"])), Command::Get("FLEETY_ADDR".into()));
+        assert_eq!(
+            parse(&v(&["set", "FLEETY_MODEL", "gpt-4o"])),
+            Command::Set("FLEETY_MODEL".into(), "gpt-4o".into())
+        );
+        assert_eq!(parse(&v(&["unset", "FLEETY_TZ"])), Command::Unset("FLEETY_TZ".into()));
+        assert_eq!(parse(&v(&["edit"])), Command::Edit);
+        assert_eq!(parse(&v(&["get"])), Command::Help); // missing operand
+        assert_eq!(parse(&v(&["set", "X"])), Command::Help);
+    }
+
+    #[test]
+    fn rows_cover_registry() {
+        let r = rows(&ConfigMap::new());
+        assert_eq!(r.len(), registry().len());
+        assert!(r.iter().all(|(_, _, _, source)| source == "default"));
+    }
 
     #[test]
     fn unknown_key_is_rejected() {

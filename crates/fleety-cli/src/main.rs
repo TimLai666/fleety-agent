@@ -177,6 +177,18 @@ async fn main() {
                 eprintln!("error: {}", e.report().message);
             }
         }
+        Some("daemon") => {
+            // Drive the local daemon from the unified CLI: `fleety daemon <verb>`
+            // forwards to the `fleetyd` binary (install/start/stop/status/update/…).
+            let sub = &args[2..];
+            if sub.is_empty() {
+                eprintln!(
+                    "usage: fleety daemon <install|uninstall|start|stop|restart|enable|disable|status|up|down|update>"
+                );
+            } else if let Err(e) = daemon_delegate(sub) {
+                eprintln!("error: {}", e.report().message);
+            }
+        }
         Some("acp") => {
             // ACP agent over stdio: stdout carries only JSON-RPC; logs/errors go
             // to stderr (tracing is already on stderr), so the editor's parser
@@ -204,6 +216,39 @@ async fn main() {
             );
         }
     }
+}
+
+/// Resolve the local `fleetyd` binary: prefer a sibling of the running `fleety`
+/// (same install dir), else rely on PATH.
+fn daemon_binary() -> std::path::PathBuf {
+    let name = if cfg!(windows) { "fleetyd.exe" } else { "fleetyd" };
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join(name)))
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| std::path::PathBuf::from("fleetyd"))
+}
+
+/// Run `fleetyd <args...>` to manage the local daemon from the CLI. Inherits
+/// stdio (so the daemon's output shows through) and forwards a non-zero exit.
+fn daemon_delegate(args: &[String]) -> Result<()> {
+    let program = daemon_binary();
+    let status = std::process::Command::new(&program)
+        .args(args)
+        .status()
+        .map_err(|e| {
+            CoreError::Message(format!(
+                "cannot run the daemon binary ({}): {e}. Is fleetyd installed and on PATH?",
+                program.display()
+            ))
+        })?;
+    if !status.success() {
+        return Err(CoreError::Message(format!(
+            "fleetyd {} exited unsuccessfully ({status})",
+            args.first().map(String::as_str).unwrap_or("")
+        )));
+    }
+    Ok(())
 }
 
 /// Interactive TUI: connect, then loop over key events and server frames.

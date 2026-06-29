@@ -104,6 +104,16 @@ fn main() {
     ));
     let cmd = std::env::args().nth(1);
 
+    // `config ...` inspects/edits this host's settings (model, addr, token, …),
+    // then exits — no runtime needed. Same command surface as `fleety config`.
+    if cmd.as_deref() == Some("config") {
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        if let Err(e) = fleety_tools::config::run(&args) {
+            tracing::error!(report = ?e.report(), "config failed");
+        }
+        return;
+    }
+
     // On Windows, `run-service` is the SCM entry point and must speak the service
     // control protocol on this thread, before any tokio runtime exists.
     #[cfg(windows)]
