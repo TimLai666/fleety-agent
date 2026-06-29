@@ -49,7 +49,7 @@ jobs:
             libxcb-randr0-dev libxcb-shm0-dev \
             libwayland-dev libxkbcommon-dev libxdo-dev libdbus-1-dev pkg-config \
             libpipewire-0.3-dev clang libclang-dev \
-            libegl1-mesa-dev libgbm-dev libgl1-mesa-dev
+            libegl1-mesa-dev libgbm-dev libgl1-mesa-dev libasound2-dev
       - uses: actions/setup-go@v5
         with:
           go-version: stable
