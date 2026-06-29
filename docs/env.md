@@ -526,6 +526,27 @@ current automatically (re-embeds notes whose content hash changed).
 |---|---|---|
 | `FLEETY_CMD_TIMEOUT_SECS` | `120` | Wall-clock limit for `run_command` and `ssh_exec` (shared by the server and every device). On expiry the child is terminated and the result has `"timed_out": true`. `0` disables the limit; a per-call `timeout_secs` argument overrides it. These tools are **non-interactive** — they capture output and return when the process exits, so they cannot answer a prompt or drive a TUI; use non-interactive flags. |
 
+## Interactive terminal sessions
+
+For interactive programs (TUI / REPL / installer prompts / anything needing a
+TTY) the agent uses **PTY-backed terminal sessions**: `terminal_open` starts a
+process under a PTY, `terminal_input` sends input and reads the response,
+`terminal_read` fetches output that arrived later, `terminal_close` ends it. The
+live PTY + child persist across calls in the process's session registry (server
+process for local/ssh, daemon process for a device via `device_exec`). Set
+`ssh_host` on `terminal_open` to run the session on a remote host via `ssh -tt`.
+
+It is **half-interactive**, not a real-time stream: each turn reads until the
+output goes quiet, the max window elapses, or the child exits. `output` has ANSI
+escapes stripped for readability; `raw_output` keeps the original bytes.
+
+| Var | Default | Meaning |
+|---|---|---|
+| `FLEETY_TERMINAL_QUIET_MS` | `400` | A turn returns once output has been quiet this long (measured from the last output, or the turn start if none yet). |
+| `FLEETY_TERMINAL_READ_MAX_MS` | `8000` | Hard cap on how long a single read turn waits before returning. |
+| `FLEETY_TERMINAL_MAX_SESSIONS` | `8` | Max concurrent terminal sessions per process; opening beyond this errors (close one first). |
+| `FLEETY_TERMINAL_IDLE_TTL_SECS` | `600` | Idle sessions are reclaimed (terminated) after this long; reaped lazily when a new session opens. |
+
 ## Tools that talk to the network
 
 | Var | Default | Meaning |

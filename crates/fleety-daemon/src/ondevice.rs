@@ -30,6 +30,9 @@ pub fn build_local_registry(root: &Path) -> ToolRegistry {
     // Native computer-use (desktop control) so device_exec can drive this
     // device's screen/mouse/keyboard. Errors actionably on headless hosts.
     fleety_tools::register_computer(&mut registry);
+    // Interactive PTY terminal sessions on this device (driven via device_exec);
+    // sessions live in this daemon process's registry across calls.
+    fleety_tools::register_terminal(&mut registry);
     registry
 }
 

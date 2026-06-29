@@ -34,6 +34,10 @@ png = { workspace = true }
 base64 = { workspace = true }
 # Self-update: verify downloaded artifacts.
 sha2 = "0.10"
+# Interactive PTY terminal sessions (cross-platform: ConPTY / openpty). The
+# crate's internal unsafe is isolated there — our crates stay forbid(unsafe).
+portable-pty = "0.8"
+strip-ansi-escapes = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true }
