@@ -1,4 +1,4 @@
-//! fleety — the Fleety CLI.
+﻿//! fleety — the Fleety CLI.
 //!
 //! M2: `fleety ask "<message>"` connects to the Agent over WebSocket, does one
 //! conversation round-trip, and prints the reply. Interactive TUI comes later.
@@ -1154,7 +1154,7 @@ async fn recv(rx: &mut Rx) -> Result<Option<ServerMsg>> {
 }
 
 #[cfg(test)]
-mod tests {
+mod coverage_tests {
     use super::{format_relative, format_uptime};
 
     #[test]
@@ -1181,5 +1181,172 @@ mod tests {
         // Clock skew (ts in the future) is also rendered as a dash so we don't
         // print nonsense like "-3s ago".
         assert_eq!(format_relative(1_000_000, 2_000_000), "—");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        saved: Vec<(&'static str, Option<String>)>,
+        temp_home: PathBuf,
+    }
+
+    impl EnvGuard {
+        fn new(name: &str) -> Self {
+            let keys = [
+                "HOME",
+                "USERPROFILE",
+                "FLEETY_AGENT_URL",
+                "FLEETY_DEVICE_ID",
+                "FLEETY_TOKEN",
+                "COMPUTERNAME",
+                "HOSTNAME",
+            ];
+            let saved = keys
+                .into_iter()
+                .map(|key| (key, std::env::var(key).ok()))
+                .collect::<Vec<_>>();
+            let temp_home =
+                std::env::temp_dir().join(format!("fleety-cli-test-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&temp_home);
+            std::fs::create_dir_all(&temp_home).expect("temp home");
+
+            std::env::set_var("HOME", &temp_home);
+            std::env::set_var("USERPROFILE", &temp_home);
+            for key in [
+                "FLEETY_AGENT_URL",
+                "FLEETY_DEVICE_ID",
+                "FLEETY_TOKEN",
+                "COMPUTERNAME",
+                "HOSTNAME",
+            ] {
+                std::env::remove_var(key);
+            }
+
+            Self { saved, temp_home }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.saved {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.temp_home);
+        }
+    }
+
+    #[test]
+    fn agent_url_prefers_env_then_config_then_default() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let guard = EnvGuard::new("agent-url");
+
+        assert_eq!(agent_url(), "ws://127.0.0.1:8787");
+
+        let dir = guard.temp_home.join(".fleety");
+        std::fs::create_dir_all(&dir).expect("config dir");
+        std::fs::write(dir.join("config.json"), r#"{"agent_url":"ws://cfg"}"#).expect("config");
+        assert_eq!(agent_url(), "ws://cfg");
+
+        std::env::set_var("FLEETY_AGENT_URL", "ws://env");
+        assert_eq!(agent_url(), "ws://env");
+    }
+
+    #[test]
+    fn device_id_is_stable_and_nonempty() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("device-id");
+
+        let first = device_id();
+        assert!(!first.is_empty());
+        assert_eq!(device_id(), first);
+    }
+
+    #[test]
+    fn saved_token_prefers_nonempty_env_then_config() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let guard = EnvGuard::new("saved-token");
+        let dir = guard.temp_home.join(".fleety");
+        std::fs::create_dir_all(&dir).expect("config dir");
+        std::fs::write(dir.join("config.json"), r#"{"token":"from-config"}"#).expect("config");
+
+        assert_eq!(saved_token().as_deref(), Some("from-config"));
+        std::env::set_var("FLEETY_TOKEN", "");
+        assert_eq!(saved_token().as_deref(), Some("from-config"));
+        std::env::set_var("FLEETY_TOKEN", "from-env");
+        assert_eq!(saved_token().as_deref(), Some("from-env"));
+    }
+
+    #[test]
+    fn write_config_preserves_existing_fields_and_updates_requested_values() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let guard = EnvGuard::new("write-config");
+        std::env::set_var("FLEETY_DEVICE_ID", "dev-1");
+
+        let dir = guard.temp_home.join(".fleety");
+        std::fs::create_dir_all(&dir).expect("config dir");
+        std::fs::write(
+            dir.join("config.json"),
+            serde_json::to_string(&json!({
+                "agent_url": "ws://old",
+                "extra": true,
+                "token": "old-token"
+            }))
+            .expect("json"),
+        )
+        .expect("config");
+
+        write_config(Some("ws://new"), Some("new-token")).expect("write");
+
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).expect("read"))
+                .expect("json");
+        assert_eq!(value["agent_url"], json!("ws://new"));
+        assert_eq!(value["token"], json!("new-token"));
+        assert_eq!(value["device_id"], json!(device_id()));
+        assert_eq!(value["extra"], json!(true));
+    }
+
+    #[test]
+    fn hello_includes_protocol_token_pairing_and_device() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("hello");
+        std::env::set_var("FLEETY_TOKEN", "tok-1");
+        let expected_device_id = device_id();
+
+        match hello(Some("pair-1".to_string())) {
+            ClientMsg::Hello {
+                device_id,
+                protocol,
+                token,
+                pairing_code,
+                ..
+            } => {
+                assert_eq!(device_id, expected_device_id);
+                assert_eq!(protocol, PROTOCOL_VERSION);
+                assert_eq!(token.as_deref(), Some("tok-1"));
+                assert_eq!(pairing_code.as_deref(), Some("pair-1"));
+            }
+            other => panic!("unexpected hello: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn origin_reports_os_and_best_effort_context() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("origin");
+
+        let value = origin();
+        assert_eq!(value.os.as_deref(), Some(std::env::consts::OS));
+        assert!(value.cwd.is_some());
     }
 }

@@ -1,4 +1,4 @@
-//! Connection authentication: per-device tokens + short-lived pairing codes.
+﻿//! Connection authentication: per-device tokens + short-lived pairing codes.
 //!
 //! Enforced only when the server runs with `FLEETY_REQUIRE_AUTH`. A bootstrap
 //! admin token can be set via `FLEETY_TOKEN` (use it to pair the first device).

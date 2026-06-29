@@ -1,4 +1,4 @@
-//! Site (場域 / location) registry: group devices by physical location so the
+﻿//! Site (場域 / location) registry: group devices by physical location so the
 //! agent understands which devices live where (e.g. devices at "home-office"
 //! vs "warehouse"). Sites are first-class records under `fleet/sites/`; each
 //! `device.json` carries a `site` field set via `device_set_site`.

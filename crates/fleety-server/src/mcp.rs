@@ -1,4 +1,4 @@
-//! MCP runtime: configure external MCP servers and call their tools.
+﻿//! MCP runtime: configure external MCP servers and call their tools.
 //!
 //! `mcp_add`/`mcp_list`/`mcp_remove` persist a JSON list of servers; `mcp_call`
 //! spawns a server over stdio and speaks newline-delimited JSON-RPC

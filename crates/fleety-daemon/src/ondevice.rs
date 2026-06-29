@@ -1,4 +1,4 @@
-//! On-device tools fleetyd runs locally when the server dispatches a `RunTool`.
+﻿//! On-device tools fleetyd runs locally when the server dispatches a `RunTool`.
 //!
 //! These are the **shared** workspace tools from `fleety-tools` (read/list/
 //! search-ripgrep/write/edit/run/git, with backups + unified diffs and the

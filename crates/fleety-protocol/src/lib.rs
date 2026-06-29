@@ -1,4 +1,4 @@
-//! fleety-protocol — wire types shared across the Fleety client runtime and server.
+﻿//! fleety-protocol — wire types shared across the Fleety client runtime and server.
 //!
 //! Pure data: this crate carries no logic and depends only on `serde`, so it can
 //! act as the contract between components (and, later, across languages).

@@ -1,4 +1,4 @@
-//! SSH connector: run commands on remote hosts via the system `ssh` client.
+﻿//! SSH connector: run commands on remote hosts via the system `ssh` client.
 //!
 //! No extra dependency — shells out to `ssh` in non-interactive `BatchMode`
 //! (so it fails fast instead of prompting). This lets the agent operate hosts

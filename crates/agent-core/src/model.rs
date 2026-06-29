@@ -1,4 +1,4 @@
-//! Model abstraction: messages, tool specs, and the pluggable provider trait.
+﻿//! Model abstraction: messages, tool specs, and the pluggable provider trait.
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -444,5 +444,51 @@ mod capability_tests {
         // None scheme, or no effort → no field.
         assert!(effort_field(EffortScheme::None, Some(Effort::High)).is_none());
         assert!(effort_field(EffortScheme::OpenAiReasoning, None).is_none());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn message_constructors_set_roles_and_tool_call_id() {
+        assert_eq!(Message::system("rules").role, Role::System);
+        assert_eq!(Message::user("hi").role, Role::User);
+        assert_eq!(Message::assistant("ok").role, Role::Assistant);
+
+        let tool = Message::tool_result("call-1", "done");
+        assert_eq!(tool.role, Role::Tool);
+        assert_eq!(tool.content.as_deref(), Some("done"));
+        assert_eq!(tool.tool_call_id.as_deref(), Some("call-1"));
+        assert!(tool.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn tool_spec_deserializes_default_risk_as_read() {
+        let spec: ToolSpec = serde_json::from_value(json!({
+            "name": "read_file",
+            "description": "read",
+            "parameters": {"type": "object"}
+        }))
+        .expect("tool spec");
+        assert_eq!(spec.risk, RiskLevel::Read);
+    }
+
+    #[tokio::test]
+    async fn mock_provider_returns_scripted_responses_then_errors() {
+        let provider = MockProvider::new(vec![ModelResponse {
+            message: Message::assistant("one"),
+        }]);
+
+        let first = provider.complete(&[], &[]).await.expect("first response");
+        assert_eq!(first.message.content.as_deref(), Some("one"));
+
+        let err = provider
+            .complete(&[], &[])
+            .await
+            .expect_err("empty script should error");
+        assert!(err.report().message.contains("ran out"));
     }
 }

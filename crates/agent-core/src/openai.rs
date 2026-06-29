@@ -712,6 +712,38 @@ mod tests {
         assert!(arr[1]["text"].as_str().unwrap_or("").contains("blob.bin"));
     }
 
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    fn serve_once(
+        status: &'static str,
+        content_type: &'static str,
+        body: String,
+    ) -> (String, mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut buf = vec![0_u8; 8192];
+            let n = stream.read(&mut buf).expect("read request");
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            let header = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(header.as_bytes())
+                .and_then(|_| stream.write_all(body.as_bytes()))
+                .expect("write response");
+            let _ = tx.send(request);
+        });
+        (format!("http://{addr}/v1"), rx)
+    }
+
     #[test]
     fn assemble_sse_streams_content_and_tool_calls() {
         let mut body = String::new();
@@ -798,5 +830,163 @@ mod tests {
         let response = parse_response(parsed).expect("map");
         assert_eq!(response.message.content.as_deref(), Some("hello"));
         assert!(response.message.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn request_body_includes_tools_and_stream_flag_when_enabled() {
+        let provider = OpenAiCompat::new("http://localhost:1234/v1", "model-a", Some("k".into()))
+            .with_streaming(true);
+        let body = provider.request_body(
+            &[Message::user("hi")],
+            &[ToolSpec {
+                name: "echo".into(),
+                description: "Echo input".into(),
+                parameters: json!({"type":"object"}),
+                risk: crate::model::RiskLevel::Mutate,
+            }],
+        );
+
+        assert_eq!(body["model"], json!("model-a"));
+        assert_eq!(body["stream"], json!(true));
+        assert_eq!(body["messages"][0]["role"], json!("user"));
+        assert_eq!(body["tools"][0]["function"]["name"], json!("echo"));
+    }
+
+    #[test]
+    fn wire_message_maps_tool_result_id() {
+        let wire = wire_message(
+            &Message::tool_result("call-1", "ok"),
+            ModelCapabilities::ALL,
+        );
+
+        assert_eq!(wire["role"], json!("tool"));
+        assert_eq!(wire["content"], json!("ok"));
+        assert_eq!(wire["tool_call_id"], json!("call-1"));
+    }
+
+    #[test]
+    fn assemble_sse_ignores_noise_and_synthesizes_missing_tool_id() {
+        let mut body = String::from("event: ping\n\n");
+        body.push_str(&format!(
+            "data: {}\n",
+            json!({"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"name":"run","arguments":"not-json"}}]}}]})
+        ));
+        body.push_str("data: [DONE]\n");
+
+        let response = assemble_sse(&body).expect("sse");
+        assert_eq!(response.message.content, None);
+        assert_eq!(response.message.tool_calls.len(), 1);
+        assert_eq!(response.message.tool_calls[0].id, "call_run");
+        assert_eq!(
+            response.message.tool_calls[0].arguments,
+            json!({"_unparsed":"not-json"})
+        );
+    }
+
+    #[test]
+    fn parse_models_and_response_reject_bad_shapes() {
+        assert!(parse_models(r#"{"data":[{"name":"missing-id"}]}"#).is_err());
+
+        let parsed: ChatResponse = serde_json::from_str(r#"{"choices":[]}"#).expect("shape");
+        let err = parse_response(parsed).expect_err("empty choices should error");
+        assert!(err.report().message.contains("no choices"));
+    }
+
+    #[tokio::test]
+    async fn list_models_uses_bearer_auth_and_reports_http_errors() {
+        let (base, rx) = serve_once(
+            "200 OK",
+            "application/json",
+            r#"{"data":[{"id":"model-a"}]}"#.to_string(),
+        );
+        let provider = OpenAiCompat::new(base, "unused", Some("key-1".into()));
+        assert_eq!(
+            provider.list_models().await.expect("models"),
+            vec!["model-a"]
+        );
+        let request = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("request captured");
+        assert!(request.starts_with("GET /v1/models "));
+        assert!(request.contains("Bearer key-1"));
+
+        let (base, _) = serve_once(
+            "500 Internal Server Error",
+            "text/plain",
+            "nope".to_string(),
+        );
+        let provider = OpenAiCompat::new(base, "unused", None);
+        let err = provider.list_models().await.expect_err("http error");
+        assert!(err.report().message.contains("HTTP"));
+    }
+
+    #[tokio::test]
+    async fn complete_parses_non_streaming_response_and_errors() {
+        let body = r#"{"choices":[{"message":{"content":"hello","tool_calls":[]}}]}"#.to_string();
+        let (base, rx) = serve_once("200 OK", "application/json", body);
+        let provider = OpenAiCompat::new(base, "model-a", Some("key-2".into()));
+        let response = provider
+            .complete(&[Message::user("hi")], &[])
+            .await
+            .expect("complete");
+        assert_eq!(response.message.content.as_deref(), Some("hello"));
+        let request = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("request captured");
+        assert!(request.starts_with("POST /v1/chat/completions "));
+        assert!(request.contains("Bearer key-2"));
+        assert!(request.contains("\"model\":\"model-a\""));
+
+        let (base, _) = serve_once(
+            "429 Too Many Requests",
+            "text/plain",
+            "slow down".to_string(),
+        );
+        let mut provider = OpenAiCompat::new(base, "model-a", None);
+        provider.retry.retries = 0;
+        let err = provider
+            .complete(&[Message::user("hi")], &[])
+            .await
+            .expect_err("status error");
+        assert!(err.report().message.contains("429"));
+    }
+
+    #[tokio::test]
+    async fn complete_streaming_streams_deltas_and_non_streaming_delegates() {
+        let mut stream_body = String::new();
+        stream_body.push_str(&format!(
+            "data: {}\n\n",
+            json!({"choices":[{"delta":{"content":"Hel"}}]})
+        ));
+        stream_body.push_str(&format!(
+            "data: {}\n\n",
+            json!({"choices":[{"delta":{"content":"lo"}}]})
+        ));
+        stream_body.push_str("data: [DONE]\n\n");
+        let (base, _) = serve_once("200 OK", "text/event-stream", stream_body);
+        let provider = OpenAiCompat::new(base, "model-a", None).with_streaming(true);
+        let mut deltas = String::new();
+        let response = provider
+            .complete_streaming(&[Message::user("hi")], &[], &mut |chunk| {
+                deltas.push_str(chunk)
+            })
+            .await
+            .expect("streaming");
+        assert_eq!(deltas, "Hello");
+        assert_eq!(response.message.content.as_deref(), Some("Hello"));
+
+        let body =
+            r#"{"choices":[{"message":{"content":"fallback","tool_calls":[]}}]}"#.to_string();
+        let (base, _) = serve_once("200 OK", "application/json", body);
+        let provider = OpenAiCompat::new(base, "model-a", None);
+        let mut ignored = String::new();
+        let response = provider
+            .complete_streaming(&[Message::user("hi")], &[], &mut |chunk| {
+                ignored.push_str(chunk)
+            })
+            .await
+            .expect("delegated complete");
+        assert_eq!(ignored, "");
+        assert_eq!(response.message.content.as_deref(), Some("fallback"));
     }
 }

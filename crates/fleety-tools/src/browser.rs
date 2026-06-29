@@ -352,6 +352,79 @@ impl Tool for BrowserClose {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Mutex as StdMutex;
+    use std::thread;
+    use tokio_tungstenite::tungstenite::{accept, Message};
+
+    static ENV_LOCK: StdMutex<()> = StdMutex::new(());
+
+    fn start_cdp_ws(methods: Vec<&'static str>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind cdp ws");
+        let addr = listener.local_addr().expect("cdp ws addr");
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept cdp ws");
+            let mut ws = accept(stream).expect("accept websocket");
+            for expected_method in methods {
+                let frame = ws.read().expect("cdp frame");
+                let text = frame.to_text().expect("cdp text");
+                let req: Value = serde_json::from_str(text).expect("cdp json");
+                assert_eq!(
+                    req.get("method").and_then(Value::as_str),
+                    Some(expected_method)
+                );
+                let id = req.get("id").and_then(Value::as_u64).expect("cdp id");
+                let result = match expected_method {
+                    "Runtime.evaluate" => {
+                        json!({ "result": { "type": "number", "value": 42 } })
+                    }
+                    "Page.captureScreenshot" => json!({ "data": "png-base64" }),
+                    "Page.navigate" => json!({ "frameId": "frame-1" }),
+                    _ => json!({}),
+                };
+                ws.send(Message::Text(
+                    json!({ "id": id, "result": result }).to_string(),
+                ))
+                .expect("cdp response");
+            }
+            let _ = ws.close(None);
+        });
+        format!("ws://{addr}")
+    }
+
+    fn start_chrome_json(ws_url: String) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind chrome http");
+        let addr = listener.local_addr().expect("chrome http addr");
+        thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept chrome json");
+                let mut buf = [0_u8; 1024];
+                let n = stream.read(&mut buf).expect("read chrome request");
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let body = if request.contains(" /json/version ") {
+                    json!({ "Browser": "Fake Chrome" }).to_string()
+                } else {
+                    json!([
+                        {
+                            "type": "page",
+                            "webSocketDebuggerUrl": ws_url
+                        }
+                    ])
+                    .to_string()
+                };
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream
+                    .write_all(header.as_bytes())
+                    .and_then(|_| stream.write_all(body.as_bytes()))
+                    .expect("chrome json response");
+            }
+        });
+        format!("http://{addr}")
+    }
 
     #[test]
     fn parse_ws_url_prefers_a_page() {
@@ -367,6 +440,22 @@ mod tests {
 
         assert!(parse_ws_url("[]").is_err());
         assert!(parse_ws_url("not json").is_err());
+    }
+
+    #[test]
+    fn chrome_base_prefers_trimmed_arg_then_env_then_default() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        std::env::remove_var("FLEETY_CHROME_URL");
+
+        assert_eq!(chrome_base(&json!({})), "http://127.0.0.1:9222");
+        std::env::set_var("FLEETY_CHROME_URL", "http://chrome-from-env:9222");
+        assert_eq!(chrome_base(&json!({})), "http://chrome-from-env:9222");
+        assert_eq!(
+            chrome_base(&json!({ "chrome": "http://chrome-from-arg:9222/" })),
+            "http://chrome-from-arg:9222"
+        );
+
+        std::env::remove_var("FLEETY_CHROME_URL");
     }
 
     #[tokio::test]
@@ -387,6 +476,78 @@ mod tests {
             .await
             .expect("close");
         assert_eq!(r["closed"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn browser_tools_validate_required_arguments_without_cdp() {
+        let mut registry = ToolRegistry::new();
+        register_browser(&mut registry);
+
+        assert!(registry
+            .call("browser_navigate", json!({ "session": "s1" }))
+            .await
+            .is_err());
+        assert!(registry
+            .call("browser_eval", json!({ "session": "s1" }))
+            .await
+            .is_err());
+        assert!(registry.call("browser_close", json!({})).await.is_err());
+        assert!(registry
+            .call("browser_screenshot", json!({ "session": "missing" }))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn browser_open_reuses_fake_cdp_session_for_eval_and_screenshot() {
+        let cdp_ws = start_cdp_ws(vec!["Runtime.evaluate", "Page.captureScreenshot"]);
+        let chrome = start_chrome_json(cdp_ws);
+        let mut registry = ToolRegistry::new();
+        register_browser(&mut registry);
+
+        let opened = registry
+            .call("browser_open", json!({ "chrome": chrome }))
+            .await
+            .expect("browser open");
+        let session = opened["session"].as_str().expect("session");
+
+        let eval = registry
+            .call(
+                "browser_eval",
+                json!({ "session": session, "expression": "21 + 21" }),
+            )
+            .await
+            .expect("eval");
+        assert_eq!(eval["result"]["value"], json!(42));
+
+        let screenshot = registry
+            .call("browser_screenshot", json!({ "session": session }))
+            .await
+            .expect("screenshot");
+        assert_eq!(screenshot["data"], json!("png-base64"));
+
+        let closed = registry
+            .call("browser_close", json!({ "session": session }))
+            .await
+            .expect("close");
+        assert_eq!(closed["closed"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn browser_navigate_can_use_one_shot_fake_cdp_connection() {
+        let cdp_ws = start_cdp_ws(vec!["Page.navigate"]);
+        let chrome = start_chrome_json(cdp_ws);
+        let mut registry = ToolRegistry::new();
+        register_browser(&mut registry);
+
+        let result = registry
+            .call(
+                "browser_navigate",
+                json!({ "chrome": chrome, "url": "https://example.com" }),
+            )
+            .await
+            .expect("navigate");
+        assert_eq!(result["frameId"], json!("frame-1"));
     }
 
     #[test]

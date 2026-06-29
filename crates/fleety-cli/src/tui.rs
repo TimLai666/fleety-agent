@@ -1,4 +1,4 @@
-//! Interactive multi-pane TUI (ratatui): a conversation pane, an input box, and
+﻿//! Interactive multi-pane TUI (ratatui): a conversation pane, an input box, and
 //! a status line. The `App` state, key handling, and rendering are unit-tested
 //! (ratatui `TestBackend` renders to an in-memory buffer); the live
 //! terminal/event/WebSocket loop in `main.rs` is the glue around them.

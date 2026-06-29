@@ -1,4 +1,4 @@
-//! Server-only agent tools: core memory (ME/USER/TODO/TOOLS), the per-device
+﻿//! Server-only agent tools: core memory (ME/USER/TODO/TOOLS), the per-device
 //! audit history, and the device registry. The workspace file/search/edit/run/
 //! git tools live in the shared `fleety-tools` crate (so they also run on any
 //! device via `fleetyd`) and are wired in here by `build_registry`.

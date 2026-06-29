@@ -1,4 +1,4 @@
-//! Knowledge wiki: a durable Obsidian-style markdown vault, separate from any
+﻿//! Knowledge wiki: a durable Obsidian-style markdown vault, separate from any
 //! workspace. The agent distils general knowledge here (one note per concept,
 //! `[[wikilinks]]`, tags) via these tools; the runtime just enforces that writes
 //! stay inside the vault and use `.md`.

@@ -398,3 +398,174 @@ async fn run_server(shutdown: Option<tokio::sync::watch::Receiver<bool>>) {
     }
     tracing::info!("fleety-server stopped");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_core::Message;
+    use std::io::{Read, Write};
+    use std::net::TcpListener as StdTcpListener;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        saved: Vec<(&'static str, Option<String>)>,
+        temp_home: PathBuf,
+    }
+
+    impl EnvGuard {
+        fn new(name: &str) -> Self {
+            let keys = [
+                "HOME",
+                "USERPROFILE",
+                "FLEETY_AGENT_HOME",
+                "FLEETY_WORKSPACE",
+                "FLEETY_POLICY",
+                "FLEETY_MODEL_BASE_URL",
+                "FLEETY_MODEL",
+                "FLEETY_MODEL_KEY",
+                "FLEETY_MODEL_STREAM",
+            ];
+            let saved = keys
+                .into_iter()
+                .map(|key| (key, std::env::var(key).ok()))
+                .collect::<Vec<_>>();
+            let temp_home = std::env::temp_dir()
+                .join(format!("fleety-server-test-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&temp_home);
+            std::fs::create_dir_all(&temp_home).expect("temp home");
+
+            std::env::set_var("HOME", &temp_home);
+            std::env::set_var("USERPROFILE", &temp_home);
+            for key in [
+                "FLEETY_AGENT_HOME",
+                "FLEETY_WORKSPACE",
+                "FLEETY_POLICY",
+                "FLEETY_MODEL_BASE_URL",
+                "FLEETY_MODEL",
+                "FLEETY_MODEL_KEY",
+                "FLEETY_MODEL_STREAM",
+            ] {
+                std::env::remove_var(key);
+            }
+
+            Self { saved, temp_home }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.saved {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.temp_home);
+        }
+    }
+
+    fn serve_once(body: String) -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind fake provider");
+        let addr = listener.local_addr().expect("fake provider addr");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept fake provider request");
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).expect("read provider request");
+            let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+            let _ = tx.send(request);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write provider response");
+        });
+        (format!("http://{addr}/v1"), rx)
+    }
+
+    #[test]
+    fn agent_home_prefers_env_then_home_default() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let guard = EnvGuard::new("agent-home");
+
+        assert_eq!(agent_home(), guard.temp_home.join(".fleety").join("agent"));
+
+        let explicit = guard.temp_home.join("custom-agent-home");
+        std::env::set_var("FLEETY_AGENT_HOME", &explicit);
+        assert_eq!(agent_home(), explicit);
+    }
+
+    #[test]
+    fn workspace_root_prefers_env_then_current_dir() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let guard = EnvGuard::new("workspace-root");
+
+        assert_eq!(
+            workspace_root(),
+            std::env::current_dir().expect("current dir")
+        );
+
+        let explicit = guard.temp_home.join("workspace");
+        std::env::set_var("FLEETY_WORKSPACE", &explicit);
+        assert_eq!(workspace_root(), explicit);
+    }
+
+    #[test]
+    fn policy_from_env_defaults_to_full_access_unless_exact_match() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("policy");
+
+        assert_eq!(policy_from_env(), agent_core::Policy::FullAccess);
+        std::env::set_var("FLEETY_POLICY", "RequireApproval");
+        assert_eq!(policy_from_env(), agent_core::Policy::FullAccess);
+        std::env::set_var("FLEETY_POLICY", "require_approval");
+        assert_eq!(policy_from_env(), agent_core::Policy::RequireApproval);
+    }
+
+    #[tokio::test]
+    async fn build_provider_uses_echo_when_model_env_is_incomplete() {
+        let provider = {
+            let _lock = ENV_LOCK.lock().expect("env lock");
+            let _guard = EnvGuard::new("provider");
+            std::env::set_var("FLEETY_MODEL_BASE_URL", "http://localhost:1234/v1");
+            build_provider()
+        };
+        let response = provider
+            .complete(&[Message::user("hello")], &[])
+            .await
+            .expect("echo provider");
+        assert_eq!(response.message.content.as_deref(), Some("echo: hello"));
+    }
+
+    #[tokio::test]
+    async fn build_provider_uses_openai_compatible_env_when_complete() {
+        let body = r#"{"choices":[{"message":{"content":"provider-ok","tool_calls":[]}}]}"#;
+        let (base_url, rx) = serve_once(body.to_string());
+        let provider = {
+            let _lock = ENV_LOCK.lock().expect("env lock");
+            let _guard = EnvGuard::new("provider-openai");
+            std::env::set_var("FLEETY_MODEL_BASE_URL", base_url);
+            std::env::set_var("FLEETY_MODEL", "server-model");
+            std::env::set_var("FLEETY_MODEL_KEY", "server-key");
+            build_provider()
+        };
+
+        let response = provider
+            .complete(&[Message::user("hello")], &[])
+            .await
+            .expect("openai-compatible provider");
+        assert_eq!(response.message.content.as_deref(), Some("provider-ok"));
+
+        let request = rx.recv_timeout(Duration::from_secs(5)).expect("request");
+        assert!(request.starts_with("POST /v1/chat/completions "));
+        assert!(request.contains("Bearer server-key"));
+        assert!(request.contains("\"model\":\"server-model\""));
+    }
+}

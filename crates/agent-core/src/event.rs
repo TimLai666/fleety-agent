@@ -1,4 +1,4 @@
-//! Event log for a turn — the durable record of the agent loop.
+﻿//! Event log for a turn — the durable record of the agent loop.
 //!
 //! Each loop step (assistant message, tool call, tool result) is pushed here. An
 //! optional **sink** lets a caller persist every event the instant it happens

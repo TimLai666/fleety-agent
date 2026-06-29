@@ -1,4 +1,4 @@
-//! Shared workspace tools, root-relative so the same implementations run on the
+﻿//! Shared workspace tools, root-relative so the same implementations run on the
 //! server's workspace and on any device via `fleetyd` (no drift between them).
 //!
 //! `register_workspace(registry, root, backups_dir)` adds: `read_file`,
@@ -1455,5 +1455,220 @@ mod tests {
         ] {
             assert!(critical_reason(c).is_none(), "should allow: {c}");
         }
+    }
+
+    #[test]
+    fn helpers_validate_required_args_and_scope_rules() {
+        let root = temp();
+        std::fs::create_dir_all(root.join("sub")).expect("sub");
+        std::fs::write(root.join("sub/file.txt"), "x").expect("file");
+        let confined = fs_confined();
+
+        assert!(require_str(&json!({}), "path").is_err());
+        assert!(resolve_in_root(&root, "missing.txt").is_err());
+        assert!(resolve_in_root(&root, "../outside.txt").is_err());
+        assert_eq!(
+            resolve_for_write(&root, "../outside.txt").is_err(),
+            confined
+        );
+        assert!(resolve_for_write(&root, "missing-parent/file.txt").is_err());
+        assert!(resolve_lenient(&root, "").is_err());
+        assert_eq!(resolve_lenient(&root, "../outside.txt").is_err(), confined);
+        let absolute = root.join("absolute.txt").display().to_string();
+        assert_eq!(resolve_lenient(&root, &absolute).is_err(), confined);
+        assert!(resolve_lenient(&root, "new.txt")
+            .expect("lenient")
+            .ends_with("new.txt"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn backup_listing_and_apply_cover_empty_invalid_and_valid_cases() {
+        let root = temp();
+        let backups = root.join(".bak");
+
+        assert!(list_backups(&backups).expect("missing backups").is_empty());
+        assert!(apply_backup(&root, &backups, "").is_err());
+        assert!(apply_backup(&root, &backups, "../x").is_err());
+        assert!(apply_backup(&root, &backups, "missing").is_err());
+
+        std::fs::create_dir_all(backups.join("empty")).expect("empty backup");
+        std::fs::write(backups.join("not-a-dir"), "skip").expect("skip file");
+        std::fs::create_dir_all(backups.join("id1/nested")).expect("backup dir");
+        std::fs::write(backups.join("id1/nested/a.txt"), "restored").expect("backup file");
+
+        let entries = list_backups(&backups).expect("list backups");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["id"], json!("id1"));
+        assert_eq!(entries[0]["original_rel_path"], json!("nested/a.txt"));
+
+        let restored = apply_backup(&root, &backups, "id1").expect("restore");
+        assert_eq!(restored["restored"], json!("nested/a.txt"));
+        assert_eq!(
+            std::fs::read_to_string(root.join("nested/a.txt")).expect("read restored"),
+            "restored"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn registry_reports_validation_errors_without_mutating() {
+        let root = temp();
+        let backups = root.join(".bak");
+        std::fs::write(root.join("dup.txt"), "same same").expect("dup");
+        std::fs::create_dir_all(root.join("dir")).expect("dir");
+        let mut reg = ToolRegistry::new();
+        register_workspace(&mut reg, &root, &backups);
+
+        assert!(reg
+            .call("search_files", json!({ "query": "" }))
+            .await
+            .is_err());
+        assert!(reg
+            .call("search_files", json!({ "query": "[" }))
+            .await
+            .is_err());
+        assert!(reg
+            .call(
+                "edit_file",
+                json!({ "path": "dup.txt", "old": "absent", "new": "x" })
+            )
+            .await
+            .is_err());
+        assert!(reg
+            .call(
+                "edit_file",
+                json!({ "path": "dup.txt", "old": "same", "new": "x" })
+            )
+            .await
+            .is_err());
+        assert!(reg
+            .call(
+                "write_file",
+                json!({ "path": "missing-parent/new.txt", "content": "x" })
+            )
+            .await
+            .is_err());
+        assert!(reg
+            .call("delete_file", json!({ "path": "dir" }))
+            .await
+            .is_err());
+        assert!(reg
+            .call("run_command", json!({ "command": "rm -rf /" }))
+            .await
+            .is_err());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn search_truncates_and_move_backups_existing_destination() {
+        let root = temp();
+        let backups = root.join(".bak");
+        std::fs::write(root.join("a.txt"), "needle 1\nneedle 2\n").expect("a");
+        std::fs::write(root.join("from.txt"), "from").expect("from");
+        std::fs::write(root.join("to.txt"), "old-to").expect("to");
+        let mut reg = ToolRegistry::new();
+        register_workspace(&mut reg, &root, &backups);
+
+        let found = reg
+            .call(
+                "search_files",
+                json!({ "query": "needle", "max_results": 1 }),
+            )
+            .await
+            .expect("search");
+        assert_eq!(found["matches"].as_array().map(Vec::len), Some(1));
+        assert_eq!(found["truncated"], json!(true));
+
+        let moved = reg
+            .call("move_file", json!({ "from": "from.txt", "to": "to.txt" }))
+            .await
+            .expect("move");
+        assert!(moved["backup"]["id"].is_string());
+        assert_eq!(
+            std::fs::read_to_string(root.join("to.txt")).expect("moved content"),
+            "from"
+        );
+
+        let backup_id = moved["backup"]["id"].as_str().expect("backup id");
+        reg.call("rollback", json!({ "backup_id": backup_id }))
+            .await
+            .expect("rollback destination backup");
+        assert_eq!(
+            std::fs::read_to_string(root.join("to.txt")).expect("rolled back"),
+            "old-to"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn git_tools_surface_status_diff_log_and_show() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+
+        let root = temp();
+        let backups = root.join(".bak");
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .output()
+                .expect("git command");
+            assert!(
+                output.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+
+        git(&["init"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Fleety Test"]);
+        std::fs::write(root.join("file.txt"), "one\n").expect("seed");
+        git(&["add", "file.txt"]);
+        git(&["commit", "-m", "initial"]);
+        std::fs::write(root.join("file.txt"), "one\ntwo\n").expect("modify");
+        std::fs::write(root.join("new.txt"), "new\n").expect("untracked");
+
+        let mut reg = ToolRegistry::new();
+        register_workspace(&mut reg, &root, &backups);
+
+        let status = reg.call("git_status", json!({})).await.expect("git status");
+        assert!(status["status"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("file.txt"));
+
+        let diff = reg.call("git_diff", json!({})).await.expect("git diff");
+        assert!(diff["diff"].as_str().unwrap_or_default().contains("+two"));
+        assert!(diff["untracked"]
+            .as_array()
+            .expect("untracked")
+            .iter()
+            .any(|v| v == "new.txt"));
+
+        let log = reg
+            .call("git_log", json!({ "limit": 1 }))
+            .await
+            .expect("git log");
+        assert!(log["log"].as_str().unwrap_or_default().contains("initial"));
+
+        let show = reg
+            .call("git_show", json!({ "ref": "HEAD" }))
+            .await
+            .expect("git show");
+        assert!(show["show"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("file.txt"));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

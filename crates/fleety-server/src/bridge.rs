@@ -258,6 +258,14 @@ impl Tool for DeviceExec {
 
         let call_id = uuid::Uuid::new_v4().to_string();
         let (reply_tx, reply_rx) = oneshot::channel();
+        let sender = {
+            let hub = self.hub.lock().await;
+            hub.get(device).cloned().ok_or_else(|| {
+                CoreError::Message(format!(
+                    "device '{device}' is not connected; use device_list to see connected devices"
+                ))
+            })?
+        };
         self.pending.lock().await.insert(call_id.clone(), reply_tx);
 
         let frame = ServerMsg::RunTool {
@@ -267,16 +275,11 @@ impl Tool for DeviceExec {
         };
         let text = serde_json::to_string(&frame)
             .map_err(|e| CoreError::Message(format!("serialize RunTool: {e}")))?;
-        {
-            let hub = self.hub.lock().await;
-            let sender = hub.get(device).ok_or_else(|| {
-                CoreError::Message(format!(
-                    "device '{device}' is not connected; use device_list to see connected devices"
-                ))
-            })?;
-            sender
-                .send(WsMessage::Text(text))
-                .map_err(|_| CoreError::Provider(format!("device '{device}' connection closed")))?;
+        if sender.send(WsMessage::Text(text)).is_err() {
+            self.pending.lock().await.remove(&call_id);
+            return Err(CoreError::Provider(format!(
+                "device '{device}' connection closed"
+            )));
         }
 
         match tokio::time::timeout(CALL_TIMEOUT, reply_rx).await {
@@ -364,6 +367,7 @@ pub async fn dispatch_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_core::ToolRegistry;
 
     #[test]
     fn handle_scoping_rejects_cross_device() {
@@ -375,5 +379,112 @@ mod tests {
         // cross-device: rejected, naming the owner.
         let err = check_handle(&map, "sess1", "laptop").expect_err("cross-device");
         assert!(err.report().message.contains("pi"));
+    }
+
+    #[tokio::test]
+    async fn device_exec_validates_args_and_connection_before_dispatch() {
+        let hub = new_hub();
+        let pending = new_pending();
+        let handles = new_handles();
+        let mut registry = ToolRegistry::new();
+        register(
+            &mut registry,
+            hub.clone(),
+            pending.clone(),
+            handles,
+            new_device_tools(),
+        );
+
+        let missing_device = registry
+            .call("device_exec", json!({ "tool": "read_file" }))
+            .await
+            .expect_err("device is required");
+        assert!(missing_device.report().message.contains("'device'"));
+
+        let missing_tool = registry
+            .call("device_exec", json!({ "device": "dev" }))
+            .await
+            .expect_err("tool is required");
+        assert!(missing_tool.report().message.contains("'tool'"));
+
+        let disconnected = registry
+            .call(
+                "device_exec",
+                json!({ "device": "dev", "tool": "read_file" }),
+            )
+            .await
+            .expect_err("device is not connected");
+        assert!(disconnected.report().message.contains("not connected"));
+        assert!(
+            pending.lock().await.is_empty(),
+            "failed dispatch should not leave pending calls"
+        );
+
+        let (tx, rx) = mpsc::unbounded_channel::<WsMessage>();
+        hub.lock().await.insert("dev".to_string(), tx);
+        drop(rx);
+        let closed = registry
+            .call(
+                "device_exec",
+                json!({ "device": "dev", "tool": "read_file" }),
+            )
+            .await
+            .expect_err("closed device sender");
+        assert!(closed.report().message.contains("connection closed"));
+        assert!(
+            pending.lock().await.is_empty(),
+            "closed sender should not leave pending calls"
+        );
+    }
+
+    #[tokio::test]
+    async fn device_exec_sends_run_tool_with_default_args_and_binds_returned_handle() {
+        let hub = new_hub();
+        let pending = new_pending();
+        let handles = new_handles();
+        let mut registry = ToolRegistry::new();
+        register(
+            &mut registry,
+            hub.clone(),
+            pending.clone(),
+            handles.clone(),
+            new_device_tools(),
+        );
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<WsMessage>();
+        hub.lock().await.insert("dev".to_string(), tx);
+
+        let call = tokio::spawn(async move {
+            registry
+                .call(
+                    "device_exec",
+                    json!({ "device": "dev", "tool": "open_handle" }),
+                )
+                .await
+        });
+
+        let frame = rx.recv().await.expect("run tool frame");
+        let text = frame.to_text().expect("text frame");
+        let msg: ServerMsg = serde_json::from_str(text).expect("server msg");
+        let call_id = match msg {
+            ServerMsg::RunTool {
+                call_id,
+                tool,
+                args_json,
+            } => {
+                assert_eq!(tool, "open_handle");
+                assert_eq!(args_json, "{}");
+                call_id
+            }
+            other => panic!("unexpected frame: {other:?}"),
+        };
+        dispatch_result(&pending, &call_id, Ok(json!({ "handle": "h1" }))).await;
+
+        let result = call.await.expect("join").expect("tool result");
+        assert_eq!(result["handle"], json!("h1"));
+        assert_eq!(
+            handles.lock().await.get("h1").map(String::as_str),
+            Some("dev")
+        );
     }
 }

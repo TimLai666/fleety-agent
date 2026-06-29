@@ -1,4 +1,4 @@
-//! fleetyd — the Fleety device background service.
+﻿//! fleetyd — the Fleety device background service.
 //!
 //! Connects to the Agent on startup (registering this device) and stays
 //! connected across drops and device sleep via an exponential-backoff reconnect
@@ -612,5 +612,105 @@ async fn serve(
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        saved: Vec<(&'static str, Option<String>)>,
+        temp_home: PathBuf,
+    }
+
+    impl EnvGuard {
+        fn new(name: &str) -> Self {
+            let keys = [
+                "HOME",
+                "USERPROFILE",
+                "FLEETY_AGENT_URL",
+                "FLEETY_DEVICE_ID",
+                "COMPUTERNAME",
+                "HOSTNAME",
+            ];
+            let saved = keys
+                .into_iter()
+                .map(|key| (key, std::env::var(key).ok()))
+                .collect::<Vec<_>>();
+            let temp_home =
+                std::env::temp_dir().join(format!("fleetyd-test-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&temp_home);
+            std::fs::create_dir_all(&temp_home).expect("temp home");
+
+            std::env::set_var("HOME", &temp_home);
+            std::env::set_var("USERPROFILE", &temp_home);
+            for key in [
+                "FLEETY_AGENT_URL",
+                "FLEETY_DEVICE_ID",
+                "COMPUTERNAME",
+                "HOSTNAME",
+            ] {
+                std::env::remove_var(key);
+            }
+
+            Self { saved, temp_home }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.saved {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.temp_home);
+        }
+    }
+
+    #[test]
+    fn token_roundtrip_trims_empty_and_clear_removes_file() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("token");
+
+        assert!(read_saved_token().is_none());
+
+        let path = token_path().expect("token path");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("token dir");
+        std::fs::write(&path, "  saved-token\n").expect("seed token");
+        assert_eq!(read_saved_token().as_deref(), Some("saved-token"));
+
+        std::fs::write(&path, " \n").expect("empty token");
+        assert!(read_saved_token().is_none());
+
+        write_saved_token("fresh-token").expect("write token");
+        assert_eq!(read_saved_token().as_deref(), Some("fresh-token"));
+        clear_saved_token();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn agent_url_prefers_env_then_default() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("agent-url");
+
+        assert_eq!(agent_url(), "ws://127.0.0.1:8787");
+        std::env::set_var("FLEETY_AGENT_URL", "ws://agent");
+        assert_eq!(agent_url(), "ws://agent");
+    }
+
+    #[test]
+    fn device_id_is_stable_and_nonempty() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("device-id");
+
+        let first = device_id();
+        assert!(!first.is_empty());
+        assert_eq!(device_id(), first);
     }
 }

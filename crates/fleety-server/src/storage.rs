@@ -2053,6 +2053,32 @@ mod tests {
     }
 
     #[test]
+    fn core_memory_creates_defaults_and_reads_existing_files() {
+        use crate::identity::ActingUser;
+
+        let home = temp_home();
+        let storage = Storage::new(home.clone());
+
+        let first = storage
+            .core_memory_for(&ActingUser::Guest)
+            .expect("core memory");
+        assert!(first.contains("Fleety"));
+        assert!(home.join("fleet").join("ME.md").is_file());
+        assert!(home.join("fleet").join("TODO.md").is_file());
+
+        std::fs::write(home.join("fleet").join("ME.md"), "Custom agent").expect("write me");
+        let second = storage
+            .core_memory_for(&ActingUser::Guest)
+            .expect("core memory again");
+        assert!(second.contains("Custom agent"));
+        assert!(second.contains("## ME (self)"));
+        assert!(second.contains("## USER"));
+        assert!(second.contains("## TODO"));
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn audit_list_treats_legacy_lines_as_timeless() {
         // Pre-timestamp lines (no `ts_secs`) still parse, but a `--since`
         // shouldn't silently drop them — we surface ts_secs == 0 instead.
@@ -2080,6 +2106,100 @@ mod tests {
             .list_audit("dev", Some(1_000_000_000), None)
             .expect("since");
         assert_eq!(entries.len(), 1);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn audit_list_tolerates_missing_blank_and_bad_lines() {
+        let home = temp_home();
+        let storage = Storage::new(home.clone());
+
+        assert!(storage
+            .list_audit("missing-dev", Some(1), Some(10))
+            .expect("missing audit")
+            .is_empty());
+
+        let history = storage.history_path("dev");
+        std::fs::create_dir_all(history.parent().expect("history parent")).expect("history dir");
+        std::fs::write(
+            &history,
+            "\nnot json\n{\"event\":\"tool_result\",\"id\":\"1\",\"result\":{\"ok\":true}}\n",
+        )
+        .expect("history");
+
+        let entries = storage
+            .list_audit("dev", Some(1), Some(10))
+            .expect("list audit");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["index"], serde_json::json!(2u64));
+        assert_eq!(entries[0]["kind"], serde_json::json!("tool_result"));
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn corrupt_conversation_lines_return_actionable_errors() {
+        let home = temp_home();
+        let storage = Storage::new(home.clone());
+        let path = storage.conversation_path("dev", "conv");
+        std::fs::create_dir_all(path.parent().expect("conversation parent")).expect("conv dir");
+
+        std::fs::write(&path, "\nnot json\n").expect("bad json");
+        assert!(storage
+            .load("dev", "conv")
+            .expect_err("bad json should fail")
+            .report()
+            .message
+            .contains("corrupt conversation line"));
+
+        std::fs::write(&path, r#"{"message":{"role":"user","content":"hi"}}"#).expect("no seq");
+        assert!(storage
+            .load("dev", "conv")
+            .expect_err("missing seq should fail")
+            .report()
+            .message
+            .contains("missing 'seq'"));
+
+        std::fs::write(&path, r#"{"seq":1,"message":{"role":"bogus"}}"#).expect("bad message");
+        assert!(storage
+            .load("dev", "conv")
+            .expect_err("bad message should fail")
+            .report()
+            .message
+            .contains("corrupt conversation message"));
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn journal_events_skip_non_events_and_report_corruption() {
+        let home = temp_home();
+        let storage = Storage::new(home.clone());
+
+        storage
+            .journal_begin("dev", "conv", &Message::user("hi"))
+            .expect("begin");
+        assert!(storage
+            .journal_events("dev", "conv")
+            .expect("start-only journal")
+            .is_empty());
+
+        let path = storage.journal_path("dev", "conv");
+        std::fs::write(&path, "{not json}\n").expect("bad journal");
+        assert!(storage
+            .journal_events("dev", "conv")
+            .expect_err("bad journal should fail")
+            .report()
+            .message
+            .contains("corrupt journal line"));
+
+        std::fs::write(&path, r#"{"kind":"event","event":null}"#).expect("bad event");
+        assert!(storage
+            .journal_events("dev", "conv")
+            .expect_err("bad event should fail")
+            .report()
+            .message
+            .contains("corrupt journal event"));
 
         let _ = std::fs::remove_dir_all(&home);
     }
