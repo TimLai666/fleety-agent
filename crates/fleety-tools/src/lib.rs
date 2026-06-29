@@ -1,4 +1,4 @@
-﻿//! Shared workspace tools, root-relative so the same implementations run on the
+//! Shared workspace tools, root-relative so the same implementations run on the
 //! server's workspace and on any device via `fleetyd` (no drift between them).
 //!
 //! `register_workspace(registry, root, backups_dir)` adds: `read_file`,
@@ -21,7 +21,8 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -589,6 +590,32 @@ fn run_git(root: &Path, git_args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Default wall-clock limit for `run_command` / `ssh_exec` so an interactive or
+/// hung process can't block a turn forever.
+const DEFAULT_CMD_TIMEOUT_SECS: u64 = 120;
+
+/// Resolve the command timeout: a per-call value wins, else the env value, else
+/// the default. `0` means "no timeout" (for a long job the agent opts into).
+/// Pure.
+fn resolve_timeout(per_call: Option<u64>, env_secs: Option<u64>) -> Option<Duration> {
+    let secs = per_call.or(env_secs).unwrap_or(DEFAULT_CMD_TIMEOUT_SECS);
+    if secs == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(secs))
+    }
+}
+
+/// The effective command timeout: the per-call `timeout_secs` arg over
+/// `FLEETY_CMD_TIMEOUT_SECS` over [`DEFAULT_CMD_TIMEOUT_SECS`]. `None` = no limit.
+/// Shared by `run_command` and `ssh_exec` so both honor one policy.
+pub fn command_timeout(per_call: Option<u64>) -> Option<Duration> {
+    let env_secs = std::env::var("FLEETY_CMD_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok());
+    resolve_timeout(per_call, env_secs)
+}
+
 struct ReadFile {
     root: PathBuf,
 }
@@ -871,13 +898,14 @@ impl Tool for RunCommand {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "run_command".to_string(),
-            description: "Run a shell command in the workspace and capture stdout/stderr/exit code. Clearly destructive commands are refused. Pass `track` (paths) to get a unified diff of what those files looked like before vs after — useful when a command (sed, a build, etc.) changes files.".to_string(),
+            description: "Run a shell command in the workspace and capture stdout/stderr/exit code. Clearly destructive commands are refused. Runs non-interactively and times out (default 120s, configurable) — it cannot drive an interactive prompt or TUI, so use non-interactive flags. Pass `track` (paths) to get a unified diff of what those files looked like before vs after — useful when a command (sed, a build, etc.) changes files. Pass `timeout_secs` to override the limit (0 = no limit, for a long job you expect).".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "command": { "type": "string" },
                     "cwd": { "type": "string", "description": "workspace-relative working dir (default workspace root)" },
-                    "track": { "type": "array", "items": { "type": "string" }, "description": "workspace-relative paths to diff (before vs after the command)" }
+                    "track": { "type": "array", "items": { "type": "string" }, "description": "workspace-relative paths to diff (before vs after the command)" },
+                    "timeout_secs": { "type": "integer", "description": "wall-clock limit; omit for the default, 0 to disable" }
                 },
                 "required": ["command"]
             }),
@@ -919,12 +947,42 @@ impl Tool for RunCommand {
         } else {
             ("sh", "-c")
         };
-        let output = Command::new(shell)
+        let timeout = command_timeout(args.get("timeout_secs").and_then(Value::as_u64));
+        // Non-interactive, timed out: `kill_on_drop` terminates the child if the
+        // timeout future is dropped (so a hung/interactive process can't block the
+        // turn forever). tokio's process also keeps the async runtime unblocked.
+        let mut child = tokio::process::Command::new(shell);
+        child
             .arg(flag)
             .arg(command)
             .current_dir(&cwd)
-            .output()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let spawned = child
+            .spawn()
             .map_err(|e| CoreError::Message(format!("cannot run command: {e}")))?;
+        let output = match timeout {
+            Some(dur) => match tokio::time::timeout(dur, spawned.wait_with_output()).await {
+                Ok(r) => r.map_err(|e| CoreError::Message(format!("command failed: {e}")))?,
+                Err(_) => {
+                    // Timed out — the child was killed when the future dropped.
+                    return Ok(json!({
+                        "exit_code": Value::Null,
+                        "stdout": "",
+                        "stderr": format!(
+                            "command timed out after {}s and was terminated (use non-interactive flags, or pass a larger timeout_secs / 0 to disable)",
+                            dur.as_secs()
+                        ),
+                        "timed_out": true,
+                    }));
+                }
+            },
+            None => spawned
+                .wait_with_output()
+                .await
+                .map_err(|e| CoreError::Message(format!("command failed: {e}")))?,
+        };
 
         let mut result = json!({
             "exit_code": output.status.code(),
@@ -1188,6 +1246,56 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fleety-tools-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("mk temp");
         dir
+    }
+
+    #[test]
+    fn resolve_timeout_precedence() {
+        // per-call wins over env wins over default; 0 disables.
+        assert_eq!(
+            resolve_timeout(Some(5), Some(99)),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            resolve_timeout(None, Some(30)),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            resolve_timeout(None, None),
+            Some(Duration::from_secs(DEFAULT_CMD_TIMEOUT_SECS))
+        );
+        assert_eq!(resolve_timeout(Some(0), Some(99)), None);
+    }
+
+    /// A command that sleeps ~5s on either platform (no interactive input needed).
+    fn slow_cmd() -> &'static str {
+        if cfg!(windows) {
+            "ping -n 6 127.0.0.1 >NUL"
+        } else {
+            "sleep 5"
+        }
+    }
+
+    #[tokio::test]
+    async fn run_command_times_out_and_kills() {
+        let tool = RunCommand { root: temp() };
+        let res = tool
+            .call(json!({ "command": slow_cmd(), "timeout_secs": 1 }))
+            .await
+            .expect("call ok");
+        assert_eq!(res["timed_out"], json!(true));
+        assert!(res["exit_code"].is_null());
+    }
+
+    #[tokio::test]
+    async fn run_command_completes_within_timeout() {
+        let tool = RunCommand { root: temp() };
+        let res = tool
+            .call(json!({ "command": "echo hi", "timeout_secs": 10 }))
+            .await
+            .expect("call ok");
+        assert_eq!(res["exit_code"], json!(0));
+        assert!(res["stdout"].as_str().unwrap_or_default().contains("hi"));
+        assert!(res.get("timed_out").is_none());
     }
 
     use serial_test::serial;

@@ -197,6 +197,13 @@ pub fn registry() -> &'static [Setting] {
             secret: false,
         },
         Setting {
+            key: "FLEETY_CMD_TIMEOUT_SECS",
+            scope: Shared,
+            default: "120",
+            description: "Default wall-clock limit for run_command / ssh_exec (0 = no limit); a per-call timeout_secs overrides it.",
+            secret: false,
+        },
+        Setting {
             key: "FLEETY_AUTO_INSTALL_DEPS",
             scope: Shared,
             default: "1",

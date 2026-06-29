@@ -520,6 +520,12 @@ current automatically (re-embeds notes whose content hash changed).
 | `FLEETY_WIKI_EMBED` | (unset → on) | Set to `0` to disable semantic search (no model download; `wiki_semantic_search` returns an error pointing at `wiki_search`). |
 | `FLEETY_MODELS_DIR` | `{FLEETY_AGENT_HOME}/models` | Cache dir for downloaded model weights. |
 
+## Command execution
+
+| Var | Default | Meaning |
+|---|---|---|
+| `FLEETY_CMD_TIMEOUT_SECS` | `120` | Wall-clock limit for `run_command` and `ssh_exec` (shared by the server and every device). On expiry the child is terminated and the result has `"timed_out": true`. `0` disables the limit; a per-call `timeout_secs` argument overrides it. These tools are **non-interactive** — they capture output and return when the process exits, so they cannot answer a prompt or drive a TUI; use non-interactive flags. |
+
 ## Tools that talk to the network
 
 | Var | Default | Meaning |

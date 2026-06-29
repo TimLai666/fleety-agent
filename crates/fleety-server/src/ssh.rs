@@ -1,11 +1,9 @@
-﻿//! SSH connector: run commands on remote hosts via the system `ssh` client.
+//! SSH connector: run commands on remote hosts via the system `ssh` client.
 //!
 //! No extra dependency — shells out to `ssh` in non-interactive `BatchMode`
 //! (so it fails fast instead of prompting). This lets the agent operate hosts
 //! that don't run fleetyd. The arg construction is pure and unit-tested; the
 //! live connection follows the codebase's logic-tested/live-manual posture.
-
-use std::process::Command;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -72,7 +70,7 @@ impl Tool for SshExec {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "ssh_exec".to_string(),
-            description: "Run a command on a remote host over SSH (system ssh client, non-interactive BatchMode).".to_string(),
+            description: "Run a command on a remote host over SSH (system ssh client, non-interactive BatchMode). Times out (default 120s; pass `timeout_secs`, 0 to disable). Non-interactive — it cannot answer prompts or drive a remote TUI.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -80,7 +78,8 @@ impl Tool for SshExec {
                     "command": { "type": "string" },
                     "user": { "type": "string" },
                     "port": { "type": "integer" },
-                    "identity": { "type": "string", "description": "path to a private key file" }
+                    "identity": { "type": "string", "description": "path to a private key file" },
+                    "timeout_secs": { "type": "integer", "description": "wall-clock limit; omit for the default, 0 to disable" }
                 },
                 "required": ["host", "command"]
             }),
@@ -111,11 +110,38 @@ impl Tool for SshExec {
             None
         };
         let ssh_args = build_ssh_args(host, command, user, port, identity, control_dir.as_deref());
-        let output = Command::new("ssh").args(&ssh_args).output().map_err(|e| {
+        let timeout =
+            fleety_tools::command_timeout(args.get("timeout_secs").and_then(Value::as_u64));
+        let mut cmd = tokio::process::Command::new("ssh");
+        cmd.args(&ssh_args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let spawned = cmd.spawn().map_err(|e| {
             CoreError::Message(format!(
                 "cannot run ssh (is the ssh client installed?): {e}"
             ))
         })?;
+        let output = match timeout {
+            Some(dur) => match tokio::time::timeout(dur, spawned.wait_with_output()).await {
+                Ok(r) => r.map_err(|e| CoreError::Message(format!("ssh failed: {e}")))?,
+                Err(_) => {
+                    return Ok(json!({
+                        "status": Value::Null,
+                        "stdout": "",
+                        "stderr": format!(
+                            "ssh command timed out after {}s and was terminated (pass a larger timeout_secs, or 0 to disable)",
+                            dur.as_secs()
+                        ),
+                        "timed_out": true,
+                    }));
+                }
+            },
+            None => spawned
+                .wait_with_output()
+                .await
+                .map_err(|e| CoreError::Message(format!("ssh failed: {e}")))?,
+        };
         Ok(json!({
             "status": output.status.code(),
             "stdout": String::from_utf8_lossy(&output.stdout),
