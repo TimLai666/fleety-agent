@@ -83,9 +83,8 @@ pub fn assistant_update(session_id: &str, text: &str) -> Value {
     )
 }
 
-/// `session/request_permission` params from a server approval request. Used when
-/// approval streaming is wired (a follow-up); the mapping is defined + tested now.
-#[allow(dead_code)]
+/// `session/request_permission` params from a server approval request — emitted
+/// to the editor when the server asks for tool approval (require-approval policy).
 pub fn permission_request(session_id: &str, tool: &str, summary: &str) -> Value {
     json!({
         "sessionId": session_id,
@@ -686,6 +685,35 @@ impl WsBridge {
                                 remediation: None,
                             },
                         },
+                    };
+                    if let Ok(t) = serde_json::to_string(&reply) {
+                        let _ = tx.send(WsMessage::Text(t)).await;
+                    }
+                }
+                // The server wants approval for a tool: ask the editor via ACP
+                // session/request_permission, then relay the user's choice back.
+                fleety_protocol::ServerMsg::ApprovalRequested {
+                    approval_id,
+                    tool,
+                    summary,
+                    ..
+                } => {
+                    let params = permission_request(conversation, &tool, &summary);
+                    let allow = self
+                        .editor_call("session/request_permission", params)
+                        .await
+                        .ok()
+                        .and_then(|v| {
+                            v.get("outcome")
+                                .and_then(|o| o.get("optionId"))
+                                .and_then(Value::as_str)
+                                .map(|opt| opt == "allow")
+                        })
+                        .unwrap_or(false); // error / cancel → deny (fail safe)
+                    let reply = if allow {
+                        fleety_protocol::ClientMsg::Approve { approval_id }
+                    } else {
+                        fleety_protocol::ClientMsg::Deny { approval_id }
                     };
                     if let Ok(t) = serde_json::to_string(&reply) {
                         let _ = tx.send(WsMessage::Text(t)).await;
