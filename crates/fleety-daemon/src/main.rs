@@ -119,6 +119,70 @@ fn main() {
     rt.block_on(async_main(cmd));
 }
 
+/// Forward-only fleet convergence. Bring this host's fleety binaries to the
+/// server's exact version when the server is newer; never downgrade. If this
+/// device is ahead, only warn (the operator should upgrade the server). Skips
+/// silently when no update manifest is configured.
+async fn converge_to_server_version(server_version: &str) {
+    if server_version.is_empty() || std::env::var("FLEETY_UPDATE_MANIFEST").is_err() {
+        return; // older server, or no updater configured on this host
+    }
+    let me = agent_core::VERSION;
+    if fleety_tools::update::is_newer(me, server_version) {
+        tracing::warn!(
+            device = me,
+            server = server_version,
+            "this device is newer than the server; upgrade the server so the fleet converges \
+             (devices never auto-downgrade)"
+        );
+        return;
+    }
+    if !fleety_tools::update::is_newer(server_version, me) {
+        return; // already matched
+    }
+    if !fleety_tools::update::manifest_supports_version() {
+        tracing::warn!(
+            server = server_version,
+            "server is newer but FLEETY_UPDATE_MANIFEST has no {{version}} template; cannot pin to \
+             the server's version — set it (e.g. https://host/dl/{{bin}}/{{version}}/manifest.json)"
+        );
+        return;
+    }
+    tracing::info!(
+        device = me,
+        server = server_version,
+        "server is newer; converging this host"
+    );
+
+    let self_updated = match fleety_tools::update::self_update_to_version(server_version).await {
+        Ok(updated) => updated,
+        Err(e) => {
+            tracing::warn!(report = ?e.report(), "could not self-update fleetyd to the server version");
+            false
+        }
+    };
+    // Bring sibling binaries on this host to the same version. fleety-server is a
+    // service (restart it); the fleety CLI just needs its binary swapped.
+    for bin in ["fleety", "fleety-server"] {
+        let Some(exe) = fleety_tools::update::sibling_exe(bin) else {
+            continue;
+        };
+        match fleety_tools::update::update_to_version(bin, &exe, server_version).await {
+            Ok(true) if bin == "fleety-server" => {
+                let _ = std::process::Command::new(&exe).arg("restart").status();
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(report = ?e.report(), bin, "could not update sibling to the server version")
+            }
+        }
+    }
+    if self_updated {
+        // Restart at the next idle frame so the new fleetyd takes over.
+        request_self_restart("converge-to-server-version");
+    }
+}
+
 async fn async_main(cmd: Option<String>) {
     // Lifecycle subcommands act on the OS service manager and exit; `run-service`
     // and no subcommand fall through to actually run the daemon.
@@ -501,7 +565,10 @@ async fn serve(
         };
         match msg {
             ServerMsg::Welcome {
-                session_id, token, ..
+                session_id,
+                token,
+                server_version,
+                ..
             } => {
                 if let Some(tok) = token {
                     if let Err(e) = write_saved_token(&tok) {
@@ -511,6 +578,10 @@ async fn serve(
                     }
                 }
                 tracing::info!(%session_id, "registered with agent");
+                // Forward-only fleet convergence: match this host to the server's
+                // version when the server is newer (so a device that was offline
+                // during a `fleety update` catches up on reconnect).
+                converge_to_server_version(&server_version).await;
             }
             ServerMsg::Error { ref error } if error.kind == "unauthenticated" => {
                 tracing::warn!(

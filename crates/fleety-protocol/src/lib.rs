@@ -163,6 +163,11 @@ pub enum ServerMsg {
         session_id: String,
         conversation_id: String,
         protocol: u32,
+        /// The server's own version (`agent_core::VERSION`). A device's daemon
+        /// converges to it (forward-only) so a fleet tracks the server it
+        /// connects to. Additive; `""` when an older server omits it.
+        #[serde(default)]
+        server_version: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         token: Option<String>,
     },
@@ -289,6 +294,26 @@ mod tests {
                 assert!(hostname.is_none());
             }
             _ => panic!("not hello"),
+        }
+    }
+
+    #[test]
+    fn welcome_server_version_is_additive() {
+        // New server emits it.
+        let w = ServerMsg::Welcome {
+            session_id: "s".into(),
+            conversation_id: "c".into(),
+            protocol: PROTOCOL_VERSION,
+            server_version: "0.3.0".into(),
+            token: None,
+        };
+        let json = serde_json::to_string(&w).expect("ser");
+        assert!(json.contains("\"server_version\":\"0.3.0\""));
+        // An old server's frame (no server_version) still parses → "".
+        let old = r#"{"type":"welcome","session_id":"s","conversation_id":"c","protocol":0}"#;
+        match serde_json::from_str::<ServerMsg>(old).expect("de old") {
+            ServerMsg::Welcome { server_version, .. } => assert_eq!(server_version, ""),
+            _ => panic!("not welcome"),
         }
     }
 

@@ -225,18 +225,9 @@ async fn main() {
     }
 }
 
-/// A local fleety binary `bin` installed as a sibling of the running `fleety`
-/// (same install dir), if present.
+/// A local fleety binary `bin` installed as a sibling of the running `fleety`.
 fn sibling_bin(bin: &str) -> Option<std::path::PathBuf> {
-    let name = if cfg!(windows) {
-        format!("{bin}.exe")
-    } else {
-        bin.to_string()
-    };
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join(name)))
-        .filter(|p| p.exists())
+    fleety_tools::update::sibling_exe(bin)
 }
 
 /// Resolve the local `fleetyd` binary: prefer a sibling of `fleety`, else PATH.

@@ -77,6 +77,14 @@ pub fn manifest_is_templated() -> bool {
         .unwrap_or(false)
 }
 
+/// Whether `FLEETY_UPDATE_MANIFEST` can resolve an exact `{version}` — required
+/// for forward-only convergence to a specific (server) version.
+pub fn manifest_supports_version() -> bool {
+    std::env::var("FLEETY_UPDATE_MANIFEST")
+        .map(|b| b.contains("{version}"))
+        .unwrap_or(false)
+}
+
 /// The manifest URL for `bin`, from `FLEETY_UPDATE_MANIFEST` (with `{bin}`
 /// substituted when the base is a template).
 pub fn manifest_url_for(bin: &str) -> Result<String> {
@@ -186,6 +194,71 @@ pub async fn update_named(bin: &str, exe_path: &Path) -> Result<bool> {
     install(&url, exe_path, bin, agent_core::VERSION).await
 }
 
+// ---- version-pinned update (fleet convergence to the server's version) ----
+
+fn parse_semver(v: &str) -> Option<(u64, u64, u64)> {
+    let core = v.trim_start_matches('v');
+    let core = core.split(['-', '+']).next().unwrap_or(core); // drop pre-release/build
+    let mut it = core.split('.');
+    let major = it.next()?.parse().ok()?;
+    let minor = it.next().unwrap_or("0").parse().ok()?;
+    let patch = it.next().unwrap_or("0").parse().ok()?;
+    Some((major, minor, patch))
+}
+
+/// Whether `a` is a strictly newer semver than `b` (ignores a leading `v` and any
+/// pre-release/build suffix). Unparseable versions are treated as *not* newer, so
+/// a forward-only convergence never acts on a version it can't order.
+pub fn is_newer(a: &str, b: &str) -> bool {
+    match (parse_semver(a), parse_semver(b)) {
+        (Some(x), Some(y)) => x > y,
+        _ => false,
+    }
+}
+
+/// The manifest URL for a *specific* `version` of `bin`. Requires a `{version}`
+/// template (pinning to an exact version is the whole point), and substitutes
+/// `{bin}` too. Errors if the base can't be made version-specific.
+pub fn manifest_url_for_versioned(bin: &str, version: &str) -> Result<String> {
+    let base = std::env::var("FLEETY_UPDATE_MANIFEST").map_err(|_| {
+        CoreError::Message("set FLEETY_UPDATE_MANIFEST to the update manifest URL".to_string())
+    })?;
+    if !base.contains("{version}") {
+        return Err(CoreError::Message(
+            "FLEETY_UPDATE_MANIFEST must contain {version} (and {bin}) to pin a device to the \
+             server's version — e.g. https://host/dl/{bin}/{version}/manifest.json"
+                .to_string(),
+        ));
+    }
+    Ok(base.replace("{bin}", bin).replace("{version}", version))
+}
+
+/// A sibling binary `bin` installed next to the running process, if present.
+pub fn sibling_exe(bin: &str) -> Option<std::path::PathBuf> {
+    let name = if cfg!(windows) {
+        format!("{bin}.exe")
+    } else {
+        bin.to_string()
+    };
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join(name)))
+        .filter(|p| p.exists())
+}
+
+/// Update `bin` at `exe_path` to an exact `version` (via its versioned manifest).
+pub async fn update_to_version(bin: &str, exe_path: &Path, version: &str) -> Result<bool> {
+    let url = manifest_url_for_versioned(bin, version)?;
+    install(&url, exe_path, bin, agent_core::VERSION).await
+}
+
+/// Self-update the running binary to an exact `version`.
+pub async fn self_update_to_version(version: &str) -> Result<bool> {
+    let exe = std::env::current_exe()
+        .map_err(|e| CoreError::Message(format!("cannot find current exe: {e}")))?;
+    update_to_version(&current_bin_name(), &exe, version).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,6 +287,33 @@ mod tests {
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn is_newer_orders_semver() {
+        assert!(is_newer("0.2.0", "0.1.9"));
+        assert!(is_newer("1.0.0", "0.9.9"));
+        assert!(is_newer("v0.1.1", "0.1.0")); // leading v ignored
+        assert!(!is_newer("0.1.0", "0.1.0")); // equal → not newer
+        assert!(!is_newer("0.1.0", "0.2.0")); // older → not newer
+        assert!(!is_newer("garbage", "0.1.0")); // unparseable → not newer (safe)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn versioned_manifest_requires_version_placeholder() {
+        std::env::set_var(
+            "FLEETY_UPDATE_MANIFEST",
+            "https://h/dl/{bin}/{version}/m.json",
+        );
+        assert_eq!(
+            manifest_url_for_versioned("fleetyd", "0.3.0").unwrap(),
+            "https://h/dl/fleetyd/0.3.0/m.json"
+        );
+        // No {version} → can't pin → error.
+        std::env::set_var("FLEETY_UPDATE_MANIFEST", "https://h/dl/{bin}/latest.json");
+        assert!(manifest_url_for_versioned("fleetyd", "0.3.0").is_err());
+        std::env::remove_var("FLEETY_UPDATE_MANIFEST");
     }
 
     #[test]

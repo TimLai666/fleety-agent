@@ -316,6 +316,17 @@ treated as the *current* binary's manifest — `fleety update` then only self-up
 the CLI (it can't safely resolve the others) and says so. Binaries ship in lockstep
 (one workspace version), so the running process's version is the baseline.
 
+**Fleet convergence (server-driven).** `Welcome` carries the server's version, so
+when a device's daemon (re)connects and finds the server **newer**, it pulls this
+host's binaries (fleetyd + any sibling `fleety`/`fleety-server`) to the server's
+**exact** version and restarts — so a device that was offline during a `fleety
+update` catches up on reconnect, and the whole fleet tracks the server rather than a
+floating "latest". It is **forward-only**: a device never auto-downgrades; if a
+device is newer than the server, it only warns (upgrade the server to converge).
+Pinning to an exact version needs a `{version}` placeholder in the manifest URL
+(e.g. `https://host/dl/{bin}/{version}/manifest.json`); without it, the daemon logs
+that it can't pin. With no `FLEETY_UPDATE_MANIFEST` set, convergence is skipped.
+
 ### Background polling (`fleetyd` loop)
 
 24h periodic check of the release manifest. Only spawns when a manifest URL is
@@ -325,7 +336,7 @@ to run it; `fleetyd update` (one-shot) restarts the installed service the same w
 
 | Var | Default | Meaning |
 |---|---|---|
-| `FLEETY_UPDATE_MANIFEST` | (unset → no poll) | URL of the JSON manifest (`version`, `url`, `sha256`). May contain `{bin}` to serve all binaries from one base. |
+| `FLEETY_UPDATE_MANIFEST` | (unset → no poll) | URL of the JSON manifest (`version`, `url`, `sha256`). May contain `{bin}` (serve all binaries from one base) and `{version}` (required for server-version convergence). |
 | `FLEETY_UPDATE_POLL_SECS` | `86400` (24 h) | How often to check. Floor 60 s. |
 | `FLEETY_AUTO_UPDATE` | `notify` | Set to `apply` to run the full update on each tick (`fleetyd update` equivalent). |
 
