@@ -70,7 +70,7 @@ ready-to-use systemd unit for autostart.
 | [`crates/fleety-tools`](crates/fleety-tools) | Shared, root-relative workspace tools (read/list/search-ripgrep/write/edit/run/git + unified diff). Used by the server **and** the daemon, so every device gets the full toolset. |
 | [`crates/fleety-server`](crates/fleety-server) | Fleety Agent server (`fleety-server`): runs the agent loop, the tool surface, cross-device routing, and the scheduler. |
 | [`crates/fleety-daemon`](crates/fleety-daemon) | Device background service (`fleetyd`): connects, runs on-device tools, `install`/`update` (also provisions the `fleety-insyra` sidecar so `insyra_exec` works on the device). |
-| [`crates/fleety-cli`](crates/fleety-cli) | CLI + interactive TUI (`fleety`): `init` / `ask` / `resume` / `tui`. |
+| [`crates/fleety-cli`](crates/fleety-cli) | CLI + interactive TUI (`fleety`): `init` / `ask` / `resume` / `tui` / `voice` / `config` / `audit` / `rollback` / `acp` / `pair` (see [Command reference](#command-reference)). |
 
 Dependency rule: everything may depend on `agent-core`; `agent-core` depends on
 nothing Fleety-specific, so it can later be extracted to its own repo and mounted
@@ -129,6 +129,62 @@ See [`docs/env.md`](docs/env.md) for the **full reference** — every
 `FLEETY_*` variable the runtime reads, grouped by binary (server, daemon,
 sidecars, CLI). Includes mDNS discovery, retention / GC, self-update
 polling, and on-device tool routing.
+
+## Command reference
+
+Three binaries. The **CLI** (`fleety`) is what you talk to the agent with; the
+**server** (`fleety-server`) runs the agent; the **daemon** (`fleetyd`) connects a
+device so the agent can operate it. Server and daemon share the same
+service-lifecycle verbs (they register with the OS service manager — systemd /
+launchd / Windows SCM).
+
+### `fleety` — the CLI
+
+| Command | What it does |
+|---|---|
+| `fleety init <ws-url>` | Save the agent URL (e.g. `ws://host:8787`) for later commands. |
+| `fleety ask "<text>"` | One-shot prompt; prints the reply. Accepts file paths as attachments. |
+| `fleety resume <conversation_id>` | Continue an existing conversation. |
+| `fleety tui` | Interactive terminal UI (streaming chat). |
+| `fleety voice` | Voice conversation (speech-to-text in, spoken reply out). |
+| `fleety status` | Server health: version, uptime, connected devices. |
+| `fleety config <list\|get\|set\|unset\|edit>` | Inspect/edit settings (`~/.fleety/config.toml`); secrets masked. `edit` is interactive. |
+| `fleety audit [device]` | List a device's audit-log entries (tool calls/results/replies). |
+| `fleety rollback <...>` | List backups / restore a file from a backup. |
+| `fleety pair` | Enroll this device with a pairing code (auth-required servers). |
+| `fleety acp` | Run as an [Agent Client Protocol](https://agentclientprotocol.com) agent over stdio (for ACP editors like Zed). Not run by hand — the editor launches it. |
+
+### `fleety-server` — the agent server
+
+Run with **no argument** for a foreground dev run (Ctrl+C to stop). The lifecycle
+verbs register/run it as a background service:
+
+| Command | What it does |
+|---|---|
+| `fleety-server up` | install + enable + start (one shot, `docker compose up -d` style). |
+| `fleety-server down` | stop the running service. |
+| `fleety-server install` / `uninstall` | register / remove the OS service (install also enables boot autostart). |
+| `fleety-server start` / `stop` / `restart` | run now / stop now / restart (restart defers until idle — never interrupts a turn). |
+| `fleety-server enable` / `disable` | turn boot autostart on / off. |
+| `fleety-server status` | running? autostart on? |
+| `fleety-server run-service` | internal: the entry point the service manager starts. Not for manual use. |
+
+> On Windows, `install`/`uninstall` need a one-time **Administrator** terminal.
+
+### `fleetyd` — the device daemon
+
+Run with **no argument** to connect in the foreground. Same lifecycle verbs as the
+server, plus self-update:
+
+| Command | What it does |
+|---|---|
+| `fleetyd install` / `uninstall` | register / remove the daemon service (install leaves autostart off until `enable`). |
+| `fleetyd start` / `stop` / `restart` / `enable` / `disable` / `status` | as above (restart defers until any running on-device tool finishes). |
+| `fleetyd update` | self-update to the latest release (also refreshes the `fleety-insyra` sidecar). |
+| `fleetyd run-service` | internal service entry point. |
+
+Configuration for all three is environment-first (`FLEETY_*`) with a `config.toml`
+fallback — see the **full reference** in [`docs/env.md`](docs/env.md).
 
 ## Design docs
 
