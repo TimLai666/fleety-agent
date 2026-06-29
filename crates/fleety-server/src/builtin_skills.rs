@@ -17,10 +17,10 @@ use agent_core::{CoreError, Result};
 /// uses that `description`, followed by the Fleety usage note and the upstream
 /// DSL reference.
 const INSYRA_HEADER: &str = "---\n\
-name: use-insyra-cli\n\
+name: fleety-use-insyra-dsl\n\
 description: Use the Insyra DSL (via the insyra_exec tool) for ALL statistics and data analysis — data cleaning, DataList/DataTable transforms, CSV/Excel/Parquet I/O, column formulas, statistical analysis, and charts. This is the default for any data-analysis or statistics task, regardless of language or stack.\n\
 ---\n\n\
-# use-insyra-cli\n\n\
+# fleety-use-insyra-dsl\n\n\
 > **In Fleety, run the Insyra DSL through the `insyra_exec` tool — there is no `insyra` shell command here.** \
 Pass one DSL line as `command`, a multi-line `.isr` program as `script`, and a `session` name to keep variables/data across calls; \
 `save <var> <file>` writes results into the workspace (read them back with `read_file`). \
@@ -32,16 +32,16 @@ The upstream reference below describes a CLI/REPL — ignore the install/REPL pa
 /// empty header the body's own first line is used.
 const SKILLS: &[(&str, &str, &str)] = &[
     (
-        "use-insyra-cli",
+        "fleety-use-insyra-dsl",
         INSYRA_HEADER,
-        include_str!("../builtin-skills/use-insyra-cli/SKILL.upstream.md"),
+        include_str!("../builtin-skills/fleety-use-insyra-dsl/SKILL.upstream.md"),
     ),
     (
         // Fleety-native adaptation of the upstream skill-creator: build/improve
         // authored skills via the `skill_*` tools (no eval-viewer / packaging).
-        "skill-creator",
+        "fleety-skill-creator",
         "",
-        include_str!("../builtin-skills/skill-creator/SKILL.md"),
+        include_str!("../builtin-skills/fleety-skill-creator/SKILL.md"),
     ),
 ];
 
@@ -71,10 +71,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fleety-bskill-{}", uuid::Uuid::new_v4()));
         seed(&dir).expect("seed");
         let content =
-            std::fs::read_to_string(dir.join("use-insyra-cli").join("SKILL.md")).expect("read");
+            std::fs::read_to_string(dir.join("fleety-use-insyra-dsl").join("SKILL.md")).expect("read");
         // Opens with Agent Skills frontmatter (name + description)...
         assert!(content.starts_with("---"));
-        assert!(content.contains("name: use-insyra-cli"));
+        assert!(content.contains("name: fleety-use-insyra-dsl"));
         assert!(content.contains("insyra_exec"));
         // ...followed by the upstream DSL reference.
         assert!(content.contains(".isr"));
@@ -86,11 +86,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fleety-bskill-{}", uuid::Uuid::new_v4()));
         seed(&dir).expect("seed");
         let content =
-            std::fs::read_to_string(dir.join("skill-creator").join("SKILL.md")).expect("read");
+            std::fs::read_to_string(dir.join("fleety-skill-creator").join("SKILL.md")).expect("read");
         // Opens with Agent Skills frontmatter; body teaches the Fleety skill_*
         // workflow, not the upstream eval-viewer machinery.
         assert!(content.starts_with("---"));
-        assert!(content.contains("name: skill-creator"));
+        assert!(content.contains("name: fleety-skill-creator"));
         assert!(content.contains("skill_write_file"));
         assert!(content.contains("authored"));
         let _ = std::fs::remove_dir_all(&dir);

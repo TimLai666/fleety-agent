@@ -31,7 +31,7 @@ code:
   - docs/env.md
   - prompts/protocol.md
   - prompts/rules.md
-  - crates/fleety-server/builtin-skills/skill-creator/SKILL.md
+  - crates/fleety-server/builtin-skills/fleety-skill-creator/SKILL.md
   - crates/fleety-server/src/skills.rs
   - crates/fleety-server/src/conn.rs
   - docs/tools.md
@@ -61,7 +61,7 @@ code:
   - docs/env.md
   - prompts/protocol.md
   - prompts/rules.md
-  - crates/fleety-server/builtin-skills/skill-creator/SKILL.md
+  - crates/fleety-server/builtin-skills/fleety-skill-creator/SKILL.md
   - crates/fleety-server/src/skills.rs
   - crates/fleety-server/src/conn.rs
   - docs/tools.md
@@ -91,7 +91,7 @@ code:
   - docs/env.md
   - prompts/protocol.md
   - prompts/rules.md
-  - crates/fleety-server/builtin-skills/skill-creator/SKILL.md
+  - crates/fleety-server/builtin-skills/fleety-skill-creator/SKILL.md
   - crates/fleety-server/src/skills.rs
   - crates/fleety-server/src/conn.rs
   - docs/tools.md
@@ -115,7 +115,7 @@ code:
   - docs/env.md
   - prompts/protocol.md
   - prompts/rules.md
-  - crates/fleety-server/builtin-skills/skill-creator/SKILL.md
+  - crates/fleety-server/builtin-skills/fleety-skill-creator/SKILL.md
   - crates/fleety-server/src/skills.rs
   - crates/fleety-server/src/conn.rs
   - docs/tools.md

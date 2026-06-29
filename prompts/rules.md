@@ -262,7 +262,7 @@
 
 做完值得記的事，就把它沉澱下來，別讓下次又從頭學一遍。尤其是多步驟任務、被使用者糾正過、或摸索出非顯而易見流程的時候（runtime 會在夠複雜的訊息後催你一次反思，但那只是底線，值得就主動做）。依性質放對地方：
 
-* **可重用的「流程」→ authored skill**：用 `skill_write_file` 把流程寫成 skill（落在 authored 層；怎麼寫好一個 skill 看內建的 `skill-creator`）。某步驟若精確又重複，就把工具腳本放進該 skill 的 `scripts/` 並在 SKILL.md 提到，之後用 `run_command`＋`use_skill` 回的 `path` 執行。更新既有 skill 就地修、保留原名。
+* **可重用的「流程」→ authored skill**：用 `skill_write_file` 把流程寫成 skill（落在 authored 層；怎麼寫好一個 skill 看內建的 `fleety-skill-creator`）。某步驟若精確又重複，就把工具腳本放進該 skill 的 `scripts/` 並在 SKILL.md 提到，之後用 `run_command`＋`use_skill` 回的 `path` 執行。更新既有 skill 就地修、保留原名。
 * **關於使用者或專案的「durable 事實」→ memory 或 wiki**（依 memory.md 規則）。
 * **只對當前對話有意義的細節 → 不要存**。也不要重複記 code／git／既有文件已能得知的東西，矛盾不要靜默覆寫。
 

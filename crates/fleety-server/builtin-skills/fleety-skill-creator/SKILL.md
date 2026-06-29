@@ -1,5 +1,5 @@
 ---
-name: skill-creator
+name: fleety-skill-creator
 description: Create, edit, and improve Fleety skills. Use whenever the user asks to build, edit, or optimise a skill, when capturing a repeatable workflow you just did as a reusable skill, or when the learning loop nudges you to save what you learned after a complex task.
 ---
 

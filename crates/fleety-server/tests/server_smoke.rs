@@ -38,7 +38,7 @@ fn invalid_bind_exits_after_startup_setup() {
         .0
         .join("skills")
         .join("builtin")
-        .join("use-insyra-cli")
+        .join("fleety-use-insyra-dsl")
         .join("SKILL.md")
         .is_file());
 }

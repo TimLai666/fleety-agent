@@ -38,8 +38,8 @@ no Fleety crate). This file holds things that aren't derivable from the code.
 **Before cutting a release, update the bundled Insyra — both the library and the
 skill.** The `fleety-insyra` sidecar ([`sidecars/fleety-insyra`](sidecars/fleety-insyra))
 embeds `github.com/HazelnutParadise/insyra`, and `fleety-server` embeds the
-upstream `use-insyra-cli` skill at
-[`crates/fleety-server/builtin-skills/use-insyra-cli/SKILL.upstream.md`](crates/fleety-server/builtin-skills/use-insyra-cli/SKILL.upstream.md).
+upstream Insyra skill (vendored as the `fleety-use-insyra-dsl` builtin) at
+[`crates/fleety-server/builtin-skills/fleety-use-insyra-dsl/SKILL.upstream.md`](crates/fleety-server/builtin-skills/fleety-use-insyra-dsl/SKILL.upstream.md).
 We want releases to ship the latest of both, kept in lockstep. CI's release
 workflow does this automatically (`go get -u …@latest && go mod tidy`, then
 `curl` the skill from the Insyra repo at the resolved version, then build +

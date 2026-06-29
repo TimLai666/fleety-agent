@@ -197,7 +197,7 @@ tool="insyra_exec", args={…})`.
 
 > Backed by the `fleety-insyra` Go sidecar that wraps Insyra's `engine/dsl`,
 > kept alive per session, with named environments persisted under
-> `<root>/.insyra`. Load the built-in `use-insyra-cli` skill for the full
+> `<root>/.insyra`. Load the built-in `fleety-use-insyra-dsl` skill for the full
 > `.isr` DSL command reference. Resolved via `FLEETY_INSYRA_BIN` → beside the
 > exe → `PATH`. fleetyd auto-provisions it on `install` / `update`.
 
@@ -462,7 +462,7 @@ so the surface is complete.
 | Sidecar | Owns | Provisioned by |
 |---|---|---|
 | `fleety-insyra` (Go) | `insyra_exec` over NDJSON | `fleetyd install` / `fleetyd update` |
-| `use-insyra-cli` (built-in skill, shipped in-binary) | DSL reference for `insyra_exec` | `builtin_skills::seed` at server boot |
+| `fleety-use-insyra-dsl` (built-in skill, shipped in-binary) | DSL reference for `insyra_exec` | `builtin_skills::seed` at server boot |
 
 ## Risk class → policy (summary)
 

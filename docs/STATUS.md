@@ -166,7 +166,7 @@ is on `main`; see commit history for the exact change.
 
 ### Built-ins shipped in the binary
 
-- **`builtin_skills::seed`** — embeds `use-insyra-cli/SKILL.upstream.md` (kept
+- **`builtin_skills::seed`** — embeds `fleety-use-insyra-dsl/SKILL.upstream.md` (kept
   lockstep with the insyra release via CI).
 - **Insyra DSL via Go sidecar** — `fleety-insyra` provisioned onto each
   device by `fleetyd install/update` from the per-target asset.
