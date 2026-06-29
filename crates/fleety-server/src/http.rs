@@ -207,12 +207,29 @@ async fn sse_handler(
         conn_state.sse_sessions.lock().await.remove(&conn_session);
     });
 
-    // Stream outbound frames as SSE `data:` events; axum's keep-alive sends a
-    // periodic comment so proxies don't drop an idle stream (half-open guard).
-    let events = stream::unfold(out_rx, |mut rx| async move {
-        rx.recv()
-            .await
-            .map(|text| (Ok::<Event, std::convert::Infallible>(Event::default().data(text)), rx))
+    // When this SSE stream ends or is dropped (client gone), reclaim the session
+    // so a vanished client doesn't leak it. axum's keep-alive writes a periodic
+    // comment, so a dead client surfaces (the write fails, the stream is dropped)
+    // within the keep-alive interval even when the connection is otherwise idle.
+    let guard = SessionGuard {
+        sessions: state.sse_sessions.clone(),
+        session: session.clone(),
+    };
+    // Stream outbound frames as SSE `data:` events. Tag each event that carries a
+    // conversation `seq` with that seq as the SSE `id`, so a reconnecting client
+    // can resume from `Last-Event-ID` (or send a `Resume` with the same value) and
+    // the server replays only later events.
+    let events = stream::unfold((out_rx, guard), |(mut rx, guard)| async move {
+        rx.recv().await.map(|text| {
+            let mut event = Event::default().data(&text);
+            if let Some(seq) = serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .and_then(|v| v.get("seq").and_then(serde_json::Value::as_u64))
+            {
+                event = event.id(seq.to_string());
+            }
+            (Ok::<Event, std::convert::Infallible>(event), (rx, guard))
+        })
     });
     Sse::new(events).keep_alive(KeepAlive::default()).into_response()
 }
@@ -249,6 +266,26 @@ fn bearer_header(headers: &HeaderMap) -> Option<String> {
         .get(AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string)
+}
+
+/// Drops a session from the registry when its SSE stream ends or is dropped
+/// (client disconnected). Removing the entry drops the inbound sender, which ends
+/// the connection's `serve` loop, so a vanished client leaks neither the session
+/// nor a parked connection task.
+struct SessionGuard {
+    sessions: SseSessions,
+    session: String,
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        let sessions = Arc::clone(&self.sessions);
+        let session = std::mem::take(&mut self.session);
+        // Removal needs the async lock; do it on the runtime.
+        tokio::spawn(async move {
+            sessions.lock().await.remove(&session);
+        });
+    }
 }
 
 /// Inbound adapter: yields `ClientMsg`s posted to `/send` for this session.
@@ -349,6 +386,174 @@ mod tests {
                 None => panic!("sse stream ended before the expected frame"),
             }
         }
+    }
+
+    /// Dropping a session's stream guard reclaims it from the registry (so a
+    /// vanished SSE client doesn't leak the session).
+    #[tokio::test]
+    async fn session_guard_reclaims_on_drop() {
+        let sessions = new_sse_sessions();
+        let (in_tx, _in_rx) = mpsc::unbounded_channel::<ClientMsg>();
+        sessions.lock().await.insert(
+            "s".into(),
+            SseSession {
+                in_tx,
+                auth_header: None,
+            },
+        );
+        {
+            let _guard = SessionGuard {
+                sessions: Arc::clone(&sessions),
+                session: "s".into(),
+            };
+            assert!(sessions.lock().await.contains_key("s"));
+        } // guard dropped here → spawns removal
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+            if !sessions.lock().await.contains_key("s") {
+                break;
+            }
+        }
+        assert!(
+            !sessions.lock().await.contains_key("s"),
+            "guard should reclaim the session on drop"
+        );
+    }
+
+    /// Read the next complete SSE event block (terminated by a blank line).
+    async fn next_block(resp: &mut reqwest::Response, buf: &mut String) -> String {
+        loop {
+            if let Some(idx) = buf.find("\n\n") {
+                return buf.drain(..idx + 2).collect();
+            }
+            let chunk = timeout(Duration::from_secs(5), resp.chunk())
+                .await
+                .expect("sse read timed out")
+                .expect("sse stream error")
+                .expect("sse stream ended");
+            buf.push_str(&String::from_utf8_lossy(&chunk));
+        }
+    }
+
+    /// SSE events carry the conversation `seq` as their event `id`, and a `Resume`
+    /// posted over SSE+POST replays the prior turn — the building blocks of
+    /// gap-free reconnect.
+    #[tokio::test]
+    async fn sse_tags_seq_and_resumes() {
+        let home = std::env::temp_dir().join(format!("fleety-sseseq-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&home).expect("mk home");
+        let base = serve(test_state(&home)).await;
+        let client = reqwest::Client::new();
+
+        // Session A: run one turn.
+        let mut a = client
+            .get(format!("{base}/sse?session=A"))
+            .send()
+            .await
+            .expect("open A");
+        let mut buf = String::new();
+        let post = |sess: &str, body: String| {
+            client
+                .post(format!("{base}/send?session={sess}"))
+                .body(body)
+        };
+        post(
+            "A",
+            serde_json::to_string(&ClientMsg::Hello {
+                device_id: "seq-dev".into(),
+                protocol: PROTOCOL_VERSION,
+                token: None,
+                pairing_code: None,
+                local_tools_json: None,
+                hostname: None,
+            })
+            .unwrap(),
+        )
+        .send()
+        .await
+        .expect("hello A");
+        let welcome = next_matching(&mut a, &mut buf, |m| matches!(m, ServerMsg::Welcome { .. })).await;
+        let conv = match welcome {
+            ServerMsg::Welcome { conversation_id, .. } => conversation_id,
+            _ => unreachable!(),
+        };
+        post(
+            "A",
+            serde_json::to_string(&ClientMsg::UserMessage {
+                conversation_id: Some(conv.clone()),
+                text: "remember this".into(),
+                origin: Default::default(),
+                attachments: Vec::new(),
+                voice: false,
+                acting_user: None,
+            })
+            .unwrap(),
+        )
+        .send()
+        .await
+        .expect("msg A");
+
+        // Find the Assistant event block and confirm it carries `id: <seq>`.
+        let mut assistant_seq = None;
+        for _ in 0..200 {
+            let block = next_block(&mut a, &mut buf).await;
+            let data = block
+                .lines()
+                .find_map(|l| l.strip_prefix("data:"))
+                .map(str::trim);
+            if let Some(d) = data {
+                if let Ok(ServerMsg::Assistant { seq, .. }) = serde_json::from_str::<ServerMsg>(d) {
+                    assert!(
+                        block.contains(&format!("id:{seq}")) || block.contains(&format!("id: {seq}")),
+                        "assistant event must carry its seq as the SSE id; block was: {block:?}"
+                    );
+                    assistant_seq = Some(seq);
+                    break;
+                }
+            }
+        }
+        assert!(assistant_seq.is_some(), "never saw an Assistant event");
+
+        // Session B: resume the conversation from the start; expect a Replay.
+        let mut b = client
+            .get(format!("{base}/sse?session=B"))
+            .send()
+            .await
+            .expect("open B");
+        let mut buf_b = String::new();
+        post(
+            "B",
+            serde_json::to_string(&ClientMsg::Hello {
+                device_id: "seq-dev".into(),
+                protocol: PROTOCOL_VERSION,
+                token: None,
+                pairing_code: None,
+                local_tools_json: None,
+                hostname: None,
+            })
+            .unwrap(),
+        )
+        .send()
+        .await
+        .expect("hello B");
+        next_matching(&mut b, &mut buf_b, |m| matches!(m, ServerMsg::Welcome { .. })).await;
+        post(
+            "B",
+            serde_json::to_string(&ClientMsg::Resume {
+                conversation_id: conv,
+                after_seq: 0,
+            })
+            .unwrap(),
+        )
+        .send()
+        .await
+        .expect("resume B");
+        let replay = next_matching(&mut b, &mut buf_b, |m| matches!(m, ServerMsg::Replay { .. })).await;
+        if let ServerMsg::Replay { seq, .. } = replay {
+            assert!(seq > 0, "replayed events come after after_seq=0");
+        }
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     /// A full turn over SSE+POST: open the stream, POST Hello, read Welcome, POST a

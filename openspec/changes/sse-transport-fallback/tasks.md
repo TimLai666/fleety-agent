@@ -17,8 +17,8 @@
 
 ## 5. 續傳與 keepalive
 
-- [ ] 5.1 SSE 事件帶 seq,並依 `Last-Event-ID` 或 `Resume{conversation_id, after_seq}` 從該 seq 之後續傳,交付 "Gap-free resumption over SSE";對應設計「斷線續傳重用事件 seq 與 Resume,對應 Last-Event-ID」。先寫失敗測試:client 已收到至 seq N、斷線重連後 server 只送 seq > N、不重不漏。
-- [ ] 5.2 SSE 下行定期送 keepalive comment、server 在下行寫入失敗時回收該 session、client 在逾時無心跳時視為斷線觸發重連,交付 "SSE keepalive and half-open detection";對應設計「SSE keepalive 與半開連線偵測」。驗證:半開逾時觸發重連的單元測試;server 寫入失敗回收 session 的測試。
+- [x] 5.1 SSE 事件帶 seq,並依 `Last-Event-ID` 或 `Resume{conversation_id, after_seq}` 從該 seq 之後續傳,交付 "Gap-free resumption over SSE";對應設計「斷線續傳重用事件 seq 與 Resume,對應 Last-Event-ID」。先寫失敗測試:client 已收到至 seq N、斷線重連後 server 只送 seq > N、不重不漏。
+- [x] 5.2 SSE 下行定期送 keepalive comment、server 在下行寫入失敗時回收該 session、client 在逾時無心跳時視為斷線觸發重連,交付 "SSE keepalive and half-open detection";對應設計「SSE keepalive 與半開連線偵測」。驗證:半開逾時觸發重連的單元測試;server 寫入失敗回收 session 的測試。
 
 ## 6. Client 傳輸層、fallback 與設定
 
