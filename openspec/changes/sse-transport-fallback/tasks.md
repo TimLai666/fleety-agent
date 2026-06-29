@@ -8,8 +8,8 @@
 
 ## 3. SSE+POST 傳輸與 session 關聯
 
-- [ ] 3.1 實作 `GET /sse`(下行 ServerMsg 串流,事件帶對話事件 seq 作為 id)與 `POST /send`(上行單一 ClientMsg),以 session id 關聯兩條 HTTP 請求,交付 "SSE plus POST provides a bidirectional transport via session correlation";對應設計「SSE 下行 + POST 上行,以 session id 關聯兩條請求」。先寫失敗測試:建立 session、開 SSE、POST Hello→收到 Welcome 與串流回覆;另測兩個 session 各自 POST 只路由到自己。
-- [ ] 3.2 讓 SSE+POST 滿足 task 1.1 的 server 傳輸抽象並與 WebSocket 共用同一連線服務迴圈,交付 "Server connection loop is transport-agnostic" 的第二個傳輸實作。驗證:同一最小對話分別經 WebSocket 與 SSE+POST 各跑一次、結果等價的整合測試。
+- [x] 3.1 實作 `GET /sse`(下行 ServerMsg 串流,事件帶對話事件 seq 作為 id)與 `POST /send`(上行單一 ClientMsg),以 session id 關聯兩條 HTTP 請求,交付 "SSE plus POST provides a bidirectional transport via session correlation";對應設計「SSE 下行 + POST 上行,以 session id 關聯兩條請求」。先寫失敗測試:建立 session、開 SSE、POST Hello→收到 Welcome 與串流回覆;另測兩個 session 各自 POST 只路由到自己。
+- [x] 3.2 讓 SSE+POST 滿足 task 1.1 的 server 傳輸抽象並與 WebSocket 共用同一連線服務迴圈,交付 "Server connection loop is transport-agnostic" 的第二個傳輸實作。驗證:同一最小對話分別經 WebSocket 與 SSE+POST 各跑一次、結果等價的整合測試。
 
 ## 4. HTTP 通道認證
 

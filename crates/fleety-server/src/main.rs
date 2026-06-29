@@ -374,6 +374,7 @@ async fn run_server(shutdown: Option<tokio::sync::watch::Receiver<bool>>) {
         handles: Arc::clone(&handles),
         auth: Arc::clone(&auth),
         device_tools: Arc::clone(&device_tools),
+        sse_sessions: http::new_sse_sessions(),
     };
     let app = http::router(state);
     tokio::select! {
