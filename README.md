@@ -130,6 +130,60 @@ See [`docs/env.md`](docs/env.md) for the **full reference** — every
 sidecars, CLI). Includes mDNS discovery, retention / GC, self-update
 polling, and on-device tool routing.
 
+## Connecting & configuring
+
+### Point the CLI at a server
+
+`fleety` resolves the server URL in this order:
+
+1. `FLEETY_AGENT_URL` (env), else
+2. the URL saved by `fleety init <ws-url>` (in `~/.fleety/config.json`), else
+3. mDNS discovery on the LAN (a short 2 s probe), else
+4. the local default `ws://127.0.0.1:8787`.
+
+So on one machine `fleety tui` just works; for a remote server run
+`fleety init ws://host:8787` once and every later command uses it. If the server
+requires auth (`FLEETY_REQUIRE_AUTH=1`), enroll this device with
+`fleety pair <code>` — the code comes from `pair_create` on an already-paired
+device, or the server console for the very first device.
+
+### Configure the model (server side)
+
+The server talks to any OpenAI-compatible endpoint (or a native Gemini one).
+Three ways, in increasing power:
+
+1. **Env (quickest)** — `FLEETY_MODEL_BASE_URL` + `FLEETY_MODEL` (+ optional
+   `FLEETY_MODEL_KEY`, `FLEETY_MODEL_STREAM=1`). With none set the server echoes
+   (an offline stub), so it always boots.
+2. **Persisted config** — `fleety-server config set FLEETY_MODEL <name>` (plus
+   `… set FLEETY_MODEL_BASE_URL …` / `… set FLEETY_MODEL_KEY …`). Stored in the
+   server host's `~/.fleety/config.toml` and seeded into the environment at boot
+   (an explicit env var still wins). A cheaper economy tier for subagents lives
+   in the `FLEETY_CHEAP_MODEL_*` twins.
+3. **Named provider pool (`providers.toml`)** — when you have **several accounts
+   or endpoints** of the same model (e.g. multiple Codex accounts). Define
+   `[[provider]]` entries, pool them in a `[[group]]` with a `round_robin`
+   (spread quota) or `failover` (primary + backups) strategy, and map roles
+   (`main` / `cheap` / any subagent tier) to a provider or group. On any error
+   the pool moves to the next member. Absent or broken → it falls back to the env
+   vars above, so zero-config behavior is unchanged. See
+   [`docs/env.md`](docs/env.md#named-provider-pool-providerstoml).
+
+### Edit config interactively
+
+On a TTY:
+
+- `fleety config edit` — edit the flat `FLEETY_*` settings (ratatui list; secrets
+  masked; line-based fallback when not a TTY).
+- `fleety config provider edit` — list and edit `providers.toml`: add/remove
+  providers, set a group's members + strategy, bind roles. Saving runs the same
+  validation + atomic write as the subcommands.
+
+Non-interactively, manage the pool with
+`config provider|group|role <…>` (below). `fleety-server config …` and
+`fleetyd config …` expose the **same** surface, applied on the host where each
+binary runs.
+
 ## Command reference
 
 Three binaries. The **CLI** (`fleety`) is what you talk to the agent with; the
@@ -148,7 +202,8 @@ launchd / Windows SCM).
 | `fleety tui` | Interactive terminal UI (streaming chat). |
 | `fleety voice` | Voice conversation (speech-to-text in, spoken reply out). |
 | `fleety status` | Server health: version, uptime, connected devices. |
-| `fleety config <list\|get\|set\|unset\|edit>` | Inspect/edit settings (`~/.fleety/config.toml`); secrets masked. `edit` opens an interactive screen (ratatui list on a TTY, line-based otherwise). |
+| `fleety config <list\|get\|set\|unset\|edit>` | Inspect/edit flat settings (`~/.fleety/config.toml`); secrets masked. `edit` opens an interactive screen (ratatui list on a TTY, line-based otherwise). |
+| `fleety config provider\|group\|role <…>` | Manage the named provider pool (`providers.toml`): `provider add\|set\|remove\|list`, `group set\|remove\|list`, `role set\|unset\|list`. `config provider edit` opens an interactive editor on a TTY. |
 | `fleety audit [device]` | List a device's audit-log entries (tool calls/results/replies). |
 | `fleety rollback <...>` | List backups / restore a file from a backup. |
 | `fleety pair` | Enroll this device with a pairing code (auth-required servers). |
@@ -169,7 +224,7 @@ verbs register/run it as a background service:
 | `fleety-server start` / `stop` / `restart` | run now / stop now / restart (restart defers until idle — never interrupts a turn). |
 | `fleety-server enable` / `disable` | turn boot autostart on / off. |
 | `fleety-server status` | running? autostart on? |
-| `fleety-server config <list\|get\|set\|unset\|edit>` | Inspect/edit **this host's** settings (e.g. `set FLEETY_MODEL …`, `set FLEETY_TOKEN …`); same surface as `fleety config`, applied where the server boots. |
+| `fleety-server config <list\|get\|set\|unset\|edit>` | Inspect/edit **this host's** settings (e.g. `set FLEETY_MODEL …`, `set FLEETY_TOKEN …`); also `config provider\|group\|role …` for the provider pool. Same surface as `fleety config`, applied where the server boots. |
 | `fleety-server run-service` | internal: the entry point the service manager starts. Not for manual use. |
 
 > On Windows, `install`/`uninstall` need a one-time **Administrator** terminal.
@@ -183,7 +238,7 @@ server, plus self-update:
 |---|---|
 | `fleetyd install` / `uninstall` | register / remove the daemon service (install leaves autostart off until `enable`). |
 | `fleetyd start` / `stop` / `restart` / `enable` / `disable` / `status` | as above (restart defers until any running on-device tool finishes). |
-| `fleetyd config <list\|get\|set\|unset\|edit>` | Inspect/edit **this host's** settings; same surface as `fleety config`. |
+| `fleetyd config <list\|get\|set\|unset\|edit>` | Inspect/edit **this host's** settings (incl. `config provider\|group\|role …`); same surface as `fleety config`. |
 | `fleetyd update` | self-update to the latest release (also refreshes the `fleety-insyra` sidecar). For a host-wide update of all components, prefer `fleety update`. |
 | `fleetyd run-service` | internal service entry point. |
 
