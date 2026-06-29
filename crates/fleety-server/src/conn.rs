@@ -377,6 +377,7 @@ async fn serve(
             conversation_id: default_conversation.clone(),
             protocol: PROTOCOL_VERSION,
             server_version: agent_core::VERSION.to_string(),
+            audio_input: provider.capabilities().audio,
             token: minted_token,
         },
     )?;

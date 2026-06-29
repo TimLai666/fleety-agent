@@ -723,6 +723,26 @@ async fn ask(text: String, attachments: Vec<WireAttachment>) -> Result<()> {
 /// `voice` flag on, prints the reply, and speaks the spoken channel aloud. The
 /// agent only produces a spoken version on the terminal turn, so one summary is
 /// read per completed request, not one per intermediate step.
+/// Capture one utterance as text: OS/Whisper dictation if available, else typed.
+/// `None` means the input stream ended — stop the voice loop.
+fn capture_voice_text() -> Option<String> {
+    match voice::listen() {
+        Some(spoken) => {
+            println!("you: {spoken}");
+            Some(spoken)
+        }
+        None => {
+            print!("(dictation unavailable — type your message) > ");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            let mut line = String::new();
+            if std::io::stdin().read_line(&mut line).is_err() {
+                return None;
+            }
+            Some(line.trim().to_string())
+        }
+    }
+}
+
 async fn voice_chat() -> Result<()> {
     let url = agent_url();
     let (mut tx, mut rx) = transport::connect(&url, saved_token().as_deref())
@@ -730,36 +750,51 @@ async fn voice_chat() -> Result<()> {
         .split();
 
     send(&mut tx, &hello(None)).await?;
-    let conversation = match recv(&mut rx).await? {
+    let (conversation, audio_input) = match recv(&mut rx).await? {
         Some(ServerMsg::Welcome {
-            conversation_id, ..
-        }) => conversation_id,
+            conversation_id,
+            audio_input,
+            ..
+        }) => (conversation_id, audio_input),
         other => {
             return Err(CoreError::Provider(format!(
                 "expected welcome, got {other:?}"
             )))
         }
     };
+    // Decide once: send audio to an audio-capable model, else transcribe locally.
+    let voice_mode = voice::voice_mode(audio_input, voice::voice_audio_setting());
 
     println!("Voice mode — speak your message (say or type 'quit' to exit).");
     loop {
-        // Capture input: OS dictation if available, else fall back to typing.
-        let input = match voice::listen() {
-            Some(spoken) => {
-                println!("you: {spoken}");
-                spoken
-            }
-            None => {
-                print!("(dictation unavailable — type your message) > ");
-                let _ = std::io::Write::flush(&mut std::io::stdout());
-                let mut line = String::new();
-                if std::io::stdin().read_line(&mut line).is_err() {
-                    break;
+        // SendAudio: capture compressed audio and let the model transcribe. If
+        // capture fails / is oversized, fall back to local transcription. Quit is
+        // a text affordance, so audio turns don't run the quit-string check.
+        let (text, attachments): (String, Vec<WireAttachment>) = match voice_mode {
+            voice::VoiceMode::SendAudio => match voice::capture_audio() {
+                Some((bytes, mime)) => {
+                    use base64::Engine;
+                    println!("you: (sent {} bytes of speech audio)", bytes.len());
+                    let att = WireAttachment {
+                        mime: mime.to_string(),
+                        bytes_b64: Some(base64::engine::general_purpose::STANDARD.encode(&bytes)),
+                        url: None,
+                        name: Some("speech.wav".to_string()),
+                    };
+                    (String::new(), vec![att])
                 }
-                line.trim().to_string()
-            }
+                None => match capture_voice_text() {
+                    Some(t) => (t, Vec::new()),
+                    None => break,
+                },
+            },
+            voice::VoiceMode::LocalStt => match capture_voice_text() {
+                Some(t) => (t, Vec::new()),
+                None => break,
+            },
         };
-        if input.is_empty() || input.eq_ignore_ascii_case("quit") {
+        // For text turns, honor an empty/"quit" utterance as exit.
+        if attachments.is_empty() && (text.is_empty() || text.eq_ignore_ascii_case("quit")) {
             break;
         }
 
@@ -767,9 +802,9 @@ async fn voice_chat() -> Result<()> {
             &mut tx,
             &ClientMsg::UserMessage {
                 conversation_id: Some(conversation.clone()),
-                text: input,
+                text,
                 origin: origin(),
-                attachments: Vec::new(),
+                attachments,
                 voice: true,
                 acting_user: None,
             },

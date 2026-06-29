@@ -50,6 +50,8 @@ Read by the `fleety voice` terminal. Microphone capture is built in (via `cpal`)
 | `FLEETY_STT_CMD` | (unset → whisper.cpp) | Transcription command template. `{wav}` and `{model}` are substituted. Unset uses the whisper.cpp default `whisper-cli -m <model> -f <wav> -nt` (which needs `FLEETY_STT_MODEL`). |
 | `FLEETY_STT_MODEL` | (unset) | Path to the transcription model (e.g. a whisper.cpp `ggml-*.bin`). Required when using the default command. |
 | `FLEETY_STT_SECONDS` | `5` | Seconds of microphone audio to record per spoken utterance. |
+| `FLEETY_VOICE_AUDIO` | `auto` | Voice transport. `auto`: send the captured audio to the model when it accepts audio input (the server advertises this on connect), else transcribe locally. `on`: always send audio. `off`: always transcribe locally (the prior behavior). Sent audio is a compact 16 kHz mono WAV; an unknown value is treated as `auto`. |
+| `FLEETY_VOICE_AUDIO_MAX_KB` | `2048` | Max audio payload (KB); a larger capture falls back to local transcription. |
 
 ## Model provider
 

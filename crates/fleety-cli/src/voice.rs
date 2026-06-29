@@ -37,6 +37,88 @@ pub fn listen() -> Option<String> {
     whisper_listen().or_else(os_listen)
 }
 
+/// Voice transport mode from `FLEETY_VOICE_AUDIO`: `auto` (default), `on`, `off`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VoiceAudio {
+    Auto,
+    On,
+    Off,
+}
+
+/// What to do with a spoken utterance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VoiceMode {
+    /// Send the captured audio to the model (it transcribes).
+    SendAudio,
+    /// Transcribe on-device and send text (the existing path).
+    LocalStt,
+}
+
+/// Resolve the voice transport setting from env (unknown values → Auto).
+pub fn voice_audio_setting() -> VoiceAudio {
+    match std::env::var("FLEETY_VOICE_AUDIO")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "on" => VoiceAudio::On,
+        "off" => VoiceAudio::Off,
+        _ => VoiceAudio::Auto,
+    }
+}
+
+/// Decide the voice mode: `on` always sends audio, `off` always transcribes
+/// locally, `auto` sends audio only when the model accepts audio input. Pure.
+pub fn voice_mode(audio_input: bool, setting: VoiceAudio) -> VoiceMode {
+    match setting {
+        VoiceAudio::On => VoiceMode::SendAudio,
+        VoiceAudio::Off => VoiceMode::LocalStt,
+        VoiceAudio::Auto => {
+            if audio_input {
+                VoiceMode::SendAudio
+            } else {
+                VoiceMode::LocalStt
+            }
+        }
+    }
+}
+
+/// Whether an encoded-audio payload is within the configured size cap. Pure.
+pub fn within_limit(len: usize, cap: usize) -> bool {
+    len <= cap
+}
+
+/// Max audio payload bytes before falling back to local STT
+/// (`FLEETY_VOICE_AUDIO_MAX_KB`, default 2048 KB).
+fn audio_size_cap() -> usize {
+    let kb = std::env::var("FLEETY_VOICE_AUDIO_MAX_KB")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(2048);
+    kb * 1024
+}
+
+/// Capture a spoken utterance as a compact 16 kHz mono WAV attachment
+/// `(bytes, mime)`, or `None` when capture fails or the payload exceeds the cap
+/// (the caller then falls back to local transcription).
+pub fn capture_audio() -> Option<(Vec<u8>, &'static str)> {
+    let pcm16 = record_pcm16(stt_seconds())?;
+    if pcm16.is_empty() {
+        return None;
+    }
+    let bytes = wav_bytes_mono16(&pcm16);
+    if !within_limit(bytes.len(), audio_size_cap()) {
+        tracing::warn!(
+            bytes = bytes.len(),
+            "captured audio exceeds cap; falling back to local STT"
+        );
+        return None;
+    }
+    Some((bytes, "audio/wav"))
+}
+
 // --- speech-to-text: record (cpal) + transcribe (whisper.cpp) ---------------
 
 /// Seconds to record per utterance (`FLEETY_STT_SECONDS`, default 5).
@@ -97,6 +179,16 @@ fn record_err(_e: cpal::StreamError) {}
 /// WAV, returning its path. `None` when there is no input device, the format is
 /// unsupported, or nothing was captured. Never panics.
 fn record_wav(seconds: u64) -> Option<PathBuf> {
+    let pcm16 = record_pcm16(seconds)?;
+    let path = std::env::temp_dir().join(format!("fleety-stt-{}.wav", std::process::id()));
+    write_wav_mono16(&path, &pcm16).ok()?;
+    Some(path)
+}
+
+/// Record `seconds` of microphone audio as 16 kHz mono 16-bit PCM samples.
+/// `None` when there is no input device, the format is unsupported, or nothing
+/// was captured. Never panics. Shared by local STT and audio-to-model.
+fn record_pcm16(seconds: u64) -> Option<Vec<i16>> {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
     let host = cpal::default_host();
@@ -161,10 +253,7 @@ fn record_wav(seconds: u64) -> Option<PathBuf> {
         return None;
     }
     let mono = downmix(&samples, channels);
-    let pcm16 = resample_to_16k(&mono, sample_rate);
-    let path = std::env::temp_dir().join(format!("fleety-stt-{}.wav", std::process::id()));
-    write_wav_mono16(&path, &pcm16).ok()?;
-    Some(path)
+    Some(resample_to_16k(&mono, sample_rate))
 }
 
 /// Average interleaved channels down to mono.
@@ -200,33 +289,37 @@ fn to_i16(s: f32) -> i16 {
     (s.clamp(-1.0, 1.0) * 32767.0) as i16
 }
 
-/// Write a minimal 16 kHz mono 16-bit PCM WAV.
-fn write_wav_mono16(path: &Path, samples: &[i16]) -> std::io::Result<()> {
-    use std::io::Write;
+/// Build a minimal 16 kHz mono 16-bit PCM WAV in memory.
+fn wav_bytes_mono16(samples: &[i16]) -> Vec<u8> {
     let sample_rate: u32 = 16_000;
     let channels: u16 = 1;
     let bits: u16 = 16;
     let byte_rate = sample_rate * u32::from(channels) * u32::from(bits) / 8;
     let block_align = channels * bits / 8;
     let data_len = (samples.len() * 2) as u32;
-    let mut f = std::fs::File::create(path)?;
-    f.write_all(b"RIFF")?;
-    f.write_all(&(36 + data_len).to_le_bytes())?;
-    f.write_all(b"WAVE")?;
-    f.write_all(b"fmt ")?;
-    f.write_all(&16u32.to_le_bytes())?;
-    f.write_all(&1u16.to_le_bytes())?; // PCM
-    f.write_all(&channels.to_le_bytes())?;
-    f.write_all(&sample_rate.to_le_bytes())?;
-    f.write_all(&byte_rate.to_le_bytes())?;
-    f.write_all(&block_align.to_le_bytes())?;
-    f.write_all(&bits.to_le_bytes())?;
-    f.write_all(b"data")?;
-    f.write_all(&data_len.to_le_bytes())?;
+    let mut out = Vec::with_capacity(44 + samples.len() * 2);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(36 + data_len).to_le_bytes());
+    out.extend_from_slice(b"WAVE");
+    out.extend_from_slice(b"fmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    out.extend_from_slice(&channels.to_le_bytes());
+    out.extend_from_slice(&sample_rate.to_le_bytes());
+    out.extend_from_slice(&byte_rate.to_le_bytes());
+    out.extend_from_slice(&block_align.to_le_bytes());
+    out.extend_from_slice(&bits.to_le_bytes());
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&data_len.to_le_bytes());
     for s in samples {
-        f.write_all(&s.to_le_bytes())?;
+        out.extend_from_slice(&s.to_le_bytes());
     }
-    Ok(())
+    out
+}
+
+/// Write a minimal 16 kHz mono 16-bit PCM WAV to `path`.
+fn write_wav_mono16(path: &Path, samples: &[i16]) -> std::io::Result<()> {
+    std::fs::write(path, wav_bytes_mono16(samples))
 }
 
 // --- shared command helpers -------------------------------------------------
@@ -346,6 +439,32 @@ mod tests {
                 .expect("template");
         assert_eq!(program, "mywhisper");
         assert_eq!(args, vec!["m.bin".to_string(), "a.wav".to_string()]);
+    }
+
+    #[test]
+    fn voice_mode_decision_table() {
+        // (audio_input, setting) → mode, per the spec example table.
+        assert_eq!(voice_mode(true, VoiceAudio::Auto), VoiceMode::SendAudio);
+        assert_eq!(voice_mode(false, VoiceAudio::Auto), VoiceMode::LocalStt);
+        assert_eq!(voice_mode(false, VoiceAudio::On), VoiceMode::SendAudio);
+        assert_eq!(voice_mode(true, VoiceAudio::Off), VoiceMode::LocalStt);
+    }
+
+    #[test]
+    fn within_limit_bounds() {
+        assert!(within_limit(100, 100));
+        assert!(within_limit(50, 100));
+        assert!(!within_limit(101, 100));
+    }
+
+    #[test]
+    fn wav_bytes_match_file_writer() {
+        let samples = [0i16, 1, -1, 32767, -32768];
+        let bytes = wav_bytes_mono16(&samples);
+        assert_eq!(&bytes[0..4], b"RIFF");
+        assert_eq!(&bytes[8..12], b"WAVE");
+        // 44-byte header + 2 bytes per sample.
+        assert_eq!(bytes.len(), 44 + samples.len() * 2);
     }
 
     #[test]

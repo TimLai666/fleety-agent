@@ -168,6 +168,11 @@ pub enum ServerMsg {
         /// connects to. Additive; `""` when an older server omits it.
         #[serde(default)]
         server_version: String,
+        /// Whether the active model accepts audio input. The voice client uses
+        /// this to decide whether to send compressed audio or transcribe locally.
+        /// Additive; `false` when an older server omits it (→ local STT).
+        #[serde(default)]
+        audio_input: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         token: Option<String>,
     },
@@ -305,14 +310,24 @@ mod tests {
             conversation_id: "c".into(),
             protocol: PROTOCOL_VERSION,
             server_version: "0.3.0".into(),
+            audio_input: true,
             token: None,
         };
         let json = serde_json::to_string(&w).expect("ser");
         assert!(json.contains("\"server_version\":\"0.3.0\""));
-        // An old server's frame (no server_version) still parses → "".
+        assert!(json.contains("\"audio_input\":true"));
+        // An old server's frame (no server_version / audio_input) still parses
+        // → defaults ("" and false → local STT).
         let old = r#"{"type":"welcome","session_id":"s","conversation_id":"c","protocol":0}"#;
         match serde_json::from_str::<ServerMsg>(old).expect("de old") {
-            ServerMsg::Welcome { server_version, .. } => assert_eq!(server_version, ""),
+            ServerMsg::Welcome {
+                server_version,
+                audio_input,
+                ..
+            } => {
+                assert_eq!(server_version, "");
+                assert!(!audio_input);
+            }
             _ => panic!("not welcome"),
         }
     }

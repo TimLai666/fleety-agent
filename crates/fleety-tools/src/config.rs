@@ -162,6 +162,20 @@ pub fn registry() -> &'static [Setting] {
             secret: false,
         },
         Setting {
+            key: "FLEETY_VOICE_AUDIO",
+            scope: Cli,
+            default: "auto",
+            description: "Voice transport: auto (send audio iff model accepts it) / on / off (local STT).",
+            secret: false,
+        },
+        Setting {
+            key: "FLEETY_VOICE_AUDIO_MAX_KB",
+            scope: Cli,
+            default: "2048",
+            description: "Max voice-audio payload (KB) before falling back to local STT.",
+            secret: false,
+        },
+        Setting {
             key: "FLEETY_CHEAP_MODEL",
             scope: Server,
             default: "",
