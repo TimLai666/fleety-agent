@@ -7,7 +7,9 @@
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
-use crate::model::{Message, ModelProvider, ModelResponse, Role, ToolCall, ToolSpec};
+use crate::model::{
+    Message, ModelCapabilities, ModelProvider, ModelResponse, Role, ToolCall, ToolSpec,
+};
 use crate::{CoreError, Result};
 
 /// A provider backed by any OpenAI-compatible `/chat/completions` endpoint.
@@ -18,6 +20,7 @@ pub struct OpenAiCompat {
     client: reqwest::Client,
     stream: bool,
     retry: crate::retry::RetryConfig,
+    caps: ModelCapabilities,
 }
 
 impl OpenAiCompat {
@@ -34,7 +37,15 @@ impl OpenAiCompat {
             client: reqwest::Client::new(),
             stream: false,
             retry: crate::retry::RetryConfig::from_env(),
+            caps: ModelCapabilities::ALL,
         }
+    }
+
+    /// Set the model's input modality capabilities (unsupported attachments
+    /// then degrade to a text note instead of being sent and rejected).
+    pub fn with_capabilities(mut self, caps: ModelCapabilities) -> Self {
+        self.caps = caps;
+        self
     }
 
     /// Request the streaming (`stream: true`) chat-completions API and assemble
@@ -235,6 +246,10 @@ impl ModelProvider for OpenAiCompat {
         }
         Ok(acc.finish())
     }
+
+    fn capabilities(&self) -> ModelCapabilities {
+        self.caps
+    }
 }
 
 impl OpenAiCompat {
@@ -243,7 +258,10 @@ impl OpenAiCompat {
         body.insert("model".to_string(), json!(self.model));
         body.insert(
             "messages".to_string(),
-            json!(messages.iter().map(wire_message).collect::<Vec<_>>()),
+            json!(messages
+                .iter()
+                .map(|m| wire_message(m, self.caps))
+                .collect::<Vec<_>>()),
         );
         if !tools.is_empty() {
             body.insert(
@@ -361,10 +379,10 @@ fn role_str(role: Role) -> &'static str {
     }
 }
 
-fn wire_message(message: &Message) -> Value {
+fn wire_message(message: &Message, caps: ModelCapabilities) -> Value {
     let mut object = Map::new();
     object.insert("role".to_string(), json!(role_str(message.role)));
-    object.insert("content".to_string(), wire_content(message));
+    object.insert("content".to_string(), wire_content(message, caps));
     if !message.tool_calls.is_empty() {
         let calls: Vec<Value> = message
             .tool_calls
@@ -391,7 +409,7 @@ fn wire_message(message: &Message) -> Value {
 /// followed by one `image_url` / `input_audio` part per attachment, routed by
 /// MIME. Unsupported MIME types are dropped with a tracing warning rather
 /// than failing the turn (the model still sees the rest).
-fn wire_content(message: &Message) -> Value {
+fn wire_content(message: &Message, caps: ModelCapabilities) -> Value {
     if message.attachments.is_empty() {
         return message
             .content
@@ -399,6 +417,16 @@ fn wire_content(message: &Message) -> Value {
             .map(|c| json!(c))
             .unwrap_or(Value::Null);
     }
+    // A short text note for an attachment we won't send (model lacks the
+    // capability, or an unknown MIME) — so the model still knows it existed.
+    let note = |att: &crate::model::Attachment| -> Value {
+        let text = match (&att.name, &att.url) {
+            (Some(name), _) => format!("[attachment: {} ({})]", name, att.mime),
+            (None, Some(url)) => format!("[attachment: {} at {}]", att.mime, url),
+            (None, None) => format!("[attachment: {} (omitted)]", att.mime),
+        };
+        json!({ "type": "text", "text": text })
+    };
     let mut parts: Vec<Value> = Vec::new();
     if let Some(text) = &message.content {
         if !text.is_empty() {
@@ -407,7 +435,8 @@ fn wire_content(message: &Message) -> Value {
     }
     for att in &message.attachments {
         let mime = att.mime.to_ascii_lowercase();
-        if mime.starts_with("image/") || mime.starts_with("video/") {
+        let is_visual = mime.starts_with("image/") || mime.starts_with("video/");
+        if is_visual && caps.image {
             // For images this is the standard OpenAI `image_url` part; for video
             // it's how OpenRouter/Gemini wrappers accept clips (a `data:` URL
             // in the same slot). Pure OpenAI rejects video here — that's an
@@ -421,7 +450,7 @@ fn wire_content(message: &Message) -> Value {
                 continue;
             };
             parts.push(json!({ "type": "image_url", "image_url": { "url": url } }));
-        } else if mime.starts_with("audio/") {
+        } else if mime.starts_with("audio/") && caps.audio {
             // `gpt-4o-audio-preview` style: data is bare base64 (no data: prefix),
             // format is the codec hint after the slash (mp3 / wav / ogg / …).
             let Some(b64) = att.bytes_b64.as_ref().or(att.url.as_ref()) else {
@@ -436,7 +465,7 @@ fn wire_content(message: &Message) -> Value {
                 "type": "input_audio",
                 "input_audio": { "data": b64, "format": format },
             }));
-        } else if mime == "application/pdf" {
+        } else if mime == "application/pdf" && caps.pdf {
             // OpenAI's PDF input shape: a `file` part with a data: URL.
             let Some(b64) = &att.bytes_b64 else {
                 tracing::warn!("pdf attachment has no bytes; skipping");
@@ -451,15 +480,11 @@ fn wire_content(message: &Message) -> Value {
             }
             parts.push(json!({ "type": "file", "file": file }));
         } else {
-            // Everything else: surface as a text note so the model still knows
-            // an attachment existed, but we didn't pretend we could send it.
-            tracing::warn!(mime = %att.mime, "attachment mime not routable to a model part; sending as text note");
-            let note = match (&att.name, &att.url) {
-                (Some(name), _) => format!("[attachment: {} ({})]", name, att.mime),
-                (None, Some(url)) => format!("[attachment: {} at {}]", att.mime, url),
-                (None, None) => format!("[attachment: {} (omitted)]", att.mime),
-            };
-            parts.push(json!({ "type": "text", "text": note }));
+            // The model lacks this modality, or the MIME is unknown: surface a
+            // text note so the model still knows an attachment existed, rather
+            // than sending media the endpoint would reject.
+            tracing::warn!(mime = %att.mime, "attachment not sent (model lacks capability or unknown mime); text note");
+            parts.push(note(att));
         }
     }
     if parts.is_empty() {
@@ -550,7 +575,22 @@ mod tests {
     #[test]
     fn wire_content_falls_back_to_string_with_no_attachments() {
         let msg = Message::user("hello");
-        assert_eq!(wire_content(&msg), json!("hello"));
+        assert_eq!(wire_content(&msg, ModelCapabilities::ALL), json!("hello"));
+    }
+
+    #[test]
+    fn wire_content_degrades_image_to_note_for_text_only_model() {
+        let att = Attachment::from_bytes("image/png", b"\x89PNG\r\n");
+        let msg = Message::user_with_attachments("what is this?", vec![att]);
+        let v = wire_content(&msg, ModelCapabilities::TEXT_ONLY);
+        let arr = v.as_array().expect("array");
+        // No image_url part — the image is replaced by a text note.
+        assert!(arr.iter().all(|p| p["type"] != json!("image_url")));
+        assert!(arr.iter().any(|p| p["type"] == json!("text")
+            && p["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("attachment")));
     }
 
     #[test]
@@ -558,7 +598,7 @@ mod tests {
         // Inline image bytes → data: URL in an image_url part.
         let att = Attachment::from_bytes("image/png", b"\x89PNG\r\n");
         let msg = Message::user_with_attachments("what is this?", vec![att]);
-        let v = wire_content(&msg);
+        let v = wire_content(&msg, ModelCapabilities::ALL);
         let arr = v.as_array().expect("array");
         assert_eq!(arr.len(), 2);
         assert_eq!(arr[0]["type"], json!("text"));
@@ -570,7 +610,10 @@ mod tests {
         // External URL → bare URL (no data: prefix).
         let att = Attachment::from_url("image/jpeg", "https://example.com/cat.jpg");
         let msg = Message::user_with_attachments("describe", vec![att]);
-        let arr = wire_content(&msg).as_array().cloned().expect("array");
+        let arr = wire_content(&msg, ModelCapabilities::ALL)
+            .as_array()
+            .cloned()
+            .expect("array");
         assert_eq!(
             arr[1]["image_url"]["url"],
             json!("https://example.com/cat.jpg")
@@ -581,7 +624,10 @@ mod tests {
     fn wire_content_emits_input_audio_for_audio_attachment() {
         let att = Attachment::from_bytes("audio/mp3", b"\xff\xfb\x90");
         let msg = Message::user_with_attachments("transcribe", vec![att]);
-        let arr = wire_content(&msg).as_array().cloned().expect("array");
+        let arr = wire_content(&msg, ModelCapabilities::ALL)
+            .as_array()
+            .cloned()
+            .expect("array");
         assert_eq!(arr[1]["type"], json!("input_audio"));
         assert_eq!(arr[1]["input_audio"]["format"], json!("mp3"));
         assert!(arr[1]["input_audio"]["data"].is_string());
@@ -594,7 +640,10 @@ mod tests {
         // for the user, not a silent text-note degrade.
         let att = Attachment::from_bytes("video/mp4", b"\x00\x00\x00").with_name("clip.mp4");
         let msg = Message::user_with_attachments("look", vec![att]);
-        let arr = wire_content(&msg).as_array().cloned().expect("array");
+        let arr = wire_content(&msg, ModelCapabilities::ALL)
+            .as_array()
+            .cloned()
+            .expect("array");
         assert_eq!(arr[1]["type"], json!("image_url"));
         let url = arr[1]["image_url"]["url"].as_str().expect("url");
         assert!(url.starts_with("data:video/mp4;base64,"));
@@ -604,7 +653,10 @@ mod tests {
     fn wire_content_routes_pdf_through_file_part() {
         let att = Attachment::from_bytes("application/pdf", b"%PDF-1.4").with_name("report.pdf");
         let msg = Message::user_with_attachments("summarise", vec![att]);
-        let arr = wire_content(&msg).as_array().cloned().expect("array");
+        let arr = wire_content(&msg, ModelCapabilities::ALL)
+            .as_array()
+            .cloned()
+            .expect("array");
         assert_eq!(arr[1]["type"], json!("file"));
         assert_eq!(arr[1]["file"]["filename"], json!("report.pdf"));
         assert!(arr[1]["file"]["file_data"]
@@ -617,7 +669,10 @@ mod tests {
     fn wire_content_drops_unknown_mime_into_text_note() {
         let att = Attachment::from_bytes("application/x-weird", b"\x00").with_name("blob.bin");
         let msg = Message::user_with_attachments("look", vec![att]);
-        let arr = wire_content(&msg).as_array().cloned().expect("array");
+        let arr = wire_content(&msg, ModelCapabilities::ALL)
+            .as_array()
+            .cloned()
+            .expect("array");
         assert_eq!(arr[1]["type"], json!("text"));
         assert!(arr[1]["text"].as_str().unwrap_or("").contains("blob.bin"));
     }
@@ -676,7 +731,7 @@ mod tests {
             tool_call_id: None,
             attachments: Vec::new(),
         };
-        let wire = wire_message(&msg);
+        let wire = wire_message(&msg, ModelCapabilities::ALL);
         assert_eq!(wire["role"], json!("assistant"));
         assert_eq!(wire["content"], Value::Null);
         assert_eq!(wire["tool_calls"][0]["function"]["name"], json!("echo"));

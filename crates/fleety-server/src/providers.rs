@@ -33,19 +33,38 @@ pub fn build(prefix: &str) -> Option<Arc<dyn ModelProvider>> {
         .ok()
         .filter(|k| !k.is_empty());
     let stream = std::env::var(format!("{prefix}_STREAM")).as_deref() == Ok("1");
-    if !looks_multimodal(&model) {
-        tracing::warn!(
-            %model, %prefix,
-            "configured model name doesn't match a known multimodal family — \
-             image/audio/video attachments may be rejected or ignored by the provider"
-        );
-    }
+    // Modality capabilities: explicit `{prefix}_MODALITIES` (e.g. "text,image")
+    // wins; otherwise derive from the model-family heuristic. Capable providers
+    // route attachments natively; others degrade unsupported ones to a text note.
+    let caps = match std::env::var(format!("{prefix}_MODALITIES"))
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    {
+        Some(s) => agent_core::model::parse_modalities(&s),
+        None if looks_multimodal(&model) => agent_core::model::ModelCapabilities::ALL,
+        None => {
+            tracing::warn!(
+                %model, %prefix,
+                "model name doesn't match a known multimodal family; treating it as text-only — \
+                 set {prefix}_MODALITIES (e.g. text,image) to override"
+            );
+            agent_core::model::ModelCapabilities::TEXT_ONLY
+        }
+    };
     Some(if agent_core::gemini::looks_like_gemini_model(&model) {
         tracing::info!(%base_url, %model, stream, %prefix, "using native Gemini provider");
-        Arc::new(Gemini::new(base_url, model, key).with_streaming(stream))
+        Arc::new(
+            Gemini::new(base_url, model, key)
+                .with_streaming(stream)
+                .with_capabilities(caps),
+        )
     } else {
         tracing::info!(%base_url, %model, stream, %prefix, "using OpenAI-compatible provider");
-        Arc::new(OpenAiCompat::new(base_url, model, key).with_streaming(stream))
+        Arc::new(
+            OpenAiCompat::new(base_url, model, key)
+                .with_streaming(stream)
+                .with_capabilities(caps),
+        )
     })
 }
 

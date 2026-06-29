@@ -134,6 +134,20 @@ pub fn registry() -> &'static [Setting] {
             secret: false,
         },
         Setting {
+            key: "FLEETY_MODEL_MODALITIES",
+            scope: Server,
+            default: "(heuristic)",
+            description: "Main model input modalities, e.g. text,image,audio,pdf (overrides the name heuristic).",
+            secret: false,
+        },
+        Setting {
+            key: "FLEETY_CHEAP_MODEL_MODALITIES",
+            scope: Server,
+            default: "(heuristic)",
+            description: "Economy model input modalities (same form as FLEETY_MODEL_MODALITIES).",
+            secret: false,
+        },
+        Setting {
             key: "FLEETY_CHEAP_MODEL",
             scope: Server,
             default: "",

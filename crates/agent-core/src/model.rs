@@ -204,6 +204,93 @@ pub trait ModelProvider: Send + Sync {
     ) -> Result<ModelResponse> {
         self.complete(messages, tools).await
     }
+
+    /// Which input modalities this model accepts. The default reports full
+    /// support so existing providers/tests behave exactly as before; real
+    /// providers report their configured/derived capabilities so unsupported
+    /// attachments degrade gracefully instead of being sent and rejected.
+    fn capabilities(&self) -> ModelCapabilities {
+        ModelCapabilities::ALL
+    }
+}
+
+/// A non-text input modality an attachment can carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Modality {
+    Image,
+    Audio,
+    Pdf,
+    /// An unrecognized MIME type — always degraded to a text note.
+    Other,
+}
+
+/// Classify an attachment's MIME type into a modality.
+pub fn mime_modality(mime: &str) -> Modality {
+    let m = mime.to_ascii_lowercase();
+    if m.starts_with("image/") {
+        Modality::Image
+    } else if m.starts_with("audio/") {
+        Modality::Audio
+    } else if m == "application/pdf" {
+        Modality::Pdf
+    } else {
+        Modality::Other
+    }
+}
+
+/// Which input modalities a model accepts (text is always supported).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelCapabilities {
+    pub image: bool,
+    pub audio: bool,
+    pub pdf: bool,
+}
+
+impl ModelCapabilities {
+    /// Full multimodal support.
+    pub const ALL: Self = Self {
+        image: true,
+        audio: true,
+        pdf: true,
+    };
+    /// Text only — no media attachments.
+    pub const TEXT_ONLY: Self = Self {
+        image: false,
+        audio: false,
+        pdf: false,
+    };
+
+    /// Whether this model accepts the given modality. `Other` (unknown MIME) is
+    /// never "supported" — it always degrades to a text note.
+    pub fn supports(&self, m: Modality) -> bool {
+        match m {
+            Modality::Image => self.image,
+            Modality::Audio => self.audio,
+            Modality::Pdf => self.pdf,
+            Modality::Other => false,
+        }
+    }
+}
+
+impl Default for ModelCapabilities {
+    fn default() -> Self {
+        Self::ALL
+    }
+}
+
+/// Parse a comma-separated modality list (e.g. `text,image`) into capabilities.
+/// `text` is implicit; unknown tokens are ignored; an empty string is text-only.
+pub fn parse_modalities(s: &str) -> ModelCapabilities {
+    let mut caps = ModelCapabilities::TEXT_ONLY;
+    for tok in s.split(',') {
+        match tok.trim().to_ascii_lowercase().as_str() {
+            "image" => caps.image = true,
+            "audio" => caps.audio = true,
+            "pdf" => caps.pdf = true,
+            _ => {} // "text" / "" / unknown
+        }
+    }
+    caps
 }
 
 /// A scripted provider for tests and demos: returns queued responses in order.
@@ -229,5 +316,38 @@ impl ModelProvider for MockProvider {
         queue.pop_front().ok_or_else(|| {
             CoreError::Provider("mock provider ran out of scripted responses".to_string())
         })
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    #[test]
+    fn mime_modality_classifies() {
+        assert_eq!(mime_modality("image/png"), Modality::Image);
+        assert_eq!(mime_modality("AUDIO/MP3"), Modality::Audio);
+        assert_eq!(mime_modality("application/pdf"), Modality::Pdf);
+        assert_eq!(mime_modality("text/csv"), Modality::Other);
+    }
+
+    #[test]
+    fn parse_modalities_table() {
+        let c = parse_modalities("text,image");
+        assert!(c.image && !c.audio && !c.pdf);
+        let all = parse_modalities("text,image,audio,pdf");
+        assert!(all.image && all.audio && all.pdf);
+        let empty = parse_modalities("");
+        assert!(!empty.image && !empty.audio && !empty.pdf);
+        let bogus = parse_modalities("text,bogus");
+        assert!(!bogus.image && !bogus.audio && !bogus.pdf);
+    }
+
+    #[test]
+    fn supports_respects_flags_and_other() {
+        let c = parse_modalities("text,image");
+        assert!(c.supports(Modality::Image));
+        assert!(!c.supports(Modality::Audio));
+        assert!(!c.supports(Modality::Other));
     }
 }

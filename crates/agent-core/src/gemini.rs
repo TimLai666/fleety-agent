@@ -20,7 +20,9 @@
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
-use crate::model::{Message, ModelProvider, ModelResponse, Role, ToolCall, ToolSpec};
+use crate::model::{
+    Message, ModelCapabilities, ModelProvider, ModelResponse, Role, ToolCall, ToolSpec,
+};
 use crate::{CoreError, Result};
 
 /// Default base URL for the Gemini API. Override via `FLEETY_MODEL_BASE_URL`.
@@ -33,6 +35,7 @@ pub struct Gemini {
     client: reqwest::Client,
     stream: bool,
     retry: crate::retry::RetryConfig,
+    caps: ModelCapabilities,
 }
 
 impl Gemini {
@@ -52,11 +55,19 @@ impl Gemini {
             client: reqwest::Client::new(),
             stream: false,
             retry: crate::retry::RetryConfig::from_env(),
+            caps: ModelCapabilities::ALL,
         }
     }
 
     pub fn with_streaming(mut self, stream: bool) -> Self {
         self.stream = stream;
+        self
+    }
+
+    /// Set the model's input modality capabilities (unsupported attachments
+    /// then degrade to a text note instead of being sent and rejected).
+    pub fn with_capabilities(mut self, caps: ModelCapabilities) -> Self {
+        self.caps = caps;
         self
     }
 
@@ -82,7 +93,7 @@ impl Gemini {
 #[async_trait::async_trait]
 impl ModelProvider for Gemini {
     async fn complete(&self, messages: &[Message], tools: &[ToolSpec]) -> Result<ModelResponse> {
-        let body = build_request(messages, tools, &self.model);
+        let body = build_request(messages, tools, &self.model, self.caps);
         let text = crate::retry::run_with_retry(&self.retry, || {
             let request = self.client.post(self.endpoint(false)).json(&body);
             async move {
@@ -136,6 +147,10 @@ impl ModelProvider for Gemini {
         parse_response(&parsed)
     }
 
+    fn capabilities(&self) -> ModelCapabilities {
+        self.caps
+    }
+
     async fn complete_streaming(
         &self,
         messages: &[Message],
@@ -145,7 +160,7 @@ impl ModelProvider for Gemini {
         if !self.stream {
             return self.complete(messages, tools).await;
         }
-        let body = build_request(messages, tools, &self.model);
+        let body = build_request(messages, tools, &self.model, self.caps);
         // Retry only the connection + initial status, before any delta is emitted.
         let response = crate::retry::run_with_retry(&self.retry, || {
             let request = self.client.post(self.endpoint(true)).json(&body);
@@ -232,9 +247,14 @@ impl ModelProvider for Gemini {
 /// `contents` array by turn (alternating user/model roles) with a separate
 /// `tools` block. The `systemInstruction` field carries the system prompt
 /// once at request level, not as a first-class role in `contents`.
-fn build_request(messages: &[Message], tools: &[ToolSpec], _model: &str) -> Value {
+fn build_request(
+    messages: &[Message],
+    tools: &[ToolSpec],
+    _model: &str,
+    caps: ModelCapabilities,
+) -> Value {
     let mut body = Map::new();
-    let (system, contents) = split_messages(messages);
+    let (system, contents) = split_messages(messages, caps);
     if let Some(sys) = system {
         body.insert(
             "systemInstruction".to_string(),
@@ -264,7 +284,7 @@ fn build_request(messages: &[Message], tools: &[ToolSpec], _model: &str) -> Valu
 /// Split a flat `[Message]` into `(systemPrompt, contents[])`. Gemini doesn't
 /// have a system role in `contents`; the system prompt rides in
 /// `systemInstruction` and the rest becomes alternating user/model parts.
-fn split_messages(messages: &[Message]) -> (Option<String>, Vec<Value>) {
+fn split_messages(messages: &[Message], caps: ModelCapabilities) -> (Option<String>, Vec<Value>) {
     let mut system: Option<String> = None;
     let mut contents = Vec::new();
     for msg in messages {
@@ -279,7 +299,7 @@ fn split_messages(messages: &[Message]) -> (Option<String>, Vec<Value>) {
             Role::User => {
                 contents.push(json!({
                     "role": "user",
-                    "parts": build_parts(msg),
+                    "parts": build_parts(msg, caps),
                 }));
             }
             Role::Assistant => {
@@ -322,7 +342,7 @@ fn split_messages(messages: &[Message]) -> (Option<String>, Vec<Value>) {
 
 /// Build the `parts` array for a user message: text first, then one
 /// `inline_data` (or `file_data`) part per attachment, routed by MIME.
-fn build_parts(msg: &Message) -> Vec<Value> {
+fn build_parts(msg: &Message, caps: ModelCapabilities) -> Vec<Value> {
     let mut parts: Vec<Value> = Vec::new();
     if let Some(text) = &msg.content {
         if !text.is_empty() {
@@ -330,6 +350,25 @@ fn build_parts(msg: &Message) -> Vec<Value> {
         }
     }
     for att in &msg.attachments {
+        // Gate the known modalities by the model's capabilities: a known
+        // modality this model can't accept (image/video → image, audio, pdf)
+        // becomes a text note rather than media the endpoint would reject.
+        // Unknown MIMEs keep Gemini's permissive `inline_data` routing.
+        let mime = att.mime.to_ascii_lowercase();
+        let visual = mime.starts_with("image/") || mime.starts_with("video/");
+        let unsupported_known = (visual && !caps.image)
+            || (mime.starts_with("audio/") && !caps.audio)
+            || (mime == "application/pdf" && !caps.pdf);
+        if unsupported_known {
+            let text = match (&att.name, &att.url) {
+                (Some(name), _) => format!("[attachment: {} ({})]", name, att.mime),
+                (None, Some(url)) => format!("[attachment: {} at {}]", att.mime, url),
+                (None, None) => format!("[attachment: {} (omitted)]", att.mime),
+            };
+            tracing::warn!(mime = %att.mime, "attachment not sent (model lacks capability); text note");
+            parts.push(json!({ "text": text }));
+            continue;
+        }
         // Gemini accepts `inline_data` with raw base64 bytes for image / audio
         // / video / pdf alike — same shape, different mime. URL-only attachments
         // ride along as `file_data { file_uri }` (requires Files API to have
@@ -498,7 +537,7 @@ mod tests {
             Message::user("hi"),
             Message::assistant("hello"),
         ];
-        let body = build_request(&msgs, &[], "gemini-1.5-pro");
+        let body = build_request(&msgs, &[], "gemini-1.5-pro", ModelCapabilities::ALL);
         assert_eq!(
             body["systemInstruction"]["parts"][0]["text"],
             json!("be terse")
@@ -507,6 +546,23 @@ mod tests {
         assert_eq!(contents[0]["role"], json!("user"));
         assert_eq!(contents[0]["parts"][0]["text"], json!("hi"));
         assert_eq!(contents[1]["role"], json!("model"));
+    }
+
+    #[test]
+    fn text_only_caps_degrade_image_to_note() {
+        let msg = Message::user_with_attachments(
+            "look",
+            vec![Attachment::from_bytes("image/png", b"\x89PNG")],
+        );
+        let body = build_request(&[msg], &[], "gemini-1.5-pro", ModelCapabilities::TEXT_ONLY);
+        let parts = body["contents"][0]["parts"].as_array().expect("parts");
+        // No inline_data image part — replaced by a text note.
+        assert!(parts.iter().all(|p| p.get("inline_data").is_none()));
+        assert!(parts.iter().any(|p| p
+            .get("text")
+            .and_then(|t| t.as_str())
+            .unwrap_or_default()
+            .contains("attachment")));
     }
 
     #[test]
@@ -521,7 +577,7 @@ mod tests {
                 Attachment::from_url("video/mp4", "gs://bucket/clip.mp4"),
             ],
         );
-        let body = build_request(&[msg], &[], "gemini-1.5-pro");
+        let body = build_request(&[msg], &[], "gemini-1.5-pro", ModelCapabilities::ALL);
         let parts = body["contents"][0]["parts"].as_array().expect("parts");
         // text + 4 inline_data + 1 file_data = 6
         assert_eq!(parts.len(), 6);
@@ -567,7 +623,7 @@ mod tests {
         }];
         messages.push(asst);
         messages.push(Message::tool_result("read_file", "{\"content\":\"hi\"}"));
-        let body = build_request(&messages, &[], "gemini-1.5-pro");
+        let body = build_request(&messages, &[], "gemini-1.5-pro", ModelCapabilities::ALL);
         let contents = body["contents"].as_array().expect("contents");
         // user, model, user(functionResponse)
         assert_eq!(contents.len(), 3);

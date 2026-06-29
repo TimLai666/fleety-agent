@@ -62,6 +62,8 @@ Read by the `fleety voice` terminal. Microphone capture is built in (via `cpal`)
 | `FLEETY_MODEL_RETRIES` | `3` | Retry attempts when a model call fails transiently (429, 5xx, connection/timeout). `0` disables retry (single request). |
 | `FLEETY_MODEL_RETRY_BASE_MS` | `500` | Base for exponential backoff (with jitter) between model-call retries. A `Retry-After` header, when present, overrides it. |
 | `FLEETY_MODEL_RETRY_CAP_MS` | `30000` | Cap on the backoff delay. |
+| `FLEETY_MODEL_MODALITIES` | (name heuristic) | Comma-separated input modalities the main model accepts: `text` (implicit), `image`, `audio`, `pdf`. When unset, derived from the model name (known multimodal family → all; else text-only). Attachments of an unsupported modality degrade to a text note instead of being sent and rejected. |
+| `FLEETY_CHEAP_MODEL_MODALITIES` | (name heuristic) | Same, for the economy tier. |
 
 Retries apply to both the main and economy tiers. Non-retryable errors (4xx other
 than 429/408/425, e.g. auth/bad-request) fail fast; a streaming call only retries
