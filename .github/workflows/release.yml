@@ -53,25 +53,32 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: stable
-      # Ship the latest Insyra at release time: bump the sidecar's dependency,
-      # then refresh the vendored insyra DSL skill to the SAME version so the
-      # DSL reference the agent reads matches the engine it drives. A breaking
-      # Insyra change surfaces here as a build/test failure (fix the sidecar,
-      # don't pin around it). Must run before the cargo build, which embeds the
-      # skill into fleety-server via include_str!.
-      - name: Update Insyra + skill to latest
+      # Ship the latest Insyra at release time: bump the sidecar's Insyra
+      # dependency AND all its sub-packages to latest, then refresh the vendored
+      # skills from the SAME (release) Insyra version so the docs the agent reads
+      # match the engine it drives. A breaking Insyra change surfaces here as a
+      # build/test failure (fix the sidecar, don't pin around it). Must run before
+      # the cargo build, which embeds the skills into fleety-server via include_str!.
+      - name: Update Insyra + skills to latest release
         shell: bash
         run: |
           cd sidecars/fleety-insyra
+          # Bump Insyra and every sidecar dependency to its latest version. CI
+          # uses the latest stable Go (setup-go: stable), and `go mod tidy` raises
+          # the go.mod `go` directive if a dependency needs a newer language version.
           go get -u github.com/HazelnutParadise/insyra@latest
+          go get -u ./...
           go mod tidy
           go test ./...
           v=$(go list -m -f '{{.Version}}' github.com/HazelnutParadise/insyra)
           echo "Insyra $v"
-          skill="$GITHUB_WORKSPACE/crates/fleety-server/builtin-skills/fleety-use-insyra-dsl/SKILL.upstream.md"
-          base="https://raw.githubusercontent.com/HazelnutParadise/insyra"
-          curl -fsSL "$base/$v/skills/use-insyra-cli/SKILL.md" -o "$skill" \
-            || curl -fsSL "$base/main/skills/use-insyra-cli/SKILL.md" -o "$skill"
+          # Pull the vendored skills from the resolved RELEASE tag ($v) — never
+          # main — so the skill version matches the embedded engine. Fail loudly
+          # if a skill is missing at that tag (no main fallback).
+          base="https://raw.githubusercontent.com/HazelnutParadise/insyra/$v/skills"
+          bs="$GITHUB_WORKSPACE/crates/fleety-server/builtin-skills"
+          curl -fsSL "$base/use-insyra-cli/SKILL.md" -o "$bs/fleety-use-insyra-dsl/SKILL.upstream.md"
+          curl -fsSL "$base/insyra/SKILL.md" -o "$bs/insyra/SKILL.md"
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }} --bin fleety --bin fleety-server --bin fleetyd
       # Each runner's arch matches its target, so a native `go build` is correct.

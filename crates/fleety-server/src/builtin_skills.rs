@@ -43,6 +43,14 @@ const SKILLS: &[(&str, &str, &str)] = &[
         "",
         include_str!("../builtin-skills/fleety-skill-creator/SKILL.md"),
     ),
+    (
+        // Upstream Insyra skill, vendored verbatim (no Fleety header / rename) —
+        // the Go-oriented companion to fleety-use-insyra-dsl. Release CI refreshes
+        // it from the same Insyra release version.
+        "insyra",
+        "",
+        include_str!("../builtin-skills/insyra/SKILL.md"),
+    ),
 ];
 
 /// Write the embedded built-in skills into `builtin_dir` (overwriting built-ins
@@ -93,6 +101,18 @@ mod tests {
         assert!(content.contains("name: fleety-skill-creator"));
         assert!(content.contains("skill_write_file"));
         assert!(content.contains("authored"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn seed_writes_verbatim_insyra_skill() {
+        let dir = std::env::temp_dir().join(format!("fleety-bskill-{}", uuid::Uuid::new_v4()));
+        seed(&dir).expect("seed");
+        let content =
+            std::fs::read_to_string(dir.join("insyra").join("SKILL.md")).expect("read");
+        // Vendored verbatim (no Fleety header): the upstream frontmatter name is kept.
+        assert!(content.starts_with("---"));
+        assert!(content.contains("name: insyra"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

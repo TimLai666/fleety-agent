@@ -463,6 +463,7 @@ so the surface is complete.
 |---|---|---|
 | `fleety-insyra` (Go) | `insyra_exec` over NDJSON | `fleetyd install` / `fleetyd update` |
 | `fleety-use-insyra-dsl` (built-in skill, shipped in-binary) | DSL reference for `insyra_exec` | `builtin_skills::seed` at server boot |
+| `insyra` (built-in skill, shipped in-binary) | upstream Insyra skill, vendored verbatim | `builtin_skills::seed` at server boot |
 
 ## Risk class → policy (summary)
 
