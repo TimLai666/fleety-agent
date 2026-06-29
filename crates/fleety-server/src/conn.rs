@@ -966,10 +966,91 @@ async fn serve(
                 };
                 emit(out, &reply)?;
             }
+            ClientMsg::ConfigExec { target, args } => {
+                // Reachable only on an authenticated (or auth-disabled) connection —
+                // unauthenticated clients are rejected at `Hello`, so remote config
+                // is implicitly gated by the connection's auth.
+                let reply = config_apply(target, &args);
+                // A successful mutation (effect present) is auditable.
+                if let ServerMsg::ConfigResult {
+                    ok: true,
+                    effect: Some(_),
+                    ..
+                } = &reply
+                {
+                    let event = agent_core::Event::ToolResult {
+                        id: "config".to_string(),
+                        result: serde_json::json!({ "config": args }),
+                    };
+                    let _ = storage.append_history(device_id, &event);
+                }
+                emit(out, &reply)?;
+            }
         }
     }
 
     Ok(())
+}
+
+/// Run a remote `config` request against this (the server's) own config files
+/// and wrap it as a `ConfigResult`. `Server` reuses the shared config logic
+/// (rendered to text, the same code the local command prints) and tags when the
+/// change takes effect; `Local` is the CLI's job (rejected here); `Device` is a
+/// follow-up (rejected as unsupported). Never panics — a bad request becomes an
+/// error result.
+fn config_apply(target: fleety_protocol::ConfigTarget, args: &[String]) -> ServerMsg {
+    use fleety_protocol::{ConfigTarget, Effect};
+    match target {
+        ConfigTarget::Server => match fleety_tools::config::run_rendered(args) {
+            Ok(output) => {
+                let effect = match fleety_tools::config::config_effect(args) {
+                    Some(fleety_tools::config::ConfigEffect::NextConnection) => {
+                        Some(Effect::NextConnection)
+                    }
+                    Some(fleety_tools::config::ConfigEffect::Restart) => Some(Effect::Restart),
+                    None => None,
+                };
+                ServerMsg::ConfigResult {
+                    ok: true,
+                    output,
+                    effect,
+                    error: None,
+                }
+            }
+            Err(e) => ServerMsg::ConfigResult {
+                ok: false,
+                output: String::new(),
+                effect: None,
+                error: Some(WireError {
+                    kind: e.report().kind,
+                    message: e.report().message,
+                    remediation: e.report().remediation,
+                }),
+            },
+        },
+        ConfigTarget::Local => ServerMsg::ConfigResult {
+            ok: false,
+            output: String::new(),
+            effect: None,
+            error: Some(WireError {
+                kind: "config".to_string(),
+                message: "local config is handled by the CLI, not sent to the server".to_string(),
+                remediation: None,
+            }),
+        },
+        ConfigTarget::Device(id) => ServerMsg::ConfigResult {
+            ok: false,
+            output: String::new(),
+            effect: None,
+            error: Some(WireError {
+                kind: "unsupported".to_string(),
+                message: format!("per-device config ('{id}') is a follow-up change, not yet supported"),
+                remediation: Some(
+                    "configure the device on its own host with `fleetyd config`, or use --target server".to_string(),
+                ),
+            }),
+        },
+    }
 }
 
 /// Authenticate a Hello. `Ok(Some(token))` = pairing minted a token to return;
@@ -1825,6 +1906,75 @@ mod tests {
     use tokio_tungstenite::MaybeTlsStream;
 
     type ClientWs = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+    #[test]
+    #[serial_test::serial]
+    fn config_apply_server_local_device() {
+        use fleety_protocol::{ConfigTarget, Effect};
+        let s = |a: &[&str]| a.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let dir = std::env::temp_dir().join(format!("fleety-cfgapply-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("mk dir");
+        std::env::set_var("FLEETY_CONFIG", dir.join("config.toml"));
+        std::env::set_var("FLEETY_PROVIDERS", dir.join("providers.toml"));
+        // Don't let an ambient env var shadow the config read.
+        std::env::remove_var("FLEETY_MODEL");
+
+        // Server flat set → ok + Restart effect.
+        match config_apply(ConfigTarget::Server, &s(&["set", "FLEETY_MODEL", "gpt-5"])) {
+            ServerMsg::ConfigResult { ok, effect, .. } => {
+                assert!(ok);
+                assert_eq!(effect, Some(Effect::Restart));
+            }
+            other => panic!("expected ConfigResult, got {other:?}"),
+        }
+        // list reflects the change; a read has no effect.
+        match config_apply(ConfigTarget::Server, &s(&["list"])) {
+            ServerMsg::ConfigResult {
+                ok, output, effect, ..
+            } => {
+                assert!(ok);
+                assert!(output.contains("FLEETY_MODEL"));
+                assert_eq!(effect, None);
+            }
+            other => panic!("got {other:?}"),
+        }
+        // Unknown key → error result (no crash, nothing written).
+        match config_apply(ConfigTarget::Server, &s(&["set", "FLEETY_NOPE", "x"])) {
+            ServerMsg::ConfigResult { ok, error, .. } => {
+                assert!(!ok);
+                assert!(error.is_some());
+            }
+            other => panic!("got {other:?}"),
+        }
+        // Provider add → ok + NextConnection effect.
+        match config_apply(
+            ConfigTarget::Server,
+            &s(&["provider", "add", "p", "--base-url", "u", "--model", "m"]),
+        ) {
+            ServerMsg::ConfigResult { ok, effect, .. } => {
+                assert!(ok);
+                assert_eq!(effect, Some(Effect::NextConnection));
+            }
+            other => panic!("got {other:?}"),
+        }
+        // Local is the CLI's job → error.
+        match config_apply(ConfigTarget::Local, &s(&["list"])) {
+            ServerMsg::ConfigResult { ok, .. } => assert!(!ok),
+            other => panic!("got {other:?}"),
+        }
+        // Device is a follow-up → unsupported error.
+        match config_apply(ConfigTarget::Device("pi".into()), &s(&["list"])) {
+            ServerMsg::ConfigResult { ok, error, .. } => {
+                assert!(!ok);
+                assert_eq!(error.expect("err").kind, "unsupported");
+            }
+            other => panic!("got {other:?}"),
+        }
+
+        std::env::remove_var("FLEETY_CONFIG");
+        std::env::remove_var("FLEETY_PROVIDERS");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A non-WebSocket `ClientInbound` backed by a queue — proves the connection
     /// loop's inbound is transport-agnostic (the SSE+POST transport plugs in the

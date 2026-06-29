@@ -11,7 +11,46 @@ use std::io::IsTerminal;
 use std::path::Path;
 
 use agent_core::{CoreError, Result};
+use fleety_protocol::ConfigTarget;
 use fleety_tools::config::{self, ConfigMap, Source};
+
+/// Split a leading-or-embedded `--target <server|local|<device-id>>` out of the
+/// config args, returning the target (default `Server`) and the remaining args.
+/// Pure. `local` is handled by this CLI; `server`/`device` go over the wire.
+pub fn split_target(args: &[String]) -> (ConfigTarget, Vec<String>) {
+    let mut target = ConfigTarget::Server;
+    let mut rest = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--target" {
+            if let Some(v) = args.get(i + 1) {
+                target = match v.as_str() {
+                    "server" => ConfigTarget::Server,
+                    "local" => ConfigTarget::Local,
+                    other => ConfigTarget::Device(other.to_string()),
+                };
+                i += 2;
+                continue;
+            }
+        }
+        rest.push(args[i].clone());
+        i += 1;
+    }
+    (target, rest)
+}
+
+/// Whether `args` is an interactive edit (`edit` / `provider edit`), which is
+/// always local + TTY (remote interactive editing is a follow-up).
+pub fn is_interactive_edit(args: &[String]) -> bool {
+    matches!(args.first().map(String::as_str), Some("edit"))
+        || matches!(
+            (
+                args.first().map(String::as_str),
+                args.get(1).map(String::as_str)
+            ),
+            (Some("provider"), Some("edit"))
+        )
+}
 use ratatui::crossterm::event::KeyCode;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::text::Line;
@@ -226,6 +265,27 @@ fn run_tui_edit(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_target_extracts_and_defaults() {
+        let s = |a: &[&str]| a.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // Default is Server, args untouched.
+        let (t, rest) = split_target(&s(&["set", "FLEETY_MODEL", "gpt-5"]));
+        assert_eq!(t, ConfigTarget::Server);
+        assert_eq!(rest, s(&["set", "FLEETY_MODEL", "gpt-5"]));
+        // --target local is stripped.
+        let (t, rest) = split_target(&s(&["--target", "local", "list"]));
+        assert_eq!(t, ConfigTarget::Local);
+        assert_eq!(rest, s(&["list"]));
+        // A non-server/local value is a device id; stripped from the middle.
+        let (t, rest) = split_target(&s(&["provider", "--target", "pi", "list"]));
+        assert_eq!(t, ConfigTarget::Device("pi".into()));
+        assert_eq!(rest, s(&["provider", "list"]));
+        // Edit detection.
+        assert!(is_interactive_edit(&s(&["edit"])));
+        assert!(is_interactive_edit(&s(&["provider", "edit"])));
+        assert!(!is_interactive_edit(&s(&["list"])));
+    }
 
     #[test]
     fn config_tui_key_handling() {

@@ -368,6 +368,34 @@ pub fn display_value(setting: &Setting, value: &str) -> String {
     }
 }
 
+/// When a config operation takes effect. Local mirror of the wire `Effect`
+/// (this crate doesn't depend on the protocol crate); the server maps it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigEffect {
+    /// Picked up on the next client connection (providers.toml is re-read per connection).
+    NextConnection,
+    /// Needs a restart (flat settings are env-seeded at boot and env takes precedence).
+    Restart,
+}
+
+/// Classify when a config operation takes effect, by its verb. `None` means a
+/// read (no change). A mutating `provider`/`group`/`role` op rewrites
+/// `providers.toml`, which the provider registry re-reads on the next
+/// connection; a flat `set`/`unset` is shadowed by the boot-seeded environment
+/// until a restart. Pure.
+pub fn config_effect(args: &[String]) -> Option<ConfigEffect> {
+    match args.first().map(String::as_str) {
+        Some("provider" | "group" | "role") => match args.get(1).map(String::as_str) {
+            // A read sub-verb changes nothing.
+            Some("list") | None => None,
+            _ => Some(ConfigEffect::NextConnection),
+        },
+        Some("set" | "unset") => Some(ConfigEffect::Restart),
+        // list / get / edit / unknown → read or no-op.
+        _ => None,
+    }
+}
+
 // ---- command dispatch, shared by `fleety`, `fleety-server`, and `fleetyd` ----
 
 /// A parsed `config` subcommand.
@@ -429,41 +457,60 @@ pub fn rows(map: &ConfigMap) -> Vec<(String, String, String, String)> {
 /// Run a `config` subcommand against the config file. `edit` is the line-based
 /// loop; the CLI overrides `edit` with a ratatui screen when stdout is a TTY.
 pub fn run(args: &[String]) -> Result<()> {
-    // `provider` / `group` / `role` manage the structured providers.toml (a
-    // separate file); everything else is the flat-key registry below.
+    // Interactive flat-key edit stays local + line-based; everything else
+    // renders to text (so the same code serves the remote handler).
+    let is_providers = matches!(
+        args.first().map(String::as_str),
+        Some("provider" | "group" | "role")
+    );
+    if !is_providers && matches!(parse(args), Command::Edit) {
+        return edit_line_based(&config_path());
+    }
+    let out = run_rendered(args)?;
+    let out = out.trim_end_matches('\n');
+    if !out.is_empty() {
+        println!("{out}");
+    }
+    Ok(())
+}
+
+/// Run a `config` subcommand and return its rendered text instead of printing,
+/// so the remote handler can send it over the wire. `provider`/`group`/`role`
+/// manage the structured providers.toml; everything else is the flat-key
+/// registry. `edit` is interactive and has no rendered form (an error here).
+pub fn run_rendered(args: &[String]) -> Result<String> {
     if matches!(
         args.first().map(String::as_str),
         Some("provider" | "group" | "role")
     ) {
-        return run_providers(args);
+        return run_providers_at(&pc::providers_path(), args);
     }
     let path = config_path();
-    match parse(args) {
+    Ok(match parse(args) {
         Command::List => {
             let map = load(&path);
-            println!("Settings (env → config → default; secrets masked):\n");
+            let mut out = String::from("Settings (env → config → default; secrets masked):\n\n");
             for (key, scope, value, source) in rows(&map) {
-                println!("  [{scope:6}] {key:<26} = {value}  ({source})");
+                out.push_str(&format!("  [{scope:6}] {key:<26} = {value}  ({source})\n"));
             }
-            println!(
+            out.push_str(&format!(
                 "\nEdit with: config set <KEY> <VALUE>   (file: {})",
                 path.display()
-            );
-            Ok(())
+            ));
+            out
         }
         Command::Get(key) => {
             let setting =
                 find(&key).ok_or_else(|| CoreError::Message(format!("unknown setting '{key}'")))?;
             let map = load(&path);
-            let Some(r) = resolve(&key, &map) else {
-                return Ok(());
-            };
-            println!(
-                "{key} = {}  ({})",
-                display_value(setting, &r.value),
-                source_label(r.source)
-            );
-            Ok(())
+            match resolve(&key, &map) {
+                Some(r) => format!(
+                    "{key} = {}  ({})",
+                    display_value(setting, &r.value),
+                    source_label(r.source)
+                ),
+                None => String::new(),
+            }
         }
         Command::Set(key, value) => {
             let setting = find(&key).ok_or_else(|| {
@@ -474,8 +521,7 @@ pub fn run(args: &[String]) -> Result<()> {
             let mut map = load(&path);
             map.insert((setting.scope, key.clone()), value);
             save(&path, &map)?;
-            println!("set {key} (scope {})", setting.scope.as_str());
-            Ok(())
+            format!("set {key} (scope {})", setting.scope.as_str())
         }
         Command::Unset(key) => {
             let setting =
@@ -483,15 +529,17 @@ pub fn run(args: &[String]) -> Result<()> {
             let mut map = load(&path);
             map.remove(&(setting.scope, key.clone()));
             save(&path, &map)?;
-            println!("unset {key} (reverts to env/default)");
-            Ok(())
+            format!("unset {key} (reverts to env/default)")
         }
-        Command::Edit => edit_line_based(&path),
+        Command::Edit => {
+            return Err(CoreError::Message(
+                "`config edit` is interactive — run it locally on a TTY".to_string(),
+            ))
+        }
         Command::Help => {
-            println!("usage: config [list | get <KEY> | set <KEY> <VALUE> | unset <KEY> | edit]");
-            Ok(())
+            "usage: config [list | get <KEY> | set <KEY> <VALUE> | unset <KEY> | edit]".to_string()
         }
-    }
+    })
 }
 
 // ---- providers.toml subcommands (provider / group / role) ----
@@ -692,30 +740,37 @@ fn mask_key(key: &Option<String>) -> &'static str {
 /// load (empty when missing, error when present-but-broken), apply, validate,
 /// and write atomically.
 pub fn run_providers(args: &[String]) -> Result<()> {
-    run_providers_at(&pc::providers_path(), args)
+    let out = run_providers_at(&pc::providers_path(), args)?;
+    let out = out.trim_end_matches('\n');
+    if !out.is_empty() {
+        println!("{out}");
+    }
+    Ok(())
 }
 
-/// Like [`run_providers`] but against an explicit `providers.toml` path (used by
-/// tests and the interactive editor's save path).
-pub fn run_providers_at(path: &std::path::Path, args: &[String]) -> Result<()> {
+/// Like [`run_providers`] but against an explicit `providers.toml` path and
+/// returning the rendered text instead of printing (so the remote handler and
+/// the interactive editor reuse it). Tests use this directly.
+pub fn run_providers_at(path: &std::path::Path, args: &[String]) -> Result<String> {
     let cmd = parse_providers(args)?;
     match cmd {
         ProviderCmd::ProviderList => {
             let cfg = pc::load_or_default(path)?;
+            let mut out = String::new();
             if cfg.providers.is_empty() {
-                println!("(no providers defined in {})", path.display());
+                out.push_str(&format!("(no providers defined in {})\n", path.display()));
             }
             for p in &cfg.providers {
-                println!(
-                    "  {:<16} {} [{}] key={} stream={}",
+                out.push_str(&format!(
+                    "  {:<16} {} [{}] key={} stream={}\n",
                     p.name,
                     p.base_url,
                     p.model,
                     mask_key(&p.key),
                     p.stream
-                );
+                ));
             }
-            Ok(())
+            Ok(out)
         }
         ProviderCmd::ProviderAdd(spec) => {
             let mut cfg = pc::load_or_default(path)?;
@@ -728,8 +783,7 @@ pub fn run_providers_at(path: &std::path::Path, args: &[String]) -> Result<()> {
             let name = spec.name.clone();
             cfg.providers.push(spec);
             pc::write_providers(path, &cfg)?;
-            println!("added provider '{name}'");
-            Ok(())
+            Ok(format!("added provider '{name}'"))
         }
         ProviderCmd::ProviderSet {
             name,
@@ -765,8 +819,7 @@ pub fn run_providers_at(path: &std::path::Path, args: &[String]) -> Result<()> {
                 p.effort = effort;
             }
             pc::write_providers(path, &cfg)?;
-            println!("updated provider '{name}'");
-            Ok(())
+            Ok(format!("updated provider '{name}'"))
         }
         ProviderCmd::ProviderRemove(name) => {
             let mut cfg = pc::load_or_default(path)?;
@@ -786,23 +839,23 @@ pub fn run_providers_at(path: &std::path::Path, args: &[String]) -> Result<()> {
             }
             cfg.providers.retain(|p| p.name != name);
             pc::write_providers(path, &cfg)?;
-            println!("removed provider '{name}'");
-            Ok(())
+            Ok(format!("removed provider '{name}'"))
         }
         ProviderCmd::GroupList => {
             let cfg = pc::load_or_default(path)?;
+            let mut out = String::new();
             if cfg.groups.is_empty() {
-                println!("(no groups defined in {})", path.display());
+                out.push_str(&format!("(no groups defined in {})\n", path.display()));
             }
             for g in &cfg.groups {
-                println!(
-                    "  {:<16} [{:?}] {}",
+                out.push_str(&format!(
+                    "  {:<16} [{:?}] {}\n",
                     g.name,
                     g.strategy,
                     g.members.join(", ")
-                );
+                ));
             }
-            Ok(())
+            Ok(out)
         }
         ProviderCmd::GroupSet {
             name,
@@ -817,8 +870,7 @@ pub fn run_providers_at(path: &std::path::Path, args: &[String]) -> Result<()> {
                 strategy,
             });
             pc::write_providers(path, &cfg)?;
-            println!("set group '{name}'");
-            Ok(())
+            Ok(format!("set group '{name}'"))
         }
         ProviderCmd::GroupRemove(name) => {
             let mut cfg = pc::load_or_default(path)?;
@@ -832,15 +884,13 @@ pub fn run_providers_at(path: &std::path::Path, args: &[String]) -> Result<()> {
             }
             cfg.groups.retain(|g| g.name != name);
             pc::write_providers(path, &cfg)?;
-            println!("removed group '{name}'");
-            Ok(())
+            Ok(format!("removed group '{name}'"))
         }
         ProviderCmd::RoleSet { role, target } => {
             let mut cfg = pc::load_or_default(path)?;
             cfg.roles.insert(role.clone(), target.clone());
             pc::write_providers(path, &cfg)?;
-            println!("bound role '{role}' → '{target}'");
-            Ok(())
+            Ok(format!("bound role '{role}' → '{target}'"))
         }
         ProviderCmd::RoleUnset(role) => {
             let mut cfg = pc::load_or_default(path)?;
@@ -848,18 +898,18 @@ pub fn run_providers_at(path: &std::path::Path, args: &[String]) -> Result<()> {
                 return Err(CoreError::Message(format!("no such role '{role}'")));
             }
             pc::write_providers(path, &cfg)?;
-            println!("unset role '{role}'");
-            Ok(())
+            Ok(format!("unset role '{role}'"))
         }
         ProviderCmd::RoleList => {
             let cfg = pc::load_or_default(path)?;
+            let mut out = String::new();
             if cfg.roles.is_empty() {
-                println!("(no roles defined in {})", path.display());
+                out.push_str(&format!("(no roles defined in {})\n", path.display()));
             }
             for (r, t) in &cfg.roles {
-                println!("  {r:<16} → {t}");
+                out.push_str(&format!("  {r:<16} → {t}\n"));
             }
-            Ok(())
+            Ok(out)
         }
     }
 }
@@ -1106,6 +1156,46 @@ mod tests {
         ]))
         .is_err());
         assert!(parse_providers(&v(&["provider", "add", "p", "--model", "m"])).is_err());
+    }
+
+    #[test]
+    fn config_effect_by_verb() {
+        let eff = |p: &[&str]| config_effect(&v(p));
+        // providers.toml mutations → next connection.
+        assert_eq!(
+            eff(&["provider", "add", "p", "--base-url", "u", "--model", "m"]),
+            Some(ConfigEffect::NextConnection)
+        );
+        assert_eq!(
+            eff(&[
+                "group",
+                "set",
+                "g",
+                "--members",
+                "p",
+                "--strategy",
+                "failover"
+            ]),
+            Some(ConfigEffect::NextConnection)
+        );
+        assert_eq!(
+            eff(&["role", "set", "main", "g"]),
+            Some(ConfigEffect::NextConnection)
+        );
+        // flat set/unset → restart.
+        assert_eq!(
+            eff(&["set", "FLEETY_MODEL", "gpt-5"]),
+            Some(ConfigEffect::Restart)
+        );
+        assert_eq!(eff(&["unset", "FLEETY_ADDR"]), Some(ConfigEffect::Restart));
+        assert_eq!(
+            eff(&["set", "FLEETY_POLICY", "require_approval"]),
+            Some(ConfigEffect::Restart)
+        );
+        // reads → none.
+        assert_eq!(eff(&["list"]), None);
+        assert_eq!(eff(&["get", "FLEETY_MODEL"]), None);
+        assert_eq!(eff(&["provider", "list"]), None);
     }
 
     #[test]

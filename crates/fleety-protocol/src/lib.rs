@@ -61,6 +61,28 @@ pub struct OriginContext {
     pub cwd: Option<String>,
 }
 
+/// Which host a remote `ConfigExec` operates on. `Local` is handled by the CLI
+/// without a connection (so it never travels the wire); `Device` is reserved for
+/// a follow-up change (the server rejects it as unsupported for now).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigTarget {
+    Server,
+    Local,
+    Device(String),
+}
+
+/// When a config change takes effect (reported back so the user isn't misled
+/// into thinking a change applied immediately).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Effect {
+    /// Re-read on the next client connection (provider pool / model selection).
+    NextConnection,
+    /// Needs a server restart (flat settings seeded into env at boot).
+    Restart,
+}
+
 /// Frames sent client -> server over the WebSocket.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -150,6 +172,15 @@ pub enum ClientMsg {
     /// Ask the server for its health snapshot (version, uptime, connected
     /// device count, etc.). Used by `fleety status`.
     ServerStatus,
+    /// Manage configuration over the connection. `args` is the full config
+    /// argument vector (e.g. `["set","FLEETY_MODEL","gpt-5"]`, `["list"]`,
+    /// `["provider","add",…]`), fed to the same parser the local CLI uses.
+    /// `target` selects the host: `Server` runs on the connected server;
+    /// `Device` is a follow-up (rejected for now). Reply: `ConfigResult`.
+    ConfigExec {
+        target: ConfigTarget,
+        args: Vec<String>,
+    },
 }
 
 /// Frames sent server -> client over the WebSocket.
@@ -263,6 +294,18 @@ pub enum ServerMsg {
         device_ids_json: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         extra_json: Option<String>,
+    },
+    /// Reply to `ConfigExec`: `output` is the command's rendered text (list
+    /// table, confirmation, …). `effect` says when a successful change takes
+    /// effect; `error` carries an actionable message on failure (errors-as-
+    /// messages — the server never crashes on a bad config request).
+    ConfigResult {
+        ok: bool,
+        output: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effect: Option<Effect>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<WireError>,
     },
 }
 
@@ -387,6 +430,48 @@ mod tests {
         };
         let json = serde_json::to_string(&reply).expect("ser");
         assert_eq!(reply, serde_json::from_str(&json).expect("de"));
+    }
+
+    #[test]
+    fn config_frames_roundtrip() {
+        // Request: a provider op targeting the server.
+        let req = ClientMsg::ConfigExec {
+            target: ConfigTarget::Server,
+            args: vec!["set".into(), "FLEETY_MODEL".into(), "gpt-5".into()],
+        };
+        let json = serde_json::to_string(&req).expect("ser");
+        assert_eq!(req, serde_json::from_str(&json).expect("de"));
+
+        // Device target carries its id.
+        let dev = ClientMsg::ConfigExec {
+            target: ConfigTarget::Device("pi".into()),
+            args: vec!["list".into()],
+        };
+        let json = serde_json::to_string(&dev).expect("ser");
+        assert_eq!(dev, serde_json::from_str(&json).expect("de"));
+
+        // Result: success with an effect, and a failure with an error.
+        let ok = ServerMsg::ConfigResult {
+            ok: true,
+            output: "added provider 'codex-1'".into(),
+            effect: Some(Effect::NextConnection),
+            error: None,
+        };
+        let json = serde_json::to_string(&ok).expect("ser");
+        assert_eq!(ok, serde_json::from_str(&json).expect("de"));
+
+        let err = ServerMsg::ConfigResult {
+            ok: false,
+            output: String::new(),
+            effect: None,
+            error: Some(WireError {
+                kind: "config".into(),
+                message: "unknown setting".into(),
+                remediation: None,
+            }),
+        };
+        let json = serde_json::to_string(&err).expect("ser");
+        assert_eq!(err, serde_json::from_str(&json).expect("de"));
     }
 
     #[test]

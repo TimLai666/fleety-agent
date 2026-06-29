@@ -169,6 +169,25 @@ On a TTY, `config provider edit` (CLI only) opens an interactive screen to list
 and edit providers, groups, and roles; it saves through the same validation and
 atomic write. Without a TTY it falls back to the subcommands above.
 
+#### Remote vs local (`--target`)
+
+`fleety config …` manages the **connected server's** config by default (over the
+authenticated connection — no shell access to the server host needed). Pick the
+host with `--target`:
+
+- `--target server` (default) — the connected server. The result reports when the
+  change takes effect: a provider-pool change (`provider`/`group`/`role`) on the
+  next connection; a flat `set`/`unset` after a server restart (flat settings are
+  env-seeded at boot, and the environment takes precedence).
+- `--target local` — this CLI host's own `~/.fleety` files (no connection; the
+  pre-existing behavior).
+- `--target <device-id>` — a follow-up; the server reports it as not-yet-supported.
+  Configure a device on its own host with `fleetyd config` for now.
+
+`fleety-server config` (run on the server host) stays available as a bootstrap
+path before the CLI can connect. Remote config travels only over the
+authenticated connection — use TLS for remote/untrusted networks.
+
 ## Retention / GC (server background loop)
 
 Six-hour periodic sweep that keeps audit + backup surfaces bounded.

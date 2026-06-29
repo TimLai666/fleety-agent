@@ -16,7 +16,9 @@ mod voice;
 use std::path::{Path, PathBuf};
 
 use agent_core::{obs, CoreError, Result};
-use fleety_protocol::{ClientMsg, OriginContext, ServerMsg, WireAttachment, PROTOCOL_VERSION};
+use fleety_protocol::{
+    ClientMsg, ConfigTarget, Effect, OriginContext, ServerMsg, WireAttachment, PROTOCOL_VERSION,
+};
 // The client transport (WebSocket with SSE+POST fallback) lives in fleety-tools;
 // `Tx`/`Rx` are its split halves so the existing connect sites barely change.
 use fleety_tools::transport::{self, Receiver as Rx, Sender as Tx};
@@ -173,8 +175,23 @@ async fn main() {
             }
         }
         Some("config") => {
-            if let Err(e) = config::run(&args[2..]) {
-                eprintln!("error: {}", e.report().message);
+            // `--target server` (default) manages the connected server's config
+            // over the connection; `--target local` (and interactive `edit`) edit
+            // this host's own files. `--target <device-id>` is sent to the server
+            // (which reports it as a follow-up for now).
+            let (target, rest) = config::split_target(&args[2..]);
+            let res = if config::is_interactive_edit(&rest) || matches!(target, ConfigTarget::Local)
+            {
+                config::run(&rest)
+            } else {
+                config_remote(target, &rest).await
+            };
+            if let Err(e) = res {
+                let report = e.report();
+                eprintln!("error: {}", report.message);
+                if let Some(hint) = report.remediation {
+                    eprintln!("hint: {hint}");
+                }
             }
         }
         Some("daemon") => {
@@ -711,7 +728,8 @@ async fn ask(text: String, attachments: Vec<WireAttachment>) -> Result<()> {
             | Some(ServerMsg::RollbackListResult { .. })
             | Some(ServerMsg::RollbackResult { .. })
             | Some(ServerMsg::ConversationRolled { .. })
-            | Some(ServerMsg::ServerStatusResult { .. }) => {}
+            | Some(ServerMsg::ServerStatusResult { .. })
+            | Some(ServerMsg::ConfigResult { .. }) => {}
         }
     }
     // Close the connection gracefully so the server sees a clean disconnect.
@@ -919,6 +937,64 @@ async fn connect_hello() -> Result<(Tx, Rx)> {
         Some(ServerMsg::Welcome { .. }) => Ok((tx, rx)),
         other => Err(CoreError::Provider(format!(
             "expected welcome, got {other:?}"
+        ))),
+    }
+}
+
+/// Manage a remote (server / device) host's config over the connection: connect,
+/// send `ConfigExec`, print the rendered result and when it takes effect. A
+/// connection failure suggests `--target local`.
+async fn config_remote(target: ConfigTarget, args: &[String]) -> Result<()> {
+    let (mut tx, mut rx) = connect_hello().await.map_err(|e| {
+        CoreError::Message(format!(
+            "could not reach the server: {} — use `--target local` to edit this host, or set the server URL with `fleety init <ws-url>`",
+            e.report().message
+        ))
+    })?;
+    send(
+        &mut tx,
+        &ClientMsg::ConfigExec {
+            target,
+            args: args.to_vec(),
+        },
+    )
+    .await?;
+    match recv(&mut rx).await? {
+        Some(ServerMsg::ConfigResult {
+            ok,
+            output,
+            effect,
+            error,
+        }) => {
+            if ok {
+                let out = output.trim_end();
+                if !out.is_empty() {
+                    println!("{out}");
+                }
+                if let Some(eff) = effect {
+                    println!(
+                        "{}",
+                        match eff {
+                            Effect::NextConnection =>
+                                "(applied — takes effect on the next connection)",
+                            Effect::Restart => "(applied — takes effect after a server restart)",
+                        }
+                    );
+                }
+            } else if let Some(e) = error {
+                eprintln!("error: {}", e.message);
+                if let Some(hint) = e.remediation {
+                    eprintln!("hint: {hint}");
+                }
+            }
+            Ok(())
+        }
+        Some(ServerMsg::Error { error }) => {
+            eprintln!("error: {}", error.message);
+            Ok(())
+        }
+        other => Err(CoreError::Provider(format!(
+            "expected a config result, got {other:?}"
         ))),
     }
 }

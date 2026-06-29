@@ -169,20 +169,33 @@ Three ways, in increasing power:
    vars above, so zero-config behavior is unchanged. See
    [`docs/env.md`](docs/env.md#named-provider-pool-providerstoml).
 
+### Where config commands apply (`--target`)
+
+By default `fleety config …` manages the **connected server's** config over the
+connection — set the server's model from your laptop without shell access to the
+server host. Use `--target` to choose:
+
+- `--target server` (default) — the connected server. Requires an authenticated
+  connection; the result says when it takes effect (a provider-pool change on the
+  next connection; a flat `FLEETY_*` setting after a server restart).
+- `--target local` — this CLI host's own `~/.fleety` files (the pre-existing
+  behavior; no connection).
+- `--target <device-id>` — a specific device. *Follow-up* — the server currently
+  reports this as not-yet-supported; configure the device on its own host with
+  `fleetyd config` for now.
+
+If the server can't be reached, the CLI says so and suggests `--target local`.
+`fleety-server config …` (run on the server host) remains as a bootstrap path.
+
 ### Edit config interactively
 
-On a TTY:
+On a TTY (always local — remote interactive editing is a follow-up):
 
 - `fleety config edit` — edit the flat `FLEETY_*` settings (ratatui list; secrets
   masked; line-based fallback when not a TTY).
 - `fleety config provider edit` — list and edit `providers.toml`: add/remove
   providers, set a group's members + strategy, bind roles. Saving runs the same
   validation + atomic write as the subcommands.
-
-Non-interactively, manage the pool with
-`config provider|group|role <…>` (below). `fleety-server config …` and
-`fleetyd config …` expose the **same** surface, applied on the host where each
-binary runs.
 
 ## Command reference
 
@@ -202,8 +215,8 @@ launchd / Windows SCM).
 | `fleety tui` | Interactive terminal UI (streaming chat). |
 | `fleety voice` | Voice conversation (speech-to-text in, spoken reply out). |
 | `fleety status` | Server health: version, uptime, connected devices. |
-| `fleety config <list\|get\|set\|unset\|edit>` | Inspect/edit flat settings (`~/.fleety/config.toml`); secrets masked. `edit` opens an interactive screen (ratatui list on a TTY, line-based otherwise). |
-| `fleety config provider\|group\|role <…>` | Manage the named provider pool (`providers.toml`): `provider add\|set\|remove\|list`, `group set\|remove\|list`, `role set\|unset\|list`. `config provider edit` opens an interactive editor on a TTY. |
+| `fleety config <list\|get\|set\|unset\|edit>` | Inspect/edit settings; secrets masked. Targets the connected **server** by default; `--target local` edits this host's `~/.fleety/config.toml`. `edit` is local + interactive (ratatui on a TTY, line-based otherwise). |
+| `fleety config provider\|group\|role <…>` | Manage the named provider pool (`providers.toml`): `provider add\|set\|remove\|list`, `group set\|remove\|list`, `role set\|unset\|list`. Same `--target` rule (default server). `config provider edit` is a local interactive editor on a TTY. |
 | `fleety audit [device]` | List a device's audit-log entries (tool calls/results/replies). |
 | `fleety rollback <...>` | List backups / restore a file from a backup. |
 | `fleety pair` | Enroll this device with a pairing code (auth-required servers). |
