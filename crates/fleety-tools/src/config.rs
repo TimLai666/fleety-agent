@@ -360,8 +360,8 @@ pub fn run(args: &[String]) -> Result<()> {
             Ok(())
         }
         Command::Get(key) => {
-            let setting = find(&key)
-                .ok_or_else(|| CoreError::Message(format!("unknown setting '{key}'")))?;
+            let setting =
+                find(&key).ok_or_else(|| CoreError::Message(format!("unknown setting '{key}'")))?;
             let map = load(&path);
             let Some(r) = resolve(&key, &map) else {
                 return Ok(());
@@ -386,8 +386,8 @@ pub fn run(args: &[String]) -> Result<()> {
             Ok(())
         }
         Command::Unset(key) => {
-            let setting = find(&key)
-                .ok_or_else(|| CoreError::Message(format!("unknown setting '{key}'")))?;
+            let setting =
+                find(&key).ok_or_else(|| CoreError::Message(format!("unknown setting '{key}'")))?;
             let mut map = load(&path);
             map.remove(&(setting.scope, key.clone()));
             save(&path, &map)?;
@@ -396,9 +396,7 @@ pub fn run(args: &[String]) -> Result<()> {
         }
         Command::Edit => edit_line_based(&path),
         Command::Help => {
-            println!(
-                "usage: config [list | get <KEY> | set <KEY> <VALUE> | unset <KEY> | edit]"
-            );
+            println!("usage: config [list | get <KEY> | set <KEY> <VALUE> | unset <KEY> | edit]");
             Ok(())
         }
     }
@@ -456,12 +454,18 @@ mod tests {
     fn parse_commands() {
         let v = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert_eq!(parse(&v(&[])), Command::List);
-        assert_eq!(parse(&v(&["get", "FLEETY_ADDR"])), Command::Get("FLEETY_ADDR".into()));
+        assert_eq!(
+            parse(&v(&["get", "FLEETY_ADDR"])),
+            Command::Get("FLEETY_ADDR".into())
+        );
         assert_eq!(
             parse(&v(&["set", "FLEETY_MODEL", "gpt-4o"])),
             Command::Set("FLEETY_MODEL".into(), "gpt-4o".into())
         );
-        assert_eq!(parse(&v(&["unset", "FLEETY_TZ"])), Command::Unset("FLEETY_TZ".into()));
+        assert_eq!(
+            parse(&v(&["unset", "FLEETY_TZ"])),
+            Command::Unset("FLEETY_TZ".into())
+        );
         assert_eq!(parse(&v(&["edit"])), Command::Edit);
         assert_eq!(parse(&v(&["get"])), Command::Help); // missing operand
         assert_eq!(parse(&v(&["set", "X"])), Command::Help);

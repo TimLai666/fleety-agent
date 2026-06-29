@@ -31,6 +31,8 @@ enigo = "0.6"
 xcap = "0.9"
 png = { workspace = true }
 base64 = { workspace = true }
+# Self-update: verify downloaded artifacts.
+sha2 = "0.10"
 
 [dev-dependencies]
 tokio = { workspace = true }

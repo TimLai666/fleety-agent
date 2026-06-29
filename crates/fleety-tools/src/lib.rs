@@ -37,6 +37,7 @@ pub mod device;
 mod insyra;
 pub mod restart;
 pub mod service;
+pub mod update;
 pub use browser::register_browser;
 pub use chrome::{ensure_chrome, upgrade_managed_chrome};
 pub use computer::register_computer;

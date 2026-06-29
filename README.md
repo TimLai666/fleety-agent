@@ -148,10 +148,12 @@ launchd / Windows SCM).
 | `fleety tui` | Interactive terminal UI (streaming chat). |
 | `fleety voice` | Voice conversation (speech-to-text in, spoken reply out). |
 | `fleety status` | Server health: version, uptime, connected devices. |
-| `fleety config <list\|get\|set\|unset\|edit>` | Inspect/edit settings (`~/.fleety/config.toml`); secrets masked. `edit` is interactive. |
+| `fleety config <list\|get\|set\|unset\|edit>` | Inspect/edit settings (`~/.fleety/config.toml`); secrets masked. `edit` opens an interactive screen (ratatui list on a TTY, line-based otherwise). |
 | `fleety audit [device]` | List a device's audit-log entries (tool calls/results/replies). |
 | `fleety rollback <...>` | List backups / restore a file from a backup. |
 | `fleety pair` | Enroll this device with a pairing code (auth-required servers). |
+| `fleety daemon <verb>` | Manage the local daemon from the unified CLI — forwards to `fleetyd` (`install`/`start`/`stop`/`restart`/`status`/`update`/…). |
+| `fleety update` | Update **every** fleety component installed on this host (CLI + any local server + daemon, incl. the `fleety-insyra` sidecar). One command. |
 | `fleety acp` | Run as an [Agent Client Protocol](https://agentclientprotocol.com) agent over stdio (for ACP editors like Zed). Not run by hand — the editor launches it. |
 
 ### `fleety-server` — the agent server
@@ -167,6 +169,7 @@ verbs register/run it as a background service:
 | `fleety-server start` / `stop` / `restart` | run now / stop now / restart (restart defers until idle — never interrupts a turn). |
 | `fleety-server enable` / `disable` | turn boot autostart on / off. |
 | `fleety-server status` | running? autostart on? |
+| `fleety-server config <list\|get\|set\|unset\|edit>` | Inspect/edit **this host's** settings (e.g. `set FLEETY_MODEL …`, `set FLEETY_TOKEN …`); same surface as `fleety config`, applied where the server boots. |
 | `fleety-server run-service` | internal: the entry point the service manager starts. Not for manual use. |
 
 > On Windows, `install`/`uninstall` need a one-time **Administrator** terminal.
@@ -180,7 +183,8 @@ server, plus self-update:
 |---|---|
 | `fleetyd install` / `uninstall` | register / remove the daemon service (install leaves autostart off until `enable`). |
 | `fleetyd start` / `stop` / `restart` / `enable` / `disable` / `status` | as above (restart defers until any running on-device tool finishes). |
-| `fleetyd update` | self-update to the latest release (also refreshes the `fleety-insyra` sidecar). |
+| `fleetyd config <list\|get\|set\|unset\|edit>` | Inspect/edit **this host's** settings; same surface as `fleety config`. |
+| `fleetyd update` | self-update to the latest release (also refreshes the `fleety-insyra` sidecar). For a host-wide update of all components, prefer `fleety update`. |
 | `fleetyd run-service` | internal service entry point. |
 
 Configuration for all three is environment-first (`FLEETY_*`) with a `config.toml`

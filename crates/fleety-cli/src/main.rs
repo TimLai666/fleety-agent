@@ -189,6 +189,13 @@ async fn main() {
                 eprintln!("error: {}", e.report().message);
             }
         }
+        Some("update") => {
+            // Update every fleety component installed on this host (CLI + any
+            // local server + daemon). One command, per the unified update model.
+            if let Err(e) = update_all().await {
+                eprintln!("error: {}", e.report().message);
+            }
+        }
         Some("acp") => {
             // ACP agent over stdio: stdout carries only JSON-RPC; logs/errors go
             // to stderr (tracing is already on stderr), so the editor's parser
@@ -218,15 +225,61 @@ async fn main() {
     }
 }
 
-/// Resolve the local `fleetyd` binary: prefer a sibling of the running `fleety`
-/// (same install dir), else rely on PATH.
-fn daemon_binary() -> std::path::PathBuf {
-    let name = if cfg!(windows) { "fleetyd.exe" } else { "fleetyd" };
+/// A local fleety binary `bin` installed as a sibling of the running `fleety`
+/// (same install dir), if present.
+fn sibling_bin(bin: &str) -> Option<std::path::PathBuf> {
+    let name = if cfg!(windows) {
+        format!("{bin}.exe")
+    } else {
+        bin.to_string()
+    };
     std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join(name)))
         .filter(|p| p.exists())
-        .unwrap_or_else(|| std::path::PathBuf::from("fleetyd"))
+}
+
+/// Resolve the local `fleetyd` binary: prefer a sibling of `fleety`, else PATH.
+fn daemon_binary() -> std::path::PathBuf {
+    sibling_bin("fleetyd").unwrap_or_else(|| std::path::PathBuf::from("fleetyd"))
+}
+
+/// `fleety update`: update every fleety component installed on THIS host. Updates
+/// the CLI itself, then the server binary (restarting its service), then delegates
+/// the daemon to `fleetyd update` (which also refreshes the insyra sidecar).
+/// Remote components are updated by running `fleety update` on their own host.
+async fn update_all() -> Result<()> {
+    println!("Updating fleety (CLI)…");
+    fleety_tools::update::self_update().await?;
+
+    // fleety-server: update the binary, then restart its service. Resolving its
+    // artifact needs a `{bin}` manifest template (a plain URL is the CLI's own).
+    if let Some(exe) = sibling_bin("fleety-server") {
+        if fleety_tools::update::manifest_is_templated() {
+            match fleety_tools::update::update_named("fleety-server", &exe).await {
+                Ok(true) => {
+                    let _ = std::process::Command::new(&exe).arg("restart").status();
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    eprintln!(
+                        "warning: fleety-server update failed: {}",
+                        e.report().message
+                    )
+                }
+            }
+        } else {
+            println!(
+                "note: set FLEETY_UPDATE_MANIFEST to a URL containing {{bin}} to also update fleety-server."
+            );
+        }
+    }
+
+    // fleetyd: delegate to its own complete update (binary + insyra + restart).
+    if let Some(exe) = sibling_bin("fleetyd") {
+        let _ = std::process::Command::new(&exe).arg("update").status();
+    }
+    Ok(())
 }
 
 /// Run `fleetyd <args...>` to manage the local daemon from the CLI. Inherits

@@ -16,7 +16,6 @@ mod ondevice;
 mod poll_updates;
 mod provision;
 mod service;
-mod update;
 #[cfg(windows)]
 mod winsvc;
 
@@ -147,7 +146,7 @@ async fn async_main(cmd: Option<String>) {
         Some("disable") => return log_verb("disable", service::disable()),
         Some("status") => return log_verb("status", service::status()),
         Some("update") => {
-            match update::update().await {
+            match fleety_tools::update::self_update().await {
                 Ok(true) => {
                     // We swapped the binary; restart the installed service (best
                     // effort) so it runs the new exe. The manager stop is graceful

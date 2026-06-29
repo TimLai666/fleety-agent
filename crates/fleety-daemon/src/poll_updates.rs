@@ -12,8 +12,6 @@ use std::time::Duration;
 
 use agent_core::Result;
 
-use crate::update;
-
 const DEFAULT_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const MIN_INTERVAL: Duration = Duration::from_secs(60); // floor; lets tests opt in
 
@@ -71,16 +69,16 @@ async fn tick(auto_apply: bool) -> Result<()> {
         // returns Ok(false) when already up to date. If it installed a new
         // binary, request a self-restart that the serve loop carries out at the
         // next idle frame boundary (so an update never interrupts a running tool).
-        if update::update().await? {
+        if fleety_tools::update::self_update().await? {
             crate::request_self_restart("self-update");
         }
         return Ok(());
     }
     // Notify-only path: check the manifest, print a one-line summary, never
     // touch the binary.
-    let latest = update::probe_latest().await?;
+    let latest = fleety_tools::update::probe_latest().await?;
     let current = agent_core::VERSION;
-    if update::needs_update_str(current, &latest) {
+    if fleety_tools::update::needs_update_str(current, &latest) {
         tracing::warn!(
             current,
             latest = %latest,

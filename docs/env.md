@@ -300,7 +300,23 @@ insyra (add node/python via `FLEETY_DEPS` for device-side skills/MCP).
 | `FLEETY_DDGS_AUTO_INSTALL` | (on) | Per-dep opt-out for ddgs (`0` = don't auto-install ddgs). |
 | `FLEETY_INSYRA_URL` | release asset | Override the insyra sidecar download URL. |
 
-## Self-update polling (`fleetyd` background loop)
+## Self-update
+
+`fleety update` is the unified, host-wide updater: it updates every fleety
+component installed on the machine (the CLI itself, plus any local `fleety-server`
+and `fleetyd` — the latter also refreshing the `fleety-insyra` sidecar), restarting
+the services it touches. Run it on each host. `fleetyd update` (binary + sidecar)
+and the daemon's background poll below are the same mechanism, scoped to the daemon.
+
+Each binary's artifact is described by a JSON manifest (`version`, `url`, `sha256`).
+`FLEETY_UPDATE_MANIFEST` gives the manifest URL; when it contains the literal
+`{bin}`, that placeholder is substituted with the binary name so one base URL serves
+all of them (e.g. `https://host/dl/{bin}/latest.json`). A plain URL (no `{bin}`) is
+treated as the *current* binary's manifest — `fleety update` then only self-updates
+the CLI (it can't safely resolve the others) and says so. Binaries ship in lockstep
+(one workspace version), so the running process's version is the baseline.
+
+### Background polling (`fleetyd` loop)
 
 24h periodic check of the release manifest. Only spawns when a manifest URL is
 set; without `FLEETY_AUTO_UPDATE=apply` it's notify-only (log a warning). When
@@ -309,7 +325,7 @@ to run it; `fleetyd update` (one-shot) restarts the installed service the same w
 
 | Var | Default | Meaning |
 |---|---|---|
-| `FLEETY_UPDATE_MANIFEST` | (unset → no poll) | URL of the JSON manifest with `version`, `url`, `sha256`. |
+| `FLEETY_UPDATE_MANIFEST` | (unset → no poll) | URL of the JSON manifest (`version`, `url`, `sha256`). May contain `{bin}` to serve all binaries from one base. |
 | `FLEETY_UPDATE_POLL_SECS` | `86400` (24 h) | How often to check. Floor 60 s. |
 | `FLEETY_AUTO_UPDATE` | `notify` | Set to `apply` to run the full update on each tick (`fleetyd update` equivalent). |
 
