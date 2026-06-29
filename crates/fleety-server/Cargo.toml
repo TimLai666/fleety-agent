@@ -22,6 +22,8 @@ serde = { workspace = true }
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures = { workspace = true }
+# HTTP front (WebSocket upgrade + SSE/POST fallback) on the one listen port.
+axum = { version = "0.8", features = ["ws"] }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }

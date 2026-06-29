@@ -19,6 +19,7 @@ mod conversation_recall;
 mod editor_tools;
 mod embed;
 mod gc;
+mod http;
 mod identity;
 mod mdns;
 mod privacy;
@@ -359,63 +360,37 @@ async fn run_server(shutdown: Option<tokio::sync::watch::Receiver<bool>>) {
     // find us without a hand-typed URL. No-op when disabled.
     mdns::spawn_advertise(&addr);
 
-    loop {
-        let accept = listener.accept();
-        let stop = wait_stop(shutdown.clone());
-        tokio::select! {
-            accepted = accept => {
-                let (stream, peer) = match accepted {
-                    Ok(pair) => pair,
-                    Err(e) => {
-                        tracing::warn!("accept failed: {e}");
-                        continue;
-                    }
-                };
-                let storage = Arc::clone(&storage);
-                let provider = Arc::clone(&provider);
-                let workspace = Arc::clone(&workspace);
-                let hub = Arc::clone(&hub);
-                let pending = Arc::clone(&pending);
-                let handles = Arc::clone(&handles);
-                let auth = Arc::clone(&auth);
-                let device_tools = Arc::clone(&device_tools);
-                tokio::spawn(async move {
-                    match conn::handle_conn(
-                        stream,
-                        storage,
-                        provider,
-                        workspace,
-                        policy,
-                        hub,
-                        pending,
-                        handles,
-                        auth,
-                        device_tools,
-                    )
-                    .await
-                    {
-                        Ok(()) => {}
-                        Err(e) => {
-                            tracing::warn!(%peer, report = ?e.report(), "connection error")
-                        }
-                    }
-                });
-            }
-            _ = stop => {
-                tracing::info!("stop signal received; closing listener and shutting down");
-                // Drop the listener so no new connections come in. In-flight
-                // connections finish their current turn (the journal protects
-                // anything they're mid-step on if they don't).
-                drop(listener);
-                // Close every live connection's writer channel so peers see
-                // the shutdown immediately, not on the next ping timeout.
-                let mut hub = hub.lock().await;
-                for (device, _) in hub.drain() {
-                    tracing::info!(%device, "closing connection on shutdown");
-                }
-                tracing::info!("fleety-server stopped");
-                return;
+    // Serve WebSocket + (added by this change) the SSE+POST fallback through one
+    // axum app on this port. `conn::handle_conn` (raw-TCP WebSocket) stays for the
+    // integration tests; in production axum owns the listener and routes to the
+    // same transport-agnostic `conn::run_connection`.
+    let state = http::AppState {
+        storage: Arc::clone(&storage),
+        provider: Arc::clone(&provider),
+        workspace: Arc::clone(&workspace),
+        policy,
+        hub: Arc::clone(&hub),
+        pending: Arc::clone(&pending),
+        handles: Arc::clone(&handles),
+        auth: Arc::clone(&auth),
+        device_tools: Arc::clone(&device_tools),
+    };
+    let app = http::router(state);
+    tokio::select! {
+        r = axum::serve(listener, app.into_make_service()) => {
+            if let Err(e) = r {
+                tracing::error!(%e, "http server error");
             }
         }
+        _ = wait_stop(shutdown.clone()) => {
+            tracing::info!("stop signal received; shutting down");
+        }
     }
+    // Close every live connection's writer channel so peers see the shutdown
+    // immediately (an in-flight connection task ends when its writer closes).
+    let mut hub = hub.lock().await;
+    for (device, _) in hub.drain() {
+        tracing::info!(%device, "closing connection on shutdown");
+    }
+    tracing::info!("fleety-server stopped");
 }

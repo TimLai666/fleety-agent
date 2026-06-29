@@ -3,11 +3,21 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use tokio_tungstenite::tungstenite::Message as WsMessage;
+// The raw-TCP WebSocket cluster (Tx/Rx, handle_conn, WsInbound/WsFrameWriter,
+// read_client, is_disconnect) is the in-process test harness; production serves
+// WebSocket through axum (see crate::http). These imports support that harness.
+#[cfg(test)]
 use futures::stream::{SplitSink, SplitStream};
+#[cfg(test)]
 use futures::{SinkExt, StreamExt};
+#[cfg(test)]
 use tokio::net::TcpStream;
+#[cfg(test)]
 use tokio_tungstenite::tungstenite::error::ProtocolError;
-use tokio_tungstenite::tungstenite::{Error as WsErr, Message as WsMessage};
+#[cfg(test)]
+use tokio_tungstenite::tungstenite::Error as WsErr;
+#[cfg(test)]
 use tokio_tungstenite::WebSocketStream;
 
 use tokio::sync::mpsc;
@@ -26,7 +36,9 @@ use crate::storage::Storage;
 /// Outbound frame sender (drained by the connection's writer task).
 pub(crate) type Out = mpsc::UnboundedSender<WsMessage>;
 
+#[cfg(test)]
 type Tx = SplitSink<WebSocketStream<TcpStream>, WsMessage>;
+#[cfg(test)]
 type Rx = SplitStream<WebSocketStream<TcpStream>>;
 
 /// The server's own hostname (for deciding whether an originating CLI is on the
@@ -158,7 +170,10 @@ fn build_connection_stack(
     (tools, subagent_host, goal_state)
 }
 
-/// Handle one client connection to completion.
+/// Handle one client connection over a raw-TCP WebSocket. Production serves
+/// WebSocket via axum ([`crate::http`]); this is the in-process test harness,
+/// and like the axum path it delegates to [`run_connection`].
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_conn(
     stream: TcpStream,
@@ -175,10 +190,43 @@ pub async fn handle_conn(
     let ws = tokio_tungstenite::accept_async(stream)
         .await
         .map_err(|e| CoreError::Provider(format!("websocket handshake failed: {e}")))?;
-    let (mut tx, mut rx) = ws.split();
+    let (tx, rx) = ws.split();
+    run_connection(
+        Box::new(WsInbound { rx }),
+        Box::new(WsFrameWriter { tx }),
+        storage,
+        provider,
+        workspace,
+        policy,
+        hub,
+        pending,
+        handles,
+        auth,
+        device_tools,
+    )
+    .await
+}
 
+/// Run one client connection over any transport: read `Hello` + authenticate,
+/// then drive the conversation loop with an [`Out`] channel drained into the
+/// transport's [`FrameWriter`]. WebSocket ([`handle_conn`]) and the SSE+POST
+/// fallback both call this; only `inbound`/`writer` differ.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_connection(
+    mut inbound: Box<dyn ClientInbound>,
+    mut writer: Box<dyn FrameWriter>,
+    storage: Arc<Storage>,
+    provider: Arc<dyn ModelProvider>,
+    workspace: Arc<PathBuf>,
+    policy: Policy,
+    hub: Hub,
+    pending: Pending,
+    handles: Handles,
+    auth: Arc<AuthStore>,
+    device_tools: DeviceTools,
+) -> Result<()> {
     // The first frame must be Hello; enforce auth if the server requires it.
-    let (device_id, minted_token) = match read_client(&mut rx).await? {
+    let (device_id, minted_token) = match inbound.next_client().await? {
         Some(ClientMsg::Hello {
             device_id,
             protocol,
@@ -230,25 +278,25 @@ pub async fn handle_conn(
                 }
                 Err(message) => {
                     tracing::warn!(%device_id, "rejected unauthenticated connection");
-                    send_error(
-                        &mut tx,
+                    send_error_frame(
+                        &mut *writer,
                         "unauthenticated",
                         &message,
                         "pass a valid token, or a pairing_code from `pair_create` on a paired device",
                     )
-                    .await?;
+                    .await;
                     return Ok(());
                 }
             }
         }
         Some(_) => {
-            send_error(
-                &mut tx,
+            send_error_frame(
+                &mut *writer,
                 "expected_hello",
                 "first frame must be Hello",
                 "send a Hello frame with your device_id before anything else",
             )
-            .await?;
+            .await;
             return Ok(());
         }
         None => return Ok(()),
@@ -257,24 +305,24 @@ pub async fn handle_conn(
     // Register / refresh this device in the registry.
     storage.ensure_device(&device_id, "client_session")?;
 
-    // A single writer task owns the sink; everything else (this handler, the
-    // approval gate, and other connections routing RunTool here) sends frames
+    // A single writer task owns the transport sink; everything else (this handler,
+    // the approval gate, and other connections routing RunTool here) sends frames
     // through `out`, registered in the hub under this device_id.
     let (out, mut out_rx) = mpsc::unbounded_channel::<WsMessage>();
-    let writer = tokio::spawn(async move {
+    let writer_task = tokio::spawn(async move {
         while let Some(frame) = out_rx.recv().await {
-            if tx.send(frame).await.is_err() {
+            let WsMessage::Text(text) = frame else {
+                continue; // only text frames are emitted
+            };
+            if !writer.send_text(text.to_string()).await {
                 break;
             }
         }
     });
     hub.lock().await.insert(device_id.clone(), out.clone());
 
-    // The conversation loop reads through the transport-agnostic `ClientInbound`;
-    // here that's the WebSocket stream.
-    let mut inbound = WsInbound { rx };
     let result = serve(
-        &mut inbound,
+        &mut *inbound,
         &out,
         &storage,
         provider.as_ref(),
@@ -292,7 +340,7 @@ pub async fn handle_conn(
 
     hub.lock().await.remove(&device_id);
     device_tools.lock().await.remove(&device_id);
-    writer.abort();
+    writer_task.abort();
     tracing::info!(%device_id, "client disconnected");
     result
 }
@@ -1226,26 +1274,9 @@ fn emit(out: &Out, msg: &ServerMsg) -> Result<()> {
         .map_err(|_| CoreError::Provider("connection writer closed".to_string()))
 }
 
-async fn send(tx: &mut Tx, msg: &ServerMsg) -> Result<()> {
-    let json = serde_json::to_string(msg)
-        .map_err(|e| CoreError::Message(format!("serialize server frame: {e}")))?;
-    tx.send(WsMessage::Text(json))
-        .await
-        .map_err(|e| CoreError::Provider(format!("websocket send failed: {e}")))?;
-    Ok(())
-}
-
-async fn send_error(tx: &mut Tx, kind: &str, message: &str, remediation: &str) -> Result<()> {
-    let error = WireError {
-        kind: kind.to_string(),
-        message: message.to_string(),
-        remediation: Some(remediation.to_string()),
-    };
-    send(tx, &ServerMsg::Error { error }).await
-}
-
 /// A client going away (close frame, reset, or a disconnect-shaped IO error) is
 /// a normal end of connection, not an error.
+#[cfg(test)]
 fn is_disconnect(e: &WsErr) -> bool {
     use std::io::ErrorKind;
     matches!(e, WsErr::ConnectionClosed | WsErr::AlreadyClosed)
@@ -1551,6 +1582,7 @@ impl ApprovalGate for ConnGate<'_> {
     }
 }
 
+#[cfg(test)]
 async fn read_client(rx: &mut Rx) -> Result<Option<ClientMsg>> {
     while let Some(frame) = rx.next().await {
         let frame = match frame {
@@ -1588,15 +1620,59 @@ pub(crate) trait ClientInbound: Send {
     async fn next_client(&mut self) -> Result<Option<ClientMsg>>;
 }
 
-/// WebSocket inbound: reads `ClientMsg` frames off the split WS stream.
+/// WebSocket inbound: reads `ClientMsg` frames off the split WS stream (test
+/// harness; production uses the axum adapter in [`crate::http`]).
+#[cfg(test)]
 pub(crate) struct WsInbound {
     pub(crate) rx: Rx,
 }
 
+#[cfg(test)]
 #[async_trait::async_trait]
 impl ClientInbound for WsInbound {
     async fn next_client(&mut self) -> Result<Option<ClientMsg>> {
         read_client(&mut self.rx).await
+    }
+}
+
+/// Outbound writer for a transport: sends one serialized frame (a `ServerMsg`
+/// JSON string). The connection core drains the [`Out`] channel into this, so
+/// WebSocket and the SSE+POST fallback differ only in how a frame reaches the
+/// wire. Returns `false` once the transport is closed.
+#[async_trait::async_trait]
+pub(crate) trait FrameWriter: Send {
+    async fn send_text(&mut self, text: String) -> bool;
+}
+
+/// WebSocket outbound: text frames over the split WS sink (test harness).
+#[cfg(test)]
+pub(crate) struct WsFrameWriter {
+    pub(crate) tx: Tx,
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl FrameWriter for WsFrameWriter {
+    async fn send_text(&mut self, text: String) -> bool {
+        self.tx.send(WsMessage::Text(text)).await.is_ok()
+    }
+}
+
+/// Send a `ServerMsg::Error` through a `FrameWriter` (used before the `Out`
+/// channel exists — i.e. handshake/auth rejections). Best-effort.
+async fn send_error_frame(
+    writer: &mut dyn FrameWriter,
+    kind: &str,
+    message: &str,
+    remediation: &str,
+) {
+    let error = WireError {
+        kind: kind.to_string(),
+        message: message.to_string(),
+        remediation: Some(remediation.to_string()),
+    };
+    if let Ok(json) = serde_json::to_string(&ServerMsg::Error { error }) {
+        writer.send_text(json).await;
     }
 }
 

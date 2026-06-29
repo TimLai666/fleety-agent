@@ -4,7 +4,7 @@
 
 ## 2. axum 前端 router
 
-- [ ] 2.1 引入 axum 並把 WebSocket upgrade 接到 axum router(本階段僅 WS 路由),交付 "Server multiplexes WebSocket, SSE, and POST on one port" 的同 port 多路基礎;對應設計「axum 作為 server 前端 router 並多路 WS/SSE/POST」。驗證:WebSocket 經 axum 仍跑通最小對話的整合測試;clippy -D 與既有測試維持綠。
+- [x] 2.1 引入 axum 並把 WebSocket upgrade 接到 axum router(本階段僅 WS 路由),交付 "Server multiplexes WebSocket, SSE, and POST on one port" 的同 port 多路基礎;對應設計「axum 作為 server 前端 router 並多路 WS/SSE/POST」。驗證:WebSocket 經 axum 仍跑通最小對話的整合測試;clippy -D 與既有測試維持綠。
 
 ## 3. SSE+POST 傳輸與 session 關聯
 
