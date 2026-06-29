@@ -133,6 +133,7 @@ fn build_connection_stack(
         Arc::clone(auth),
         Arc::clone(device_tools),
         out.clone(),
+        acting.clone(),
     );
     let subagent_mgr = agent_core::SubagentManager::new(
         Arc::clone(&subagent_host) as Arc<dyn agent_core::SubagentHost>,

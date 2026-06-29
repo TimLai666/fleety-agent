@@ -404,7 +404,7 @@ mod tests {
         async fn cleanup_workspace(&self, _ws: Option<&str>) -> bool {
             true
         }
-        async fn record_events(&self, _events: &[agent_core::Event]) {}
+        async fn record_events(&self, _task_id: &str, _events: &[agent_core::Event]) {}
         async fn on_complete(&self, _t: String, _c: String, _s: SubagentState, _o: String) {}
     }
 
@@ -431,7 +431,7 @@ mod tests {
         async fn cleanup_workspace(&self, _ws: Option<&str>) -> bool {
             true
         }
-        async fn record_events(&self, _e: &[agent_core::Event]) {}
+        async fn record_events(&self, _task_id: &str, _e: &[agent_core::Event]) {}
         async fn on_complete(&self, _t: String, _c: String, _s: SubagentState, _o: String) {}
     }
 

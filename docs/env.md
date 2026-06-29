@@ -197,6 +197,21 @@ leak. Tool-result audit entries are tagged with their conversation so this
 scoping is enforceable; untagged (legacy/system) entries are never returned to a
 specific user.
 
+## Subagent records
+
+A subagent run is recorded as a **child conversation** (`sub-<task_id>`) owned by
+the **parent turn's acting user** (not the device owner), so its record is
+user-scoped. Its events are tagged to that child conversation — so its assistant
+turns are retrievable (recall / listing) and its tool output is reachable by
+`fetch_tool_result` within the owning user's scope (previously they went to the
+untagged device audit log and were lost to recall/fetch). The parent conversation
+links to each child: the `spawn_subagent` result carries `child_conversation_id`,
+the completion seed names it, and the server keeps a parent→children index, so a
+conversation can enumerate the subagents it spawned and open each one's full
+record. A subagent spawned by a guest (no identified user) is left unowned. This
+is server-side only; the core subagent mechanism, the one-level nesting cap, and
+the manager lifecycle are unchanged.
+
 ## Conversation recall
 
 The agent can search its **own user's** past conversations (per-user; conversations

@@ -89,3 +89,43 @@ code:
   - crates/agent-core/src/lib.rs
   - crates/agent-core/src/subagent.rs
 -->
+
+---
+### Requirement: The host records a subagent under a parent-owned child conversation
+
+The subagent host SHALL persist a subagent run's events under a child conversation
+(tagged with the child conversation id), owned by the parent turn's acting user,
+rather than as untagged device-audit events, and SHALL record a parent→child link.
+The core subagent mechanism, the one-level nesting cap, and the manager lifecycle
+are unchanged; only the host's persistence and ownership change.
+
+#### Scenario: events are tagged to the child, not untagged audit
+
+- **WHEN** the host records a subagent run's events
+- **THEN** they are written tagged to the child conversation id (not as untagged device-audit entries)
+
+#### Scenario: ownership follows the parent's acting user
+
+- **WHEN** the host persists the subagent's child conversation
+- **THEN** its owner is the parent turn's acting user, not the device owner
+
+<!-- @trace
+source: subagent-conversation-linkage
+updated: 2026-06-29
+code:
+  - crates/fleety-protocol/src/lib.rs
+  - crates/fleety-daemon/src/main.rs
+  - crates/fleety-tools/src/device.rs
+  - crates/agent-core/src/subagent.rs
+  - crates/fleety-server/src/auth.rs
+  - crates/fleety-server/src/conn.rs
+  - crates/fleety-cli/src/main.rs
+  - crates/fleety-server/src/subagent.rs
+  - Cargo.toml
+  - crates/fleety-tools/Cargo.toml
+  - crates/fleety-server/src/storage.rs
+  - crates/fleety-tools/src/lib.rs
+  - crates/fleety-cli/src/acp.rs
+  - docs/env.md
+  - crates/agent-workflow/src/lib.rs
+-->

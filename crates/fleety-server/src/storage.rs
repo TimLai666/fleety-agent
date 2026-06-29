@@ -139,6 +139,12 @@ fn validate_id(kind: &str, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// The child conversation id for a subagent run, derived from its task id so the
+/// parent link, the child transcript, and its tagged audit events all correlate.
+pub fn subagent_child_id(task_id: &str) -> String {
+    format!("sub-{task_id}")
+}
+
 /// Filesystem-backed conversation store rooted at the Agent home.
 pub struct Storage {
     home: PathBuf,
@@ -191,6 +197,52 @@ impl Storage {
     /// The per-user conversation embedding index db (beside their conversations).
     pub fn conversation_index_path(&self, user: &str) -> PathBuf {
         crate::conversation_embed::index_path(&self.home, user)
+    }
+
+    fn subagent_links_path(&self) -> PathBuf {
+        self.home.join("fleet").join("subagent-links.json")
+    }
+
+    /// Record that `parent` conversation spawned the subagent `child` conversation
+    /// (idempotent — deduped). The index lets a conversation enumerate the
+    /// subagents it spawned.
+    pub fn link_subagent(&self, parent: &str, child: &str) -> Result<()> {
+        let _guard = self
+            .append_lock
+            .lock()
+            .map_err(|_| CoreError::Message("storage index lock poisoned".to_string()))?;
+        let path = self.subagent_links_path();
+        let mut map: std::collections::HashMap<String, Vec<String>> = fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+        let kids = map.entry(parent.to_string()).or_default();
+        if !kids.iter().any(|c| c == child) {
+            kids.push(child.to_string());
+        }
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir)
+                .map_err(|e| CoreError::Message(format!("create fleet dir: {e}")))?;
+        }
+        let body = serde_json::to_string_pretty(&map)
+            .map_err(|e| CoreError::Message(format!("serialize subagent links: {e}")))?;
+        fs::write(&path, body)
+            .map_err(|e| CoreError::Message(format!("write subagent links: {e}")))?;
+        Ok(())
+    }
+
+    /// The child subagent conversation ids a `parent` conversation spawned.
+    /// (Read side of the link index; a tool that surfaces it to the agent is a
+    /// thin follow-up.)
+    #[allow(dead_code)]
+    pub fn subagent_children(&self, parent: &str) -> Vec<String> {
+        fs::read_to_string(self.subagent_links_path())
+            .ok()
+            .and_then(|t| {
+                serde_json::from_str::<std::collections::HashMap<String, Vec<String>>>(&t).ok()
+            })
+            .and_then(|m| m.get(parent).cloned())
+            .unwrap_or_default()
     }
 
     /// The persisted workspace binding for a conversation (root + optional
@@ -1357,6 +1409,25 @@ mod tests {
         // Corrupt file → None (safe fallback to a full summary).
         std::fs::write(storage.compaction_path("dev", "conv"), "not json").expect("clobber");
         assert!(storage.load_compaction("dev", "conv").is_none());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn subagent_links_and_child_id() {
+        let home = temp_home();
+        let storage = Storage::new(home.clone());
+        assert_eq!(super::subagent_child_id("7"), "sub-7");
+        // Empty until linked.
+        assert!(storage.subagent_children("parent-c").is_empty());
+        storage.link_subagent("parent-c", "sub-1").unwrap();
+        storage.link_subagent("parent-c", "sub-2").unwrap();
+        storage.link_subagent("parent-c", "sub-1").unwrap(); // dedup
+        assert_eq!(
+            storage.subagent_children("parent-c"),
+            vec!["sub-1", "sub-2"]
+        );
+        // Other parents are independent.
+        assert!(storage.subagent_children("other").is_empty());
         let _ = std::fs::remove_dir_all(&home);
     }
 

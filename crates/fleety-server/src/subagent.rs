@@ -52,6 +52,9 @@ pub struct FleetyHost {
     auth: Arc<AuthStore>,
     device_tools: DeviceTools,
     out: Out,
+    /// The parent turn's acting user — a subagent's child conversation is owned by
+    /// this user (not the device owner), so its record is user-scoped.
+    acting: crate::identity::ActingUser,
     active_conversation: Mutex<String>,
     /// Serializes user turns and wake turns on this connection.
     turn_lock: Mutex<()>,
@@ -72,6 +75,7 @@ impl FleetyHost {
         auth: Arc<AuthStore>,
         device_tools: DeviceTools,
         out: Out,
+        acting: crate::identity::ActingUser,
     ) -> Arc<Self> {
         Arc::new(Self {
             providers,
@@ -85,6 +89,7 @@ impl FleetyHost {
             auth,
             device_tools,
             out,
+            acting,
             active_conversation: Mutex::new(String::new()),
             turn_lock: Mutex::new(()),
             manager: OnceLock::new(),
@@ -182,10 +187,33 @@ impl SubagentHost for FleetyHost {
         }
     }
 
-    async fn record_events(&self, events: &[agent_core::Event]) {
-        for ev in events {
-            let _ = self.storage.append_history(&self.device_id, ev);
+    async fn record_events(&self, task_id: &str, events: &[agent_core::Event]) {
+        // Record the subagent as a child conversation owned by the parent's acting
+        // user, linked from the parent — so its tool output is fetchable + scoped
+        // and its transcript is retrievable. Best-effort: failures are logged and
+        // never abort the subagent.
+        let child = crate::storage::subagent_child_id(task_id);
+        let parent = self.active_conversation.lock().await.clone();
+        let _ = self
+            .storage
+            .register_conversation_owner(&child, &self.acting);
+        if !parent.is_empty() {
+            let _ = self.storage.link_subagent(&parent, &child);
         }
+        for ev in events {
+            // Tag audit events to the child conversation (fetchable + scoped).
+            let _ = self
+                .storage
+                .append_history_tagged(&self.device_id, &child, ev);
+            // Persist the subagent's assistant turns as a retrievable transcript.
+            if let agent_core::Event::Assistant(msg) = ev {
+                let _ = self.storage.append(&self.device_id, &child, msg);
+            }
+        }
+    }
+
+    fn record_id(&self, task_id: &str) -> Option<String> {
+        Some(crate::storage::subagent_child_id(task_id))
     }
 
     async fn on_complete(
@@ -203,9 +231,11 @@ impl SubagentHost for FleetyHost {
         let _guard = self.turn_lock.lock().await;
         *self.active_conversation.lock().await = context.clone();
         let summary = truncate(&output, 4000);
+        let child = crate::storage::subagent_child_id(&task_id);
         let seed = format!(
-            "[subagent {task_id} {}] The background subagent you spawned has finished. \
-             Its result:\n\n{summary}\n\nSynthesize this for the user or take any follow-up action.",
+            "[subagent {task_id} {} · full record: conversation {child}] The background subagent \
+             you spawned has finished. Its result:\n\n{summary}\n\nSynthesize this for the user or \
+             take any follow-up action.",
             state.as_str()
         );
         // A real parent turn: full tools PLUS orchestration, so it may spawn again.
@@ -345,8 +375,44 @@ mod tests {
             auth,
             crate::bridge::new_device_tools(),
             out,
+            crate::identity::ActingUser::User("alice".to_string()),
         );
         (host, home, rx, tiers)
+    }
+
+    #[tokio::test]
+    async fn record_events_makes_owned_linked_child_conversation() {
+        use agent_core::{Event, SubagentHost};
+        let (host, home, _rx, _t) = mk_host();
+        host.set_active_conversation("parent-c").await;
+        // The child id is surfaced for the spawn result.
+        assert_eq!(host.record_id("7").as_deref(), Some("sub-7"));
+        // Recording a run's events tags + owns + links the child conversation.
+        let events = vec![
+            Event::Assistant(Message::assistant("subagent thought")),
+            Event::ToolResult {
+                id: "call_1".to_string(),
+                result: serde_json::json!({ "ok": true }),
+            },
+        ];
+        host.record_events("7", &events).await;
+        // Linked from the parent.
+        assert_eq!(host.storage.subagent_children("parent-c"), vec!["sub-7"]);
+        // Owned by the parent's acting user → retrievable transcript under that user.
+        assert_eq!(
+            host.storage.conversation_owner("sub-7").as_deref(),
+            Some("alice")
+        );
+        let msgs = host.storage.load("dev", "sub-7").unwrap();
+        assert!(msgs
+            .iter()
+            .any(|m| m.content.as_deref() == Some("subagent thought")));
+        // The tool result is tagged to the child (fetchable within alice's scope).
+        let got = host
+            .storage
+            .tool_result_for("dev", "call_1", Some("sub-7"), |c| c == "sub-7");
+        assert!(got.is_some());
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[tokio::test]

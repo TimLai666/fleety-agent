@@ -117,9 +117,17 @@ pub trait SubagentHost: Send + Sync + 'static {
     /// (a host may keep one that still holds the subagent's changes).
     async fn cleanup_workspace(&self, workspace: Option<&str>) -> bool;
 
-    /// Record the run's events (audit). Takes a slice (not the `EventLog`) so
-    /// the future stays `Send`.
-    async fn record_events(&self, events: &[Event]);
+    /// Record the run's events (audit), tagged by the subagent's `task_id` so the
+    /// host can attribute them to that run (e.g. a child conversation). Takes a
+    /// slice (not the `EventLog`) so the future stays `Send`.
+    async fn record_events(&self, task_id: &str, events: &[Event]);
+
+    /// The id under which this run's record is stored (e.g. a child conversation
+    /// id), surfaced in the spawn result so the caller can open it. `None` (the
+    /// default) means the host keeps no separately-addressable record.
+    fn record_id(&self, _task_id: &str) -> Option<String> {
+        None
+    }
 
     /// A background subagent finished: the host reports back (e.g. wakes a
     /// coordinator turn) using the captured `context`.
@@ -190,6 +198,7 @@ impl SubagentManager {
     /// (possibly extended) messages. Never panics: an error becomes `Failed`.
     async fn run_loop(
         &self,
+        task_id: &str,
         mut messages: Vec<Message>,
         tier: &str,
         allowed_tools: &[String],
@@ -210,7 +219,7 @@ impl SubagentManager {
             gate.as_mut(),
         )
         .await;
-        self.host.record_events(events.events()).await;
+        self.host.record_events(task_id, events.events()).await;
         match outcome {
             Ok(o) => (SubagentState::Done, o.output, messages),
             Err(e) => (
@@ -264,12 +273,20 @@ impl SubagentManager {
             if let Some(rec) = self.tasks.lock().await.get_mut(&task_id) {
                 rec.handle = Some(handle);
             }
-            Ok(json!({ "task_id": task_id, "state": "running" }))
+            let mut out = json!({ "task_id": task_id, "state": "running" });
+            if let Some(child) = self.host.record_id(&task_id) {
+                out["child_conversation_id"] = json!(child);
+            }
+            Ok(out)
         } else {
             let (state, output) = self
                 .run_to_completion(&task_id, &req, &context, workspace)
                 .await;
-            Ok(json!({ "task_id": task_id, "state": state.as_str(), "output": output }))
+            let mut out = json!({ "task_id": task_id, "state": state.as_str(), "output": output });
+            if let Some(child) = self.host.record_id(&task_id) {
+                out["child_conversation_id"] = json!(child);
+            }
+            Ok(out)
         }
     }
 
@@ -287,6 +304,7 @@ impl SubagentManager {
             .await;
         let (state, mut output, final_messages) = self
             .run_loop(
+                task_id,
                 messages,
                 &req.tier,
                 &req.allowed_tools,
@@ -367,7 +385,8 @@ impl SubagentManager {
         if let Some(rec) = self.tasks.lock().await.get_mut(&task_id) {
             rec.state = SubagentState::Running;
         }
-        let (state, output, final_messages) = self.run_loop(messages, &tier, &[], None).await;
+        let (state, output, final_messages) =
+            self.run_loop(&task_id, messages, &tier, &[], None).await;
         if let Some(rec) = self.tasks.lock().await.get_mut(&task_id) {
             rec.state = state;
             rec.output = Some(output.clone());
@@ -687,7 +706,7 @@ mod tests {
         async fn cleanup_workspace(&self, _workspace: Option<&str>) -> bool {
             true
         }
-        async fn record_events(&self, _events: &[Event]) {}
+        async fn record_events(&self, _task_id: &str, _events: &[Event]) {}
         async fn on_complete(
             &self,
             task_id: String,
