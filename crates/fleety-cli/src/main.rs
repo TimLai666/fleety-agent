@@ -373,10 +373,7 @@ fn discover_via_mdns(timeout: std::time::Duration) -> Option<String> {
 }
 
 fn device_id() -> String {
-    std::env::var("FLEETY_DEVICE_ID")
-        .or_else(|_| std::env::var("COMPUTERNAME"))
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_else(|_| "cli-device".to_string())
+    fleety_tools::device::device_id()
 }
 
 /// The auth token saved in config (or `FLEETY_TOKEN`), for authenticated connects.
@@ -405,6 +402,7 @@ fn hello(pairing_code: Option<String>) -> ClientMsg {
         // CLI sessions have no on-device tool registry to advertise — only
         // fleetyd does (it runs tools locally).
         local_tools_json: None,
+        hostname: fleety_tools::device::hostname(),
     }
 }
 

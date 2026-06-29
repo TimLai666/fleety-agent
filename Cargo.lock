@@ -1745,6 +1745,7 @@ dependencies = [
  "futures",
  "grep",
  "ignore",
+ "machine-uid",
  "png 0.17.16",
  "reqwest",
  "serde_json",
@@ -2993,6 +2994,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d640282b302c0bb0a2a8e0233ead9035e3bed871f0b7e81fe4a1ec829765db44"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "machine-uid"
+version = "0.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d7217d573cdb141d6da43113b098172e057d39915d79c4bdedbc3aacd46bd96"
+dependencies = [
+ "libc",
+ "windows-registry",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

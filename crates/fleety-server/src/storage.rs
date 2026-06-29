@@ -708,6 +708,53 @@ impl Storage {
         Ok(())
     }
 
+    /// One-time, no-clobber device-directory migration: move
+    /// `fleet/devices/<from>/` to `fleet/devices/<to>/` when the source exists and
+    /// the destination does not. Atomic (a directory rename); the source is gone
+    /// only once the destination is in place, so a crash never loses data.
+    /// Returns whether a move happened. A no-op (and `Ok(false)`) when `from == to`,
+    /// the source is absent, or the destination already exists (never clobbers
+    /// another device's data).
+    pub fn migrate_device(&self, from: &str, to: &str) -> Result<bool> {
+        if from == to {
+            return Ok(false);
+        }
+        validate_id("device_id", from)?;
+        validate_id("device_id", to)?;
+        let src = self.devices_dir().join(from);
+        let dst = self.devices_dir().join(to);
+        if !src.is_dir() || dst.exists() {
+            return Ok(false);
+        }
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| CoreError::Message(format!("create devices dir: {e}")))?;
+        }
+        fs::rename(&src, &dst)
+            .map_err(|e| CoreError::Message(format!("migrate device {from} -> {to}: {e}")))?;
+        Ok(true)
+    }
+
+    /// Record the device's hostname as a display label on its `device.json`
+    /// (the identity is the id; this is just for humans). Best-effort on a missing
+    /// record.
+    pub fn set_device_label(&self, device_id: &str, hostname: &str) -> Result<()> {
+        validate_id("device_id", device_id)?;
+        let path = self.devices_dir().join(device_id).join("device.json");
+        let Ok(text) = fs::read_to_string(&path) else {
+            return Ok(());
+        };
+        let mut record: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        if let Some(obj) = record.as_object_mut() {
+            obj.insert("hostname".to_string(), Value::String(hostname.to_string()));
+            let pretty = serde_json::to_string_pretty(&record)
+                .map_err(|e| CoreError::Message(format!("serialize device record: {e}")))?;
+            fs::write(&path, pretty)
+                .map_err(|e| CoreError::Message(format!("write device record: {e}")))?;
+        }
+        Ok(())
+    }
+
     fn core_file(&self, name: &str, default: &str) -> Result<String> {
         let path = self.home.join("fleet").join(name);
         match fs::read_to_string(&path) {
@@ -1310,6 +1357,42 @@ mod tests {
         // Corrupt file → None (safe fallback to a full summary).
         std::fs::write(storage.compaction_path("dev", "conv"), "not json").expect("clobber");
         assert!(storage.load_compaction("dev", "conv").is_none());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn migrate_device_moves_and_is_idempotent() {
+        use agent_core::Event;
+        use serde_json::json;
+        let home = temp_home();
+        let storage = Storage::new(home.clone());
+        storage.ensure_device("old-host", "client_session").unwrap();
+        storage
+            .append_history(
+                "old-host",
+                &Event::ToolResult {
+                    id: "x".to_string(),
+                    result: json!("payload"),
+                },
+            )
+            .unwrap();
+
+        // Move legacy → machine id.
+        assert!(storage.migrate_device("old-host", "machine-1").unwrap());
+        assert!(!storage.devices_dir().join("old-host").exists());
+        assert!(storage.devices_dir().join("machine-1").exists());
+        assert!(std::fs::read_to_string(storage.history_path("machine-1"))
+            .unwrap()
+            .contains("payload"));
+        // Idempotent / no-op cases.
+        assert!(!storage.migrate_device("old-host", "machine-1").unwrap()); // source gone
+        assert!(!storage.migrate_device("machine-1", "machine-1").unwrap()); // from == to
+        assert!(!storage.migrate_device("absent", "machine-2").unwrap()); // source absent
+                                                                          // No clobber: destination already exists.
+        storage.ensure_device("a", "client_session").unwrap();
+        storage.ensure_device("b", "client_session").unwrap();
+        assert!(!storage.migrate_device("a", "b").unwrap());
+        assert!(storage.devices_dir().join("a").exists());
         let _ = std::fs::remove_dir_all(&home);
     }
 

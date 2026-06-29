@@ -15,6 +15,7 @@ serde_json = { workspace = true }
 uuid = { workspace = true }
 grep = "0.3"
 ignore = "0.4"
+machine-uid = { workspace = true }
 similar = "2"
 toml = "0.8"
 # Browser (CDP) tools + Chrome auto-provisioning, shared so they run on the

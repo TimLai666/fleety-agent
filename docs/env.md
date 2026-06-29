@@ -102,10 +102,31 @@ last fallback when no URL is configured.
 | Var | Default | Meaning |
 |---|---|---|
 | `FLEETY_AGENT_URL` | mDNS → `ws://127.0.0.1:8787` | Server WebSocket URL. Tries mDNS (2 s) before falling back to localhost. |
-| `FLEETY_DEVICE_ID` | hostname / `COMPUTERNAME` / `HOSTNAME` / `fleetyd-device` | This device's id (path-safe; no slashes / `:`). |
+| `FLEETY_DEVICE_ID` | OS machine id → hostname | Override for this device's id (path-safe; no slashes / `:`). See **Device identity** below. |
 | `FLEETY_DEVICE_ROOT` | cwd | Filesystem root the on-device tools operate within. |
 | `FLEETY_TOKEN` | (unset, then `~/.fleety/fleetyd.token`) | Auth token. fleetyd persists a freshly-paired one to `~/.fleety/fleetyd.token`; this env var overrides. |
 | `FLEETY_PAIRING_CODE` | (unset) | Pass once to enroll a new device; server mints a token in `Welcome`, fleetyd writes it to disk. |
+
+## Device identity
+
+A device's id is a **stable, machine-derived id** — the OS machine id (Windows
+`MachineGuid`, Linux `/etc/machine-id`, macOS `IOPlatformUUID`), so every process
+on one machine (daemon, CLI, `fleety acp`) resolves the **same** id and two
+different machines never collide. `FLEETY_DEVICE_ID` overrides it (set it on cloned
+VMs/containers that share a machine id, or to pin a id); if the machine id can't be
+read it falls back to the hostname with a warning (set `FLEETY_DEVICE_ID` to avoid
+hostname collisions). The hostname is sent as a display **label** (shown on the
+device record), not as the identity.
+
+When authentication is on, a connection's device id is taken from its **token**
+(bound at pairing), not the value asserted on the wire — so a client can't
+impersonate another device; with auth off, the machine id is used directly. On
+connect the server runs a **one-time, no-clobber migration**: if a device's data
+still lives under its old hostname-keyed directory and the machine-id directory is
+free, it moves `fleet/devices/<hostname>/` → `fleet/devices/<machine-id>/`
+(atomically) and rebinds the token. Data from two machines that *already* shared a
+hostname directory before the upgrade can't be un-merged; they diverge cleanly
+afterward.
 
 ## Background service lifecycle (`fleetyd` and `fleety-server`)
 

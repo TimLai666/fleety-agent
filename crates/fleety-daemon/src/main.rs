@@ -307,10 +307,7 @@ fn discover_via_mdns(timeout: std::time::Duration) -> Option<String> {
 }
 
 fn device_id() -> String {
-    std::env::var("FLEETY_DEVICE_ID")
-        .or_else(|_| std::env::var("COMPUTERNAME"))
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_else(|_| "fleetyd-device".to_string())
+    fleety_tools::device::device_id()
 }
 
 /// What ended one connected session.
@@ -441,6 +438,7 @@ async fn serve(
         token,
         pairing_code,
         local_tools_json,
+        hostname: fleety_tools::device::hostname(),
     }) {
         Ok(h) => h,
         Err(e) => {

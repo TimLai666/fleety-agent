@@ -175,6 +175,7 @@ pub async fn handle_conn(
             token,
             pairing_code,
             local_tools_json,
+            hostname,
         }) => {
             if protocol != PROTOCOL_VERSION {
                 tracing::warn!(
@@ -183,8 +184,24 @@ pub async fn handle_conn(
                     "protocol version mismatch; proceeding (only v0 exists)"
                 );
             }
-            match authenticate(&auth, &device_id, token, pairing_code) {
+            match authenticate(&auth, &device_id, token.as_deref(), pairing_code.as_deref()) {
                 Ok(minted) => {
+                    // Resolve the authoritative device id (token-bound when
+                    // authenticated) and migrate any legacy hostname/bound-id data
+                    // to it once.
+                    let device_id = resolve_device_identity(
+                        &auth,
+                        &storage,
+                        &device_id,
+                        token.as_deref(),
+                        hostname.as_deref(),
+                    );
+                    // Record the hostname as a display label on the device record
+                    // (ensure the record exists first; it is re-ensured below too).
+                    if let Some(h) = &hostname {
+                        let _ = storage.ensure_device(&device_id, "client_session");
+                        let _ = storage.set_device_label(&device_id, h);
+                    }
                     // Stash any tool specs the device advertised so device_show
                     // and downstream lookups can see them. Best-effort: a parse
                     // failure means the device speaks a future shape we don't
@@ -756,25 +773,68 @@ async fn serve(
 fn authenticate(
     auth: &AuthStore,
     device_id: &str,
-    token: Option<String>,
-    pairing_code: Option<String>,
+    token: Option<&str>,
+    pairing_code: Option<&str>,
 ) -> std::result::Result<Option<String>, String> {
     if !auth.required() {
         return Ok(None);
     }
     if let Some(code) = pairing_code {
         return auth
-            .redeem(&code, device_id)
+            .redeem(code, device_id)
             .map(Some)
             .map_err(|e| e.report().message);
     }
     if let Some(tok) = token {
-        if auth.verify(&tok).is_some() {
+        if auth.verify(tok).is_some() {
             return Ok(None);
         }
         return Err("invalid token".to_string());
     }
     Err("this server requires authentication".to_string())
+}
+
+/// Resolve the connection's authoritative device id and migrate legacy data once.
+///
+/// - **Authenticated** (a token bound to a real device): the identity is the
+///   token's bound id. If the client now reports a different (machine) id and that
+///   id's directory is free, the device's data is migrated to it and the token
+///   rebound — the one-time hostname/legacy → machine-id move. If the destination
+///   already exists, we keep the bound id (never clobber/hijack another device).
+/// - **Unauthenticated / pairing / admin token**: the reported (machine) id is
+///   used, and any legacy directory keyed by the reported hostname is migrated to
+///   it once. A spoofed id can only ever move the caller's own data, never another
+///   device's (the no-clobber rule).
+fn resolve_device_identity(
+    auth: &AuthStore,
+    storage: &Storage,
+    asserted: &str,
+    token: Option<&str>,
+    hostname: Option<&str>,
+) -> String {
+    if let Some(tok) = token {
+        if let Some(bound) = auth.verify(tok) {
+            if bound != "admin" {
+                if bound == asserted {
+                    return asserted.to_string();
+                }
+                match storage.migrate_device(&bound, asserted) {
+                    Ok(true) => {
+                        let _ = auth.rebind_device(&bound, asserted);
+                        return asserted.to_string();
+                    }
+                    // Destination exists or the move failed → keep the bound id.
+                    _ => return bound,
+                }
+            }
+        }
+    }
+    if let Some(h) = hostname {
+        if h != asserted {
+            let _ = storage.migrate_device(h, asserted);
+        }
+    }
+    asserted.to_string()
 }
 
 /// The terminal result of one turn: the assistant reply text and its persisted
@@ -2079,7 +2139,52 @@ mod tests {
             token: None,
             pairing_code: None,
             local_tools_json: None,
+            hostname: None,
         }
+    }
+
+    #[test]
+    fn resolve_identity_token_authoritative_and_migrates() {
+        use crate::auth::AuthStore;
+        let home = std::env::temp_dir().join(format!("fleety-ident-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&home).expect("mk home");
+        let storage = Storage::new(home.clone());
+        let auth = AuthStore::load(storage.auth_path(), None, true);
+        let code = auth.create_pairing().expect("code");
+        let token = auth.redeem(&code, "old-host").expect("redeem"); // bound to legacy id
+        storage
+            .ensure_device("old-host", "client_session")
+            .expect("dev");
+
+        // Authed device now reports a machine id → migrate + rebind, identity = machine id.
+        let resolved =
+            resolve_device_identity(&auth, &storage, "machine-1", Some(&token), Some("old-host"));
+        assert_eq!(resolved, "machine-1");
+        assert_eq!(auth.verify(&token).as_deref(), Some("machine-1")); // token rebound
+        assert!(storage.history_path("machine-1").parent().unwrap().exists());
+        assert!(!storage.history_path("old-host").parent().unwrap().exists());
+
+        // No clobber: if the machine-id dir already exists for another device, keep the bound id.
+        let code2 = auth.create_pairing().expect("code2");
+        let token2 = auth.redeem(&code2, "bound-b").expect("redeem2");
+        storage
+            .ensure_device("bound-b", "client_session")
+            .expect("dev b");
+        storage
+            .ensure_device("machine-1", "client_session")
+            .expect("dev m1"); // occupied
+        let resolved2 = resolve_device_identity(&auth, &storage, "machine-1", Some(&token2), None);
+        assert_eq!(resolved2, "bound-b"); // not hijacked onto machine-1
+        assert_eq!(auth.verify(&token2).as_deref(), Some("bound-b"));
+
+        // Unauthenticated: the asserted machine id is used; legacy hostname dir migrates.
+        storage
+            .ensure_device("host-c", "client_session")
+            .expect("dev c");
+        let resolved3 = resolve_device_identity(&auth, &storage, "machine-3", None, Some("host-c"));
+        assert_eq!(resolved3, "machine-3");
+        assert!(storage.history_path("machine-3").parent().unwrap().exists());
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     /// Full enrollment round-trip: server requires auth, fleetyd-like device
@@ -2148,6 +2253,7 @@ mod tests {
                 token: None,
                 pairing_code: Some(pairing_code.clone()),
                 local_tools_json: None,
+                hostname: None,
             },
         )
         .await;
@@ -2168,6 +2274,7 @@ mod tests {
                 token: Some(token.clone()),
                 pairing_code: None,
                 local_tools_json: None,
+                hostname: None,
             },
         )
         .await;
@@ -2188,6 +2295,7 @@ mod tests {
                 token: Some("garbage-token-xxx".into()),
                 pairing_code: None,
                 local_tools_json: None,
+                hostname: None,
             },
         )
         .await;
@@ -2521,6 +2629,7 @@ mod tests {
                 token: Some("admintok".into()),
                 pairing_code: None,
                 local_tools_json: None,
+                hostname: None,
             },
         )
         .await;
@@ -2540,6 +2649,7 @@ mod tests {
                 token: None,
                 pairing_code: Some(code),
                 local_tools_json: None,
+                hostname: None,
             },
         )
         .await;

@@ -405,6 +405,7 @@ impl WsBridge {
             token: std::env::var("FLEETY_TOKEN").ok().filter(|s| !s.is_empty()),
             pairing_code: None,
             local_tools_json: None,
+            hostname: fleety_tools::device::hostname(),
         })
         .map_err(|e| CoreError::Message(format!("serialize hello: {e}")))?;
         tx.send(WsMessage::Text(hello))
@@ -576,10 +577,22 @@ mod tests {
         let full = parse_client_capabilities(&json!({
             "clientCapabilities": { "fs": { "readTextFile": true, "writeTextFile": true }, "terminal": true }
         }));
-        assert_eq!(full, EditorCapabilities { read: true, write: true, terminal: true });
+        assert_eq!(
+            full,
+            EditorCapabilities {
+                read: true,
+                write: true,
+                terminal: true
+            }
+        );
         assert_eq!(
             editor_tool_names(&full),
-            vec!["editor_read_file", "editor_write_file", "editor_edit", "editor_run"]
+            vec![
+                "editor_read_file",
+                "editor_write_file",
+                "editor_edit",
+                "editor_run"
+            ]
         );
         // Read-only, no terminal → just the reader.
         let ro = parse_client_capabilities(&json!({
@@ -596,12 +609,16 @@ mod tests {
         assert_eq!(m, "fs/read_text_file");
         assert_eq!(p["sessionId"], "s1");
         assert_eq!(p["path"], "a.rs");
-        let (m, p) =
-            editor_request("s1", "editor_write_file", &json!({ "path": "a.rs", "content": "x" }))
-                .unwrap();
+        let (m, p) = editor_request(
+            "s1",
+            "editor_write_file",
+            &json!({ "path": "a.rs", "content": "x" }),
+        )
+        .unwrap();
         assert_eq!(m, "fs/write_text_file");
         assert_eq!(p["content"], "x");
-        let (m, p) = editor_request("s1", "editor_run", &json!({ "command": "git status" })).unwrap();
+        let (m, p) =
+            editor_request("s1", "editor_run", &json!({ "command": "git status" })).unwrap();
         assert_eq!(m, "terminal/create");
         assert_eq!(p["command"], "git status");
         // editor_edit is composed (read+write), no single mapping.

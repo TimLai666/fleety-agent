@@ -69,6 +69,29 @@ impl AuthStore {
         Ok(())
     }
 
+    /// Rebind every token currently bound to `old` device id to `new` (used by
+    /// the one-time hostname→machine-id migration). Returns how many were moved.
+    pub fn rebind_device(&self, old: &str, new: &str) -> Result<usize> {
+        if old == new {
+            return Ok(0);
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| CoreError::Message("auth lock poisoned".to_string()))?;
+        let mut moved = 0;
+        for id in state.tokens.values_mut() {
+            if id == old {
+                *id = new.to_string();
+                moved += 1;
+            }
+        }
+        if moved > 0 {
+            self.save(&state)?;
+        }
+        Ok(moved)
+    }
+
     /// The owning device for a valid token (bootstrap token -> "admin"), else None.
     pub fn verify(&self, token: &str) -> Option<String> {
         if let Some(b) = &self.bootstrap {
@@ -171,5 +194,24 @@ mod tests {
         assert!(store.redeem(&code, "laptop").is_err());
         // unknown code rejected
         assert!(store.redeem("zzzzzzzz", "x").is_err());
+    }
+
+    #[test]
+    fn rebind_device_moves_token_to_new_id() {
+        let store = temp_store(true, None);
+        let code = store.create_pairing().expect("code");
+        let token = store.redeem(&code, "old-hostname").expect("redeem");
+        assert_eq!(store.verify(&token).as_deref(), Some("old-hostname"));
+        // Migrate the bound id to the machine id.
+        assert_eq!(
+            store
+                .rebind_device("old-hostname", "machine-xyz")
+                .expect("rebind"),
+            1
+        );
+        assert_eq!(store.verify(&token).as_deref(), Some("machine-xyz"));
+        // No-op when old == new, or when nothing is bound to `old`.
+        assert_eq!(store.rebind_device("x", "x").expect("noop"), 0);
+        assert_eq!(store.rebind_device("absent", "y").expect("noop"), 0);
     }
 }

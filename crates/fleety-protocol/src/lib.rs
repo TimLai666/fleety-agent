@@ -82,6 +82,11 @@ pub enum ClientMsg {
         pairing_code: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         local_tools_json: Option<String>,
+        /// The machine's hostname — a display label (the identity is `device_id`).
+        /// Additive + optional: old clients send `None`. Used for the device
+        /// record and the one-time hostname→machine-id migration lookup.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hostname: Option<String>,
     },
     /// A user turn. `conversation_id` continues an existing conversation, or
     /// `None` starts a new one. `attachments` carries multimodal media handed
@@ -254,6 +259,38 @@ pub enum ServerMsg {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hello_hostname_is_optional_and_additive() {
+        // With a hostname → round-trips.
+        let h = ClientMsg::Hello {
+            device_id: "machine-1".into(),
+            protocol: PROTOCOL_VERSION,
+            token: None,
+            pairing_code: None,
+            local_tools_json: None,
+            hostname: Some("laptop".into()),
+        };
+        let json = serde_json::to_string(&h).expect("ser");
+        assert!(json.contains("\"hostname\":\"laptop\""));
+        match serde_json::from_str::<ClientMsg>(&json).expect("de") {
+            ClientMsg::Hello { hostname, .. } => assert_eq!(hostname.as_deref(), Some("laptop")),
+            _ => panic!("not hello"),
+        }
+        // An old client's frame (no hostname field) still parses → None.
+        let old = r#"{"type":"hello","device_id":"d","protocol":0}"#;
+        match serde_json::from_str::<ClientMsg>(old).expect("de old") {
+            ClientMsg::Hello {
+                hostname,
+                device_id,
+                ..
+            } => {
+                assert_eq!(device_id, "d");
+                assert!(hostname.is_none());
+            }
+            _ => panic!("not hello"),
+        }
+    }
 
     #[test]
     fn wire_error_roundtrips() {
