@@ -26,6 +26,7 @@ mod mdns;
 mod privacy;
 mod sidecar;
 mod sse;
+mod triage;
 mod tz;
 mod websocket;
 

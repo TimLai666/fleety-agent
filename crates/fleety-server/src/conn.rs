@@ -585,26 +585,139 @@ async fn serve(
                 } else {
                     Message::user_with_attachments(text, attachments)
                 };
-                let mut gate = ConnGate {
-                    out: out.clone(),
-                    inbound,
+                let steps = if matches!(policy, Policy::FullAccess) {
+                    // Parallel-read interruption (full-access only — the approval
+                    // gate doesn't read inbound here, so we can read a mid-turn
+                    // message while the turn runs). A triaged interjection either
+                    // cancels the run at its next checkpoint or queues for after.
+                    use std::sync::atomic::{AtomicBool, Ordering};
+                    let cancel = AtomicBool::new(false);
+                    let mut gate = agent_core::AutoApprove;
+                    let turn = drive_to_goal(
+                        out,
+                        storage,
+                        turn_provider,
+                        &tools,
+                        policy,
+                        device_id,
+                        &conversation,
+                        user_msg,
+                        &mut gate,
+                        &goal_state,
+                        goal_max_continues,
+                        voice,
+                        &acting,
+                        &cancel,
+                    );
+                    tokio::pin!(turn);
+                    let mut pending: Option<(String, Vec<agent_core::Attachment>)> = None;
+                    let mut client_open = true;
+                    let first_steps = loop {
+                        if !client_open {
+                            break (&mut turn).await?;
+                        }
+                        tokio::select! {
+                            res = &mut turn => break res?,
+                            next = inbound.next_client() => match next {
+                                Ok(Some(ClientMsg::UserMessage { text: t2, attachments: a2, .. })) => {
+                                    let summary = goal_state.lock().await.nudge_text();
+                                    let action = crate::triage::triage(&t2, &summary, provider).await;
+                                    let atts: Vec<agent_core::Attachment> = a2
+                                        .into_iter()
+                                        .map(|a| agent_core::Attachment {
+                                            mime: a.mime,
+                                            bytes_b64: a.bytes_b64,
+                                            url: a.url,
+                                            name: a.name,
+                                        })
+                                        .collect();
+                                    let (ack, store) = match action {
+                                        crate::triage::TriageAction::InterruptNow => {
+                                            cancel.store(true, Ordering::Relaxed);
+                                            ("interrupting the current task to handle your new message", true)
+                                        }
+                                        crate::triage::TriageAction::QueueAfter => {
+                                            ("got it — I'll handle that right after the current task", true)
+                                        }
+                                        crate::triage::TriageAction::Ignore => ("noted", false),
+                                    };
+                                    let _ = emit(out, &ServerMsg::Assistant {
+                                        conversation_id: conversation.to_string(),
+                                        text: ack.to_string(),
+                                        seq: 0,
+                                        speech: None,
+                                        attention: None,
+                                    });
+                                    if store {
+                                        pending = Some((t2, atts));
+                                    }
+                                }
+                                Ok(Some(_)) => {} // other kinds mid-turn: ignore (MVP)
+                                Ok(None) | Err(_) => {
+                                    // Client went away mid-turn; wind down cleanly.
+                                    client_open = false;
+                                    cancel.store(true, Ordering::Relaxed);
+                                }
+                            },
+                        }
+                    };
+                    // Handle a queued/interrupting message as a follow-up turn
+                    // (not itself interruptible in this MVP).
+                    if let Some((t, atts)) = pending {
+                        let um = if atts.is_empty() {
+                            Message::user(t)
+                        } else {
+                            Message::user_with_attachments(t, atts)
+                        };
+                        let cancel2 = AtomicBool::new(false);
+                        let mut gate2 = agent_core::AutoApprove;
+                        let s2 = drive_to_goal(
+                            out,
+                            storage,
+                            turn_provider,
+                            &tools,
+                            policy,
+                            device_id,
+                            &conversation,
+                            um,
+                            &mut gate2,
+                            &goal_state,
+                            goal_max_continues,
+                            voice,
+                            &acting,
+                            &cancel2,
+                        )
+                        .await?;
+                        first_steps + s2
+                    } else {
+                        first_steps
+                    }
+                } else {
+                    // Require-approval: the gate reads inbound for Approve/Deny, so
+                    // we keep the sequential path (no mid-turn interjection yet).
+                    let cancel = std::sync::atomic::AtomicBool::new(false);
+                    let mut gate = ConnGate {
+                        out: out.clone(),
+                        inbound,
+                    };
+                    drive_to_goal(
+                        out,
+                        storage,
+                        turn_provider,
+                        &tools,
+                        policy,
+                        device_id,
+                        &conversation,
+                        user_msg,
+                        &mut gate,
+                        &goal_state,
+                        goal_max_continues,
+                        voice,
+                        &acting,
+                        &cancel,
+                    )
+                    .await?
                 };
-                let steps = drive_to_goal(
-                    out,
-                    storage,
-                    turn_provider,
-                    &tools,
-                    policy,
-                    device_id,
-                    &conversation,
-                    user_msg,
-                    &mut gate,
-                    &goal_state,
-                    goal_max_continues,
-                    voice,
-                    &acting,
-                )
-                .await?;
                 // Apply an explicit rollover the agent requested during the turn
                 // (fast, storage-only): set the old aside, switch active, tell the
                 // client. Transparent redirect handles clients that ignore it.
@@ -1004,6 +1117,7 @@ pub(crate) async fn drive_to_goal(
     max_continues: u32,
     voice: bool,
     acting: &crate::identity::ActingUser,
+    cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<usize> {
     // Fresh goal state for this user message.
     *goal_state.lock().await = GoalState::new();
@@ -1036,10 +1150,20 @@ pub(crate) async fn drive_to_goal(
         };
         let premature = active && matches!(terminal, Terminal::None);
         let hit_cap = continues >= max_continues;
-        if !premature || hit_cap {
+        // Cancellation checkpoint (between goal iterations): a mid-turn message
+        // triaged as `interrupt_now` sets this; we stop after the current turn
+        // rather than starting another iteration. The in-flight turn is never
+        // interrupted mid-tool.
+        let cancelled = cancel.load(std::sync::atomic::Ordering::Relaxed);
+        if !premature || hit_cap || cancelled {
             // Terminal turn: emit the real reply (and Done). On a cap stop with an
             // unmet goal, tell the user it may be incomplete.
-            let text = if premature && hit_cap {
+            let text = if cancelled && premature {
+                format!(
+                    "{}\n\n[Stopped between steps to handle your new message.]",
+                    turn.reply
+                )
+            } else if premature && hit_cap {
                 format!(
                     "{}\n\n[Reached the auto-continue cap of {max_continues}; the goal may be \
                      incomplete.]",
@@ -1758,6 +1882,48 @@ mod tests {
         }
     }
 
+    /// A pre-set cancel flag stops the goal loop after the current turn rather
+    /// than continuing — proving the mid-turn interruption checkpoint. With only
+    /// one turn scripted, a non-cancelled run would loop and exhaust the provider.
+    #[tokio::test]
+    async fn cancel_stops_goal_loop_between_iterations() {
+        let (storage, tools, goal_state, _home, out, mut rx) = goal_env();
+        // Turn 1 sets a goal (so the run is "premature" and would continue) then
+        // replies. No further turns are scripted.
+        let provider = MockProvider::new(vec![
+            call_resp("a", "set_goal", serde_json::json!({ "goal": "keep going" })),
+            text_resp("did the first step"),
+        ]);
+        let mut gate = agent_core::AutoApprove;
+        let cancel = std::sync::atomic::AtomicBool::new(true); // interrupted
+        let steps = drive_to_goal(
+            &out,
+            &storage,
+            &provider,
+            &tools,
+            Policy::FullAccess,
+            "dev",
+            "c1",
+            Message::user("do the work"),
+            &mut gate,
+            &goal_state,
+            5,
+            false,
+            &crate::identity::ActingUser::Guest,
+            &cancel,
+        )
+        .await
+        .expect("cancelled run still returns Ok (did not loop/exhaust the provider)");
+        assert!(steps >= 1);
+        let frames = drain(&mut rx);
+        // Stopped cleanly: a terminal Done was emitted, and the reply notes the stop.
+        assert!(frames.iter().any(|m| matches!(m, ServerMsg::Done { .. })));
+        assert!(frames.iter().any(|m| matches!(
+            m,
+            ServerMsg::Assistant { text, .. } if text.contains("Stopped between steps")
+        )));
+    }
+
     /// Storage + a registry holding only the goal tools + their shared state + a
     /// frame sink/source. Self-contained: no websocket, no env vars.
     #[allow(clippy::type_complexity)]
@@ -1828,6 +1994,7 @@ mod tests {
             5,
             false,
             &crate::identity::ActingUser::Guest,
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .await
         .unwrap();
@@ -1868,6 +2035,7 @@ mod tests {
             5,
             false,
             &crate::identity::ActingUser::Guest,
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .await
         .unwrap();
@@ -1902,6 +2070,7 @@ mod tests {
             5,
             false,
             &crate::identity::ActingUser::Guest,
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .await
         .unwrap();
@@ -1938,6 +2107,7 @@ mod tests {
             2,
             false,
             &crate::identity::ActingUser::Guest,
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .await
         .unwrap();
@@ -2005,6 +2175,7 @@ mod tests {
             5,
             true,
             &crate::identity::ActingUser::Guest,
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .await
         .unwrap();
@@ -2036,6 +2207,7 @@ mod tests {
             5,
             false,
             &crate::identity::ActingUser::Guest,
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .await
         .unwrap();
@@ -2077,6 +2249,7 @@ mod tests {
             5,
             false,
             &crate::identity::ActingUser::Guest,
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .await
         .unwrap();
@@ -2188,6 +2361,7 @@ mod tests {
             5,
             true,
             &crate::identity::ActingUser::Guest,
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .await
         .unwrap();
@@ -2219,6 +2393,7 @@ mod tests {
             5,
             false,
             &crate::identity::ActingUser::Guest,
+            &std::sync::atomic::AtomicBool::new(false),
         )
         .await
         .unwrap();
