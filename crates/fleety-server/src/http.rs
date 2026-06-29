@@ -13,7 +13,8 @@ use std::sync::Arc;
 use agent_core::{CoreError, ModelProvider, Policy, Result};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
+use axum::http::header::AUTHORIZATION;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -28,11 +29,19 @@ use crate::bridge::{DeviceTools, Handles, Hub, Pending};
 use crate::conn::{run_connection, ClientInbound, FrameWriter};
 use crate::storage::Storage;
 
-/// Live SSE+POST sessions: session id → inbound `ClientMsg` sender. The `GET /sse`
-/// handler registers one and spawns the connection; `POST /send` looks it up to
-/// inject upstream messages. (WebSocket needs no such map — one socket carries
-/// both directions.)
-pub type SseSessions = Arc<Mutex<HashMap<String, mpsc::UnboundedSender<ClientMsg>>>>;
+/// One live SSE+POST session: where to inject upstream messages, plus the
+/// `Authorization` header presented when the stream was opened. `POST /send` must
+/// present the same header, so only the caller that opened a session can inject
+/// into it (the Hello frame still does the real identity auth in run_connection).
+pub struct SseSession {
+    in_tx: mpsc::UnboundedSender<ClientMsg>,
+    auth_header: Option<String>,
+}
+
+/// Live SSE+POST sessions: session id → session. The `GET /sse` handler registers
+/// one and spawns the connection; `POST /send` looks it up to inject upstream
+/// messages. (WebSocket needs no such map — one socket carries both directions.)
+pub type SseSessions = Arc<Mutex<HashMap<String, SseSession>>>;
 
 /// A fresh, empty SSE session registry.
 pub fn new_sse_sessions() -> SseSessions {
@@ -140,20 +149,36 @@ impl FrameWriter for AxumWsFrameWriter {
 /// stream `ServerMsg` frames as SSE events. A missing `session` is a 400.
 async fn sse_handler(
     Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
     State(state): State<AppState>,
 ) -> Response {
     let Some(session) = params.get("session").filter(|s| !s.is_empty()).cloned() else {
         return (StatusCode::BAD_REQUEST, "missing ?session=<id>").into_response();
     };
+    let auth_header = bearer_header(&headers);
+    // When the server requires auth, a stream needs a valid token up front (an
+    // already-paired device reconnecting). Initial pairing uses WebSocket.
+    if state.auth.required() {
+        let ok = auth_header
+            .as_deref()
+            .and_then(|h| h.strip_prefix("Bearer "))
+            .map(str::trim)
+            .is_some_and(|t| state.auth.verify(t).is_some());
+        if !ok {
+            return (StatusCode::UNAUTHORIZED, "valid Bearer token required").into_response();
+        }
+    }
     // Inbound: POST /send pushes ClientMsg here. Outbound: run_connection pushes
     // serialized ServerMsg frames here, which this handler streams out as SSE.
     let (in_tx, in_rx) = mpsc::unbounded_channel::<ClientMsg>();
     let (out_tx, out_rx) = mpsc::unbounded_channel::<String>();
-    state
-        .sse_sessions
-        .lock()
-        .await
-        .insert(session.clone(), in_tx);
+    state.sse_sessions.lock().await.insert(
+        session.clone(),
+        SseSession {
+            in_tx,
+            auth_header,
+        },
+    );
 
     let conn_state = state.clone();
     let conn_session = session.clone();
@@ -196,6 +221,7 @@ async fn sse_handler(
 /// the session's inbound channel. Unknown session → 404, bad JSON → 400.
 async fn send_handler(
     Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
     State(state): State<AppState>,
     body: String,
 ) -> StatusCode {
@@ -206,12 +232,23 @@ async fn send_handler(
         Ok(m) => m,
         Err(_) => return StatusCode::BAD_REQUEST,
     };
+    let auth_header = bearer_header(&headers);
     let sessions = state.sse_sessions.lock().await;
     match sessions.get(session) {
-        Some(tx) if tx.send(msg).is_ok() => StatusCode::ACCEPTED,
+        // Only the caller that opened the stream (same Authorization) may inject.
+        Some(s) if s.auth_header != auth_header => StatusCode::FORBIDDEN,
+        Some(s) if s.in_tx.send(msg).is_ok() => StatusCode::ACCEPTED,
         // Session gone, or its connection task already dropped the receiver.
         _ => StatusCode::NOT_FOUND,
     }
+}
+
+/// The raw `Authorization` header value, if present and UTF-8.
+fn bearer_header(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
 }
 
 /// Inbound adapter: yields `ClientMsg`s posted to `/send` for this session.
@@ -249,20 +286,37 @@ mod tests {
     use std::time::Duration;
     use tokio::time::timeout;
 
-    fn test_state(home: &std::path::Path) -> AppState {
-        let storage = Arc::new(Storage::new(home.to_path_buf()));
+    fn state_with(home: &std::path::Path, auth: Arc<AuthStore>) -> AppState {
         AppState {
-            storage,
+            storage: Arc::new(Storage::new(home.to_path_buf())),
             provider: Arc::new(EchoProvider),
             workspace: Arc::new(home.to_path_buf()),
             policy: Policy::FullAccess,
             hub: bridge::new_hub(),
             pending: bridge::new_pending(),
             handles: bridge::new_handles(),
-            auth: Arc::new(AuthStore::load(home.join("auth.json"), None, false)),
+            auth,
             device_tools: bridge::new_device_tools(),
             sse_sessions: new_sse_sessions(),
         }
+    }
+
+    fn test_state(home: &std::path::Path) -> AppState {
+        let auth = Arc::new(AuthStore::load(home.join("auth.json"), None, false));
+        state_with(home, auth)
+    }
+
+    /// Serve `state` on a fresh port; returns the `http://addr` base.
+    async fn serve(state: AppState) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let app = router(state);
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app.into_make_service()).await;
+        });
+        format!("http://{addr}")
     }
 
     /// Read SSE `data:` events from the response until one parses as a `ServerMsg`
@@ -304,15 +358,7 @@ mod tests {
     async fn sse_post_full_turn_and_session_guard() {
         let home = std::env::temp_dir().join(format!("fleety-sse-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&home).expect("mk home");
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        let app = router(test_state(&home));
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app.into_make_service()).await;
-        });
-        let base = format!("http://{addr}");
+        let base = serve(test_state(&home)).await;
         let client = reqwest::Client::new();
         let session = "sess-1";
 
@@ -395,6 +441,71 @@ mod tests {
         })
         .await;
         assert!(matches!(reply, ServerMsg::Assistant { .. }));
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// With auth required: an unauthenticated SSE open is rejected; once opened
+    /// with a valid token, a `POST /send` from a different (wrong) token is
+    /// refused — only the opener can inject into the session.
+    #[tokio::test]
+    async fn sse_auth_required_and_session_binding() {
+        let home = std::env::temp_dir().join(format!("fleety-sseauth-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&home).expect("mk home");
+        let auth = Arc::new(AuthStore::load(
+            home.join("auth.json"),
+            Some("secret".to_string()),
+            true,
+        ));
+        let base = serve(state_with(&home, auth)).await;
+        let client = reqwest::Client::new();
+        let session = "sess-auth";
+
+        // Unauthenticated SSE open → 401.
+        let no_auth = client
+            .get(format!("{base}/sse?session={session}"))
+            .send()
+            .await
+            .expect("open sse no auth");
+        assert_eq!(no_auth.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        // Open with the valid token.
+        let resp = client
+            .get(format!("{base}/sse?session={session}"))
+            .bearer_auth("secret")
+            .send()
+            .await
+            .expect("open sse");
+        assert!(resp.status().is_success());
+
+        // A POST with a different Authorization is refused (foreign injection).
+        let hello = serde_json::to_string(&ClientMsg::Hello {
+            device_id: "d".into(),
+            protocol: PROTOCOL_VERSION,
+            token: Some("secret".into()),
+            pairing_code: None,
+            local_tools_json: None,
+            hostname: None,
+        })
+        .unwrap();
+        let foreign = client
+            .post(format!("{base}/send?session={session}"))
+            .bearer_auth("not-secret")
+            .body(hello.clone())
+            .send()
+            .await
+            .expect("post foreign");
+        assert_eq!(foreign.status(), reqwest::StatusCode::FORBIDDEN);
+
+        // The matching token is accepted.
+        let ok = client
+            .post(format!("{base}/send?session={session}"))
+            .bearer_auth("secret")
+            .body(hello)
+            .send()
+            .await
+            .expect("post ok");
+        assert_eq!(ok.status(), reqwest::StatusCode::ACCEPTED);
 
         let _ = std::fs::remove_dir_all(&home);
     }

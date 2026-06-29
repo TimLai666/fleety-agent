@@ -13,7 +13,7 @@
 
 ## 4. HTTP 通道認證
 
-- [ ] 4.1 對 `GET /sse` 與 `POST /send` 以 `Authorization` header 驗證 token(沿用既有 AuthStore),並要求 `POST /send` 的 session id 必須綁定該已驗證身分,交付 "HTTP transport authentication";對應設計「HTTP 通道認證沿用 token,走 Authorization header」。先寫失敗測試:未授權的 SSE 被拒(unauthorized);POST 到非本身身分綁定的 session 被拒、訊息不灌入。
+- [x] 4.1 對 `GET /sse` 與 `POST /send` 以 `Authorization` header 驗證 token(沿用既有 AuthStore),並要求 `POST /send` 的 session id 必須綁定該已驗證身分,交付 "HTTP transport authentication";對應設計「HTTP 通道認證沿用 token,走 Authorization header」。先寫失敗測試:未授權的 SSE 被拒(unauthorized);POST 到非本身身分綁定的 session 被拒、訊息不灌入。
 
 ## 5. 續傳與 keepalive
 
