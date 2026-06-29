@@ -339,7 +339,12 @@ pub fn apply_backup(root: &Path, backups: &Path, backup_id: &str) -> Result<Valu
 }
 
 /// Copy an existing file into the backups store and return a `{id, path}` handle.
-fn backup_existing(backups: &Path, rel: &str, resolved: &Path) -> Result<Value> {
+/// Copy an existing file into the backups store under a fresh id, so a
+/// subsequent overwrite is recoverable via `rollback` / [`apply_backup`].
+/// Returns `{ id, path }`. Shared by the workspace write/edit/delete tools and
+/// the knowledge wiki, so every mutation that clobbers a file is recoverable
+/// from one store (never written inside the edited directory).
+pub fn backup_existing(backups: &Path, rel: &str, resolved: &Path) -> Result<Value> {
     let id = uuid::Uuid::new_v4().to_string();
     let backup_path = backups.join(&id).join(rel);
     if let Some(parent) = backup_path.parent() {

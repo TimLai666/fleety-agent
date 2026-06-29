@@ -12,10 +12,11 @@ use agent_core::{CoreError, Result, RiskLevel, Tool, ToolRegistry, ToolSpec};
 
 /// Register the wiki tools rooted at `vault`. `models_dir` is the cache for the
 /// semantic-search embedding model.
-pub fn register(registry: &mut ToolRegistry, vault: &Path, models_dir: &Path) {
+pub fn register(registry: &mut ToolRegistry, vault: &Path, models_dir: &Path, backups_dir: &Path) {
     registry.register(Box::new(WikiWrite {
         vault: vault.to_path_buf(),
         models_dir: models_dir.to_path_buf(),
+        backups: backups_dir.to_path_buf(),
     }));
     registry.register(Box::new(WikiRead {
         vault: vault.to_path_buf(),
@@ -83,6 +84,8 @@ fn collect_notes(vault: &Path, dir: &Path, out: &mut Vec<String>) {
 struct WikiWrite {
     vault: PathBuf,
     models_dir: PathBuf,
+    /// Rollback store (outside the vault) — an overwrite backs up the old note here first.
+    backups: PathBuf,
 }
 
 #[async_trait]
@@ -90,7 +93,7 @@ impl Tool for WikiWrite {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "wiki_write".to_string(),
-            description: "Create or overwrite a knowledge-wiki note (markdown). Use frontmatter + [[wikilinks]]; one concept per note.".to_string(),
+            description: "Create or overwrite a knowledge-wiki note (markdown). Use frontmatter + [[wikilinks]]; one concept per note. Overwriting an existing note backs up the previous version (recoverable via rollback) and returns its backup_id.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -111,6 +114,17 @@ impl Tool for WikiWrite {
             std::fs::create_dir_all(parent)
                 .map_err(|e| CoreError::Message(format!("cannot create wiki dir: {e}")))?;
         }
+        // Overwriting an existing note backs up the old content first (to the
+        // rollback store, never inside the vault), so a clobber is recoverable
+        // and reported — not silent.
+        let mut backup_id: Option<String> = None;
+        if resolved.exists() {
+            if let Ok(rel) = resolved.strip_prefix(&self.vault) {
+                let rel = rel.to_string_lossy().replace('\\', "/");
+                let info = fleety_tools::backup_existing(&self.backups, &rel, &resolved)?;
+                backup_id = info.get("id").and_then(Value::as_str).map(str::to_string);
+            }
+        }
         std::fs::write(&resolved, content)
             .map_err(|e| CoreError::Message(format!("cannot write wiki note: {e}")))?;
         // Refresh the semantic index for just this note (best-effort, async).
@@ -123,7 +137,7 @@ impl Tool for WikiWrite {
                 content.to_string(),
             );
         }
-        Ok(json!({ "path": path, "bytes_written": content.len() }))
+        Ok(json!({ "path": path, "bytes_written": content.len(), "backup_id": backup_id }))
     }
 }
 
@@ -253,8 +267,9 @@ mod tests {
     async fn write_read_list_search() {
         let vault = temp();
         let models = temp();
+        let backups = temp();
         let mut registry = ToolRegistry::new();
-        register(&mut registry, &vault, &models);
+        register(&mut registry, &vault, &models, &backups);
 
         registry
             .call("wiki_write", json!({ "path": "concepts/esp32", "content": "# ESP32\nflash via espflash [[serial-ports]]" }))
@@ -285,5 +300,45 @@ mod tests {
             .is_err());
 
         let _ = std::fs::remove_dir_all(&vault);
+    }
+
+    #[tokio::test]
+    async fn overwrite_backs_up_old_note() {
+        let vault = temp();
+        let models = temp();
+        let backups = temp();
+        let mut registry = ToolRegistry::new();
+        register(&mut registry, &vault, &models, &backups);
+
+        // First write: brand new note → no backup.
+        let first = registry
+            .call("wiki_write", json!({ "path": "n", "content": "original" }))
+            .await
+            .expect("first write");
+        assert!(first["backup_id"].is_null(), "new note shouldn't back up");
+
+        // Overwrite: the old content is backed up (reported + recoverable), not silent.
+        let second = registry
+            .call(
+                "wiki_write",
+                json!({ "path": "n", "content": "replacement" }),
+            )
+            .await
+            .expect("overwrite");
+        let id = second["backup_id"]
+            .as_str()
+            .expect("overwrite reports a backup id");
+        // The backup holds the *previous* content and lives outside the vault.
+        let backed = std::fs::read_to_string(backups.join(id).join("n.md")).expect("backup file");
+        assert_eq!(backed, "original");
+        assert_eq!(
+            std::fs::read_to_string(vault.join("n.md")).expect("live note"),
+            "replacement"
+        );
+        let listed = fleety_tools::list_backups(&backups).expect("list backups");
+        assert_eq!(listed.len(), 1, "exactly one backup from the overwrite");
+
+        let _ = std::fs::remove_dir_all(&vault);
+        let _ = std::fs::remove_dir_all(&backups);
     }
 }

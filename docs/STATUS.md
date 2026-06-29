@@ -184,17 +184,35 @@ is on `main`; see commit history for the exact change.
 - [`docs/eval.md`](eval.md) — golden harness format + how to add goldens.
 - [`docs/roadmap.md`](roadmap.md) — open gaps + implementation plans.
 
-## Deferred / post-v0
+## Remaining gaps
 
-- **M6 ratatui TUI** — after M5. Sketch UI-event `ServerMsg` variants (`ToolExecuting`, `ToolCompleted`, `ApprovalRequested`, `ActivityUpdate`, `StatusChange`) in `fleety-protocol` now for forward-compat.
-- **Connectors beyond client_session** — SSH first (v0.1), then HTTP and daemon; connector priority (`client_session > client_daemon > SSH > HTTP > unreachable`), device online/offline tracking, reconnect backoff. Keep `connectors[]` schema + protocol design in place.
-- **fleetyd daemon** — Agent connection, heartbeat, on-device local-tool execution, autostart/install (systemd/launchd/Windows). Out of v0 scope.
-- **M8 scheduling/cron** — `schedule_*` tools, `Scheduler` seam, fire loop, mandate-at-creation + strict fire-time enforcement, offline "report don't catch up", per-job failure isolation.
-- **M9 browser (CDP)** + **M10 computer-use** — both native in `fleety-tools`, so they run on any device via `device_exec` (browser auto-provisions Chrome; computer-use is `computer_*` via enigo+xcap, **not** an MCP); co-location + critical gating.
-- **M11 knowledge wiki** — Obsidian vault + `wiki_*` tools + classification (type folders + tags + MOC).
-- **Skills + MCP runtime** — loaders, hot reload, builtin/installed; `not_enabled` stubs for now.
-- **fleety-updater** — atomic same-package runtime update + rollback; version-consistency `degraded` detection.
-- **Codex OAuth backend** — deferred; OpenAI-compatible stays the stable path.
+The M0–M11 milestones have shipped (see the status table above). What's left is
+within-milestone depth plus a few explicitly deferred items:
+
+- **M9 browser — snapshot-ref acting** — `browser_open/close/navigate/eval/screenshot`
+  ship, but the spec's accessibility-snapshot + ref-based `act`, `browser_tabs`, and
+  login-state-sensitive critical gating are not built; acting is raw JS via
+  `browser_eval`.
+- **M10 computer-use — presence gating** — `computer_*` go through generic risk-class
+  approval, but there is no "human is actively using this machine → warn / throttle"
+  guard (spec §13). Matters most for unattended/scheduled control.
+- **M11 wiki — depth** — read/write/list/search + semantic search ship, and
+  `wiki_write` now backs up the previous note before overwriting (recoverable via
+  rollback, returns `backup_id`). Still convention-only (not enforced): the
+  raw/distilled/meta 3-layer structure and frontmatter/`[[wikilink]]` rules; no
+  dedup / lint / MOC management; no contradiction detection.
+- **M8 scheduling — show/update** — Create/List/Delete ship; no `schedule_show` /
+  `schedule_update` (edit = delete + recreate). The human-readable per-schedule
+  `mandate` string is stored but enforcement is via the `allowed_tools` allow-list.
+- **Unified remote config** — `config` (incl. `provider/group/role`) currently edits
+  the **local** host's files; managing a remote server's / device's config from the
+  CLI over the connection is under design.
+- **Presence inference** — using a mobile device's location to infer "is someone home /
+  did they leave". Needs auto-site-detection (daemon co-location reporting), a
+  `home_site` baseline, and a presence timeline first; privacy opt-in by design.
+- **Codex OAuth backend** — deferred; OpenAI-compatible stays the stable path. (Named
+  multi-account pools now exist via `providers.toml`, but those are API-key, not an
+  OAuth flow.)
 
 ## How this was produced
 
