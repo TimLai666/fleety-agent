@@ -38,19 +38,23 @@ no Fleety crate). This file holds things that aren't derivable from the code.
 **Before cutting a release, update the bundled Insyra — the library and the two
 vendored skills.** The `fleety-insyra` sidecar ([`sidecars/fleety-insyra`](sidecars/fleety-insyra))
 embeds `github.com/HazelnutParadise/insyra`, and `fleety-server` embeds two
-upstream skills: the Fleety-adapted `fleety-use-insyra-dsl`
-([`builtin-skills/fleety-use-insyra-dsl/SKILL.upstream.md`](crates/fleety-server/builtin-skills/fleety-use-insyra-dsl/SKILL.upstream.md),
-upstream `skills/use-insyra-cli`) and the verbatim `insyra`
-([`builtin-skills/insyra/SKILL.md`](crates/fleety-server/builtin-skills/insyra/SKILL.md),
+upstream skills, each embedded as a **whole directory** (via `include_dir` — the
+file set isn't hardcoded; new upstream files flow through, only `SKILL.md` is
+guaranteed): the Fleety-adapted `fleety-use-insyra-dsl`
+([`builtin-skills/fleety-use-insyra-dsl/`](crates/fleety-server/builtin-skills/fleety-use-insyra-dsl),
+upstream `skills/use-insyra-cli`; its `SKILL.md` is the pristine upstream copy and
+a Fleety-authored `HEADER.md` is folded onto it at seed) and the verbatim `insyra`
+([`builtin-skills/insyra/`](crates/fleety-server/builtin-skills/insyra),
 upstream `skills/insyra`). We want releases to ship the latest of all three, kept
 in lockstep. CI's release workflow does this automatically: `go get -u …insyra@latest`
 + `go get -u ./...` + `go mod tidy` (bumps Insyra **and** its sub-packages; CI's
 `setup-go: stable` keeps the Go toolchain current, and `go mod tidy` raises the
-go.mod `go` directive when a dep needs it), then `curl` both skills **from the
-resolved release tag — never `main`** — then build + smoke test. If you ever cut a
-release outside that workflow, in `sidecars/fleety-insyra/` run `go get -u
+go.mod `go` directive when a dep needs it), then mirrors **each skill's whole
+upstream directory from the resolved release tag — never `main`** (preserving our
+`HEADER.md`), then build + smoke test. If you ever cut a release outside that
+workflow, in `sidecars/fleety-insyra/` run `go get -u
 github.com/HazelnutParadise/insyra@latest && go get -u ./... && go mod tidy`,
-refresh both skills from `raw.githubusercontent.com/HazelnutParadise/insyra/<release-tag>/skills/{use-insyra-cli,insyra}/SKILL.md`,
-and commit the updated `go.mod`/`go.sum`/skills. A breaking Insyra change will
-surface as a sidecar build/test failure — fix the sidecar, don't pin around it
-silently.
+mirror each skill dir from `raw.githubusercontent.com/HazelnutParadise/insyra/<release-tag>/skills/{use-insyra-cli,insyra}/`
+(keep `HEADER.md`), and commit the updated `go.mod`/`go.sum`/skills. A breaking
+Insyra change will surface as a sidecar build/test failure — fix the sidecar,
+don't pin around it silently.

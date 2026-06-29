@@ -72,13 +72,28 @@ jobs:
           go test ./...
           v=$(go list -m -f '{{.Version}}' github.com/HazelnutParadise/insyra)
           echo "Insyra $v"
-          # Pull the vendored skills from the resolved RELEASE tag ($v) — never
-          # main — so the skill version matches the embedded engine. Fail loudly
-          # if a skill is missing at that tag (no main fallback).
-          base="https://raw.githubusercontent.com/HazelnutParadise/insyra/$v/skills"
+          # Mirror each vendored skill's WHOLE upstream directory (SKILL.md +
+          # references/ + whatever else it ships — the file set isn't hardcoded)
+          # from the resolved RELEASE tag ($v), never main, so the skills match the
+          # embedded engine. Our Fleety-authored HEADER.md is preserved.
           bs="$GITHUB_WORKSPACE/crates/fleety-server/builtin-skills"
-          curl -fsSL "$base/use-insyra-cli/SKILL.md" -o "$bs/fleety-use-insyra-dsl/SKILL.upstream.md"
-          curl -fsSL "$base/insyra/SKILL.md" -o "$bs/insyra/SKILL.md"
+          api="https://api.github.com/repos/HazelnutParadise/insyra/git/trees/$v?recursive=1"
+          raw="https://raw.githubusercontent.com/HazelnutParadise/insyra/$v"
+          tree=$(curl -fsSL -H "Accept: application/vnd.github+json" "$api")
+          sync_skill() {  # <upstream-skill-dir> <local-dir>
+            up="$1"; local="$2"
+            find "$local" -mindepth 1 -not -name HEADER.md -delete 2>/dev/null || true
+            mkdir -p "$local"
+            echo "$tree" | jq -r --arg p "skills/$up/" \
+              '.tree[] | select(.type=="blob" and (.path|startswith($p))) | .path' \
+              | while read -r path; do
+                  rel="${path#skills/$up/}"
+                  mkdir -p "$local/$(dirname "$rel")"
+                  curl -fsSL "$raw/$path" -o "$local/$rel"
+                done
+          }
+          sync_skill use-insyra-cli "$bs/fleety-use-insyra-dsl"
+          sync_skill insyra "$bs/insyra"
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }} --bin fleety --bin fleety-server --bin fleetyd
       # Each runner's arch matches its target, so a native `go build` is correct.
