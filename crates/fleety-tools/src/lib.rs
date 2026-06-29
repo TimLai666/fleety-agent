@@ -35,6 +35,7 @@ pub mod config;
 pub mod deps;
 pub mod device;
 mod insyra;
+pub mod providers_config;
 pub mod restart;
 pub mod service;
 pub mod transport;

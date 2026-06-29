@@ -38,6 +38,7 @@ pub(crate) fn server_start() -> std::time::Instant {
 }
 mod echo;
 mod mcp;
+mod pool;
 mod providers;
 mod scheduler;
 mod schedules;

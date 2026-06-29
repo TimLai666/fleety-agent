@@ -1804,6 +1804,7 @@ dependencies = [
  "machine-uid",
  "png 0.17.16",
  "reqwest",
+ "serde",
  "serde_json",
  "serial_test",
  "sha2",

@@ -88,6 +88,62 @@ is the bare var, base URL / key / stream are suffixed.
 | `FLEETY_CHEAP_MODEL_KEY` | (unset) | Bearer token for the economy endpoint. |
 | `FLEETY_CHEAP_MODEL_STREAM` | `0` | `1` to stream the economy model. |
 
+### Named provider pool (`providers.toml`)
+
+To run **more than two** providers — several Codex accounts, several
+OpenAI-compatible endpoints — or to spread load / fail over across multiple
+accounts of the same model, define them in `providers.toml` instead of (or
+alongside) the env vars above.
+
+| Var | Default | Meaning |
+|---|---|---|
+| `FLEETY_PROVIDERS` | `~/.fleety/providers.toml` | Path to the named-provider file. |
+
+**Fallback:** when the file is absent, empty, or unparseable, the server falls
+back to the env vars above (building providers named `main` and `cheap`), so the
+zero-config behavior is unchanged. A broken file is ignored with a warning, not
+a crash.
+
+Each `[[provider]]` has the same fields as the env path. A `[[group]]` pools
+several providers under one name with a dispatch `strategy`:
+
+- `round_robin` — advance the starting member each call, spreading quota across
+  accounts.
+- `failover` — always start at the first member, advancing only on failure
+  (primary + backups).
+
+On **any** member error (after that member's own retries — see
+`FLEETY_MODEL_RETRIES`), the pool tries the next member, returning an error only
+once all members fail. The `[roles]` table maps a role or subagent tier name
+(`main`, `cheap`, or any custom name) to a provider **or** group name; an unknown
+selector falls back to `main`.
+
+```toml
+[[provider]]
+name = "codex-1"
+base_url = "https://api.openai.com/v1"
+model = "gpt-5"
+key = "sk-aaa"
+stream = true            # optional (default false)
+modalities = "text,image" # optional (default: model-name heuristic)
+effort = "medium"         # optional (default: none)
+
+[[provider]]
+name = "codex-2"
+base_url = "https://api.openai.com/v1"
+model = "gpt-5"
+key = "sk-bbb"
+
+[[group]]
+name = "codex"
+members = ["codex-1", "codex-2"]
+strategy = "round_robin"   # or "failover"
+
+[roles]
+main = "codex"            # the main turn uses the pooled group
+cheap = "codex-1"         # subagents' cheap tier uses one account
+```
+
 ## Retention / GC (server background loop)
 
 Six-hour periodic sweep that keeps audit + backup surfaces bounded.
