@@ -326,12 +326,12 @@ impl Tool for ConversationList {
             .user_conversation_ids(user)
             .into_iter()
             .map(|conv| {
-                let events = self.storage.load_user_conversation(user, &conv);
-                let last_ts = events.iter().map(|e| e.ts_secs).max().unwrap_or(0);
+                // Metadata only — avoid deserializing every message in each file.
+                let (count, last_ts) = self.storage.conversation_summary(user, &conv);
                 json!({
                     "conversation_id": conv,
                     "last_ts_secs": last_ts,
-                    "events": events.len(),
+                    "events": count,
                 })
             })
             .collect();

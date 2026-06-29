@@ -430,6 +430,39 @@ impl Storage {
         read_events(&path).unwrap_or_default()
     }
 
+    /// Cheap (count, last_ts_secs) for a user conversation — for listings that
+    /// only need metadata. Parses just `ts_secs` per line, not the full `Message`,
+    /// so it avoids deserializing every message.
+    pub fn conversation_summary(&self, user_id: &str, conversation_id: &str) -> (u64, u64) {
+        #[derive(serde::Deserialize)]
+        struct TsOnly {
+            #[serde(default)]
+            ts_secs: u64,
+        }
+        let path = self
+            .home
+            .join("fleet")
+            .join("users")
+            .join(user_id)
+            .join("conversations")
+            .join(format!("{conversation_id}.jsonl"));
+        let Ok(text) = fs::read_to_string(&path) else {
+            return (0, 0);
+        };
+        let mut count = 0u64;
+        let mut last = 0u64;
+        for line in text.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            count += 1;
+            if let Ok(t) = serde_json::from_str::<TsOnly>(line) {
+                last = last.max(t.ts_secs);
+            }
+        }
+        (count, last)
+    }
+
     /// A user conversation's events with `seq` strictly greater than `after`.
     /// Lets the off-turn indexer fetch only the messages added since the last
     /// index pass instead of reloading the whole conversation each turn.
@@ -1195,7 +1228,9 @@ impl Storage {
         let mut hint_match: Option<(Value, String)> = None;
         let mut any_match: Option<(Value, String)> = None;
         for line in text.lines() {
-            if line.trim().is_empty() {
+            // Cheap substring pre-filter: a matching record contains the id, so
+            // skip JSON-parsing the (vast majority of) lines that can't match.
+            if line.is_empty() || !line.contains(id) {
                 continue;
             }
             let Ok(v) = serde_json::from_str::<Value>(line) else {
