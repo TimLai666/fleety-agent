@@ -206,6 +206,63 @@ pub fn editor_request(session_id: &str, tool: &str, args: &Value) -> Option<(Str
     }
 }
 
+/// The `editor_*` tool specs to advertise to the server (in Hello), gated by the
+/// editor's capabilities. Their descriptions tell the agent to prefer them for
+/// the user's files and how the surface differs (editor buffer, may be unsaved),
+/// so the agent reasons correctly without a separate system-prompt change.
+#[allow(dead_code)]
+pub fn editor_tool_specs(caps: &EditorCapabilities) -> Vec<agent_core::ToolSpec> {
+    use agent_core::{RiskLevel, ToolSpec};
+    let pref =
+        "Prefer this over the disk file tools for files the user is editing in this session.";
+    let mut specs = Vec::new();
+    if caps.read {
+        specs.push(ToolSpec {
+            name: "editor_read_file".to_string(),
+            description: format!(
+                "Read a file as the user's editor sees it (including unsaved buffer changes). {pref}"
+            ),
+            parameters: json!({ "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] }),
+            risk: RiskLevel::Read,
+        });
+    }
+    if caps.write {
+        specs.push(ToolSpec {
+            name: "editor_write_file".to_string(),
+            description: format!(
+                "Write a file through the user's editor — the change appears in their buffer (may be \
+                 unsaved, pending their approval); disk-reading tools (git, search) won't see it \
+                 until they save. {pref}"
+            ),
+            parameters: json!({ "type": "object", "properties": { "path": { "type": "string" }, "content": { "type": "string" } }, "required": ["path", "content"] }),
+            risk: RiskLevel::Mutate,
+        });
+    }
+    if caps.read && caps.write {
+        specs.push(ToolSpec {
+            name: "editor_edit".to_string(),
+            description: format!(
+                "Edit a file through the user's editor: replace `old` with `new` (shows in their \
+                 buffer/diff, may be unsaved). {pref}"
+            ),
+            parameters: json!({ "type": "object", "properties": { "path": { "type": "string" }, "old": { "type": "string" }, "new": { "type": "string" } }, "required": ["path", "old", "new"] }),
+            risk: RiskLevel::Mutate,
+        });
+    }
+    if caps.terminal {
+        specs.push(ToolSpec {
+            name: "editor_run".to_string(),
+            description: format!(
+                "Run a command in the user's editor terminal (on the editor's host, in its cwd). \
+                 Use for git/build/test/listing/etc. {pref}"
+            ),
+            parameters: json!({ "type": "object", "properties": { "command": { "type": "string" }, "cwd": { "type": "string" } }, "required": ["command"] }),
+            risk: RiskLevel::Mutate,
+        });
+    }
+    specs
+}
+
 // ---- dispatch + bridge ----
 
 /// The server-facing side of the adapter, injectable so dispatch is testable
@@ -218,6 +275,10 @@ pub trait AcpBridge: Send + Sync {
     async fn prompt(&self, session_id: &str, text: &str) -> agent_core::Result<Vec<String>>;
     /// Resume a session; returns its history as text chunks to replay.
     async fn load(&self, session_id: &str) -> agent_core::Result<Vec<String>>;
+
+    /// Note the editor's advertised capabilities (from the `initialize` request)
+    /// so the bridge can gate which `editor_*` tools it offers the server.
+    fn note_capabilities(&self, _init_params: &Value) {}
 }
 
 /// Join an ACP prompt's content blocks into a single text string.
@@ -250,7 +311,10 @@ pub async fn handle_message(msg: &Value, bridge: &dyn AcpBridge) -> Vec<Value> {
     let params = msg.get("params").cloned().unwrap_or_else(|| json!({}));
     let reply_id = || id.clone().unwrap_or(Value::Null);
     match method {
-        "initialize" => vec![response_ok(reply_id(), initialize_result())],
+        "initialize" => {
+            bridge.note_capabilities(&params);
+            vec![response_ok(reply_id(), initialize_result())]
+        }
         "authenticate" => vec![response_ok(reply_id(), json!({}))],
         "session/new" => {
             let cwd = params
@@ -342,10 +406,20 @@ async fn read_frame_async<R: tokio::io::AsyncBufRead + Unpin>(
 /// Run the ACP agent over stdio, bridging to the fleety-server. Only JSON-RPC is
 /// written to stdout; logs go to stderr (configured by the caller).
 pub async fn run(agent_url: String) -> agent_core::Result<()> {
-    let bridge = WsBridge::new(agent_url);
-    let mut reader = tokio::io::BufReader::new(tokio::io::stdin());
+    // The stdin reader is shared: the main loop reads requests from it, and during
+    // a prompt the bridge borrows it to read the editor's responses to the agent's
+    // fs/terminal calls (the editor is awaiting our prompt reply then, so stdin
+    // carries only those responses — no contention).
+    let reader = std::sync::Arc::new(tokio::sync::Mutex::new(tokio::io::BufReader::new(
+        tokio::io::stdin(),
+    )));
+    let bridge = WsBridge::new(agent_url, std::sync::Arc::clone(&reader));
     loop {
-        match read_frame_async(&mut reader).await {
+        let frame = {
+            let mut r = reader.lock().await;
+            read_frame_async(&mut *r).await
+        };
+        match frame {
             Ok(Some(msg)) => {
                 let frames = handle_message(&msg, &bridge).await;
                 let mut stdout = std::io::stdout();
@@ -364,19 +438,148 @@ pub async fn run(agent_url: String) -> agent_core::Result<()> {
     }
 }
 
+/// A shared, lockable stdin reader (see [`run`]).
+type SharedReader = std::sync::Arc<tokio::sync::Mutex<tokio::io::BufReader<tokio::io::Stdin>>>;
+
 /// Real bridge: each prompt opens a short-lived WebSocket to the server, sends
 /// the user message rooted at the session's cwd, and collects the assistant
 /// reply. Stateless per prompt (the server persists the conversation by id).
 struct WsBridge {
     agent_url: String,
     cwds: tokio::sync::Mutex<std::collections::HashMap<String, Option<String>>>,
+    /// The editor's advertised capabilities (from `initialize`), gating which
+    /// `editor_*` tools we offer the server.
+    caps: std::sync::Mutex<EditorCapabilities>,
+    /// Shared stdin reader, for reading the editor's fs/terminal responses.
+    reader: SharedReader,
+    /// JSON-RPC request id counter for our calls to the editor.
+    next_req: std::sync::atomic::AtomicI64,
 }
 
 impl WsBridge {
-    fn new(agent_url: String) -> Self {
+    fn new(agent_url: String, reader: SharedReader) -> Self {
         Self {
             agent_url,
             cwds: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            caps: std::sync::Mutex::new(EditorCapabilities::default()),
+            reader,
+            next_req: std::sync::atomic::AtomicI64::new(1),
+        }
+    }
+
+    /// Call one ACP client method on the editor and await its response. Borrows
+    /// the shared stdin reader (free during a prompt). Frames that aren't our
+    /// response (notifications, a mid-prompt request) are skipped.
+    async fn editor_call(&self, method: &str, params: Value) -> agent_core::Result<Value> {
+        use agent_core::CoreError;
+        let id = self
+            .next_req
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let req = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+        {
+            let mut so = std::io::stdout();
+            write_frame(&mut so, &req)
+                .map_err(|e| CoreError::Message(format!("write editor request: {e}")))?;
+        }
+        let mut reader = self.reader.lock().await;
+        loop {
+            match read_frame_async(&mut *reader).await {
+                Ok(Some(v)) => {
+                    if v.get("id").and_then(Value::as_i64) == Some(id) {
+                        if let Some(err) = v.get("error") {
+                            let m = err
+                                .get("message")
+                                .and_then(Value::as_str)
+                                .unwrap_or("error");
+                            return Err(CoreError::Message(format!("editor: {m}")));
+                        }
+                        return Ok(v.get("result").cloned().unwrap_or(Value::Null));
+                    }
+                    // Not our response — ignore (e.g. a mid-prompt session/cancel).
+                }
+                Ok(None) => return Err(CoreError::Message("editor connection closed".to_string())),
+                Err(e) => return Err(CoreError::Message(format!("read editor response: {e}"))),
+            }
+        }
+    }
+
+    /// Execute one editor-backed tool by translating it to ACP client calls.
+    /// Results carry a `surface` (and `saved` for writes) so the agent knows the
+    /// change is in the editor's buffer, not yet on disk.
+    async fn dispatch_editor(
+        &self,
+        session_id: &str,
+        tool: &str,
+        args: &Value,
+    ) -> agent_core::Result<Value> {
+        use agent_core::CoreError;
+        match tool {
+            "editor_read_file" => {
+                let (m, p) = editor_request(session_id, tool, args).ok_or_else(|| {
+                    CoreError::Message("editor_read_file needs 'path'".to_string())
+                })?;
+                let r = self.editor_call(&m, p).await?;
+                Ok(
+                    json!({ "surface": "editor-buffer", "content": r.get("content").cloned().unwrap_or(Value::Null) }),
+                )
+            }
+            "editor_write_file" => {
+                let (m, p) = editor_request(session_id, tool, args).ok_or_else(|| {
+                    CoreError::Message("editor_write_file needs 'path'".to_string())
+                })?;
+                self.editor_call(&m, p).await?;
+                Ok(
+                    json!({ "surface": "editor-buffer", "saved": false, "applied": true, "path": args.get("path").cloned().unwrap_or(Value::Null) }),
+                )
+            }
+            "editor_edit" => {
+                let path = args
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| CoreError::Message("editor_edit needs 'path'".to_string()))?;
+                let old = args.get("old").and_then(Value::as_str).unwrap_or("");
+                let new = args.get("new").and_then(Value::as_str).unwrap_or("");
+                let read = self
+                    .editor_call(
+                        "fs/read_text_file",
+                        json!({ "sessionId": session_id, "path": path }),
+                    )
+                    .await?;
+                let content = read.get("content").and_then(Value::as_str).unwrap_or("");
+                if !old.is_empty() && !content.contains(old) {
+                    return Err(CoreError::Message(format!(
+                        "editor_edit: `old` text not found in {path}"
+                    )));
+                }
+                let updated = content.replacen(old, new, 1);
+                self.editor_call(
+                    "fs/write_text_file",
+                    json!({ "sessionId": session_id, "path": path, "content": updated }),
+                )
+                .await?;
+                Ok(
+                    json!({ "surface": "editor-buffer", "saved": false, "applied": true, "path": path }),
+                )
+            }
+            "editor_run" => {
+                let (m, p) = editor_request(session_id, tool, args)
+                    .ok_or_else(|| CoreError::Message("editor_run needs 'command'".to_string()))?;
+                let created = self.editor_call(&m, p).await?;
+                let term = created
+                    .get("terminalId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let by = json!({ "sessionId": session_id, "terminalId": term });
+                let _ = self.editor_call("terminal/wait_for_exit", by.clone()).await;
+                let out = self.editor_call("terminal/output", by.clone()).await?;
+                let _ = self.editor_call("terminal/release", by).await;
+                Ok(json!({
+                    "surface": "editor-terminal",
+                    "output": out.get("output").cloned().unwrap_or(Value::Null),
+                    "exitStatus": out.get("exitStatus").cloned().unwrap_or(Value::Null)
+                }))
+            }
+            other => Err(CoreError::Message(format!("unknown editor tool '{other}'"))),
         }
     }
 
@@ -399,12 +602,24 @@ impl WsBridge {
                 CoreError::Provider(format!("cannot connect to {}: {e}", self.agent_url))
             })?;
         let (mut tx, mut rx) = ws.split();
+        // Advertise the editor-backed tools gated by what the editor supports, so
+        // the server offers the agent `editor_*` tools routed back to us.
+        let editor_specs = self
+            .caps
+            .lock()
+            .map(|c| editor_tool_specs(&c))
+            .unwrap_or_default();
+        let local_tools_json = if editor_specs.is_empty() {
+            None
+        } else {
+            serde_json::to_string(&editor_specs).ok()
+        };
         let hello = serde_json::to_string(&fleety_protocol::ClientMsg::Hello {
             device_id: crate::device_id(),
             protocol: fleety_protocol::PROTOCOL_VERSION,
             token: std::env::var("FLEETY_TOKEN").ok().filter(|s| !s.is_empty()),
             pairing_code: None,
-            local_tools_json: None,
+            local_tools_json,
             hostname: fleety_tools::device::hostname(),
         })
         .map_err(|e| CoreError::Message(format!("serialize hello: {e}")))?;
@@ -449,6 +664,33 @@ impl WsBridge {
                 fleety_protocol::ServerMsg::Error { error } => {
                     return Err(CoreError::Message(error.message))
                 }
+                // The agent invoked an editor-backed tool: run it via the editor's
+                // ACP fs/terminal methods and reply with the result.
+                fleety_protocol::ServerMsg::RunTool {
+                    call_id,
+                    tool,
+                    args_json,
+                } => {
+                    let args: Value =
+                        serde_json::from_str(&args_json).unwrap_or_else(|_| json!({}));
+                    let reply = match self.dispatch_editor(conversation, &tool, &args).await {
+                        Ok(v) => fleety_protocol::ClientMsg::ToolResult {
+                            call_id,
+                            result_json: v.to_string(),
+                        },
+                        Err(e) => fleety_protocol::ClientMsg::ToolError {
+                            call_id,
+                            error: fleety_protocol::WireError {
+                                kind: "editor".to_string(),
+                                message: e.report().message,
+                                remediation: None,
+                            },
+                        },
+                    };
+                    if let Ok(t) = serde_json::to_string(&reply) {
+                        let _ = tx.send(WsMessage::Text(t)).await;
+                    }
+                }
                 _ => {}
             }
         }
@@ -472,6 +714,12 @@ impl AcpBridge for WsBridge {
 
     async fn load(&self, session_id: &str) -> agent_core::Result<Vec<String>> {
         self.run_turn(session_id, "", None, true).await
+    }
+
+    fn note_capabilities(&self, init_params: &Value) {
+        if let Ok(mut c) = self.caps.lock() {
+            *c = parse_client_capabilities(init_params);
+        }
     }
 }
 
@@ -601,6 +849,40 @@ mod tests {
         assert_eq!(editor_tool_names(&ro), vec!["editor_read_file"]);
         // Nothing advertised → no editor tools.
         assert!(editor_tool_names(&parse_client_capabilities(&json!({}))).is_empty());
+    }
+
+    #[test]
+    fn editor_tool_specs_gated_by_capabilities() {
+        let full = EditorCapabilities {
+            read: true,
+            write: true,
+            terminal: true,
+        };
+        let names: Vec<String> = editor_tool_specs(&full)
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "editor_read_file",
+                "editor_write_file",
+                "editor_edit",
+                "editor_run"
+            ]
+        );
+        // Read-only editor → only the reader; descriptions steer the agent to prefer it.
+        let ro = EditorCapabilities {
+            read: true,
+            write: false,
+            terminal: false,
+        };
+        let ro_specs = editor_tool_specs(&ro);
+        assert_eq!(ro_specs.len(), 1);
+        assert_eq!(ro_specs[0].name, "editor_read_file");
+        assert!(ro_specs[0].description.to_lowercase().contains("prefer"));
+        // No capabilities → no editor tools.
+        assert!(editor_tool_specs(&EditorCapabilities::default()).is_empty());
     }
 
     #[test]

@@ -16,6 +16,7 @@ mod conn;
 mod conversation_embed;
 mod conversation_lifecycle;
 mod conversation_recall;
+mod editor_tools;
 mod embed;
 mod gc;
 mod identity;

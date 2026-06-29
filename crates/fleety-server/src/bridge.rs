@@ -307,6 +307,49 @@ impl Tool for DeviceExec {
     }
 }
 
+/// Send a `RunTool` directly to a connection's outbound `sender` and await its
+/// `ToolResult`/`ToolError`, correlated by a fresh `call_id`. The sender *is* the
+/// per-connection address — multiple connections on one machine never collide.
+/// Shared by `device_exec` (which looks the sender up in the hub) and the
+/// editor-backed tools (which hold their connection's sender directly).
+pub async fn route_run_tool_via(
+    sender: &mpsc::UnboundedSender<WsMessage>,
+    pending: &Pending,
+    tool: &str,
+    args: Value,
+) -> Result<Value> {
+    let call_id = uuid::Uuid::new_v4().to_string();
+    let (reply_tx, reply_rx) = oneshot::channel();
+    pending.lock().await.insert(call_id.clone(), reply_tx);
+
+    let frame = ServerMsg::RunTool {
+        call_id: call_id.clone(),
+        tool: tool.to_string(),
+        args_json: args.to_string(),
+    };
+    let text = serde_json::to_string(&frame)
+        .map_err(|e| CoreError::Message(format!("serialize RunTool: {e}")))?;
+    sender
+        .send(WsMessage::Text(text))
+        .map_err(|_| CoreError::Provider(format!("tool '{tool}': connection closed")))?;
+    match tokio::time::timeout(CALL_TIMEOUT, reply_rx).await {
+        Ok(Ok(Ok(value))) => Ok(value),
+        Ok(Ok(Err(message))) => Err(CoreError::Provider(format!(
+            "tool '{tool}' failed: {message}"
+        ))),
+        Ok(Err(_)) => Err(CoreError::Provider(format!(
+            "tool '{tool}': reply channel dropped (disconnected?)"
+        ))),
+        Err(_) => {
+            pending.lock().await.remove(&call_id);
+            Err(CoreError::Provider(format!(
+                "tool '{tool}' timed out after {}s",
+                CALL_TIMEOUT.as_secs()
+            )))
+        }
+    }
+}
+
 /// Dispatch a daemon's tool reply to the waiting `device_exec` call.
 pub async fn dispatch_result(
     pending: &Pending,

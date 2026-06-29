@@ -91,6 +91,7 @@ fn build_connection_stack(
     out: &Out,
     acting: &crate::identity::ActingUser,
     rollover_state: &crate::conversation_lifecycle::RolloverState,
+    editor_specs: &[agent_core::ToolSpec],
 ) -> (
     agent_core::ToolRegistry,
     Arc<crate::subagent::FleetyHost>,
@@ -146,6 +147,10 @@ fn build_connection_stack(
     let goal_state = Arc::new(tokio::sync::Mutex::new(GoalState::new()));
     agent_core::register_goal_tools(&mut tools, Arc::clone(&goal_state));
     crate::conversation_lifecycle::register(&mut tools, Arc::clone(rollover_state));
+    // Editor-backed tools (ACP delegation): when the connecting editor advertised
+    // fs/terminal tools, the agent gets `editor_*` tools that route to this very
+    // connection (its `out` sender) so file edits go through the user's editor.
+    crate::editor_tools::register_editor(&mut tools, out, Arc::clone(pending), editor_specs);
     (tools, subagent_host, goal_state)
 }
 
@@ -327,6 +332,20 @@ async fn serve(
     // scope to the device owner (rebuilt with the resolved user on first message).
     let connect_acting = storage.acting_for_device(device_id);
     let rollover_state = crate::conversation_lifecycle::new_state();
+    // Editor-backed tools to offer this connection: the `editor_*` subset it
+    // advertised in Hello (an ACP editor gates these by the editor's capabilities).
+    let editor_specs: Vec<agent_core::ToolSpec> = device_tools
+        .lock()
+        .await
+        .get(device_id)
+        .map(|specs| {
+            specs
+                .iter()
+                .filter(|s| s.name.starts_with("editor_"))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
     let (mut tools, mut subagent_host, mut goal_state) = build_connection_stack(
         storage,
         &current_root,
@@ -340,6 +359,7 @@ async fn serve(
         out,
         &connect_acting,
         &rollover_state,
+        &editor_specs,
     );
     let mut workspace_bound = false;
     let goal_max_continues = goal_max_continues_from_env();
@@ -446,6 +466,7 @@ async fn serve(
                         out,
                         &acting,
                         &rollover_state,
+                        &editor_specs,
                     );
                     tools = t;
                     subagent_host = h;

@@ -162,8 +162,23 @@ does not run its own model — connecting at `FLEETY_AGENT_URL` (else mDNS, else
 `ws://127.0.0.1:8787`), authenticating with `FLEETY_TOKEN` if set. The editor's
 working directory (`session/new` cwd) becomes the conversation's workspace root
 (via session-workspace-cwd). **stdout carries only JSON-RPC; logs go to stderr.**
-v1 does not use client-side `fs`/`terminal` (the server runs tools at the cwd);
-that delegation is a follow-up.
+
+**Editor delegation.** If the editor advertises `fs`/`terminal` client
+capabilities (read from the `initialize` request), the agent additionally gets
+`editor_*` tools that run **in the user's editor**: `editor_read_file` /
+`editor_write_file` / `editor_edit` go through the editor's text fs (changes appear
+in their buffer — may be unsaved, pending their approval), and `editor_run` runs in
+the editor's terminal on its host. These are gated by what the editor advertises
+(no terminal → no `editor_run`); their descriptions tell the agent to prefer them
+for the user's files and that buffer edits aren't on disk until saved; results
+carry a `surface`/`saved` marker. Mechanically the CLI advertises these tools in
+its `Hello`; the server routes the agent's `editor_*` calls back to **that
+connection** (so multiple editors on one machine don't collide), and the CLI
+translates them to the editor's ACP `fs/*` / `terminal/*` methods. Disk tools
+(git, search, listing) still run server-side. A **conformant editor needs no
+changes** — only standard ACP. The live editor round-trip is verified manually.
+Routing a session's *disk* tools to a remote originating device (when the server
+isn't co-located) is a separate future change.
 
 Example editor config: run `fleety acp` as the agent command (a fleety-server
 must be reachable).
