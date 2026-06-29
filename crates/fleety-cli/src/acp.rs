@@ -124,6 +124,88 @@ pub fn initialize_result() -> Value {
     })
 }
 
+// ---- editor delegation: capability gating + tool→ACP-method mapping (pure) ----
+//
+// NOTE: the ACP method and capability field names below follow the Agent Client
+// Protocol spec (agentclientprotocol.com). They are isolated here so a spec
+// check only touches these constants/shapes.
+
+#[allow(dead_code)] // consumed by acp-editor-delegation task 2.1 (bridge)
+/// What the connected editor advertised it can serve, parsed from the ACP
+/// `initialize` request's `clientCapabilities`. We only ever delegate what is
+/// advertised.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EditorCapabilities {
+    pub read: bool,
+    pub write: bool,
+    pub terminal: bool,
+}
+
+/// Parse `clientCapabilities` from an `initialize` request's params.
+#[allow(dead_code)]
+pub fn parse_client_capabilities(init_params: &Value) -> EditorCapabilities {
+    let caps = init_params.get("clientCapabilities");
+    let fs = caps.and_then(|c| c.get("fs"));
+    let b = |v: Option<&Value>| v.and_then(Value::as_bool).unwrap_or(false);
+    EditorCapabilities {
+        read: b(fs.and_then(|f| f.get("readTextFile"))),
+        write: b(fs.and_then(|f| f.get("writeTextFile"))),
+        terminal: b(caps.and_then(|c| c.get("terminal"))),
+    }
+}
+
+/// The editor-backed tool names to advertise, given what the editor supports.
+/// `editor_edit` needs both read and write (it is a read-modify-write).
+#[allow(dead_code)]
+pub fn editor_tool_names(caps: &EditorCapabilities) -> Vec<&'static str> {
+    let mut names = Vec::new();
+    if caps.read {
+        names.push("editor_read_file");
+    }
+    if caps.write {
+        names.push("editor_write_file");
+    }
+    if caps.read && caps.write {
+        names.push("editor_edit");
+    }
+    if caps.terminal {
+        names.push("editor_run");
+    }
+    names
+}
+
+/// Map an editor-backed tool call to the ACP client request (method, params) it
+/// translates to. `editor_edit` is composed of a read + a write by the bridge,
+/// so it has no single mapping here and returns `None`.
+#[allow(dead_code)]
+pub fn editor_request(session_id: &str, tool: &str, args: &Value) -> Option<(String, Value)> {
+    let path = args.get("path").and_then(Value::as_str);
+    match tool {
+        "editor_read_file" => Some((
+            "fs/read_text_file".to_string(),
+            json!({ "sessionId": session_id, "path": path? }),
+        )),
+        "editor_write_file" => Some((
+            "fs/write_text_file".to_string(),
+            json!({
+                "sessionId": session_id,
+                "path": path?,
+                "content": args.get("content").and_then(Value::as_str).unwrap_or("")
+            }),
+        )),
+        "editor_run" => Some((
+            "terminal/create".to_string(),
+            json!({
+                "sessionId": session_id,
+                "command": args.get("command").and_then(Value::as_str).unwrap_or(""),
+                "args": args.get("args").cloned().unwrap_or_else(|| json!([])),
+                "cwd": args.get("cwd").cloned().unwrap_or(Value::Null)
+            }),
+        )),
+        _ => None,
+    }
+}
+
 // ---- dispatch + bridge ----
 
 /// The server-facing side of the adapter, injectable so dispatch is testable
@@ -486,6 +568,46 @@ mod tests {
         )
         .await;
         assert!(r.is_empty());
+    }
+
+    #[test]
+    fn capabilities_gate_editor_tools() {
+        // Full capabilities → all four editor tools.
+        let full = parse_client_capabilities(&json!({
+            "clientCapabilities": { "fs": { "readTextFile": true, "writeTextFile": true }, "terminal": true }
+        }));
+        assert_eq!(full, EditorCapabilities { read: true, write: true, terminal: true });
+        assert_eq!(
+            editor_tool_names(&full),
+            vec!["editor_read_file", "editor_write_file", "editor_edit", "editor_run"]
+        );
+        // Read-only, no terminal → just the reader.
+        let ro = parse_client_capabilities(&json!({
+            "clientCapabilities": { "fs": { "readTextFile": true } }
+        }));
+        assert_eq!(editor_tool_names(&ro), vec!["editor_read_file"]);
+        // Nothing advertised → no editor tools.
+        assert!(editor_tool_names(&parse_client_capabilities(&json!({}))).is_empty());
+    }
+
+    #[test]
+    fn editor_request_maps_to_acp_methods() {
+        let (m, p) = editor_request("s1", "editor_read_file", &json!({ "path": "a.rs" })).unwrap();
+        assert_eq!(m, "fs/read_text_file");
+        assert_eq!(p["sessionId"], "s1");
+        assert_eq!(p["path"], "a.rs");
+        let (m, p) =
+            editor_request("s1", "editor_write_file", &json!({ "path": "a.rs", "content": "x" }))
+                .unwrap();
+        assert_eq!(m, "fs/write_text_file");
+        assert_eq!(p["content"], "x");
+        let (m, p) = editor_request("s1", "editor_run", &json!({ "command": "git status" })).unwrap();
+        assert_eq!(m, "terminal/create");
+        assert_eq!(p["command"], "git status");
+        // editor_edit is composed (read+write), no single mapping.
+        assert!(editor_request("s1", "editor_edit", &json!({ "path": "a.rs" })).is_none());
+        // A read without a path → None (caller surfaces an error).
+        assert!(editor_request("s1", "editor_read_file", &json!({})).is_none());
     }
 
     #[test]
