@@ -44,6 +44,7 @@ mod scheduler;
 mod schedules;
 mod service;
 mod sites;
+mod skill_sync;
 mod skills;
 mod ssh;
 mod storage;
@@ -338,6 +339,10 @@ async fn run_server(shutdown: Option<tokio::sync::watch::Receiver<bool>>) {
     // Periodic retention / GC of audit + backup surfaces (skipped if the user
     // sets FLEETY_GC_DISABLED).
     gc::spawn(Arc::clone(&storage));
+
+    // Keep the `synced` skill tier in step with the external skills repo
+    // (FLEETY_SKILLS_SYNC=0 disables). Background, never-crash.
+    skill_sync::spawn(storage.skills_synced_dir());
 
     tokio::spawn(conn::recover_all_interactive(
         Arc::clone(&storage),

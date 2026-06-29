@@ -1,4 +1,4 @@
-﻿//! Built-in skills shipped inside the `fleety-server` binary and seeded into the
+//! Built-in skills shipped inside the `fleety-server` binary and seeded into the
 //! builtin skills dir at startup, so `list_skills`/`use_skill` can serve them
 //! with no extra files to deploy and no runtime download. User-installed skills
 //! still override built-ins of the same name (see `skills::collect`).
@@ -48,7 +48,9 @@ fn write_entries(base: &Path, dir: &Dir, skill: &str) -> Result<()> {
                 let path = base.join(file.path());
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent).map_err(|e| {
-                        CoreError::Message(format!("cannot create builtin skill dir '{skill}': {e}"))
+                        CoreError::Message(format!(
+                            "cannot create builtin skill dir '{skill}': {e}"
+                        ))
                     })?;
                 }
                 std::fs::write(&path, file.contents()).map_err(|e| {
@@ -94,8 +96,8 @@ mod tests {
     fn seed_writes_insyra_skill_with_fleety_header() {
         let dir = std::env::temp_dir().join(format!("fleety-bskill-{}", uuid::Uuid::new_v4()));
         seed(&dir).expect("seed");
-        let content =
-            std::fs::read_to_string(dir.join("fleety-use-insyra-dsl").join("SKILL.md")).expect("read");
+        let content = std::fs::read_to_string(dir.join("fleety-use-insyra-dsl").join("SKILL.md"))
+            .expect("read");
         // Opens with Agent Skills frontmatter (name + description)...
         assert!(content.starts_with("---"));
         assert!(content.contains("name: fleety-use-insyra-dsl"));
@@ -105,7 +107,10 @@ mod tests {
         // The whole package is seeded — references/, not just SKILL.md — and the
         // Fleety HEADER.md is folded in, not emitted as its own file.
         let skill_dir = dir.join("fleety-use-insyra-dsl");
-        assert!(skill_dir.join("references").join("cli-commands.md").is_file());
+        assert!(skill_dir
+            .join("references")
+            .join("cli-commands.md")
+            .is_file());
         assert!(!skill_dir.join("HEADER.md").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -114,8 +119,8 @@ mod tests {
     fn seed_writes_skill_creator() {
         let dir = std::env::temp_dir().join(format!("fleety-bskill-{}", uuid::Uuid::new_v4()));
         seed(&dir).expect("seed");
-        let content =
-            std::fs::read_to_string(dir.join("fleety-skill-creator").join("SKILL.md")).expect("read");
+        let content = std::fs::read_to_string(dir.join("fleety-skill-creator").join("SKILL.md"))
+            .expect("read");
         // Opens with Agent Skills frontmatter; body teaches the Fleety skill_*
         // workflow, not the upstream eval-viewer machinery.
         assert!(content.starts_with("---"));
@@ -129,8 +134,7 @@ mod tests {
     fn seed_writes_verbatim_insyra_skill() {
         let dir = std::env::temp_dir().join(format!("fleety-bskill-{}", uuid::Uuid::new_v4()));
         seed(&dir).expect("seed");
-        let content =
-            std::fs::read_to_string(dir.join("insyra").join("SKILL.md")).expect("read");
+        let content = std::fs::read_to_string(dir.join("insyra").join("SKILL.md")).expect("read");
         // Vendored verbatim (no Fleety header): the upstream frontmatter name is kept.
         assert!(content.starts_with("---"));
         assert!(content.contains("name: insyra"));
@@ -158,7 +162,10 @@ mod tests {
         seed(&dir).expect("seed 2");
 
         // Clean replace: stale leftovers are gone, current skills intact.
-        assert!(!stale_ref.exists(), "stale reference file should be removed");
+        assert!(
+            !stale_ref.exists(),
+            "stale reference file should be removed"
+        );
         assert!(!removed_skill.exists(), "removed skill should be gone");
         assert!(dir.join("insyra").join("SKILL.md").is_file());
         assert!(dir

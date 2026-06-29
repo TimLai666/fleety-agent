@@ -38,6 +38,8 @@ sha2 = "0.10"
 # binary without hardcoding their file list — the set of files in a skill can
 # change upstream; only SKILL.md is guaranteed.
 include_dir = "0.7"
+# Unzip the synced-skills repo archive (skill_sync).
+zip = { workspace = true }
 base64 = { workspace = true }
 # Local embedding model (EmbeddingGemma via ONNX) + on-disk sqlite-vec vector
 # store (vectors live in a SQLite DB file, queried via SQL — no in-RAM index)

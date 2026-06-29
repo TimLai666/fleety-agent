@@ -547,6 +547,25 @@ escapes stripped for readability; `raw_output` keeps the original bytes.
 | `FLEETY_TERMINAL_MAX_SESSIONS` | `8` | Max concurrent terminal sessions per process; opening beyond this errors (close one first). |
 | `FLEETY_TERMINAL_IDLE_TTL_SECS` | `600` | Idle sessions are reclaimed (terminated) after this long; reaped lazily when a new session opens. |
 
+## Synced skills (external repo)
+
+The server keeps a fourth skill tier, `~/.fleety/agent/skills/synced`, in step with
+an external skills repo at runtime — so those skills update **without** a Fleety
+release. A background task syncs once at boot and then on an interval: it first
+checks the repo's latest commit SHA and only downloads (the branch zip) when it
+changed, then rebuilds the synced tier from the repo's top-level skill
+directories (each a dir with a `SKILL.md`; loose files are ignored) and swaps it
+in atomically — so added/removed skills are mirrored. The synced tier has the
+**lowest precedence** (installed > authored > builtin > synced), so a same-named
+installed/authored/builtin skill always wins. Any failure keeps the last good
+copy and logs a warning; it never crashes. Server-side only.
+
+| Var | Default | Meaning |
+|---|---|---|
+| `FLEETY_SKILLS_SYNC` | (on) | Set to `0` to disable runtime skill syncing entirely (no background task). |
+| `FLEETY_SKILLS_SYNC_REPO` | `TimLai666/skills` | `owner/repo` to sync the `main` branch from. |
+| `FLEETY_SKILLS_SYNC_INTERVAL_SECS` | `3600` | How often to check the repo for a new commit. |
+
 ## Tools that talk to the network
 
 | Var | Default | Meaning |

@@ -740,6 +740,13 @@ impl Storage {
         self.home.join("skills").join("authored")
     }
 
+    /// Skills synced at runtime from an external repo (see `skill_sync`). Managed
+    /// entirely by the sync loop — not the binary. Lowest precedence: installed >
+    /// authored > builtin > synced.
+    pub fn skills_synced_dir(&self) -> PathBuf {
+        self.home.join("skills").join("synced")
+    }
+
     /// Path to the connection-auth store (tokens + pairing codes).
     pub fn auth_path(&self) -> PathBuf {
         self.home.join("auth.json")

@@ -1800,6 +1800,7 @@ dependencies = [
  "tracing",
  "uuid",
  "windows-service",
+ "zip",
 ]
 
 [[package]]

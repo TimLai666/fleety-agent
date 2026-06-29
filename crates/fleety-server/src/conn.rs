@@ -1537,6 +1537,7 @@ pub(crate) fn build_full_registry(
         &storage.skills_builtin_dir(),
         &storage.skills_authored_dir(),
         &storage.skills_installed_dir(),
+        &storage.skills_synced_dir(),
     );
     crate::web::register(&mut tools, &storage.cookies_dir(), workspace);
     crate::mcp::register(

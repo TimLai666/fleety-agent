@@ -25,12 +25,19 @@ use serde_json::{json, Value};
 
 use agent_core::{CoreError, Result, RiskLevel, Tool, ToolRegistry, ToolSpec};
 
-/// Register the skill tools across the three tiers.
-pub fn register(registry: &mut ToolRegistry, builtin: &Path, authored: &Path, installed: &Path) {
+/// Register the skill tools across the four tiers.
+pub fn register(
+    registry: &mut ToolRegistry,
+    builtin: &Path,
+    authored: &Path,
+    installed: &Path,
+    synced: &Path,
+) {
     let tiers = || Tiers {
         builtin: builtin.to_path_buf(),
         authored: authored.to_path_buf(),
         installed: installed.to_path_buf(),
+        synced: synced.to_path_buf(),
     };
     registry.register(Box::new(ListSkills(tiers())));
     registry.register(Box::new(UseSkill(tiers())));
@@ -51,15 +58,18 @@ struct Tiers {
     builtin: PathBuf,
     authored: PathBuf,
     installed: PathBuf,
+    /// Runtime-synced from an external repo; lowest precedence.
+    synced: PathBuf,
 }
 
 impl Tiers {
-    /// Tiers in precedence order (highest first): installed, authored, builtin.
-    fn ordered(&self) -> [(&Path, &'static str); 3] {
+    /// Tiers in precedence order (highest first): installed, authored, builtin, synced.
+    fn ordered(&self) -> [(&Path, &'static str); 4] {
         [
             (&self.installed, "installed"),
             (&self.authored, "authored"),
             (&self.builtin, "builtin"),
+            (&self.synced, "synced"),
         ]
     }
 
@@ -111,11 +121,13 @@ fn valid_file(file: &str) -> Result<String> {
     Ok(f)
 }
 
-/// Collect skills by name across the three tiers; installed > authored > builtin.
+/// Collect skills by name across the four tiers; installed > authored > builtin > synced.
 fn collect(t: &Tiers) -> BTreeMap<String, SkillInfo> {
     let mut map = BTreeMap::new();
-    // Insert builtin first, then authored, then installed so later overrides win.
+    // Insert lowest precedence first (synced), then builtin, authored, installed,
+    // so later (higher) tiers override.
     for (dir, source) in [
+        (&t.synced, "synced"),
         (&t.builtin, "builtin"),
         (&t.authored, "authored"),
         (&t.installed, "installed"),
@@ -988,23 +1000,32 @@ mod tests {
 
     #[tokio::test]
     async fn list_use_precedence_and_path() {
-        let (b, a, i) = (temp(), temp(), temp());
+        let (b, a, i, s) = (temp(), temp(), temp(), temp());
+        write_skill(&s, "esp32", "# ESP32\n(synced)"); // lowest tier
         write_skill(&b, "esp32", "# ESP32\n(builtin)");
         write_skill(&a, "esp32", "# ESP32\n(authored)");
         write_skill(&i, "esp32", "# ESP32\n(installed)");
         write_skill(&b, "docker", "# Docker\nbuild");
+        write_skill(&s, "synced-only", "# Synced Only\nfrom the repo"); // only in synced
         let mut reg = ToolRegistry::new();
-        register(&mut reg, &b, &a, &i);
+        register(&mut reg, &b, &a, &i, &s);
 
         let listed = reg.call("list_skills", json!({})).await.expect("list");
         let arr = listed["skills"].as_array().expect("arr");
-        assert_eq!(arr.len(), 2); // esp32 (collapsed) + docker
+        assert_eq!(arr.len(), 3); // esp32 (collapsed) + docker + synced-only
         let esp = arr
             .iter()
             .find(|s| s["name"] == json!("esp32"))
             .expect("esp");
+        // installed beats authored/builtin/synced.
         assert_eq!(esp["source"], json!("installed"));
         assert!(esp["path"].as_str().unwrap_or_default().contains("esp32"));
+        // A skill that exists only in the synced tier is served from synced.
+        let synced_only = arr
+            .iter()
+            .find(|s| s["name"] == json!("synced-only"))
+            .expect("synced-only");
+        assert_eq!(synced_only["source"], json!("synced"));
 
         let used = reg
             .call("use_skill", json!({ "name": "esp32" }))
@@ -1012,17 +1033,17 @@ mod tests {
             .expect("use");
         assert_eq!(used["source"], json!("installed"));
 
-        for d in [&b, &a, &i] {
+        for d in [&b, &a, &i, &s] {
             let _ = std::fs::remove_dir_all(d);
         }
     }
 
     #[tokio::test]
     async fn author_multifile_and_builtin_is_readonly() {
-        let (b, a, i) = (temp(), temp(), temp());
+        let (b, a, i, s) = (temp(), temp(), temp(), temp());
         write_skill(&b, "shipped", "# Shipped\nbuiltin");
         let mut reg = ToolRegistry::new();
-        register(&mut reg, &b, &a, &i);
+        register(&mut reg, &b, &a, &i, &s);
 
         // Writing a new skill's SKILL.md creates it in authored.
         reg.call(
@@ -1104,16 +1125,16 @@ mod tests {
             .await
             .is_err());
 
-        for d in [&b, &a, &i] {
+        for d in [&b, &a, &i, &s] {
             let _ = std::fs::remove_dir_all(d);
         }
     }
 
     #[tokio::test]
     async fn install_from_content_then_remove() {
-        let (b, a, i) = (temp(), temp(), temp());
+        let (b, a, i, s) = (temp(), temp(), temp(), temp());
         let mut reg = ToolRegistry::new();
-        register(&mut reg, &b, &a, &i);
+        register(&mut reg, &b, &a, &i, &s);
 
         reg.call(
             "skill_install",
@@ -1141,16 +1162,16 @@ mod tests {
             .await
             .is_err());
 
-        for d in [&b, &a, &i] {
+        for d in [&b, &a, &i, &s] {
             let _ = std::fs::remove_dir_all(d);
         }
     }
 
     #[tokio::test]
     async fn rejects_unsafe_names_and_files() {
-        let (b, a, i) = (temp(), temp(), temp());
+        let (b, a, i, s) = (temp(), temp(), temp(), temp());
         let mut reg = ToolRegistry::new();
-        register(&mut reg, &b, &a, &i);
+        register(&mut reg, &b, &a, &i, &s);
         for bad in ["../etc", "a/b", ".hidden", ""] {
             assert!(reg
                 .call("skill_write_file", json!({ "name": bad, "content": "x" }))
@@ -1165,16 +1186,16 @@ mod tests {
             )
             .await
             .is_err());
-        for d in [&b, &a, &i] {
+        for d in [&b, &a, &i, &s] {
             let _ = std::fs::remove_dir_all(d);
         }
     }
 
     #[tokio::test]
     async fn validate_draft_content() {
-        let (b, a, i) = (temp(), temp(), temp());
+        let (b, a, i, s) = (temp(), temp(), temp(), temp());
         let mut reg = ToolRegistry::new();
-        register(&mut reg, &b, &a, &i);
+        register(&mut reg, &b, &a, &i, &s);
 
         // A well-formed draft (proper frontmatter) passes with no errors.
         let good = reg
@@ -1236,21 +1257,21 @@ mod tests {
             .iter()
             .any(|m| m["severity"] == "warning"));
 
-        for d in [&b, &a, &i] {
+        for d in [&b, &a, &i, &s] {
             let _ = std::fs::remove_dir_all(d);
         }
     }
 
     #[tokio::test]
     async fn validate_existing_and_missing_skill() {
-        let (b, a, i) = (temp(), temp(), temp());
+        let (b, a, i, s) = (temp(), temp(), temp(), temp());
         write_skill(
             &a,
             "good",
             "---\nname: good\ndescription: Does a useful thing; use when the user needs that thing.\n---\n\n# Good\n\nsteps\n",
         );
         let mut reg = ToolRegistry::new();
-        register(&mut reg, &b, &a, &i);
+        register(&mut reg, &b, &a, &i, &s);
 
         let ok = reg
             .call("skill_validate", json!({ "name": "good" }))
@@ -1268,21 +1289,21 @@ mod tests {
         // Neither name nor content is an actionable error.
         assert!(reg.call("skill_validate", json!({})).await.is_err());
 
-        for d in [&b, &a, &i] {
+        for d in [&b, &a, &i, &s] {
             let _ = std::fs::remove_dir_all(d);
         }
     }
 
     #[tokio::test]
     async fn use_skill_returns_path() {
-        let (b, a, i) = (temp(), temp(), temp());
+        let (b, a, i, s) = (temp(), temp(), temp(), temp());
         write_skill(
             &a,
             "demo",
             "---\nname: demo\ndescription: A demo skill that does a thing; use when demoing.\n---\n\n# Demo\n\nsteps\n",
         );
         let mut reg = ToolRegistry::new();
-        register(&mut reg, &b, &a, &i);
+        register(&mut reg, &b, &a, &i, &s);
         let used = reg
             .call("use_skill", json!({ "name": "demo" }))
             .await
@@ -1295,7 +1316,7 @@ mod tests {
             .as_str()
             .unwrap_or_default()
             .contains("# Demo"));
-        for d in [&b, &a, &i] {
+        for d in [&b, &a, &i, &s] {
             let _ = std::fs::remove_dir_all(d);
         }
     }
