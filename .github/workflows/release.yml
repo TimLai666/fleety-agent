@@ -38,6 +38,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      # fleety-server/fleetyd depend on fleety-tools (enigo + xcap + arboard),
+      # which need X11/wayland/xkbcommon/xdo/dbus dev libs to build on Linux.
+      - name: Install native build deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libwayland-dev libxkbcommon-dev libxdo-dev libdbus-1-dev pkg-config
       - uses: actions/setup-go@v5
         with:
           go-version: stable
@@ -85,7 +94,10 @@ jobs:
           foreach ($b in 'fleety', 'fleety-server', 'fleetyd') {
             Compress-Archive -Path "target/${{ matrix.target }}/release/$b.exe" -DestinationPath "$b-${{ matrix.target }}.zip"
           }
+      # Only attach on a real tag push; `workflow_dispatch` is a build-only
+      # dry-run that verifies every target compiles + packages before cutting a tag.
       - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: |

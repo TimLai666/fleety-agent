@@ -16,9 +16,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      # arboard (TUI clipboard) needs X11 + xcb dev libs on Linux to build.
-      - name: Install clipboard build deps (Linux)
-        run: sudo apt-get update && sudo apt-get install -y libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+      # Native deps to build on Linux: arboard (clipboard) needs X11/xcb;
+      # enigo + xcap (computer-use control/screenshots) pull wayland-sys, xkbcommon,
+      # xdo, and dbus — install their dev libs so the build script doesn't panic.
+      - name: Install native build deps (Linux)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libwayland-dev libxkbcommon-dev libxdo-dev libdbus-1-dev pkg-config
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-go@v5
         with:
@@ -35,8 +41,12 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Build
         run: cargo build --workspace --all-targets
+      # Single-threaded: several unit tests set/clear process-global env vars
+      # (FLEETY_*), which race under the default parallel runner. Serializing is
+      # how the suite is verified locally; the env mutation is a test-harness
+      # artifact, not a product concern (production reads env once at boot).
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace -- --test-threads=1
         env:
           FLEETY_INSYRA_BIN: ${{ github.workspace }}/sidecars/fleety-insyra/fleety-insyra
       - name: Eval (golden regression)
