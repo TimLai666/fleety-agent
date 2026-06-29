@@ -175,10 +175,17 @@ carry a `surface`/`saved` marker. Mechanically the CLI advertises these tools in
 its `Hello`; the server routes the agent's `editor_*` calls back to **that
 connection** (so multiple editors on one machine don't collide), and the CLI
 translates them to the editor's ACP `fs/*` / `terminal/*` methods. Disk tools
-(git, search, listing) still run server-side. A **conformant editor needs no
-changes** — only standard ACP. The live editor round-trip is verified manually.
-Routing a session's *disk* tools to a remote originating device (when the server
-isn't co-located) is a separate future change.
+(git, search, listing) still run server-side and act on the **server's own**
+files. A **conformant editor needs no changes** — only standard ACP. The live
+editor round-trip is verified manually.
+
+When the server is **remote** from the editor, the agent works on the user's
+project entirely through the `editor_*` tools — `editor_run` (the editor's
+terminal) covers git/build/list/etc. on the editor's host, and the fs tools cover
+read/write/edit. So there is **no separate "route the session's disk tools to the
+origin device" mechanism**: the editor's terminal already provides host execution.
+The server-side disk tools are for the server's own filesystem, not a routing
+path to the editor's host.
 
 Example editor config: run `fleety acp` as the agent command (a fleety-server
 must be reachable).
