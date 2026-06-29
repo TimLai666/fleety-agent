@@ -107,6 +107,25 @@ last fallback when no URL is configured.
 | `FLEETY_TOKEN` | (unset, then `~/.fleety/fleetyd.token`) | Auth token. fleetyd persists a freshly-paired one to `~/.fleety/fleetyd.token`; this env var overrides. |
 | `FLEETY_PAIRING_CODE` | (unset) | Pass once to enroll a new device; server mints a token in `Welcome`, fleetyd writes it to disk. |
 
+## Transport (WebSocket + SSE fallback)
+
+The daemon and CLI connect over WebSocket by default. When the WebSocket can't
+connect — most often a proxy or firewall blocking the upgrade — the client falls
+back to **SSE (downstream) + HTTP POST (upstream)** against the same server port,
+derived from `FLEETY_AGENT_URL` (`ws://` → `http://`, `wss://` → `https://`):
+`GET /sse?session=<id>` streams `ServerMsg` frames, `POST /send?session=<id>`
+carries `ClientMsg`. The server serves all three (WebSocket, SSE, POST) on one
+port via axum. Auth is unchanged: the token rides the `Authorization: Bearer`
+header on the SSE/POST requests (and a session can only be POSTed to by the caller
+that opened it); the `Hello` frame still establishes identity. Initial pairing
+uses WebSocket.
+
+| Var | Default | Meaning |
+|---|---|---|
+| `FLEETY_FORCE_SSE` | `0` | Always use SSE+POST, skipping the WebSocket attempt (1/0). |
+| `FLEETY_DISABLE_SSE` | `0` | Disable the fallback entirely; WebSocket only (1/0). |
+| `FLEETY_SSE_TIMEOUT_SECS` | `45` | SSE half-open timeout: if no event or keep-alive arrives within this window, the client treats the stream as dead and reconnects. |
+
 ## Device identity
 
 A device's id is a **stable, machine-derived id** — the OS machine id (Windows

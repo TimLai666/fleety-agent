@@ -15,20 +15,19 @@ mod voice;
 use std::path::{Path, PathBuf};
 
 use agent_core::{obs, CoreError, Result};
-use futures::stream::{SplitSink, SplitStream};
-use futures::{SinkExt, StreamExt};
-use tokio::net::TcpStream;
-use tokio_tungstenite::tungstenite::Message as WsMessage;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
-
 use fleety_protocol::{ClientMsg, OriginContext, ServerMsg, WireAttachment, PROTOCOL_VERSION};
-
-type Tx = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, WsMessage>;
-type Rx = SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
+// The client transport (WebSocket with SSE+POST fallback) lives in fleety-tools;
+// `Tx`/`Rx` are its split halves so the existing connect sites barely change.
+use fleety_tools::transport::{self, Receiver as Rx, Sender as Tx};
 
 #[tokio::main]
 async fn main() {
     obs::init();
+    // Seed env from ~/.fleety/config.toml so client settings (e.g. transport mode)
+    // set via `fleety config` apply; an explicit env var still wins.
+    fleety_tools::config::seed_env_from_config(&fleety_tools::config::load(
+        &fleety_tools::config::config_path(),
+    ));
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("init") => {
@@ -300,10 +299,9 @@ async fn run_tui() -> Result<()> {
     use ratatui::crossterm::event::{Event, KeyEventKind};
 
     let url = agent_url();
-    let (ws, _) = tokio_tungstenite::connect_async(&url)
-        .await
-        .map_err(|e| CoreError::Provider(format!("cannot connect to {url}: {e}")))?;
-    let (mut tx, mut rx) = ws.split();
+    let (mut tx, mut rx) = transport::connect(&url, saved_token().as_deref())
+        .await?
+        .split();
     send(&mut tx, &hello(None)).await?;
 
     // Blocking key reads happen on a thread and arrive over a channel.
@@ -370,27 +368,22 @@ async fn run_tui() -> Result<()> {
                 },
                 None => app.should_quit = true,
             },
-            frame = rx.next() => match frame {
-                Some(Ok(f)) if f.is_text() => {
-                    if let Ok(text) = f.to_text() {
-                        match serde_json::from_str::<ServerMsg>(text) {
-                            Ok(ServerMsg::AssistantDelta { chunk, .. }) => {
-                                app.push_delta(&chunk);
-                                app.status = "streaming…".to_string();
-                            }
-                            Ok(ServerMsg::Assistant { text, .. }) => {
-                                app.finish_assistant(text);
-                                app.status = "ready".to_string();
-                            }
-                            Ok(ServerMsg::Error { error }) => {
-                                app.status = format!("agent error: {}", error.message);
-                            }
-                            _ => {}
-                        }
+            frame = rx.recv_text() => match frame {
+                Some(text) => match serde_json::from_str::<ServerMsg>(&text) {
+                    Ok(ServerMsg::AssistantDelta { chunk, .. }) => {
+                        app.push_delta(&chunk);
+                        app.status = "streaming…".to_string();
                     }
-                }
-                Some(Ok(_)) => {}
-                _ => {
+                    Ok(ServerMsg::Assistant { text, .. }) => {
+                        app.finish_assistant(text);
+                        app.status = "ready".to_string();
+                    }
+                    Ok(ServerMsg::Error { error }) => {
+                        app.status = format!("agent error: {}", error.message);
+                    }
+                    _ => {}
+                },
+                None => {
                     app.status = "disconnected".to_string();
                     app.should_quit = true;
                 }
@@ -527,10 +520,9 @@ fn write_config(agent_url: Option<&str>, token: Option<&str>) -> Result<()> {
 /// `fleety pair <code>`: enroll this device with a pairing code; saves the token.
 async fn pair(code: String) -> Result<()> {
     let url = agent_url();
-    let (ws, _) = tokio_tungstenite::connect_async(&url)
-        .await
-        .map_err(|e| CoreError::Provider(format!("cannot connect to {url}: {e}")))?;
-    let (mut tx, mut rx) = ws.split();
+    let (mut tx, mut rx) = transport::connect(&url, saved_token().as_deref())
+        .await?
+        .split();
     send(&mut tx, &hello(Some(code))).await?;
     let result = match recv(&mut rx).await? {
         Some(ServerMsg::Welcome {
@@ -569,10 +561,9 @@ fn origin() -> OriginContext {
 
 /// `fleety init <agent-url>`: connect, register this device, and save config.
 async fn init(url: String) -> Result<()> {
-    let (ws, _) = tokio_tungstenite::connect_async(&url)
-        .await
-        .map_err(|e| CoreError::Provider(format!("cannot connect to {url}: {e}")))?;
-    let (mut tx, mut rx) = ws.split();
+    let (mut tx, mut rx) = transport::connect(&url, saved_token().as_deref())
+        .await?
+        .split();
 
     send(&mut tx, &hello(None)).await?;
     match recv(&mut rx).await? {
@@ -659,10 +650,9 @@ fn guess_mime(path: &Path, kind: &str) -> String {
 
 async fn ask(text: String, attachments: Vec<WireAttachment>) -> Result<()> {
     let url = agent_url();
-    let (ws, _) = tokio_tungstenite::connect_async(&url)
-        .await
-        .map_err(|e| CoreError::Provider(format!("cannot connect to {url}: {e}")))?;
-    let (mut tx, mut rx) = ws.split();
+    let (mut tx, mut rx) = transport::connect(&url, saved_token().as_deref())
+        .await?
+        .split();
 
     send(&mut tx, &hello(None)).await?;
     match recv(&mut rx).await? {
@@ -735,10 +725,9 @@ async fn ask(text: String, attachments: Vec<WireAttachment>) -> Result<()> {
 /// read per completed request, not one per intermediate step.
 async fn voice_chat() -> Result<()> {
     let url = agent_url();
-    let (ws, _) = tokio_tungstenite::connect_async(&url)
-        .await
-        .map_err(|e| CoreError::Provider(format!("cannot connect to {url}: {e}")))?;
-    let (mut tx, mut rx) = ws.split();
+    let (mut tx, mut rx) = transport::connect(&url, saved_token().as_deref())
+        .await?
+        .split();
 
     send(&mut tx, &hello(None)).await?;
     let conversation = match recv(&mut rx).await? {
@@ -843,10 +832,9 @@ async fn voice_chat() -> Result<()> {
 /// Reconnect to a conversation and print events replayed after `after_seq`.
 async fn resume(conversation_id: String, after_seq: u64) -> Result<()> {
     let url = agent_url();
-    let (ws, _) = tokio_tungstenite::connect_async(&url)
-        .await
-        .map_err(|e| CoreError::Provider(format!("cannot connect to {url}: {e}")))?;
-    let (mut tx, mut rx) = ws.split();
+    let (mut tx, mut rx) = transport::connect(&url, saved_token().as_deref())
+        .await?
+        .split();
 
     send(&mut tx, &hello(None)).await?;
     match recv(&mut rx).await? {
@@ -887,10 +875,9 @@ async fn resume(conversation_id: String, after_seq: u64) -> Result<()> {
 /// preamble for audit/rollback commands.
 async fn connect_hello() -> Result<(Tx, Rx)> {
     let url = agent_url();
-    let (ws, _) = tokio_tungstenite::connect_async(&url)
-        .await
-        .map_err(|e| CoreError::Provider(format!("cannot connect to {url}: {e}")))?;
-    let (mut tx, mut rx) = ws.split();
+    let (mut tx, mut rx) = transport::connect(&url, saved_token().as_deref())
+        .await?
+        .split();
     send(&mut tx, &hello(None)).await?;
     match recv(&mut rx).await? {
         Some(ServerMsg::Welcome { .. }) => Ok((tx, rx)),
@@ -1116,28 +1103,18 @@ async fn rollback_apply(backup_id: String) -> Result<()> {
 async fn send(tx: &mut Tx, msg: &ClientMsg) -> Result<()> {
     let json = serde_json::to_string(msg)
         .map_err(|e| CoreError::Message(format!("serialize client frame: {e}")))?;
-    tx.send(WsMessage::Text(json))
-        .await
-        .map_err(|e| CoreError::Provider(format!("websocket send failed: {e}")))?;
-    Ok(())
+    tx.send_text(json).await
 }
 
 async fn recv(rx: &mut Rx) -> Result<Option<ServerMsg>> {
-    while let Some(frame) = rx.next().await {
-        let frame =
-            frame.map_err(|e| CoreError::Provider(format!("websocket read failed: {e}")))?;
-        if frame.is_text() {
-            let text = frame
-                .to_text()
-                .map_err(|e| CoreError::Provider(format!("non-utf8 text frame: {e}")))?;
-            let msg = serde_json::from_str(text)
+    match rx.recv_text().await {
+        Some(text) => {
+            let msg = serde_json::from_str(&text)
                 .map_err(|e| CoreError::Provider(format!("malformed server frame: {e}")))?;
-            return Ok(Some(msg));
-        } else if frame.is_close() {
-            return Ok(None);
+            Ok(Some(msg))
         }
+        None => Ok(None),
     }
-    Ok(None)
 }
 
 #[cfg(test)]

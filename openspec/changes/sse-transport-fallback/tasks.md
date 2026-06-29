@@ -22,11 +22,11 @@
 
 ## 6. Client 傳輸層、fallback 與設定
 
-- [ ] 6.1 在 fleety-tools 實作 client 共用傳輸層(WebSocket 與 SSE+POST 兩實作 + 統一 connect 回傳 sink/stream)並從單一 host 推導 ws(s):// 與 http(s):// 端點,對應設計「client 共用傳輸層與雙端點 URL 推導」,並交付 "Daemon connection configuration" 的 SSE 端點推導面。先寫失敗測試:從一個 host 正確推導兩種端點;connect 在 WebSocket 失敗時改選 SSE(以可注入的假傳輸驗證選擇路徑)。
-- [ ] 6.2 [P] daemon 重連迴圈改用共用傳輸層,每輪先試 WebSocket、失敗(或被擋)再退 SSE+POST,交付 "The daemon reconnects after disconnect or sleep" 的傳輸選擇;對應設計「client 端傳輸選擇:WS 優先,連不到再退 SSE」。驗證:重連傳輸選擇單元測試(WebSocket 失敗→選 SSE)。
-- [ ] 6.3 [P] CLI 連線改用共用傳輸層(同樣 WebSocket 優先、失敗退 SSE),交付 CLI 在 WS 被擋環境仍可連線對話。驗證:CLI 連線選擇單元測試;手動驗證在強制 SSE 下可對話。
-- [ ] 6.4 新增「強制 SSE」與「關閉 SSE 備援」兩個 FLEETY_* 設定變數,完成 "Daemon connection configuration" 的設定面;對應設計「client 端傳輸選擇:WS 優先,連不到再退 SSE」。驗證:設定解析單元測試(強制 SSE 時跳過 WebSocket;關閉備援時 WebSocket 失敗即不退 SSE)。
+- [x] 6.1 在 fleety-tools 實作 client 共用傳輸層(WebSocket 與 SSE+POST 兩實作 + 統一 connect 回傳 sink/stream)並從單一 host 推導 ws(s):// 與 http(s):// 端點,對應設計「client 共用傳輸層與雙端點 URL 推導」,並交付 "Daemon connection configuration" 的 SSE 端點推導面。先寫失敗測試:從一個 host 正確推導兩種端點;connect 在 WebSocket 失敗時改選 SSE(以可注入的假傳輸驗證選擇路徑)。
+- [x] 6.2 [P] daemon 重連迴圈改用共用傳輸層,每輪先試 WebSocket、失敗(或被擋)再退 SSE+POST,交付 "The daemon reconnects after disconnect or sleep" 的傳輸選擇;對應設計「client 端傳輸選擇:WS 優先,連不到再退 SSE」。驗證:重連傳輸選擇單元測試(WebSocket 失敗→選 SSE)。
+- [x] 6.3 [P] CLI 連線改用共用傳輸層(同樣 WebSocket 優先、失敗退 SSE),交付 CLI 在 WS 被擋環境仍可連線對話。驗證:CLI 連線選擇單元測試;手動驗證在強制 SSE 下可對話。
+- [x] 6.4 新增「強制 SSE」與「關閉 SSE 備援」兩個 FLEETY_* 設定變數,完成 "Daemon connection configuration" 的設定面;對應設計「client 端傳輸選擇:WS 優先,連不到再退 SSE」。驗證:設定解析單元測試(強制 SSE 時跳過 WebSocket;關閉備援時 WebSocket 失敗即不退 SSE)。
 
 ## 7. 文件
 
-- [ ] 7.1 [P] 更新 docs/env.md 與 README.md,記錄 `GET /sse`、`POST /send` 端點、WebSocket→SSE 備援行為與「強制 SSE / 關閉備援」設定變數。驗證:內容審查,確認上述端點、fallback 與設定皆有涵蓋。
+- [x] 7.1 [P] 更新 docs/env.md 與 README.md,記錄 `GET /sse`、`POST /send` 端點、WebSocket→SSE 備援行為與「強制 SSE / 關閉備援」設定變數。驗證:內容審查,確認上述端點、fallback 與設定皆有涵蓋。

@@ -190,6 +190,11 @@ server, plus self-update:
 Configuration for all three is environment-first (`FLEETY_*`) with a `config.toml`
 fallback — see the **full reference** in [`docs/env.md`](docs/env.md).
 
+The daemon and CLI connect over WebSocket, falling back automatically to **SSE +
+HTTP POST** on the same port when the WebSocket can't connect (e.g. a proxy blocks
+the upgrade). Force or disable it with `FLEETY_FORCE_SSE` / `FLEETY_DISABLE_SSE`
+(see [`docs/env.md`](docs/env.md#transport-websocket--sse-fallback)).
+
 ## Design docs
 
 - [`docs/spec-v0.md`](docs/spec-v0.md) — v0 scope, architecture, milestones M0–M11

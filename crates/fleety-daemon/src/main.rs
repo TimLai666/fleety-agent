@@ -22,8 +22,6 @@ mod winsvc;
 use std::path::PathBuf;
 
 use agent_core::{obs, CoreError, Result};
-use futures::{SinkExt, StreamExt};
-use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use fleety_protocol::{ClientMsg, ServerMsg, WireError, PROTOCOL_VERSION};
 
@@ -391,9 +389,6 @@ enum Outcome {
     Disconnected,
 }
 
-type WsStream =
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
-
 /// Outer reconnect loop: stay connected across transient drops and device
 /// sleep. Exits only on a clean shutdown signal; everything else reconnects
 /// with exponential backoff (reset after a successful connect). `shutdown` is an
@@ -406,10 +401,13 @@ async fn run(shutdown: Option<tokio::sync::watch::Receiver<bool>>) -> Result<()>
     let mut bo = backoff::Backoff::new();
     loop {
         let url = agent_url();
-        match connect_once(&url).await {
-            Ok(ws) => {
+        let token = current_token();
+        // WebSocket first, SSE+POST fallback (unless overridden by env) — so a
+        // device behind a proxy that blocks the WS upgrade still connects.
+        match fleety_tools::transport::connect(&url, token.as_deref()).await {
+            Ok(conn) => {
                 bo.reset();
-                match serve(&url, ws, shutdown.clone()).await {
+                match serve(&url, conn, token, shutdown.clone()).await {
                     Outcome::Shutdown => return Ok(()),
                     Outcome::Disconnected => {
                         tracing::info!("fleetyd disconnected; will reconnect");
@@ -475,27 +473,23 @@ async fn wait_stop(shutdown: Option<tokio::sync::watch::Receiver<bool>>) {
     }
 }
 
-async fn connect_once(url: &str) -> Result<WsStream> {
-    let (ws, _) = tokio_tungstenite::connect_async(url)
-        .await
-        .map_err(|e| CoreError::Provider(format!("cannot connect to {url}: {e}")))?;
-    Ok(ws)
+/// The connection token: env override > on-disk persisted token (None starts the
+/// pairing flow). Used both for the SSE/POST `Authorization` header and the Hello.
+fn current_token() -> Option<String> {
+    std::env::var("FLEETY_TOKEN")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(read_saved_token)
 }
 
 /// Run one connected session: send Hello, then serve frames until the link
 /// drops or a shutdown signal arrives.
 async fn serve(
     url: &str,
-    ws: WsStream,
+    mut conn: fleety_tools::transport::Connection,
+    token: Option<String>,
     shutdown: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Outcome {
-    let (mut tx, mut rx) = ws.split();
-
-    // Token precedence: env override > on-disk persisted token > pairing flow.
-    let token = std::env::var("FLEETY_TOKEN")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .or_else(read_saved_token);
     let pairing_code = std::env::var("FLEETY_PAIRING_CODE")
         .ok()
         .filter(|s| !s.is_empty());
@@ -519,8 +513,8 @@ async fn serve(
             return Outcome::Disconnected;
         }
     };
-    if let Err(e) = tx.send(WsMessage::Text(hello)).await {
-        tracing::warn!(%e, "send hello failed; will reconnect");
+    if let Err(e) = conn.send_text(hello).await {
+        tracing::warn!(report = ?e.report(), "send hello failed; will reconnect");
         return Outcome::Disconnected;
     }
     tracing::info!(%url, "connected; holding connection");
@@ -529,38 +523,25 @@ async fn serve(
         // here so it never interrupts a tool that's mid-execution.
         if restart_due_at_idle() {
             tracing::info!("applying deferred restart now (idle); restarting service");
-            let _ = tx.close().await;
+            conn.close().await;
             if let Err(e) = service::restart() {
                 tracing::warn!(report = ?e.report(), "could not restart service for update");
             }
             return Outcome::Shutdown;
         }
         let next = tokio::select! {
-            frame = rx.next() => frame,
+            frame = conn.recv_text() => frame,
             _ = wait_stop(shutdown.clone()) => {
-                tracing::info!("stop signal received; sending Close and shutting down fleetyd");
-                let _ = tx.close().await;
+                tracing::info!("stop signal received; closing and shutting down fleetyd");
+                conn.close().await;
                 return Outcome::Shutdown;
             }
         };
-        let Some(frame) = next else {
+        // None = link closed or went dead (SSE half-open timeout) → reconnect.
+        let Some(text) = next else {
             return Outcome::Disconnected;
         };
-        let frame = match frame {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::warn!(%e, "websocket read failed; will reconnect");
-                return Outcome::Disconnected;
-            }
-        };
-        if frame.is_close() {
-            return Outcome::Disconnected;
-        }
-        if !frame.is_text() {
-            continue;
-        }
-        let Ok(text) = frame.to_text() else { continue };
-        let Ok(msg) = serde_json::from_str::<ServerMsg>(text) else {
+        let Ok(msg) = serde_json::from_str::<ServerMsg>(&text) else {
             continue;
         };
         match msg {
@@ -624,8 +605,8 @@ async fn serve(
                         continue;
                     }
                 };
-                if let Err(e) = tx.send(WsMessage::Text(out)).await {
-                    tracing::warn!(%e, "send tool reply failed; will reconnect");
+                if let Err(e) = conn.send_text(out).await {
+                    tracing::warn!(report = ?e.report(), "send tool reply failed; will reconnect");
                     return Outcome::Disconnected;
                 }
             }

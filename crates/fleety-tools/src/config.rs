@@ -154,6 +154,27 @@ pub fn registry() -> &'static [Setting] {
             description: "This device's id.",
             secret: false,
         },
+        Setting {
+            key: "FLEETY_FORCE_SSE",
+            scope: Shared,
+            default: "0",
+            description: "Always use the SSE+POST transport, skipping WebSocket (1/0).",
+            secret: false,
+        },
+        Setting {
+            key: "FLEETY_DISABLE_SSE",
+            scope: Shared,
+            default: "0",
+            description: "Disable the SSE+POST fallback; WebSocket only (1/0).",
+            secret: false,
+        },
+        Setting {
+            key: "FLEETY_SSE_TIMEOUT_SECS",
+            scope: Shared,
+            default: "45",
+            description: "SSE half-open timeout: reconnect if no event/keep-alive arrives.",
+            secret: false,
+        },
     ]
 }
 

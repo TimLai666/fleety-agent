@@ -19,9 +19,9 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
+use fleety_protocol::ClientMsg;
 use futures::stream::{self, SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
-use fleety_protocol::ClientMsg;
 use tokio::sync::{mpsc, Mutex};
 
 use crate::auth::AuthStore;
@@ -172,13 +172,11 @@ async fn sse_handler(
     // serialized ServerMsg frames here, which this handler streams out as SSE.
     let (in_tx, in_rx) = mpsc::unbounded_channel::<ClientMsg>();
     let (out_tx, out_rx) = mpsc::unbounded_channel::<String>();
-    state.sse_sessions.lock().await.insert(
-        session.clone(),
-        SseSession {
-            in_tx,
-            auth_header,
-        },
-    );
+    state
+        .sse_sessions
+        .lock()
+        .await
+        .insert(session.clone(), SseSession { in_tx, auth_header });
 
     let conn_state = state.clone();
     let conn_session = session.clone();
@@ -231,7 +229,9 @@ async fn sse_handler(
             (Ok::<Event, std::convert::Infallible>(event), (rx, guard))
         })
     });
-    Sse::new(events).keep_alive(KeepAlive::default()).into_response()
+    Sse::new(events)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 /// `POST /send?session=<id>` with a single `ClientMsg` JSON body: inject it into
@@ -472,9 +472,12 @@ mod tests {
         .send()
         .await
         .expect("hello A");
-        let welcome = next_matching(&mut a, &mut buf, |m| matches!(m, ServerMsg::Welcome { .. })).await;
+        let welcome =
+            next_matching(&mut a, &mut buf, |m| matches!(m, ServerMsg::Welcome { .. })).await;
         let conv = match welcome {
-            ServerMsg::Welcome { conversation_id, .. } => conversation_id,
+            ServerMsg::Welcome {
+                conversation_id, ..
+            } => conversation_id,
             _ => unreachable!(),
         };
         post(
@@ -504,7 +507,8 @@ mod tests {
             if let Some(d) = data {
                 if let Ok(ServerMsg::Assistant { seq, .. }) = serde_json::from_str::<ServerMsg>(d) {
                     assert!(
-                        block.contains(&format!("id:{seq}")) || block.contains(&format!("id: {seq}")),
+                        block.contains(&format!("id:{seq}"))
+                            || block.contains(&format!("id: {seq}")),
                         "assistant event must carry its seq as the SSE id; block was: {block:?}"
                     );
                     assistant_seq = Some(seq);
@@ -536,7 +540,10 @@ mod tests {
         .send()
         .await
         .expect("hello B");
-        next_matching(&mut b, &mut buf_b, |m| matches!(m, ServerMsg::Welcome { .. })).await;
+        next_matching(&mut b, &mut buf_b, |m| {
+            matches!(m, ServerMsg::Welcome { .. })
+        })
+        .await;
         post(
             "B",
             serde_json::to_string(&ClientMsg::Resume {
@@ -548,7 +555,10 @@ mod tests {
         .send()
         .await
         .expect("resume B");
-        let replay = next_matching(&mut b, &mut buf_b, |m| matches!(m, ServerMsg::Replay { .. })).await;
+        let replay = next_matching(&mut b, &mut buf_b, |m| {
+            matches!(m, ServerMsg::Replay { .. })
+        })
+        .await;
         if let ServerMsg::Replay { seq, .. } = replay {
             assert!(seq > 0, "replayed events come after after_seq=0");
         }
@@ -641,9 +651,11 @@ mod tests {
         .send()
         .await
         .expect("post user msg");
-        let reply = next_matching(&mut resp, &mut buf, |m| {
-            matches!(m, ServerMsg::Assistant { text, .. } if text.contains("echo: hi there"))
-        })
+        let reply = next_matching(
+            &mut resp,
+            &mut buf,
+            |m| matches!(m, ServerMsg::Assistant { text, .. } if text.contains("echo: hi there")),
+        )
         .await;
         assert!(matches!(reply, ServerMsg::Assistant { .. }));
 
