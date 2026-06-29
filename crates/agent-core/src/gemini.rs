@@ -32,6 +32,7 @@ pub struct Gemini {
     api_key: Option<String>,
     client: reqwest::Client,
     stream: bool,
+    retry: crate::retry::RetryConfig,
 }
 
 impl Gemini {
@@ -50,6 +51,7 @@ impl Gemini {
             api_key,
             client: reqwest::Client::new(),
             stream: false,
+            retry: crate::retry::RetryConfig::from_env(),
         }
     }
 
@@ -80,25 +82,52 @@ impl Gemini {
 #[async_trait::async_trait]
 impl ModelProvider for Gemini {
     async fn complete(&self, messages: &[Message], tools: &[ToolSpec]) -> Result<ModelResponse> {
-        let request = self.client.post(self.endpoint(false)).json(&build_request(
-            messages,
-            tools,
-            &self.model,
-        ));
-        let response = request
-            .send()
-            .await
-            .map_err(|e| CoreError::Provider(format!("gemini request failed: {e}")))?;
-        let status = response.status();
-        let text = response
-            .text()
-            .await
-            .map_err(|e| CoreError::Provider(format!("gemini reading body failed: {e}")))?;
-        if !status.is_success() {
-            return Err(CoreError::Provider(format!(
-                "gemini endpoint returned HTTP {status}: {text}"
-            )));
-        }
+        let body = build_request(messages, tools, &self.model);
+        let text = crate::retry::run_with_retry(&self.retry, || {
+            let request = self.client.post(self.endpoint(false)).json(&body);
+            async move {
+                use crate::retry::{classify, AttemptOutcome, Retryable};
+                let response = match request.send().await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let transient = e.is_timeout() || e.is_connect();
+                        let err = CoreError::Provider(format!("gemini request failed: {e}"));
+                        return match classify(None, transient) {
+                            Retryable::Retry => AttemptOutcome::Retry {
+                                err,
+                                retry_after: None,
+                            },
+                            Retryable::Fatal => AttemptOutcome::Fatal(err),
+                        };
+                    }
+                };
+                let status = response.status();
+                let retry_after = crate::retry::parse_retry_after(
+                    response
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|v| v.to_str().ok()),
+                );
+                let text = match response.text().await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        return AttemptOutcome::Fatal(CoreError::Provider(format!(
+                            "gemini reading body failed: {e}"
+                        )))
+                    }
+                };
+                if status.is_success() {
+                    return AttemptOutcome::Done(text);
+                }
+                let err =
+                    CoreError::Provider(format!("gemini endpoint returned HTTP {status}: {text}"));
+                match classify(Some(status.as_u16()), false) {
+                    Retryable::Retry => AttemptOutcome::Retry { err, retry_after },
+                    Retryable::Fatal => AttemptOutcome::Fatal(err),
+                }
+            }
+        })
+        .await?;
         let parsed: Value = serde_json::from_str(&text).map_err(|e| {
             CoreError::Provider(format!(
                 "gemini unexpected response shape: {e}; body: {text}"
@@ -116,22 +145,46 @@ impl ModelProvider for Gemini {
         if !self.stream {
             return self.complete(messages, tools).await;
         }
-        let request = self.client.post(self.endpoint(true)).json(&build_request(
-            messages,
-            tools,
-            &self.model,
-        ));
-        let response = request
-            .send()
-            .await
-            .map_err(|e| CoreError::Provider(format!("gemini request failed: {e}")))?;
-        let status = response.status();
-        if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
-            return Err(CoreError::Provider(format!(
-                "gemini endpoint returned HTTP {status}: {text}"
-            )));
-        }
+        let body = build_request(messages, tools, &self.model);
+        // Retry only the connection + initial status, before any delta is emitted.
+        let response = crate::retry::run_with_retry(&self.retry, || {
+            let request = self.client.post(self.endpoint(true)).json(&body);
+            async move {
+                use crate::retry::{classify, AttemptOutcome, Retryable};
+                let response = match request.send().await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let transient = e.is_timeout() || e.is_connect();
+                        let err = CoreError::Provider(format!("gemini request failed: {e}"));
+                        return match classify(None, transient) {
+                            Retryable::Retry => AttemptOutcome::Retry {
+                                err,
+                                retry_after: None,
+                            },
+                            Retryable::Fatal => AttemptOutcome::Fatal(err),
+                        };
+                    }
+                };
+                let status = response.status();
+                if status.is_success() {
+                    return AttemptOutcome::Done(response);
+                }
+                let retry_after = crate::retry::parse_retry_after(
+                    response
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|v| v.to_str().ok()),
+                );
+                let text = response.text().await.unwrap_or_default();
+                let err =
+                    CoreError::Provider(format!("gemini endpoint returned HTTP {status}: {text}"));
+                match classify(Some(status.as_u16()), false) {
+                    Retryable::Retry => AttemptOutcome::Retry { err, retry_after },
+                    Retryable::Fatal => AttemptOutcome::Fatal(err),
+                }
+            }
+        })
+        .await?;
         use futures::StreamExt;
         let mut stream = response.bytes_stream();
         let mut content = String::new();

@@ -113,6 +113,27 @@ pub fn registry() -> &'static [Setting] {
             secret: true,
         },
         Setting {
+            key: "FLEETY_MODEL_RETRIES",
+            scope: Server,
+            default: "3",
+            description: "Model-call retry attempts on transient failure (0 = no retry).",
+            secret: false,
+        },
+        Setting {
+            key: "FLEETY_MODEL_RETRY_BASE_MS",
+            scope: Server,
+            default: "500",
+            description: "Base backoff (ms) for model-call retries.",
+            secret: false,
+        },
+        Setting {
+            key: "FLEETY_MODEL_RETRY_CAP_MS",
+            scope: Server,
+            default: "30000",
+            description: "Max backoff (ms) for model-call retries.",
+            secret: false,
+        },
+        Setting {
             key: "FLEETY_CHEAP_MODEL",
             scope: Server,
             default: "",

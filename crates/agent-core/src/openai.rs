@@ -17,6 +17,7 @@ pub struct OpenAiCompat {
     api_key: Option<String>,
     client: reqwest::Client,
     stream: bool,
+    retry: crate::retry::RetryConfig,
 }
 
 impl OpenAiCompat {
@@ -32,6 +33,7 @@ impl OpenAiCompat {
             api_key,
             client: reqwest::Client::new(),
             stream: false,
+            retry: crate::retry::RetryConfig::from_env(),
         }
     }
 
@@ -90,27 +92,59 @@ fn parse_models(body: &str) -> Result<Vec<String>> {
 #[async_trait::async_trait]
 impl ModelProvider for OpenAiCompat {
     async fn complete(&self, messages: &[Message], tools: &[ToolSpec]) -> Result<ModelResponse> {
-        let mut request = self
-            .client
-            .post(self.endpoint())
-            .json(&self.request_body(messages, tools));
-        if let Some(key) = &self.api_key {
-            request = request.bearer_auth(key);
-        }
-
-        let response = request.send().await.map_err(|e| {
-            CoreError::Provider(format!("request to {} failed: {e}", self.endpoint()))
-        })?;
-        let status = response.status();
-        let text = response
-            .text()
-            .await
-            .map_err(|e| CoreError::Provider(format!("reading response body failed: {e}")))?;
-        if !status.is_success() {
-            return Err(CoreError::Provider(format!(
-                "endpoint returned HTTP {status}: {text}"
-            )));
-        }
+        let body = self.request_body(messages, tools);
+        // Retry transient failures (429/5xx/connection/timeout) with backoff;
+        // 4xx fail fast. The whole request is re-sent on each attempt.
+        let text = crate::retry::run_with_retry(&self.retry, || {
+            let mut request = self.client.post(self.endpoint()).json(&body);
+            if let Some(key) = &self.api_key {
+                request = request.bearer_auth(key);
+            }
+            async move {
+                use crate::retry::{classify, AttemptOutcome, Retryable};
+                let response = match request.send().await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let transient = e.is_timeout() || e.is_connect();
+                        let err = CoreError::Provider(format!(
+                            "request to {} failed: {e}",
+                            self.endpoint()
+                        ));
+                        return match classify(None, transient) {
+                            Retryable::Retry => AttemptOutcome::Retry {
+                                err,
+                                retry_after: None,
+                            },
+                            Retryable::Fatal => AttemptOutcome::Fatal(err),
+                        };
+                    }
+                };
+                let status = response.status();
+                let retry_after = crate::retry::parse_retry_after(
+                    response
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|v| v.to_str().ok()),
+                );
+                let text = match response.text().await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        return AttemptOutcome::Fatal(CoreError::Provider(format!(
+                            "reading response body failed: {e}"
+                        )))
+                    }
+                };
+                if status.is_success() {
+                    return AttemptOutcome::Done(text);
+                }
+                let err = CoreError::Provider(format!("endpoint returned HTTP {status}: {text}"));
+                match classify(Some(status.as_u16()), false) {
+                    Retryable::Retry => AttemptOutcome::Retry { err, retry_after },
+                    Retryable::Fatal => AttemptOutcome::Fatal(err),
+                }
+            }
+        })
+        .await?;
 
         if self.stream {
             return assemble_sse(&text);
@@ -130,23 +164,53 @@ impl ModelProvider for OpenAiCompat {
         if !self.stream {
             return self.complete(messages, tools).await;
         }
-        let mut request = self
-            .client
-            .post(self.endpoint())
-            .json(&self.request_body(messages, tools));
-        if let Some(key) = &self.api_key {
-            request = request.bearer_auth(key);
-        }
-        let response = request.send().await.map_err(|e| {
-            CoreError::Provider(format!("request to {} failed: {e}", self.endpoint()))
-        })?;
-        let status = response.status();
-        if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
-            return Err(CoreError::Provider(format!(
-                "endpoint returned HTTP {status}: {text}"
-            )));
-        }
+        let body = self.request_body(messages, tools);
+        // Retry only the connection + initial HTTP status (before any delta is
+        // emitted). Once the stream is producing output we never retry — that
+        // would duplicate already-emitted tokens.
+        let response = crate::retry::run_with_retry(&self.retry, || {
+            let mut request = self.client.post(self.endpoint()).json(&body);
+            if let Some(key) = &self.api_key {
+                request = request.bearer_auth(key);
+            }
+            async move {
+                use crate::retry::{classify, AttemptOutcome, Retryable};
+                let response = match request.send().await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let transient = e.is_timeout() || e.is_connect();
+                        let err = CoreError::Provider(format!(
+                            "request to {} failed: {e}",
+                            self.endpoint()
+                        ));
+                        return match classify(None, transient) {
+                            Retryable::Retry => AttemptOutcome::Retry {
+                                err,
+                                retry_after: None,
+                            },
+                            Retryable::Fatal => AttemptOutcome::Fatal(err),
+                        };
+                    }
+                };
+                let status = response.status();
+                if status.is_success() {
+                    return AttemptOutcome::Done(response);
+                }
+                let retry_after = crate::retry::parse_retry_after(
+                    response
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|v| v.to_str().ok()),
+                );
+                let text = response.text().await.unwrap_or_default();
+                let err = CoreError::Provider(format!("endpoint returned HTTP {status}: {text}"));
+                match classify(Some(status.as_u16()), false) {
+                    Retryable::Retry => AttemptOutcome::Retry { err, retry_after },
+                    Retryable::Fatal => AttemptOutcome::Fatal(err),
+                }
+            }
+        })
+        .await?;
 
         use futures::StreamExt;
         let mut stream = response.bytes_stream();

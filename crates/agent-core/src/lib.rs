@@ -20,6 +20,7 @@ pub mod model;
 pub mod obs;
 pub mod openai;
 pub mod panic;
+pub mod retry;
 pub mod subagent;
 pub mod tools;
 

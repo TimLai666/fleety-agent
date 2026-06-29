@@ -59,6 +59,13 @@ Read by the `fleety voice` terminal. Microphone capture is built in (via `cpal`)
 | `FLEETY_MODEL` | (unset → echo) | Model name to request. |
 | `FLEETY_MODEL_KEY` | (unset) | Bearer token, when the endpoint needs one. |
 | `FLEETY_MODEL_STREAM` | `0` | Set to `1` to use the SSE streaming endpoint (token-by-token TUI display). |
+| `FLEETY_MODEL_RETRIES` | `3` | Retry attempts when a model call fails transiently (429, 5xx, connection/timeout). `0` disables retry (single request). |
+| `FLEETY_MODEL_RETRY_BASE_MS` | `500` | Base for exponential backoff (with jitter) between model-call retries. A `Retry-After` header, when present, overrides it. |
+| `FLEETY_MODEL_RETRY_CAP_MS` | `30000` | Cap on the backoff delay. |
+
+Retries apply to both the main and economy tiers. Non-retryable errors (4xx other
+than 429/408/425, e.g. auth/bad-request) fail fast; a streaming call only retries
+before the first token is emitted.
 
 ### Economy model (optional second tier for subagents)
 
