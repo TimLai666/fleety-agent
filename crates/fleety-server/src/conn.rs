@@ -115,6 +115,8 @@ fn build_connection_stack(
     );
     // Let the user set their timezone (read side already feeds the system prompt).
     crate::tz::register(&mut tools, Arc::clone(storage), acting.clone());
+    // Let a user share their own data with another user (cross-user grant).
+    crate::privacy::register_grant(&mut tools, Arc::clone(storage), acting.clone());
     // Tool-result retrieval + a privacy-filtered audit listing, scoped to the
     // acting user (overrides the unscoped base `history_list`).
     crate::tools::register_user_scoped(

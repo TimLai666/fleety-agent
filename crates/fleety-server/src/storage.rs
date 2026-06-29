@@ -186,8 +186,28 @@ impl Storage {
     }
 
     /// The cross-user grants store (`fleet/grants.json`).
+    fn grants_path(&self) -> PathBuf {
+        self.home.join("fleet").join("grants.json")
+    }
+
     pub fn grants(&self) -> crate::privacy::Grants {
-        crate::privacy::Grants::load(&self.home.join("fleet").join("grants.json"))
+        crate::privacy::Grants::load(&self.grants_path())
+    }
+
+    /// Record a cross-user grant: `owner` lets `grantee` access `scope` of their
+    /// data (`"*"` = all). Load-modify-save under the index lock so concurrent
+    /// grants don't clobber each other.
+    pub fn add_grant(&self, owner: &str, grantee: &str, scope: &str) -> Result<()> {
+        validate_id("user_id", owner)?;
+        validate_id("user_id", grantee)?;
+        let _guard = self
+            .append_lock
+            .lock()
+            .map_err(|_| CoreError::Message("storage index lock poisoned".to_string()))?;
+        let path = self.grants_path();
+        let mut grants = crate::privacy::Grants::load(&path);
+        grants.grant(owner, grantee, scope);
+        grants.save(&path)
     }
 
     fn conversation_workspace_path(&self) -> PathBuf {

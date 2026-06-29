@@ -98,7 +98,62 @@ pub fn register(tools: &mut ToolRegistry, storage: Arc<Storage>, user: Option<St
         storage: Arc::clone(&storage),
         user: user.clone(),
     }));
-    tools.register(Box::new(ConversationList { storage, user }));
+    tools.register(Box::new(ConversationList {
+        storage: Arc::clone(&storage),
+        user: user.clone(),
+    }));
+    tools.register(Box::new(SubagentList { storage, user }));
+}
+
+struct SubagentList {
+    storage: Arc<Storage>,
+    user: Option<String>,
+}
+
+#[async_trait]
+impl Tool for SubagentList {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "subagent_list".to_string(),
+            description: "List the subagent child conversations a conversation spawned. Pass a \
+                conversation_id; returns the child conversation ids (each readable via \
+                conversation_search / conversation_semantic_search). Only your own conversations."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "conversation_id": { "type": "string", "description": "The parent conversation id." }
+                },
+                "required": ["conversation_id"]
+            }),
+            risk: RiskLevel::Read,
+        }
+    }
+
+    async fn call(&self, args: Value) -> Result<Value> {
+        let Some(user) = self.user.clone() else {
+            return Ok(json!({ "children": [] })); // guest
+        };
+        let conv = args
+            .get("conversation_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if conv.is_empty() {
+            return Ok(json!({ "children": [] }));
+        }
+        // Only over the acting user's accessible conversations (no cross-user leak).
+        let acting = crate::identity::ActingUser::User(user);
+        let allowed = self
+            .storage
+            .conversation_access(&acting, conv, &self.storage.grants())
+            .is_allow();
+        let children = if allowed {
+            self.storage.subagent_children(conv)
+        } else {
+            Vec::new()
+        };
+        Ok(json!({ "children": children }))
+    }
 }
 
 struct ConversationSearch {
@@ -329,6 +384,39 @@ mod tests {
         assert!(hits[0].ts_secs >= hits[1].ts_secs);
         // Guest / other-scope returns nothing for alice's data.
         assert!(keyword_search(&storage, "bob", "tonight", 10).is_empty());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn subagent_list_scopes_to_owner() {
+        let (storage, home) = temp_storage();
+        let alice = crate::identity::ActingUser::User("alice".into());
+        storage.register_conversation_owner("c1", &alice).unwrap();
+        storage.link_subagent("c1", "sub-1").unwrap();
+        storage.link_subagent("c1", "sub-2").unwrap();
+        let storage = Arc::new(storage);
+
+        // Owner sees the children.
+        let tool = SubagentList {
+            storage: Arc::clone(&storage),
+            user: Some("alice".into()),
+        };
+        let out = tool.call(json!({ "conversation_id": "c1" })).await.unwrap();
+        assert_eq!(out["children"].as_array().map(|a| a.len()), Some(2));
+        // Another user gets nothing (no leak).
+        let bob = SubagentList {
+            storage: Arc::clone(&storage),
+            user: Some("bob".into()),
+        };
+        let out = bob.call(json!({ "conversation_id": "c1" })).await.unwrap();
+        assert_eq!(out["children"].as_array().map(|a| a.len()), Some(0));
+        // Guest gets nothing.
+        let guest = SubagentList {
+            storage,
+            user: None,
+        };
+        let out = guest.call(json!({ "conversation_id": "c1" })).await.unwrap();
+        assert_eq!(out["children"].as_array().map(|a| a.len()), Some(0));
         let _ = std::fs::remove_dir_all(&home);
     }
 

@@ -8,11 +8,15 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
-use agent_core::{CoreError, Result};
+use agent_core::{CoreError, Result, RiskLevel, Tool, ToolRegistry, ToolSpec};
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
 use crate::identity::ActingUser;
+use crate::storage::Storage;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
@@ -108,12 +112,99 @@ pub fn can_access(
     }
 }
 
+/// Register the `grant_access` tool, scoped to the acting user (the data owner).
+/// Lets a user share their own data with another user; a guest can't grant.
+pub fn register_grant(tools: &mut ToolRegistry, storage: Arc<Storage>, acting: ActingUser) {
+    tools.register(Box::new(GrantAccess { storage, acting }));
+}
+
+struct GrantAccess {
+    storage: Arc<Storage>,
+    acting: ActingUser,
+}
+
+#[async_trait]
+impl Tool for GrantAccess {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "grant_access".to_string(),
+            description: "Let another user access YOUR data. Pass the grantee's user id and an \
+                optional scope ('*' = everything, the default; or a specific scope like \
+                'conversation'). Only grants access to your own data; revoke is not yet supported."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "grantee": { "type": "string", "description": "User id to grant access to." },
+                    "scope": { "type": "string", "description": "Scope, default '*' (all your data)." }
+                },
+                "required": ["grantee"]
+            }),
+            risk: RiskLevel::Mutate,
+        }
+    }
+
+    async fn call(&self, args: Value) -> Result<Value> {
+        let Some(owner) = self.acting.user_id() else {
+            return Err(CoreError::Message(
+                "no identified user for this turn; only a real user can grant access to their data"
+                    .to_string(),
+            ));
+        };
+        let grantee = args
+            .get("grantee")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| CoreError::Message("grant_access requires 'grantee'".to_string()))?;
+        let scope = args
+            .get("scope")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("*");
+        if grantee == owner {
+            return Err(CoreError::Message("you already have access to your own data".to_string()));
+        }
+        self.storage.add_grant(owner, grantee, scope)?;
+        Ok(json!({ "ok": true, "owner": owner, "grantee": grantee, "scope": scope }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn user(id: &str) -> ActingUser {
         ActingUser::User(id.to_string())
+    }
+
+    #[tokio::test]
+    async fn grant_access_tool_records_and_guards_guest() {
+        let home = std::env::temp_dir().join(format!("fleety-grant-tool-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&home).unwrap();
+        let storage = Arc::new(Storage::new(home.clone()));
+        let tool = GrantAccess {
+            storage: Arc::clone(&storage),
+            acting: user("alice"),
+        };
+        // Alice grants bob scope "trip".
+        let r = tool
+            .call(json!({ "grantee": "bob", "scope": "trip" }))
+            .await
+            .unwrap();
+        assert_eq!(r["ok"], true);
+        // The grant is persisted: bob can now access alice's "trip" scope.
+        let grants = storage.grants();
+        assert_eq!(can_access(&user("bob"), "alice", "trip", &grants), Decision::Allow);
+        assert_eq!(can_access(&user("bob"), "alice", "other", &grants), Decision::Deny);
+        // Guest can't grant.
+        let guest = GrantAccess {
+            storage,
+            acting: ActingUser::Guest,
+        };
+        assert!(guest.call(json!({ "grantee": "bob" })).await.is_err());
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
