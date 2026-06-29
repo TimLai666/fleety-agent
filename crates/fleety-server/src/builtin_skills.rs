@@ -60,10 +60,15 @@ fn write_entries(base: &Path, dir: &Dir, skill: &str) -> Result<()> {
     Ok(())
 }
 
-/// Write the embedded built-in skills (whole packages) into `builtin_dir`,
-/// overwriting built-ins so an updated binary ships updated skills. A skill's
+/// Write the embedded built-in skills (whole packages) into `builtin_dir`. The
+/// builtin tier is owned entirely by the binary, so it is **wiped first** for a
+/// clean whole-package replace: on upgrade, files (or whole skills) the new
+/// binary no longer ships don't linger as stale leftovers. The `installed` /
+/// `authored` tiers live in separate dirs and are untouched. A skill's
 /// `HEADER.md` (if present) is prepended to its `SKILL.md` and not emitted itself.
 pub fn seed(builtin_dir: &Path) -> Result<()> {
+    // Clean replace: the builtin tier is regenerated from the binary every boot.
+    let _ = std::fs::remove_dir_all(builtin_dir);
     for (name, dir) in SKILLS {
         let base = builtin_dir.join(name);
         write_entries(&base, dir, name)?;
@@ -134,6 +139,32 @@ mod tests {
             .join("insyra")
             .join("references")
             .join("ccl-operators.md")
+            .is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn seed_is_a_clean_replace() {
+        let dir = std::env::temp_dir().join(format!("fleety-bskill-{}", uuid::Uuid::new_v4()));
+        seed(&dir).expect("seed 1");
+        // Simulate leftovers an older binary seeded: a now-removed reference file
+        // and a now-removed whole skill.
+        let stale_ref = dir.join("insyra").join("references").join("stale.md");
+        std::fs::write(&stale_ref, "old").expect("plant ref");
+        let removed_skill = dir.join("removed-skill");
+        std::fs::create_dir_all(&removed_skill).expect("mk");
+        std::fs::write(removed_skill.join("SKILL.md"), "old").expect("plant skill");
+
+        seed(&dir).expect("seed 2");
+
+        // Clean replace: stale leftovers are gone, current skills intact.
+        assert!(!stale_ref.exists(), "stale reference file should be removed");
+        assert!(!removed_skill.exists(), "removed skill should be gone");
+        assert!(dir.join("insyra").join("SKILL.md").is_file());
+        assert!(dir
+            .join("fleety-use-insyra-dsl")
+            .join("references")
+            .join("cli-commands.md")
             .is_file());
         let _ = std::fs::remove_dir_all(&dir);
     }
