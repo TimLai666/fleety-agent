@@ -270,8 +270,11 @@ pub async fn handle_conn(
     });
     hub.lock().await.insert(device_id.clone(), out.clone());
 
+    // The conversation loop reads through the transport-agnostic `ClientInbound`;
+    // here that's the WebSocket stream.
+    let mut inbound = WsInbound { rx };
     let result = serve(
-        &mut rx,
+        &mut inbound,
         &out,
         &storage,
         provider.as_ref(),
@@ -298,7 +301,7 @@ pub async fn handle_conn(
 /// entry and writer task afterward.
 #[allow(clippy::too_many_arguments)]
 async fn serve(
-    rx: &mut Rx,
+    inbound: &mut dyn ClientInbound,
     out: &Out,
     storage: &Arc<Storage>,
     provider: &dyn ModelProvider,
@@ -370,7 +373,7 @@ async fn serve(
     let goal_max_continues = goal_max_continues_from_env();
     let skill_reflect_min_steps = skill_reflect_min_steps_from_env();
 
-    while let Some(msg) = read_client(rx).await? {
+    while let Some(msg) = inbound.next_client().await? {
         match msg {
             ClientMsg::UserMessage {
                 conversation_id,
@@ -490,7 +493,7 @@ async fn serve(
                 // it isn't lost and doesn't interleave with this message. Best
                 // effort: on failure the journal stays for a later retry.
                 if let Err(e) = recover_incomplete_turn(
-                    rx,
+                    inbound,
                     out,
                     storage,
                     provider,
@@ -523,7 +526,7 @@ async fn serve(
                 };
                 let mut gate = ConnGate {
                     out: out.clone(),
-                    rx,
+                    inbound,
                 };
                 let steps = drive_to_goal(
                     out,
@@ -620,7 +623,7 @@ async fn serve(
                 // Finish any interrupted turn before replaying, so the catch-up
                 // includes its result.
                 if let Err(e) = recover_incomplete_turn(
-                    rx,
+                    inbound,
                     out,
                     storage,
                     provider,
@@ -1425,7 +1428,7 @@ async fn recover_one_interactive(
 /// second crash is still recoverable.
 #[allow(clippy::too_many_arguments)]
 async fn recover_incomplete_turn(
-    rx: &mut Rx,
+    inbound: &mut dyn ClientInbound,
     out: &Out,
     storage: &Arc<Storage>,
     provider: &dyn ModelProvider,
@@ -1465,7 +1468,7 @@ async fn recover_incomplete_turn(
     let outcome = {
         let mut gate = ConnGate {
             out: out.clone(),
-            rx,
+            inbound,
         };
         run_turn_streaming(
             provider,
@@ -1511,7 +1514,7 @@ async fn recover_incomplete_turn(
 /// the reply directly from `rx`.
 struct ConnGate<'a> {
     out: Out,
-    rx: &'a mut Rx,
+    inbound: &'a mut dyn ClientInbound,
 }
 
 #[async_trait::async_trait]
@@ -1534,7 +1537,7 @@ impl ApprovalGate for ConnGate<'_> {
             },
         )?;
         loop {
-            match read_client(self.rx).await? {
+            match self.inbound.next_client().await? {
                 Some(ClientMsg::Approve { approval_id: id }) if id == approval_id => {
                     return Ok(ApprovalDecision::Approve)
                 }
@@ -1573,6 +1576,30 @@ async fn read_client(rx: &mut Rx) -> Result<Option<ClientMsg>> {
     Ok(None)
 }
 
+/// Inbound half of a client transport: yields the next `ClientMsg`, or `None` at
+/// end-of-stream. The connection service loop ([`serve`]) and the approval gate
+/// read through this, so the loop is agnostic to whether frames arrive over a
+/// WebSocket or the SSE+POST fallback. The outbound half is already transport-
+/// agnostic — everything emits into the [`Out`] channel and a per-transport
+/// writer task drains it.
+#[async_trait::async_trait]
+pub(crate) trait ClientInbound: Send {
+    /// The next client message, or `None` once the client half is closed.
+    async fn next_client(&mut self) -> Result<Option<ClientMsg>>;
+}
+
+/// WebSocket inbound: reads `ClientMsg` frames off the split WS stream.
+pub(crate) struct WsInbound {
+    pub(crate) rx: Rx,
+}
+
+#[async_trait::async_trait]
+impl ClientInbound for WsInbound {
+    async fn next_client(&mut self) -> Result<Option<ClientMsg>> {
+        read_client(&mut self.rx).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1580,6 +1607,41 @@ mod tests {
     use tokio_tungstenite::MaybeTlsStream;
 
     type ClientWs = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+    /// A non-WebSocket `ClientInbound` backed by a queue — proves the connection
+    /// loop's inbound is transport-agnostic (the SSE+POST transport plugs in the
+    /// same way). The end-to-end WS path is covered by the integration tests below.
+    #[tokio::test]
+    async fn client_inbound_is_transport_agnostic() {
+        struct QueueInbound(std::collections::VecDeque<ClientMsg>);
+        #[async_trait::async_trait]
+        impl ClientInbound for QueueInbound {
+            async fn next_client(&mut self) -> Result<Option<ClientMsg>> {
+                Ok(self.0.pop_front())
+            }
+        }
+        let mut inbound: Box<dyn ClientInbound> = Box::new(QueueInbound(
+            vec![
+                ClientMsg::Approve {
+                    approval_id: "a1".into(),
+                },
+                ClientMsg::Deny {
+                    approval_id: "a2".into(),
+                },
+            ]
+            .into(),
+        ));
+        // Drains in order, then signals end-of-stream with None.
+        assert!(matches!(
+            inbound.next_client().await.unwrap(),
+            Some(ClientMsg::Approve { approval_id }) if approval_id == "a1"
+        ));
+        assert!(matches!(
+            inbound.next_client().await.unwrap(),
+            Some(ClientMsg::Deny { approval_id }) if approval_id == "a2"
+        ));
+        assert!(inbound.next_client().await.unwrap().is_none());
+    }
 
     // ---- drive-to-goal loop tests --------------------------------------------
 
