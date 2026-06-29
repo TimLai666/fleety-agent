@@ -187,6 +187,10 @@ origin device" mechanism**: the editor's terminal already provides host executio
 The server-side disk tools are for the server's own filesystem, not a routing
 path to the editor's host.
 
+Tool approvals (under the require-approval policy) are surfaced to the editor via
+ACP `session/request_permission`, and the user's allow/deny is relayed back to the
+server; under the default full-access policy no prompts are raised.
+
 Example editor config: run `fleety acp` as the agent command (a fleety-server
 must be reachable).
 

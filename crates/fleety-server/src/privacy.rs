@@ -164,7 +164,9 @@ impl Tool for GrantAccess {
             .filter(|s| !s.is_empty())
             .unwrap_or("*");
         if grantee == owner {
-            return Err(CoreError::Message("you already have access to your own data".to_string()));
+            return Err(CoreError::Message(
+                "you already have access to your own data".to_string(),
+            ));
         }
         self.storage.add_grant(owner, grantee, scope)?;
         Ok(json!({ "ok": true, "owner": owner, "grantee": grantee, "scope": scope }))
@@ -196,8 +198,14 @@ mod tests {
         assert_eq!(r["ok"], true);
         // The grant is persisted: bob can now access alice's "trip" scope.
         let grants = storage.grants();
-        assert_eq!(can_access(&user("bob"), "alice", "trip", &grants), Decision::Allow);
-        assert_eq!(can_access(&user("bob"), "alice", "other", &grants), Decision::Deny);
+        assert_eq!(
+            can_access(&user("bob"), "alice", "trip", &grants),
+            Decision::Allow
+        );
+        assert_eq!(
+            can_access(&user("bob"), "alice", "other", &grants),
+            Decision::Deny
+        );
         // Guest can't grant.
         let guest = GrantAccess {
             storage,

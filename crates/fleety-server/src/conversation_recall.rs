@@ -415,7 +415,10 @@ mod tests {
             storage,
             user: None,
         };
-        let out = guest.call(json!({ "conversation_id": "c1" })).await.unwrap();
+        let out = guest
+            .call(json!({ "conversation_id": "c1" }))
+            .await
+            .unwrap();
         assert_eq!(out["children"].as_array().map(|a| a.len()), Some(0));
         let _ = std::fs::remove_dir_all(&home);
     }
