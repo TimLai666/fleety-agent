@@ -245,6 +245,27 @@ pub fn registry() -> &'static [Setting] {
             description: "SSE half-open timeout: reconnect if no event/keep-alive arrives.",
             secret: false,
         },
+        Setting {
+            key: "FLEETY_BACKUP_REPO",
+            scope: Server,
+            default: "",
+            description: "Private GitHub repo for auto-backup (owner/repo or URL); unset disables.",
+            secret: false,
+        },
+        Setting {
+            key: "FLEETY_BACKUP_TOKEN",
+            scope: Server,
+            default: "",
+            description: "PAT for the backup repo (push + private-visibility check).",
+            secret: true,
+        },
+        Setting {
+            key: "FLEETY_BACKUP_INTERVAL_SECS",
+            scope: Server,
+            default: "3600",
+            description: "Seconds between scheduled backups.",
+            secret: false,
+        },
     ]
 }
 

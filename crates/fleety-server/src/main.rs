@@ -9,6 +9,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod auth;
+mod backup;
 mod bridge;
 mod builtin_mcp;
 mod builtin_skills;
@@ -198,6 +199,14 @@ async fn async_main(cmd: Option<String>) {
         return;
     }
 
+    // `backup now` / `backup restore` run once against the user-configured repo
+    // and exit (runtime needed for git/network). Restore is meant to be run with
+    // the server stopped.
+    if cmd.as_deref() == Some("backup") {
+        run_backup_command(std::env::args().nth(2)).await;
+        return;
+    }
+
     // Service mode (non-Windows run-service) claims the single-instance pidfile;
     // foreground dev runs do not. On Windows the service path goes through winsvc.
     let service_mode = cmd.as_deref() == Some("run-service");
@@ -218,6 +227,67 @@ async fn async_main(cmd: Option<String>) {
     };
 
     run_server(None).await;
+}
+
+/// Handle `fleety-server backup <now|restore>`: run once against the
+/// user-configured repo, then exit. Prints a clear message when no repo is set.
+async fn run_backup_command(sub: Option<String>) {
+    let home = agent_home();
+    let mirror = Storage::new(home.clone()).backup_mirror_dir();
+    let config_path = fleety_tools::config::config_path();
+    let providers_path = fleety_tools::providers_config::providers_path();
+    let env = match backup::config_from_env() {
+        Some(e) => e,
+        None => {
+            println!(
+                "未設定備份 repo:請先設定 FLEETY_BACKUP_REPO(與 FLEETY_BACKUP_TOKEN),見 docs/env.md。"
+            );
+            return;
+        }
+    };
+    match sub.as_deref() {
+        Some("now") => {
+            match backup::run_backup(
+                &home,
+                &config_path,
+                &providers_path,
+                &mirror,
+                &env.repo,
+                &env.token,
+            )
+            .await
+            {
+                Ok(backup::BackupOutcome::Pushed) => println!("備份完成並已推送到 {}。", env.repo),
+                Ok(backup::BackupOutcome::NothingChanged) => {
+                    println!("狀態未變更,無需備份。")
+                }
+                Ok(backup::BackupOutcome::RefusedNotPrivate) => println!(
+                    "已在本地建立備份快照,但 repo {} 非私人(或無法確認),拒絕推送。請確認 repo 為私人。",
+                    env.repo
+                ),
+                Err(e) => tracing::error!(report = ?e.report(), "backup now failed"),
+            }
+        }
+        Some("restore") => {
+            let ts = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+            match backup::restore(
+                &home,
+                &config_path,
+                &providers_path,
+                &env.repo,
+                &env.token,
+                &ts,
+            )
+            .await
+            {
+                Ok(()) => println!(
+                    "已從備份還原。請重新啟動 server;原有資料已保留在 .pre-restore-{ts}(未刪除)。"
+                ),
+                Err(e) => tracing::error!(report = ?e.report(), "backup restore failed"),
+            }
+        }
+        _ => println!("用法:fleety-server backup <now|restore>"),
+    }
 }
 
 /// Ensure this server's external dependencies (best-effort, non-blocking).
@@ -343,6 +413,15 @@ async fn run_server(shutdown: Option<tokio::sync::watch::Receiver<bool>>) {
     // Keep the `synced` skill tier in step with the external skills repo
     // (FLEETY_SKILLS_SYNC=0 disables). Background, never-crash.
     skill_sync::spawn(storage.skills_synced_dir());
+
+    // Auto-backup the non-regenerable state to a user-configured private repo
+    // (inert unless FLEETY_BACKUP_REPO is set). Background, never-crash.
+    backup::spawn(
+        agent_home(),
+        fleety_tools::config::config_path(),
+        fleety_tools::providers_config::providers_path(),
+        storage.backup_mirror_dir(),
+    );
 
     tokio::spawn(conn::recover_all_interactive(
         Arc::clone(&storage),

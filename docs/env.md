@@ -199,6 +199,47 @@ Six-hour periodic sweep that keeps audit + backup surfaces bounded.
 | `FLEETY_BACKUPS_RETENTION_SECS` | `604800` (7 d) | Backup directories older than this are deleted. |
 | `FLEETY_HISTORY_ROTATE_BYTES` | `33554432` (32 MiB) | When a device's `history.jsonl` crosses this size, it's renamed to `history.jsonl.<unix_ts>` (archive kept; live file resets). |
 
+## Auto-backup to a private repo (server background loop)
+
+Backs up the server's **non-regenerable** state to a user-configured **private**
+GitHub repo. Inert unless `FLEETY_BACKUP_REPO` is set (no loop, no mirror). When
+set, it commits + pushes on a schedule (and via `fleety-server backup now`),
+keeping a local git mirror at `<agent_home>/../backup-mirror`.
+
+**Scope.** Copies the agent home into the mirror **minus** re-obtainable/oversized
+paths — downloaded `models`, the `skills/builtin` and `skills/synced` tiers, and
+the `fleet/backups` rollback store — **plus** `config.toml` and `providers.toml`.
+Everything else (conversations, memory, wiki, devices, sites, schedules,
+`skills/installed`, `skills/authored`, `auth.json`, MCP config, cookies) is
+included. The exclude-set (not an include-list) means new state dirs are backed
+up automatically. `git` produces no commit when nothing changed, so unchanged
+state is never re-pushed.
+
+**Private-only.** Before every push, the server confirms via the GitHub API that
+the target repo is `private`. If it is not private, or visibility can't be
+determined, it **refuses to push**, logs a warning, and keeps the local commit.
+
+**Restore.** `fleety-server backup restore` (run with the server stopped) clones
+the repo and puts it back. It first renames the existing agent home and config
+files to `.pre-restore-<timestamp>` (kept, not deleted) so the operation is
+reversible, then prints a restart prompt. It never runs automatically at boot.
+
+| Var | Default | Meaning |
+|---|---|---|
+| `FLEETY_BACKUP_REPO` | (unset → disabled) | Target repo as `owner/repo` or `https://github.com/owner/repo`. Unset = auto-backup entirely off. |
+| `FLEETY_BACKUP_TOKEN` | (unset) | GitHub PAT used to push and to check repo visibility. Secret (masked in `config list`). |
+| `FLEETY_BACKUP_INTERVAL_SECS` | `3600` (1 h) | Seconds between scheduled backups. |
+
+> ⚠️ **Security — secrets are backed up in cleartext.** `providers.toml` (model
+> API keys), `auth.json` (tokens/pairing), and cookies go into the repo **as
+> plaintext**, by design. Anyone who obtains `FLEETY_BACKUP_TOKEN`, or gains
+> access to the backup repo, gets **all of your secrets**. Use a **dedicated
+> private repo** and a **minimally-scoped PAT** (single-repo, `contents:write`).
+> The private-repo check is a guardrail against accidentally pushing to a public
+> repo — it is not a substitute for protecting the token and the repo. Optional
+> at-rest encryption (`FLEETY_BACKUP_PASSPHRASE`) is a future addition; the MVP
+> stores cleartext.
+
 ## mDNS service discovery
 
 Server announces `_fleety._tcp.local.`; CLI / fleetyd browse for it as the

@@ -692,6 +692,16 @@ impl Storage {
         self.home.join("fleet").join("backups")
     }
 
+    /// The local git mirror the auto-backup loop commits/pushes. Kept beside the
+    /// agent home (`<agent_home>/../backup-mirror`) so it is never itself part of
+    /// a backup.
+    pub fn backup_mirror_dir(&self) -> PathBuf {
+        self.home
+            .parent()
+            .map(|p| p.join("backup-mirror"))
+            .unwrap_or_else(|| self.home.join("backup-mirror"))
+    }
+
     /// Directory holding agent-level core memory files (ME/USER/TODO/TOOLS).
     pub fn memory_dir(&self) -> PathBuf {
         self.home.join("fleet")
