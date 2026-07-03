@@ -28,6 +28,7 @@ dependencies = [
  "tree-sitter-python",
  "tree-sitter-rust",
  "tree-sitter-typescript",
+ "uuid",
 ]
 
 [[package]]
@@ -1720,6 +1721,7 @@ dependencies = [
  "mdns-sd",
  "png 0.17.16",
  "ratatui",
+ "reqwest",
  "serde_json",
  "tokio",
  "tokio-tungstenite 0.24.0",

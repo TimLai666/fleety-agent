@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use agent_core::{Gemini, ModelProvider, OpenAiCompat};
+use agent_core::{CodexResponses, Gemini, ModelProvider, OpenAiCompat};
 
 use crate::echo::EchoProvider;
 
@@ -40,6 +40,7 @@ pub fn build(prefix: &str) -> Option<Arc<dyn ModelProvider>> {
         .ok()
         .filter(|s| !s.trim().is_empty());
     let effort = std::env::var(format!("{prefix}_EFFORT")).ok();
+    let auth = std::env::var(format!("{prefix}_AUTH")).ok();
     Some(build_provider(
         base_url,
         model,
@@ -47,8 +48,15 @@ pub fn build(prefix: &str) -> Option<Arc<dyn ModelProvider>> {
         stream,
         modalities.as_deref(),
         effort.as_deref(),
+        auth.as_deref(),
         prefix,
     ))
+}
+
+/// Whether an auth-mode string selects the Codex OAuth bearer. `None`/`"static"`
+/// (or anything else) keeps the static-key path. Pure — unit-testable.
+fn auth_is_oauth(auth: Option<&str>) -> bool {
+    matches!(auth, Some(a) if a.eq_ignore_ascii_case("oauth:codex"))
 }
 
 /// Build one provider from explicit fields (shared by the env path and the
@@ -64,6 +72,7 @@ pub fn build_provider(
     stream: bool,
     modalities: Option<&str>,
     effort: Option<&str>,
+    auth: Option<&str>,
     label: &str,
 ) -> Arc<dyn ModelProvider> {
     // Modality capabilities: explicit `modalities` (e.g. "text,image") wins;
@@ -86,6 +95,11 @@ pub fn build_provider(
     // field is sent.
     let default_effort = effort.and_then(agent_core::model::Effort::parse);
     let scheme = effort_scheme_for(&model);
+    // Codex OAuth mode talks to the ChatGPT backend over the Responses API — a
+    // different provider entirely, ignoring base_url/key.
+    if auth_is_oauth(auth) {
+        return build_codex_responses(model, caps, default_effort, label);
+    }
     if agent_core::gemini::looks_like_gemini_model(&model) {
         tracing::info!(%base_url, %model, stream, %label, "using native Gemini provider");
         Arc::new(
@@ -105,6 +119,28 @@ pub fn build_provider(
     }
 }
 
+/// Build the Codex Responses provider for the `oauth:codex` auth mode: it calls
+/// the ChatGPT backend over the Responses API with the account's OAuth token
+/// (refreshed on demand). The configured `base_url`/`key` are ignored — Codex has
+/// its own backend, resolved from `FLEETY_CODEX_BACKEND_URL`.
+fn build_codex_responses(
+    model: String,
+    caps: agent_core::model::ModelCapabilities,
+    default_effort: Option<agent_core::model::Effort>,
+    label: &str,
+) -> Arc<dyn ModelProvider> {
+    let cfg = fleety_tools::oauth::oauth_config();
+    let endpoint = format!("{}/responses", cfg.backend_base_url.trim_end_matches('/'));
+    tracing::info!(%endpoint, %model, %label, "using Codex Responses provider (oauth:codex)");
+    let auth_src =
+        fleety_tools::oauth::OAuthCodexAuth::new(fleety_tools::oauth::default_token_path(), &cfg);
+    Arc::new(
+        CodexResponses::new(endpoint, model, Arc::new(auth_src))
+            .with_capabilities(caps)
+            .with_effort(default_effort),
+    )
+}
+
 /// Build one provider from a `providers.toml` entry.
 fn build_from_spec(spec: &fleety_tools::providers_config::ProviderSpec) -> Arc<dyn ModelProvider> {
     build_provider(
@@ -114,6 +150,7 @@ fn build_from_spec(spec: &fleety_tools::providers_config::ProviderSpec) -> Arc<d
         spec.stream,
         spec.modalities.as_deref(),
         spec.effort.as_deref(),
+        spec.auth.as_deref(),
         &spec.name,
     )
 }
@@ -333,6 +370,30 @@ mod tests {
             &tiers.resolve("main")
         ));
         clear();
+    }
+
+    #[test]
+    fn auth_mode_selects_oauth_only_for_codex() {
+        assert!(auth_is_oauth(Some("oauth:codex")));
+        assert!(auth_is_oauth(Some("OAuth:Codex"))); // case-insensitive
+        assert!(!auth_is_oauth(None)); // default → static
+        assert!(!auth_is_oauth(Some("static")));
+        assert!(!auth_is_oauth(Some("oauth:other")));
+    }
+
+    #[test]
+    #[serial]
+    fn build_reads_auth_mode_and_yields_a_provider() {
+        clear();
+        std::env::set_var("FLEETY_MODEL_BASE_URL", "https://api.example/v1");
+        std::env::set_var("FLEETY_MODEL", "gpt-5");
+        // Default (no _AUTH) builds a provider (static path).
+        assert!(build("FLEETY_MODEL").is_some());
+        // oauth:codex also builds a provider (bearer source attached internally).
+        std::env::set_var("FLEETY_MODEL_AUTH", "oauth:codex");
+        assert!(build("FLEETY_MODEL").is_some());
+        clear();
+        std::env::remove_var("FLEETY_MODEL_AUTH");
     }
 
     #[test]

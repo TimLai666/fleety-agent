@@ -169,6 +169,26 @@ Three ways, in increasing power:
    vars above, so zero-config behavior is unchanged. See
    [`docs/env.md`](docs/env.md#named-provider-pool-providerstoml).
 
+### Sign in with ChatGPT instead of an API key (Codex OAuth)
+
+Use a ChatGPT subscription rather than a static key:
+
+1. `fleety auth login` — opens the browser (or `fleety auth login --no-browser`
+   prints the URL), captures the redirect on the fixed loopback port
+   `http://localhost:1455/auth/callback` (must be free during login), and stores
+   tokens at `~/.fleety/codex-oauth.json` (0600 on Unix; refreshed automatically,
+   never printed). The public Codex client id is the default — no setup needed.
+2. Point a provider at it with `auth = "oauth:codex"` in `providers.toml` (or
+   `FLEETY_MODEL_AUTH=oauth:codex`). Fleety then calls the ChatGPT/Codex backend
+   over the **Responses API** with your account's token (auto-refreshed) — no key.
+
+`fleety auth status` shows whether you're signed in; `fleety auth logout` clears the tokens.
+
+> **Note:** end-to-end behavior against the live Codex backend is network-gated
+> and unverified from CI (the request/SSE shapes follow the documented Codex CLI
+> contract and are unit-tested offline). See
+> [`docs/env.md`](docs/env.md#codex-chatgpt-oauth-sign-in-instead-of-an-api-key).
+
 ### Where config commands apply (`--target`)
 
 By default `fleety config …` manages the **connected server's** config over the

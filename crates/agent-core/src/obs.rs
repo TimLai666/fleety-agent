@@ -8,7 +8,13 @@ pub fn init() {
     use tracing_subscriber::{fmt, EnvFilter};
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let _ = fmt().with_env_filter(filter).try_init();
+    // Logs go to stderr, never stdout. The ACP adapter (`fleety acp`) speaks a
+    // JSON-RPC protocol over stdout — a log line there would corrupt the stream.
+    // stderr is the correct sink for every binary here anyway.
+    let _ = fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .try_init();
 }
 
 #[cfg(test)]

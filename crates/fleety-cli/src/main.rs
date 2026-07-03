@@ -7,6 +7,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod acp;
+mod auth;
 mod clipboard;
 mod config;
 mod provider_tui;
@@ -187,6 +188,16 @@ async fn main() {
                 config_remote(target, &rest).await
             };
             if let Err(e) = res {
+                let report = e.report();
+                eprintln!("error: {}", report.message);
+                if let Some(hint) = report.remediation {
+                    eprintln!("hint: {hint}");
+                }
+            }
+        }
+        Some("auth") => {
+            // `fleety auth <login|status|logout>` — Codex ChatGPT OAuth sign-in.
+            if let Err(e) = auth::run(&args[2..]).await {
                 let report = e.report();
                 eprintln!("error: {}", report.message);
                 if let Some(hint) = report.remediation {

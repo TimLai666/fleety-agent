@@ -213,7 +213,7 @@ impl SubagentManager {
         let registry = self.host.child_registry(workspace).await;
         let base = self.host.resolve_provider(tier);
         // Apply the parent-chosen effort for this subagent's whole run.
-        let provider = base.with_effort(effort).unwrap_or(base);
+        let provider = provider_with_spawn_effort(base, effort);
         let mut gate = self.make_gate(allowed_tools);
         let mut events = EventLog::new();
         let cfg = LoopConfig::default();
@@ -447,6 +447,21 @@ fn require_str<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
 
 fn opt_str<'a>(args: &'a Value, key: &str, default: &'a str) -> &'a str {
     args.get(key).and_then(Value::as_str).unwrap_or(default)
+}
+
+/// Choose the provider for a subagent run: apply the parent-chosen `effort` only
+/// when one was given. When `effort` is `None` the base provider is returned
+/// as-is so it keeps its configured default effort — calling `with_effort(None)`
+/// would instead wipe that default (spec: "spawn without effort inherits the
+/// default").
+fn provider_with_spawn_effort(
+    base: Arc<dyn ModelProvider>,
+    effort: Option<Effort>,
+) -> Arc<dyn ModelProvider> {
+    match effort {
+        Some(_) => base.with_effort(effort).unwrap_or(base),
+        None => base,
+    }
 }
 
 fn parse_request(args: &Value) -> Result<SpawnRequest> {
@@ -934,5 +949,47 @@ mod tests {
         let r2 = mgr.spawn(req("b", "spawn", "main", true, "none")).await;
         assert!(r2.is_err(), "second background exceeds cap=1");
         gate.notify_waiters();
+    }
+
+    #[tokio::test]
+    async fn spawn_without_effort_keeps_provider_default() {
+        use std::sync::Mutex;
+        struct EffortSpy {
+            calls: Arc<Mutex<Vec<Option<Effort>>>>,
+        }
+        #[async_trait]
+        impl ModelProvider for EffortSpy {
+            async fn complete(
+                &self,
+                _m: &[Message],
+                _t: &[ToolSpec],
+            ) -> Result<crate::model::ModelResponse> {
+                Ok(crate::model::ModelResponse {
+                    message: Message::assistant("x"),
+                })
+            }
+            fn with_effort(&self, effort: Option<Effort>) -> Option<Arc<dyn ModelProvider>> {
+                self.calls.lock().unwrap().push(effort);
+                Some(Arc::new(EffortSpy {
+                    calls: Arc::clone(&self.calls),
+                }))
+            }
+        }
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let base: Arc<dyn ModelProvider> = Arc::new(EffortSpy {
+            calls: Arc::clone(&calls),
+        });
+
+        // No parent effort → base is used as-is; `with_effort` is NOT called, so the
+        // provider's configured default effort is preserved.
+        let _ = provider_with_spawn_effort(Arc::clone(&base), None);
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "None must not call with_effort (that would wipe the default)"
+        );
+
+        // Explicit effort → applied.
+        let _ = provider_with_spawn_effort(base, Some(Effort::High));
+        assert_eq!(*calls.lock().unwrap(), vec![Some(Effort::High)]);
     }
 }

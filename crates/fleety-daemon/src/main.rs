@@ -12,6 +12,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod backoff;
+mod colocation;
 mod ondevice;
 mod poll_updates;
 mod provision;
@@ -518,6 +519,18 @@ async fn serve(
         return Outcome::Disconnected;
     }
     tracing::info!(%url, "connected; holding connection");
+    // Presence: when opted in (`FLEETY_PRESENCE=on`), periodically report this
+    // device's co-location fingerprint so the server can infer its site. Absent
+    // when disabled — nothing is computed or sent.
+    let mut presence_tick = if colocation::presence_enabled() {
+        let mut iv = tokio::time::interval(std::time::Duration::from_secs(
+            colocation::interval_secs(),
+        ));
+        iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        Some(iv)
+    } else {
+        None
+    };
     loop {
         // Idle frame boundary: carry out a deferred self-restart (auto-update)
         // here so it never interrupts a tool that's mid-execution.
@@ -530,15 +543,34 @@ async fn serve(
             return Outcome::Shutdown;
         }
         let next = tokio::select! {
-            frame = conn.recv_text() => frame,
+            frame = conn.recv_text() => Some(frame),
+            _ = async {
+                match presence_tick.as_mut() {
+                    Some(iv) => { iv.tick().await; }
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                // Presence report tick: send best-effort; a send failure just
+                // means we retry next tick (or the link drops and we reconnect).
+                if let Some(frame) = colocation::report_frame() {
+                    if let Err(e) = conn.send_text(frame).await {
+                        tracing::warn!(report = ?e.report(), "could not send co-location report");
+                    }
+                }
+                None
+            }
             _ = wait_stop(shutdown.clone()) => {
                 tracing::info!("stop signal received; closing and shutting down fleetyd");
                 conn.close().await;
                 return Outcome::Shutdown;
             }
         };
-        // None = link closed or went dead (SSE half-open timeout) → reconnect.
-        let Some(text) = next else {
+        // `None` = a presence tick (handled above); loop for the next event.
+        let Some(frame) = next else {
+            continue;
+        };
+        // Inner `None` = link closed or went dead (SSE half-open timeout) → reconnect.
+        let Some(text) = frame else {
             return Outcome::Disconnected;
         };
         let Ok(msg) = serde_json::from_str::<ServerMsg>(&text) else {

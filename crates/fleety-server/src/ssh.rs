@@ -95,6 +95,14 @@ impl Tool for SshExec {
             )));
         }
         let command = require_str(&args, "command")?;
+        // Irreversible remote commands are treated as critical: refuse them, the
+        // same guard the local `run_command` applies (a remote `rm -rf /` is just
+        // as catastrophic).
+        if let Some(reason) = fleety_tools::critical_reason(command) {
+            return Err(CoreError::Message(format!(
+                "refusing critical remote command ({reason}); run it yourself on the host if you're sure"
+            )));
+        }
         let user = args.get("user").and_then(Value::as_str);
         let port = args.get("port").and_then(Value::as_u64);
         let identity = args.get("identity").and_then(Value::as_str);
@@ -201,5 +209,21 @@ mod tests {
             .call("ssh_exec", json!({ "host": "a b", "command": "x" }))
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn refuses_critical_remote_command() {
+        let mut registry = ToolRegistry::new();
+        register(&mut registry);
+        // A catastrophic, irreversible command is refused before any ssh spawn —
+        // the same guard as the local run_command.
+        let err = registry
+            .call("ssh_exec", json!({ "host": "host", "command": "rm -rf /" }))
+            .await
+            .expect_err("critical remote command must be refused");
+        assert!(err.report().message.contains("critical"));
+        // An ordinary command is not blocked by the guard (it fails later only if
+        // the host is unreachable, not here).
+        assert!(fleety_tools::critical_reason("ls -la").is_none());
     }
 }

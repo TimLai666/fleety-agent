@@ -24,6 +24,7 @@ mod gc;
 mod http;
 mod identity;
 mod mdns;
+mod presence;
 mod privacy;
 mod sidecar;
 mod sse;

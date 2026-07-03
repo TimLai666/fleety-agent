@@ -79,6 +79,7 @@ pub async fn tick(
     fleety_tools::register_browser(&mut tools);
     fleety_tools::register_computer(&mut tools);
     crate::sites::register(&mut tools, &storage.sites_dir(), &storage.devices_dir());
+    crate::presence::register_presence(&mut tools, storage.home(), storage.sites_dir());
     // Finish interrupted scheduled turns first (best-effort, each isolated).
     for conversation in incomplete {
         if let Err(e) = recover_schedule_turn(storage, provider, &tools, &conversation).await {

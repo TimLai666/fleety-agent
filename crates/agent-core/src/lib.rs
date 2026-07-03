@@ -11,6 +11,7 @@
 
 pub mod agent;
 pub mod approval;
+pub mod codex_responses;
 pub mod compress;
 pub mod error;
 pub mod event;
@@ -38,7 +39,8 @@ pub use model::{
     Attachment, Message, MockProvider, ModelProvider, ModelResponse, RiskLevel, Role, ToolCall,
     ToolSpec,
 };
-pub use openai::OpenAiCompat;
+pub use codex_responses::{CodexAuth, CodexCreds, CodexResponses};
+pub use openai::{BearerSource, OpenAiCompat, StaticBearer};
 pub use subagent::{
     register_orchestration, SpawnRequest, SubagentHost, SubagentManager, SubagentMode,
     SubagentState,

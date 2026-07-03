@@ -46,6 +46,10 @@ pub struct ProviderSpec {
     /// Default reasoning effort (`low`/`medium`/`high`); `None` sends none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// Authentication mode: `None`/`"static"` uses `key`; `"oauth:codex"` sources
+    /// the bearer from the Codex OAuth token store (refreshing on expiry).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<String>,
 }
 
 /// A named group over member providers, with a dispatch strategy.
@@ -284,6 +288,7 @@ mod tests {
                     stream: true,
                     modalities: Some("text,image".to_string()),
                     effort: Some("medium".to_string()),
+                    auth: None,
                 },
                 ProviderSpec {
                     name: "codex-2".to_string(),
@@ -293,6 +298,7 @@ mod tests {
                     stream: false,
                     modalities: None,
                     effort: None,
+                    auth: Some("oauth:codex".to_string()),
                 },
             ],
             groups: vec![GroupSpec {

@@ -188,6 +188,38 @@ host with `--target`:
 path before the CLI can connect. Remote config travels only over the
 authenticated connection — use TLS for remote/untrusted networks.
 
+## Codex ChatGPT OAuth (sign in instead of an API key)
+
+`fleety auth login` signs in to ChatGPT (OAuth 2.0 with PKCE, the same public
+client id and simplified flow as the upstream Codex CLI) and stores tokens at
+`~/.fleety/codex-oauth.json` (0600 on Unix), refreshed automatically and never
+printed. `fleety auth status` / `fleety auth logout` manage the session. Login
+uses a **fixed loopback redirect** (`http://localhost:1455/auth/callback`) because
+the client id is registered with it — port 1455 must be free during login.
+
+The defaults work out of the box; override only for a non-default install.
+
+| Var | Default | Meaning |
+|---|---|---|
+| `FLEETY_CODEX_CLIENT_ID` | `app_EMoamEEZ73f0CkXaXp7hrann` | Codex OAuth public client id. |
+| `FLEETY_CODEX_AUTHORIZE_URL` | `https://auth.openai.com/oauth/authorize` | Authorization endpoint. |
+| `FLEETY_CODEX_TOKEN_URL` | `https://auth.openai.com/oauth/token` | Token endpoint. |
+| `FLEETY_CODEX_BACKEND_URL` | `https://chatgpt.com/backend-api/codex` | Codex backend base; the provider calls `<base>/responses`. |
+| `FLEETY_CODEX_ORIGINATOR` | `codex_cli_rs` | Originator sent on the Responses call (`fleety` is used on the authorize request). |
+
+Setting a provider to `auth = "oauth:codex"` builds a **Codex Responses provider**:
+it calls `<FLEETY_CODEX_BACKEND_URL>/responses` (the OpenAI Responses API, not
+`/chat/completions`) with the account's OAuth bearer, the `chatgpt-account-id`
+header (decoded from the login `id_token`), and the Codex beta/originator/session
+headers, streaming the reply and driving tool calls. The configured
+`FLEETY_MODEL_BASE_URL`/`_KEY` are ignored for this mode — Codex has its own
+backend.
+
+> **Live verification pending.** The Responses request/header/SSE shapes follow
+> the documented Codex CLI contract (mirrored by codex-openai-proxy and heddle)
+> and are unit-tested offline; end-to-end behavior against the real Codex backend
+> is network-gated (like SSH/CDP) and unverified from CI.
+
 ## Retention / GC (server background loop)
 
 Six-hour periodic sweep that keeps audit + backup surfaces bounded.
@@ -198,6 +230,17 @@ Six-hour periodic sweep that keeps audit + backup surfaces bounded.
 | `FLEETY_GC_INTERVAL_SECS` | `21600` (6 h) | How often to run a sweep. Clamped to a 60 s floor. |
 | `FLEETY_BACKUPS_RETENTION_SECS` | `604800` (7 d) | Backup directories older than this are deleted. |
 | `FLEETY_HISTORY_ROTATE_BYTES` | `33554432` (32 MiB) | When a device's `history.jsonl` crosses this size, it's renamed to `history.jsonl.<unix_ts>` (archive kept; live file resets). |
+
+`FLEETY_HISTORY_ROTATE_BYTES` also rotates the presence timeline (`fleet/presence/timeline.jsonl`) past the same size.
+
+## Presence (`fleetyd`, opt-in — off by default)
+
+Presence tracking is off unless a device opts in. When on, `fleetyd` periodically reports a **hashed** network fingerprint (default-gateway MAC/IP + subnet — the raw values are never sent) so the server can infer which site the device is at. Server-side, each device also has its own opt-in flag (`device_set_presence_opt_in`, default off); both must be on for anything to be recorded.
+
+| Var | Default | Meaning |
+|---|---|---|
+| `FLEETY_PRESENCE` | `off` | Set to `on` to enable co-location reporting from this daemon. |
+| `FLEETY_PRESENCE_INTERVAL_SECS` | `300` | Seconds between co-location reports. Clamped to a 60 s floor. |
 
 ## Auto-backup to a private repo (server background loop)
 

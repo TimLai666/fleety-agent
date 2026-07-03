@@ -150,9 +150,12 @@ impl SubagentHost for FleetyHost {
         context: &str,
         prompt: &str,
     ) -> Vec<Message> {
+        // Build the system prompt for the parent's *acting* user (not the device
+        // owner) — on a shared device these differ, and using the owner would leak
+        // the owner's core memory (USER.md) into another user's subagent.
         let system = self
             .storage
-            .system_prompt_for(&self.storage.acting_for_device(&self.device_id))
+            .system_prompt_for(&self.acting)
             .unwrap_or_default();
         match mode {
             SubagentMode::Spawn => vec![Message::system(system), Message::user(prompt)],
@@ -257,7 +260,9 @@ impl SubagentHost for FleetyHost {
             true,
             // Background wake turns are non-voice.
             false,
-            &self.storage.acting_for_device(&self.device_id),
+            // Act as the parent's acting user, not the device owner (shared-device
+            // isolation): the wake turn's memory + ownership stay scoped correctly.
+            &self.acting,
         )
         .await
         {
@@ -349,6 +354,17 @@ mod tests {
         tokio::sync::mpsc::UnboundedReceiver<tokio_tungstenite::tungstenite::Message>,
         ProviderTiers,
     ) {
+        mk_host_acting(crate::identity::ActingUser::User("alice".to_string()))
+    }
+
+    fn mk_host_acting(
+        acting: crate::identity::ActingUser,
+    ) -> (
+        Arc<FleetyHost>,
+        PathBuf,
+        tokio::sync::mpsc::UnboundedReceiver<tokio_tungstenite::tungstenite::Message>,
+        ProviderTiers,
+    ) {
         let home = std::env::temp_dir().join(format!("fleety-host-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&home).unwrap();
         let storage = Arc::new(Storage::new(home.clone()));
@@ -375,7 +391,7 @@ mod tests {
             auth,
             crate::bridge::new_device_tools(),
             out,
-            crate::identity::ActingUser::User("alice".to_string()),
+            acting,
         );
         (host, home, rx, tiers)
     }
@@ -412,6 +428,38 @@ mod tests {
             .storage
             .tool_result_for("dev", "call_1", Some("sub-7"), |c| c == "sub-7");
         assert!(got.is_some());
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn subagent_system_prompt_uses_acting_user_not_device_owner() {
+        use agent_core::SubagentHost;
+        // Shared device: owned by alice, but bob is the acting user on this turn.
+        let (host, home, _rx, _t) =
+            mk_host_acting(crate::identity::ActingUser::User("bob".to_string()));
+        host.storage
+            .set_device_ownership("dev", Some("alice"), &["bob".to_string()], true)
+            .unwrap();
+        host.storage
+            .write_user_profile("alice", "ALICE-SECRET-PROFILE")
+            .unwrap();
+        host.storage
+            .write_user_profile("bob", "BOB-PROFILE")
+            .unwrap();
+
+        let msgs = host
+            .initial_messages(SubagentMode::Spawn, "", "do it")
+            .await;
+        let system = msgs[0].content.clone().unwrap_or_default();
+        // The subagent's core memory must be the acting user's, not the owner's.
+        assert!(
+            system.contains("BOB-PROFILE"),
+            "subagent prompt should carry the acting user's USER.md"
+        );
+        assert!(
+            !system.contains("ALICE-SECRET-PROFILE"),
+            "subagent prompt must not leak the device owner's USER.md"
+        );
         let _ = std::fs::remove_dir_all(home);
     }
 

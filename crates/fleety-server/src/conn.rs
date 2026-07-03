@@ -986,6 +986,27 @@ async fn serve(
                 }
                 emit(out, &reply)?;
             }
+            ClientMsg::Colocation {
+                fingerprint,
+                subnet,
+                peers: _,
+            } => {
+                // A device's periodic co-location report. Gated on the device's
+                // presence opt-in inside `apply_colocation`; unopted devices record
+                // nothing. No reply frame — the site + timeline update silently.
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let _ = crate::presence::apply_colocation(
+                    storage,
+                    &storage.sites_dir(),
+                    device_id,
+                    fingerprint.as_deref(),
+                    subnet.as_deref(),
+                    now,
+                );
+            }
         }
     }
 
@@ -1064,16 +1085,24 @@ fn authenticate(
     if !auth.required() {
         return Ok(None);
     }
+    // A valid token wins — authenticate with it and leave any (possibly
+    // already-redeemed) pairing code untouched. A daemon keeps `FLEETY_PAIRING_CODE`
+    // set across reconnects; checking the code first would redeem-fail the used
+    // code and reject an otherwise-authenticated device.
+    if let Some(tok) = token {
+        if auth.verify(tok).is_some() {
+            return Ok(None);
+        }
+    }
+    // No valid token: a pairing code enrolls the device and mints a token.
     if let Some(code) = pairing_code {
         return auth
             .redeem(code, device_id)
             .map(Some)
             .map_err(|e| e.report().message);
     }
-    if let Some(tok) = token {
-        if auth.verify(tok).is_some() {
-            return Ok(None);
-        }
+    // A token was supplied but did not verify (and there was no pairing code).
+    if token.is_some() {
         return Err("invalid token".to_string());
     }
     Err("this server requires authentication".to_string())
@@ -1555,6 +1584,7 @@ pub(crate) fn build_full_registry(
     fleety_tools::register_browser(&mut tools);
     fleety_tools::register_computer(&mut tools);
     crate::sites::register(&mut tools, &storage.sites_dir(), &storage.devices_dir());
+    crate::presence::register_presence(&mut tools, storage.home(), storage.sites_dir());
     auth::register(&mut tools, Arc::clone(auth));
     bridge::register(
         &mut tools,
@@ -1907,6 +1937,31 @@ mod tests {
     use tokio_tungstenite::MaybeTlsStream;
 
     type ClientWs = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+    #[test]
+    fn valid_token_authenticates_even_when_a_used_pairing_code_is_resent() {
+        // A daemon keeps FLEETY_PAIRING_CODE set across reconnects and sends both
+        // the (now-redeemed) code and its saved token. Auth must accept the token
+        // and not reject on the spent code.
+        let path = std::env::temp_dir().join(format!("fleety-auth-{}.json", uuid::Uuid::new_v4()));
+        let auth = AuthStore::load(path, None, true);
+        let code = auth.create_pairing().expect("mint code");
+
+        // First connect: the code enrolls the device and mints a token.
+        let token = match authenticate(&auth, "dev", None, Some(&code)) {
+            Ok(Some(t)) => t,
+            other => panic!("expected a minted token, got {other:?}"),
+        };
+
+        // Reconnect: the same (now-used) code is resent alongside the valid token.
+        assert!(
+            matches!(authenticate(&auth, "dev", Some(&token), Some(&code)), Ok(None)),
+            "a valid token must authenticate even when the spent pairing code is resent"
+        );
+
+        // Sanity: a bad token with no code is still rejected.
+        assert!(authenticate(&auth, "dev", Some("bogus"), None).is_err());
+    }
 
     #[test]
     #[serial_test::serial]

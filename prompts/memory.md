@@ -66,6 +66,12 @@ A device record carries more than one way to reach it and where it physically li
 
 When a task depends on location, refresh the mobile origin's current `site` from fresh facts before acting. Physical-world actions are gated on co-location — see `policy.md`.
 
+**Presence inference (opt-in, probabilistic).** When a device opts in (`device_set_presence_opt_in`; off by default), its daemon periodically reports a hashed network fingerprint, and the server auto-updates that device's current `site` — bind a device's current network to a place with `site_bind_fingerprint`, and set a device's usual place with `device_set_home_site`. You can then ask `presence_show` (who is at a site and whether a person is likely present) and `device_presence` (a device's site, home site, and departure signal). Discipline when using these:
+
+- **Probabilistic, never certain.** Every answer carries a `confidence` and `reasons`. Report it as a likelihood ("probably", "leans toward"), never as fact. Reachability is not presence — a device left at home or asleep looks "present"; a phone at its home site is a stronger but still imperfect signal.
+- **Respect the opt-in.** Only reason about presence for devices that opted in; devices that did not are simply not tracked. Presence data belongs to the user.
+- **Be careful whose presence you reveal.** Treat "is someone home / did they leave" as sensitive; surface it only to the acting user about their own devices, not third parties.
+
 **Not every node is a physical device.** A node may be a platform or piece of software reached over an `http` or `mcp` connector (a SaaS, Home Assistant, a database, an MCP server). These share the same registry, memory, capabilities, and audit as devices, distinguished by `kind` (`host`/`target`/`tool` vs `service`). Physical-only attributes — `mobility`, `site`, co-location, screen/UI control (browser, computer-use) — apply only to physical device nodes; a `service` node has none of those, only endpoints, auth, and capabilities. Credentials for any node (device tokens, API keys, OAuth) live in the Agent's secret store, never in memory or a workspace.
 
 ## Capability Exploration

@@ -95,6 +95,58 @@ fn devices_at(devices_dir: &Path, site: &str) -> Vec<Value> {
     out
 }
 
+/// Add a fingerprint to a site's set (idempotent). Errors if the site is absent.
+pub(crate) fn add_fingerprint_to_site(sites_dir: &Path, site: &str, fingerprint: &str) -> Result<()> {
+    safe_id("site id", site)?;
+    let path = sites_dir.join(format!("{site}.json"));
+    let text = std::fs::read_to_string(&path).map_err(|e| {
+        CoreError::Message(format!(
+            "no such site '{site}' ({e}); register it with site_set first"
+        ))
+    })?;
+    let mut record: Value = serde_json::from_str(&text)
+        .map_err(|e| CoreError::Message(format!("corrupt site record: {e}")))?;
+    let mut fps: Vec<String> = record
+        .get("fingerprints")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    if !fps.iter().any(|f| f == fingerprint) {
+        fps.push(fingerprint.to_string());
+    }
+    record["fingerprints"] = json!(fps);
+    let pretty = serde_json::to_string_pretty(&record)
+        .map_err(|e| CoreError::Message(format!("serialize site: {e}")))?;
+    std::fs::write(&path, pretty).map_err(|e| CoreError::Message(format!("write site: {e}")))
+}
+
+/// The site whose fingerprint set contains `fingerprint`, if any.
+pub(crate) fn site_for_fingerprint(sites_dir: &Path, fingerprint: &str) -> Option<String> {
+    let entries = std::fs::read_dir(sites_dir).ok()?;
+    for entry in entries.flatten() {
+        if entry.path().extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        let has = value
+            .get("fingerprints")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().any(|x| x.as_str() == Some(fingerprint)))
+            .unwrap_or(false);
+        if has {
+            if let Some(id) = value.get("id").and_then(Value::as_str) {
+                return Some(id.to_string());
+            }
+        }
+    }
+    None
+}
+
 struct SiteSet {
     dir: PathBuf,
 }
@@ -128,10 +180,25 @@ impl Tool for SiteSet {
             .unwrap_or("");
         std::fs::create_dir_all(&self.dir)
             .map_err(|e| CoreError::Message(format!("cannot create sites dir: {e}")))?;
-        let record = json!({ "id": id, "name": name, "description": description });
+        // Preserve fingerprints (and any other fields) already bound to this site
+        // so re-running site_set to edit the name/description does not wipe them.
+        let path = self.dir.join(format!("{id}.json"));
+        let mut record = match std::fs::read_to_string(&path) {
+            Ok(text) => serde_json::from_str::<Value>(&text).unwrap_or(Value::Null),
+            Err(_) => Value::Null,
+        };
+        if !record.is_object() {
+            record = json!({ "fingerprints": [] });
+        }
+        record["id"] = json!(id);
+        record["name"] = json!(name);
+        record["description"] = json!(description);
+        if record.get("fingerprints").and_then(Value::as_array).is_none() {
+            record["fingerprints"] = json!([]);
+        }
         let pretty = serde_json::to_string_pretty(&record)
             .map_err(|e| CoreError::Message(format!("serialize site: {e}")))?;
-        std::fs::write(self.dir.join(format!("{id}.json")), pretty)
+        std::fs::write(&path, pretty)
             .map_err(|e| CoreError::Message(format!("write site: {e}")))?;
         Ok(json!({ "id": id, "saved": true }))
     }
@@ -409,6 +476,45 @@ mod tests {
             .call("site_set", json!({ "id": "../evil" }))
             .await
             .is_err());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn site_fingerprints_default_empty_add_and_lookup() {
+        let root = temp();
+        let sites_dir = root.join("sites");
+        let devices_dir = root.join("devices");
+        let mut registry = ToolRegistry::new();
+        register(&mut registry, &sites_dir, &devices_dir);
+
+        // A legacy site record without a `fingerprints` field reads as empty.
+        std::fs::create_dir_all(&sites_dir).expect("mk sites");
+        std::fs::write(
+            sites_dir.join("home.json"),
+            json!({ "id": "home", "name": "Home" }).to_string(),
+        )
+        .expect("legacy site");
+        assert_eq!(site_for_fingerprint(&sites_dir, "fp-1"), None);
+
+        // Binding a fingerprint is idempotent and looks up by fingerprint.
+        add_fingerprint_to_site(&sites_dir, "home", "fp-1").expect("bind");
+        add_fingerprint_to_site(&sites_dir, "home", "fp-1").expect("bind again");
+        assert_eq!(site_for_fingerprint(&sites_dir, "fp-1").as_deref(), Some("home"));
+        // Idempotent: the fingerprint appears exactly once in the record.
+        let raw = std::fs::read_to_string(sites_dir.join("home.json")).expect("read");
+        let rec: Value = serde_json::from_str(&raw).expect("json");
+        assert_eq!(rec["fingerprints"], json!(["fp-1"]));
+
+        // Binding to an unregistered site errors.
+        assert!(add_fingerprint_to_site(&sites_dir, "ghost", "fp-2").is_err());
+
+        // Re-running site_set to edit the name preserves the bound fingerprints.
+        registry
+            .call("site_set", json!({ "id": "home", "name": "Home Office" }))
+            .await
+            .expect("edit name");
+        assert_eq!(site_for_fingerprint(&sites_dir, "fp-1").as_deref(), Some("home"));
 
         let _ = std::fs::remove_dir_all(&root);
     }

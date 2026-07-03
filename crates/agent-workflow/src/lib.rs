@@ -149,6 +149,12 @@ async fn agent_native(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
+    // A foreground subagent that ran but failed comes back as `Ok` with
+    // `state:"failed"`. Reject the promise so the script's try/catch and
+    // `Promise.all` short-circuit see the failure instead of a bogus output.
+    if result.get("state").and_then(Value::as_str) == Some("failed") {
+        return Err(js_err(format!("subagent failed: {output}")));
+    }
     Ok(JsValue::from(js_string!(output)))
 }
 
@@ -459,8 +465,55 @@ mod tests {
         }
     }
 
+    /// Provider that always fails, so its subagent run ends in `Failed`.
+    struct FailProvider;
+    #[async_trait::async_trait]
+    impl ModelProvider for FailProvider {
+        async fn complete(&self, _m: &[Message], _t: &[ToolSpec]) -> Result<ModelResponse> {
+            Err(agent_core::CoreError::Provider("model exploded".into()))
+        }
+    }
+
+    struct FailHost;
+    #[async_trait::async_trait]
+    impl SubagentHost for FailHost {
+        fn resolve_provider(&self, _tier: &str) -> Arc<dyn ModelProvider> {
+            Arc::new(FailProvider)
+        }
+        async fn capture_context(&self) -> String {
+            String::new()
+        }
+        async fn child_registry(&self, _ws: Option<&str>) -> ToolRegistry {
+            ToolRegistry::new()
+        }
+        async fn initial_messages(&self, _m: SubagentMode, _c: &str, prompt: &str) -> Vec<Message> {
+            vec![Message::user(prompt)]
+        }
+        async fn prepare_workspace(&self, _i: &str, _id: &str) -> Result<Option<String>> {
+            Ok(None)
+        }
+        async fn cleanup_workspace(&self, _ws: Option<&str>) -> bool {
+            true
+        }
+        async fn record_events(&self, _t: &str, _e: &[agent_core::Event]) {}
+        async fn on_complete(&self, _t: String, _c: String, _s: SubagentState, _o: String) {}
+    }
+
     fn manager(host: Arc<dyn SubagentHost>) -> Arc<SubagentManager> {
         SubagentManager::new(host, Policy::FullAccess, 8)
+    }
+
+    #[tokio::test]
+    async fn failed_agent_rejects_the_promise() {
+        let mgr = manager(Arc::new(FailHost));
+        // A failing subagent must reject `agent()` so the script can catch it,
+        // rather than resolving with a bogus output.
+        let script = r#"
+            try { await agent({ prompt: "x" }); return "no-throw"; }
+            catch (e) { return "caught"; }
+        "#;
+        let out = run_script(mgr, script).await.unwrap();
+        assert_eq!(out["result"], "caught");
     }
 
     #[tokio::test]

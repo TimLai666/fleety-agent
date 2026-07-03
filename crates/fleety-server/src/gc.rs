@@ -50,11 +50,13 @@ fn disabled() -> bool {
     std::env::var("FLEETY_GC_DISABLED").is_ok()
 }
 
-/// Number of backups deleted + number of history files rotated, per sweep.
+/// Number of backups deleted + history files rotated + whether the presence
+/// timeline was rotated, per sweep.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct GcReport {
     pub backups_deleted: u64,
     pub histories_rotated: u64,
+    pub presence_rotated: u64,
 }
 
 /// Spawn the retention loop. No-op when `FLEETY_GC_DISABLED` is set.
@@ -78,10 +80,11 @@ pub fn spawn(storage: Arc<Storage>) {
         loop {
             ticker.tick().await;
             match run_sweep(&storage, backup_retention, rotate_bytes) {
-                Ok(r) if r.backups_deleted > 0 || r.histories_rotated > 0 => {
+                Ok(r) if r.backups_deleted > 0 || r.histories_rotated > 0 || r.presence_rotated > 0 => {
                     tracing::info!(
                         backups_deleted = r.backups_deleted,
                         histories_rotated = r.histories_rotated,
+                        presence_rotated = r.presence_rotated,
                         "retention sweep finished"
                     );
                 }
@@ -101,7 +104,33 @@ pub fn run_sweep(
     Ok(GcReport {
         backups_deleted: gc_backups(&storage.backups_dir(), backup_retention)?,
         histories_rotated: rotate_histories(&storage.devices_dir(), rotate_bytes)?,
+        presence_rotated: rotate_big_file(&storage.presence_timeline_path(), rotate_bytes),
     })
+}
+
+/// Rotate a single append-only file when it exceeds `rotate_bytes`, renaming it
+/// to `<name>.<unix_ts>` so a fresh file starts on the next append. Returns 1 if
+/// rotated, 0 otherwise. Used for the presence timeline.
+fn rotate_big_file(path: &Path, rotate_bytes: u64) -> u64 {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return 0;
+    };
+    if !meta.is_file() || meta.len() <= rotate_bytes {
+        return 0;
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return 0;
+    };
+    let archive = path.with_file_name(format!("{name}.{now}"));
+    if std::fs::rename(path, &archive).is_ok() {
+        1
+    } else {
+        0
+    }
 }
 
 /// Walk `backups_dir/<uuid>` entries; delete those whose mtime is older than
@@ -202,6 +231,34 @@ mod tests {
         assert!(!old.exists());
         assert!(fresh.exists());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn presence_timeline_rotates_only_when_oversize() {
+        let dir = temp_home();
+        fs::create_dir_all(&dir).expect("mk");
+        let timeline = dir.join("timeline.jsonl");
+
+        // Under the cap → not rotated.
+        fs::write(&timeline, b"one event\n").expect("write small");
+        assert_eq!(rotate_big_file(&timeline, 1024), 0);
+        assert!(timeline.exists());
+
+        // Over the cap → rotated to an archive, live file gone.
+        let mut f = fs::File::create(&timeline).expect("touch");
+        f.write_all(&vec![b'x'; 2048]).expect("fill");
+        drop(f);
+        assert_eq!(rotate_big_file(&timeline, 1024), 1);
+        assert!(!timeline.exists());
+        let archived = fs::read_dir(&dir)
+            .expect("read")
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().starts_with("timeline.jsonl."));
+        assert!(archived, "an archive file should remain");
+
+        // Missing file → nothing to do.
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(rotate_big_file(&timeline, 1024), 0);
     }
 
     #[test]

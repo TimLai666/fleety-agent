@@ -36,6 +36,7 @@ pub mod config;
 pub mod deps;
 pub mod device;
 mod insyra;
+pub mod oauth;
 pub mod providers_config;
 pub mod restart;
 pub mod service;
@@ -244,7 +245,29 @@ fn resolve_lenient(root: &Path, rel: &str) -> Result<PathBuf> {
     let canon_root = root
         .canonicalize()
         .map_err(|e| CoreError::Message(format!("root unavailable: {e}")))?;
-    Ok(canon_root.join(rel))
+    let candidate = canon_root.join(rel);
+    // The target may not exist yet, but any existing path segment might be a
+    // symlink pointing outside the workspace. Canonicalize the deepest existing
+    // ancestor and confirm it stays within the root — otherwise a symlink like
+    // `ws/link -> /outside` would let `link/x` escape confinement.
+    let mut existing = candidate.as_path();
+    loop {
+        match existing.canonicalize() {
+            Ok(canon) => {
+                if !canon.starts_with(&canon_root) {
+                    return Err(CoreError::Message(format!(
+                        "path '{rel}' escapes the workspace via a symlink"
+                    )));
+                }
+                break;
+            }
+            Err(_) => match existing.parent() {
+                Some(parent) => existing = parent,
+                None => break,
+            },
+        }
+    }
+    Ok(candidate)
 }
 
 /// Find the first file under `dir` (recursively); used to locate a backup's content.
@@ -453,7 +476,9 @@ pub fn line_of_offset(content: &str, pos: usize) -> usize {
 
 /// Critical-command guard: refuses clearly irreversible commands. Conservative
 /// (ordinary `rm -rf ./build` is allowed); whitespace is normalized first.
-fn critical_reason(command: &str) -> Option<&'static str> {
+/// Public so remote executors (e.g. `ssh_exec`) apply the same guard as the local
+/// `run_command`.
+pub fn critical_reason(command: &str) -> Option<&'static str> {
     let norm = command
         .to_lowercase()
         .split_whitespace()
@@ -525,7 +550,7 @@ fn catastrophic_delete(norm: &str) -> Option<&'static str> {
 fn ripgrep_search(base: &Path, root: &Path, pattern: &str, max: usize) -> Result<Vec<Value>> {
     use grep::regex::RegexMatcher;
     use grep::searcher::sinks::UTF8;
-    use grep::searcher::Searcher;
+    use grep::searcher::{BinaryDetection, SearcherBuilder};
     use ignore::WalkBuilder;
 
     let matcher = RegexMatcher::new(pattern)
@@ -560,7 +585,11 @@ fn ripgrep_search(base: &Path, root: &Path, pattern: &str, max: usize) -> Result
             .unwrap_or(path)
             .display()
             .to_string();
-        let mut searcher = Searcher::new();
+        // Skip binary files (ripgrep behavior): stop searching a file on the
+        // first NUL byte rather than emitting matches from binary content.
+        let mut searcher = SearcherBuilder::new()
+            .binary_detection(BinaryDetection::quit(b'\x00'))
+            .build();
         let _ = searcher.search_path(
             &matcher,
             path,
@@ -1208,6 +1237,9 @@ impl Tool for MakeDir {
     async fn call(&self, args: Value) -> Result<Value> {
         let path = require_str(&args, "path")?;
         let resolved = resolve_lenient(&self.root, path)?;
+        // Refuse creating directories under sensitive paths (SSH dirs, /etc, /dev,
+        // Windows system dirs), the same guard the other mutating tools apply.
+        guard_sensitive(&resolved)?;
         std::fs::create_dir_all(&resolved)
             .map_err(|e| CoreError::Message(format!("cannot create dir '{path}': {e}")))?;
         Ok(json!({ "path": path, "created": true }))
@@ -1301,6 +1333,74 @@ mod tests {
     }
 
     use serial_test::serial;
+
+    #[tokio::test]
+    async fn make_dir_refuses_sensitive_paths() {
+        let root = temp();
+        let backups = root.join(".bak");
+        let mut reg = ToolRegistry::new();
+        register_workspace(&mut reg, &root, &backups);
+        // A directory under a sensitive path (SSH) is refused, like the other
+        // mutating tools — regardless of scope.
+        assert!(reg
+            .call("make_dir", json!({ "path": "x/.ssh/keys" }))
+            .await
+            .is_err());
+        // An ordinary directory is created.
+        reg.call("make_dir", json!({ "path": "x/normal" }))
+            .await
+            .expect("ordinary mkdir");
+        assert!(root.join("x/normal").is_dir());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn search_files_skips_binary_content() {
+        let root = temp();
+        let backups = root.join(".bak");
+        std::fs::write(root.join("text.txt"), "NEEDLE here\n").expect("w text");
+        // A binary blob containing the same needle around NUL bytes.
+        std::fs::write(root.join("blob.bin"), b"\x00NEEDLE\x00tail\x00").expect("w blob");
+        let mut reg = ToolRegistry::new();
+        register_workspace(&mut reg, &root, &backups);
+        let res = reg
+            .call("search_files", json!({ "query": "NEEDLE" }))
+            .await
+            .expect("search");
+        let files: Vec<String> = res["matches"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|m| m["file"].as_str().map(|s| s.replace('\\', "/")))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(files.iter().any(|f| f.ends_with("text.txt")), "text match expected");
+        assert!(
+            !files.iter().any(|f| f.ends_with("blob.bin")),
+            "binary file must be skipped, got {files:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn resolve_lenient_blocks_symlink_escape_when_confined() {
+        let root = temp();
+        let outside = temp();
+        std::os::unix::fs::symlink(&outside, root.join("link")).expect("symlink");
+        std::env::set_var("FLEETY_FS_SCOPE", "workspace");
+        // `link` points outside the workspace; a create under it must be refused.
+        let escaped = resolve_lenient(&root, "link/x");
+        // A genuinely-in-workspace path still resolves.
+        let ok = resolve_lenient(&root, "inside/x");
+        std::env::remove_var("FLEETY_FS_SCOPE");
+        assert!(escaped.is_err(), "symlink escape must be blocked when confined");
+        assert!(ok.is_ok(), "an in-workspace path should resolve");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
 
     #[tokio::test]
     async fn read_search_edit_with_diff_and_escape_guard() {

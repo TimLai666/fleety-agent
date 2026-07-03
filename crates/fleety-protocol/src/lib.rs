@@ -181,6 +181,21 @@ pub enum ClientMsg {
         target: ConfigTarget,
         args: Vec<String>,
     },
+    /// A periodic co-location report from a device that has presence tracking
+    /// enabled, used to infer which site the device is currently at. `fingerprint`
+    /// is a hash of the current LAN's stable attributes (default-gateway MAC +
+    /// subnet); `subnet` is the CIDR; `peers` are mDNS-discovered Fleety device
+    /// ids on the same segment. Additive and optional — an absent `fingerprint`
+    /// means it could not be determined. There is no reply frame; the server
+    /// updates the device's site and presence timeline silently.
+    Colocation {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fingerprint: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subnet: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        peers: Vec<String>,
+    },
 }
 
 /// Frames sent server -> client over the WebSocket.
@@ -472,6 +487,39 @@ mod tests {
         };
         let json = serde_json::to_string(&err).expect("ser");
         assert_eq!(err, serde_json::from_str(&json).expect("de"));
+    }
+
+    #[test]
+    fn colocation_frame_roundtrip() {
+        // Full report with all fields.
+        let full = ClientMsg::Colocation {
+            fingerprint: Some("sha256:abcd".into()),
+            subnet: Some("192.168.1.0/24".into()),
+            peers: vec!["pi".into(), "desk".into()],
+        };
+        let json = serde_json::to_string(&full).expect("ser");
+        assert_eq!(full, serde_json::from_str(&json).expect("de"));
+
+        // Absent fingerprint (could not be determined) still round-trips, and a
+        // minimal wire form (only the tag) deserializes to all-empty fields.
+        let bare: ClientMsg =
+            serde_json::from_str(r#"{"type":"colocation"}"#).expect("de bare");
+        assert_eq!(
+            bare,
+            ClientMsg::Colocation {
+                fingerprint: None,
+                subnet: None,
+                peers: vec![],
+            }
+        );
+
+        // Adding this additive variant does not disturb existing frames.
+        let resume = ClientMsg::Resume {
+            conversation_id: "c1".into(),
+            after_seq: 7,
+        };
+        let json = serde_json::to_string(&resume).expect("ser");
+        assert_eq!(resume, serde_json::from_str(&json).expect("de"));
     }
 
     #[test]

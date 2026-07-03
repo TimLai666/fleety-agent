@@ -266,6 +266,51 @@ pub fn registry() -> &'static [Setting] {
             description: "Seconds between scheduled backups.",
             secret: false,
         },
+        Setting {
+            key: "FLEETY_PRESENCE",
+            scope: Daemon,
+            default: "off",
+            description: "Presence tracking: report this device's co-location (on/off).",
+            secret: false,
+        },
+        Setting {
+            key: "FLEETY_PRESENCE_INTERVAL_SECS",
+            scope: Daemon,
+            default: "300",
+            description: "Seconds between co-location reports (floored at 60).",
+            secret: false,
+        },
+        Setting {
+            key: "FLEETY_CODEX_CLIENT_ID",
+            scope: Shared,
+            // The Codex CLI public client id (same value the upstream Codex CLI and
+            // other clients use). Overridable, but this default lets login work
+            // out of the box.
+            default: "app_EMoamEEZ73f0CkXaXp7hrann",
+            description: "Codex ChatGPT OAuth public client id.",
+            secret: false,
+        },
+        Setting {
+            key: "FLEETY_CODEX_AUTHORIZE_URL",
+            scope: Shared,
+            default: "https://auth.openai.com/oauth/authorize",
+            description: "Codex OAuth authorization endpoint.",
+            secret: false,
+        },
+        Setting {
+            key: "FLEETY_CODEX_TOKEN_URL",
+            scope: Shared,
+            default: "https://auth.openai.com/oauth/token",
+            description: "Codex OAuth token endpoint.",
+            secret: false,
+        },
+        Setting {
+            key: "FLEETY_CODEX_BACKEND_URL",
+            scope: Shared,
+            default: "https://chatgpt.com/backend-api/codex",
+            description: "Codex OAuth backend base URL for model calls.",
+            secret: false,
+        },
     ]
 }
 
@@ -681,6 +726,7 @@ pub fn parse_providers(args: &[String]) -> Result<ProviderCmd> {
             let key = kv.remove("key");
             let modalities = kv.remove("modalities");
             let effort = kv.remove("effort");
+            let auth = kv.remove("auth");
             no_unknown_flags(&kv)?;
             Ok(ProviderCmd::ProviderAdd(ProviderSpec {
                 name,
@@ -690,6 +736,7 @@ pub fn parse_providers(args: &[String]) -> Result<ProviderCmd> {
                 stream: bare.contains("stream"),
                 modalities,
                 effort,
+                auth,
             }))
         }
         (Some("provider"), Some("set")) => {
@@ -1016,6 +1063,32 @@ mod tests {
         let r = rows(&ConfigMap::new());
         assert_eq!(r.len(), registry().len());
         assert!(r.iter().all(|(_, _, _, source)| source == "default"));
+    }
+
+    #[test]
+    fn codex_oauth_settings_registered_with_defaults() {
+        let cid = find("FLEETY_CODEX_CLIENT_ID").expect("client id registered");
+        assert!(cid.default.starts_with("app_")); // the Codex public client id
+        assert!(!cid.secret); // not a secret (it's a public client id)
+        let auth_url = find("FLEETY_CODEX_AUTHORIZE_URL").expect("authorize url");
+        assert!(auth_url.default.starts_with("https://"));
+        assert!(find("FLEETY_CODEX_TOKEN_URL").is_some());
+        assert!(find("FLEETY_CODEX_BACKEND_URL").is_some());
+    }
+
+    #[test]
+    fn presence_settings_registered_with_defaults() {
+        let presence = find("FLEETY_PRESENCE").expect("FLEETY_PRESENCE registered");
+        assert_eq!(presence.scope, Scope::Daemon);
+        assert_eq!(presence.default, "off");
+        let interval = find("FLEETY_PRESENCE_INTERVAL_SECS").expect("interval registered");
+        assert_eq!(interval.default, "300");
+
+        // Unset → resolves to the default (source = default).
+        std::env::remove_var("FLEETY_PRESENCE");
+        let resolved = resolve("FLEETY_PRESENCE", &ConfigMap::new()).expect("resolve");
+        assert_eq!(resolved.value, "off");
+        assert_eq!(resolved.source, Source::Default);
     }
 
     #[test]

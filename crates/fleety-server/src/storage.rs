@@ -161,6 +161,11 @@ impl Storage {
         }
     }
 
+    /// The Agent home root this store is anchored at.
+    pub fn home(&self) -> PathBuf {
+        self.home.clone()
+    }
+
     fn conversation_path(&self, device_id: &str, conversation_id: &str) -> PathBuf {
         // User-primary when the conversation has a registered owner; otherwise
         // the legacy device path (unattributed / pre-identity conversations).
@@ -731,6 +736,42 @@ impl Storage {
         self.home.join("fleet").join("schedules")
     }
 
+    /// Append-only presence timeline (site-change events across devices).
+    pub fn presence_timeline_path(&self) -> PathBuf {
+        self.home
+            .join("fleet")
+            .join("presence")
+            .join("timeline.jsonl")
+    }
+
+    /// Append one presence-timeline event. Best-effort: a write failure is logged
+    /// and swallowed (presence is non-critical and must never break a turn).
+    pub fn append_presence_timeline(&self, event: &Value) {
+        let path = self.presence_timeline_path();
+        if let Some(parent) = path.parent() {
+            if let Err(e) = fs::create_dir_all(parent) {
+                tracing::warn!(error = %e, "cannot create presence dir; skipping timeline event");
+                return;
+            }
+        }
+        let line = format!("{event}\n");
+        match fs::OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(mut f) => {
+                use std::io::Write;
+                if let Err(e) = f.write_all(line.as_bytes()) {
+                    tracing::warn!(error = %e, "cannot append presence timeline event");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "cannot open presence timeline"),
+        }
+    }
+
+    /// Set a device's current `site` and stamp `site_since_secs`.
+    pub fn set_device_site(&self, device_id: &str, site: &str, since_secs: u64) -> Result<()> {
+        self.set_device_field(device_id, "site", Value::String(site.to_string()))?;
+        self.set_device_field(device_id, "site_since_secs", serde_json::json!(since_secs))
+    }
+
     /// Built-in skills (shipped with the runtime); read-only, replaced on update.
     pub fn skills_builtin_dir(&self) -> PathBuf {
         self.home.join("skills").join("builtin")
@@ -822,6 +863,8 @@ impl Storage {
                 "owner": Value::Null,
                 "users": [],
                 "shared": false,
+                "home_site": "",
+                "presence_opt_in": false,
             });
         }
         let now = SystemTime::now()
@@ -1093,6 +1136,113 @@ impl Storage {
             .map_err(|e| CoreError::Message(format!("write device record: {e}")))?;
         Ok(())
     }
+
+    /// Read a device record as JSON, or `Null` when it is missing/corrupt.
+    fn read_device_record(&self, device_id: &str) -> Value {
+        let path = self.devices_dir().join(device_id).join("device.json");
+        match fs::read_to_string(&path) {
+            Ok(text) => serde_json::from_str(&text).unwrap_or(Value::Null),
+            Err(_) => Value::Null,
+        }
+    }
+
+    /// Set one field on a device record, preserving the rest and creating the
+    /// record (with its id) when absent. Shared by the presence setters below.
+    fn set_device_field(&self, device_id: &str, key: &str, value: Value) -> Result<()> {
+        validate_id("device_id", device_id)?;
+        let dir = self.devices_dir().join(device_id);
+        let path = dir.join("device.json");
+        let mut record = self.read_device_record(device_id);
+        if !record.is_object() {
+            record = serde_json::json!({ "id": device_id });
+        }
+        record[key] = value;
+        fs::create_dir_all(&dir)
+            .map_err(|e| CoreError::Message(format!("cannot create device dir: {e}")))?;
+        let pretty = serde_json::to_string_pretty(&record)
+            .map_err(|e| CoreError::Message(format!("serialize device record: {e}")))?;
+        fs::write(&path, pretty)
+            .map_err(|e| CoreError::Message(format!("write device record: {e}")))
+    }
+
+    /// A device's usual location (`home_site`), empty when never set.
+    pub fn device_home_site(&self, device_id: &str) -> String {
+        self.read_device_record(device_id)
+            .get("home_site")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    }
+
+    /// Set a device's `home_site` baseline (distinct from its current `site`).
+    pub fn set_device_home_site(&self, device_id: &str, home_site: &str) -> Result<()> {
+        self.set_device_field(device_id, "home_site", Value::String(home_site.to_string()))
+    }
+
+    /// Whether presence tracking is opted in for this device (default `false`).
+    pub fn device_presence_opt_in(&self, device_id: &str) -> bool {
+        self.read_device_record(device_id)
+            .get("presence_opt_in")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    /// Set a device's server-side presence opt-in flag.
+    pub fn set_device_presence_opt_in(&self, device_id: &str, enabled: bool) -> Result<()> {
+        self.set_device_field(device_id, "presence_opt_in", Value::Bool(enabled))
+    }
+
+    /// The last co-location fingerprint a device reported, if any. Used by
+    /// `site_bind_fingerprint` to bind the device's current network to a site.
+    pub fn device_last_fingerprint(&self, device_id: &str) -> Option<String> {
+        self.read_device_record(device_id)
+            .get("last_fingerprint")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    }
+
+    /// Record the last co-location fingerprint a device reported.
+    pub fn set_device_last_fingerprint(&self, device_id: &str, fingerprint: &str) -> Result<()> {
+        self.set_device_field(
+            device_id,
+            "last_fingerprint",
+            Value::String(fingerprint.to_string()),
+        )
+    }
+
+    /// The subnet a device last reported (from its co-location report), if any.
+    pub fn device_last_subnet(&self, device_id: &str) -> Option<String> {
+        self.read_device_record(device_id)
+            .get("last_subnet")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    }
+
+    /// Record the subnet a device reported alongside its fingerprint.
+    pub fn set_device_last_subnet(&self, device_id: &str, subnet: &str) -> Result<()> {
+        self.set_device_field(device_id, "last_subnet", Value::String(subnet.to_string()))
+    }
+
+    /// A device's current `site`, defaulting to `unknown` when unset.
+    pub fn device_site(&self, device_id: &str) -> String {
+        self.read_device_record(device_id)
+            .get("site")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string()
+    }
+
+    /// A device's mobility (`stationary` | `mobile` | `unknown`), if recorded.
+    pub fn read_device_mobility(&self, device_id: &str) -> Option<String> {
+        self.read_device_record(device_id)
+            .get("mobility")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    }
+
 
     /// A compact summary of one audit log line — what the CLI shows in
     /// `fleety audit list` so the user can browse without parsing the full
@@ -1475,6 +1625,39 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fleety-storage-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("mk temp");
         dir
+    }
+
+    #[test]
+    fn presence_device_fields_default_and_round_trip() {
+        let home = temp_home();
+        let storage = Storage::new(home.clone());
+
+        // A legacy device.json without the new fields reads as defaults.
+        let dir = storage.devices_dir().join("pi");
+        std::fs::create_dir_all(&dir).expect("mk device dir");
+        std::fs::write(
+            dir.join("device.json"),
+            serde_json::json!({ "id": "pi", "site": "away" }).to_string(),
+        )
+        .expect("write legacy record");
+        assert_eq!(storage.device_home_site("pi"), "");
+        assert!(!storage.device_presence_opt_in("pi"));
+        assert_eq!(storage.device_site("pi"), "away");
+        // A device with no record at all also reads defaults, not a panic.
+        assert_eq!(storage.device_home_site("ghost"), "");
+        assert!(!storage.device_presence_opt_in("ghost"));
+        assert_eq!(storage.device_site("ghost"), "unknown");
+
+        // Setting the fields round-trips and preserves the existing `site`.
+        storage.set_device_home_site("pi", "home").expect("set home");
+        storage
+            .set_device_presence_opt_in("pi", true)
+            .expect("set opt-in");
+        assert_eq!(storage.device_home_site("pi"), "home");
+        assert!(storage.device_presence_opt_in("pi"));
+        assert_eq!(storage.device_site("pi"), "away");
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

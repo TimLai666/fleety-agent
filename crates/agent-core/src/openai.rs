@@ -15,11 +15,34 @@ use crate::model::{
 };
 use crate::{CoreError, Result};
 
+/// Supplies the bearer token for a provider request. The default is a static
+/// key (`StaticBearer`); an OAuth implementation (in `fleety-tools`) reads a
+/// token store and refreshes on expiry. Called before each request so a rotated
+/// token is always current. `None` means "send no Authorization header".
+#[async_trait::async_trait]
+pub trait BearerSource: Send + Sync {
+    async fn bearer(&self) -> Result<Option<String>>;
+}
+
+/// The default bearer source: a fixed key (or none). Preserves the pre-OAuth
+/// behavior exactly.
+pub struct StaticBearer(pub Option<String>);
+
+#[async_trait::async_trait]
+impl BearerSource for StaticBearer {
+    async fn bearer(&self) -> Result<Option<String>> {
+        Ok(self.0.clone())
+    }
+}
+
 /// A provider backed by any OpenAI-compatible `/chat/completions` endpoint.
 pub struct OpenAiCompat {
     base_url: String,
     model: String,
     api_key: Option<String>,
+    /// When set, supplies the bearer per request (e.g. OAuth with refresh),
+    /// taking precedence over `api_key`. Default is the static-key path.
+    bearer: Option<Arc<dyn BearerSource>>,
     client: reqwest::Client,
     stream: bool,
     retry: crate::retry::RetryConfig,
@@ -39,12 +62,29 @@ impl OpenAiCompat {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             model: model.into(),
             api_key,
+            bearer: None,
             client: reqwest::Client::new(),
             stream: false,
             retry: crate::retry::RetryConfig::from_env(),
             caps: ModelCapabilities::ALL,
             effort: None,
             effort_scheme: EffortScheme::None,
+        }
+    }
+
+    /// Use a dynamic bearer source (e.g. OAuth) instead of a static key. The
+    /// source is consulted before every request, so a refreshed token is current.
+    pub fn with_bearer_source(mut self, source: Arc<dyn BearerSource>) -> Self {
+        self.bearer = Some(source);
+        self
+    }
+
+    /// Resolve the Authorization bearer for a request: the dynamic source when
+    /// set (may refresh), otherwise the static key. `None` = send no auth header.
+    async fn auth_token(&self) -> Result<Option<String>> {
+        match &self.bearer {
+            Some(source) => source.bearer().await,
+            None => Ok(self.api_key.clone()),
         }
     }
 
@@ -67,6 +107,7 @@ impl OpenAiCompat {
             base_url: self.base_url.clone(),
             model: self.model.clone(),
             api_key: self.api_key.clone(),
+            bearer: self.bearer.clone(),
             client: self.client.clone(),
             stream: self.stream,
             retry: self.retry,
@@ -92,8 +133,8 @@ impl OpenAiCompat {
     pub async fn list_models(&self) -> Result<Vec<String>> {
         let url = format!("{}/models", self.base_url);
         let mut request = self.client.get(&url);
-        if let Some(key) = &self.api_key {
-            request = request.bearer_auth(key);
+        if let Some(token) = self.auth_token().await? {
+            request = request.bearer_auth(token);
         }
         let response = request
             .send()
@@ -132,12 +173,15 @@ fn parse_models(body: &str) -> Result<Vec<String>> {
 impl ModelProvider for OpenAiCompat {
     async fn complete(&self, messages: &[Message], tools: &[ToolSpec]) -> Result<ModelResponse> {
         let body = self.request_body(messages, tools);
+        // Resolve the bearer once (an OAuth source may refresh here) and reuse it
+        // across retries.
+        let token = self.auth_token().await?;
         // Retry transient failures (429/5xx/connection/timeout) with backoff;
         // 4xx fail fast. The whole request is re-sent on each attempt.
         let text = crate::retry::run_with_retry(&self.retry, || {
             let mut request = self.client.post(self.endpoint()).json(&body);
-            if let Some(key) = &self.api_key {
-                request = request.bearer_auth(key);
+            if let Some(token) = &token {
+                request = request.bearer_auth(token);
             }
             async move {
                 use crate::retry::{classify, AttemptOutcome, Retryable};
@@ -204,13 +248,14 @@ impl ModelProvider for OpenAiCompat {
             return self.complete(messages, tools).await;
         }
         let body = self.request_body(messages, tools);
+        let token = self.auth_token().await?;
         // Retry only the connection + initial HTTP status (before any delta is
         // emitted). Once the stream is producing output we never retry — that
         // would duplicate already-emitted tokens.
         let response = crate::retry::run_with_retry(&self.retry, || {
             let mut request = self.client.post(self.endpoint()).json(&body);
-            if let Some(key) = &self.api_key {
-                request = request.bearer_auth(key);
+            if let Some(token) = &token {
+                request = request.bearer_auth(token);
             }
             async move {
                 use crate::retry::{classify, AttemptOutcome, Retryable};
@@ -890,6 +935,52 @@ mod tests {
         let parsed: ChatResponse = serde_json::from_str(r#"{"choices":[]}"#).expect("shape");
         let err = parse_response(parsed).expect_err("empty choices should error");
         assert!(err.report().message.contains("no choices"));
+    }
+
+    struct StubBearer {
+        token: String,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl BearerSource for StubBearer {
+        async fn bearer(&self) -> Result<Option<String>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some(self.token.clone()))
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_bearer_source_supplies_token_and_static_default_unchanged() {
+        // OAuth mode: the source is consulted and its token is sent as the bearer.
+        let (base, rx) = serve_once(
+            "200 OK",
+            "application/json",
+            r#"{"data":[{"id":"m"}]}"#.to_string(),
+        );
+        let stub = std::sync::Arc::new(StubBearer {
+            token: "oauth-token".into(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let provider = OpenAiCompat::new(base, "unused", Some("static-key".into()))
+            .with_bearer_source(stub.clone());
+        provider.list_models().await.expect("models");
+        let request = rx.recv_timeout(Duration::from_secs(5)).expect("request");
+        // The dynamic source takes precedence over the static key.
+        assert!(request.contains("Bearer oauth-token"));
+        assert!(!request.contains("static-key"));
+        assert_eq!(stub.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Default (no source): the static key path is used, exactly as before.
+        let (base, rx) = serve_once(
+            "200 OK",
+            "application/json",
+            r#"{"data":[{"id":"m"}]}"#.to_string(),
+        );
+        let provider = OpenAiCompat::new(base, "unused", Some("static-key".into()));
+        provider.list_models().await.expect("models");
+        let request = rx.recv_timeout(Duration::from_secs(5)).expect("request");
+        assert!(request.contains("Bearer static-key"));
     }
 
     #[tokio::test]

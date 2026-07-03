@@ -250,6 +250,16 @@ onboard a new device.
 | `site_show` | A site plus the devices located there. | `site` | read |
 | `site_set` | Create/update a site. | `id`, `name?`, `description?` | mutate |
 | `site_delete` | Delete a site (device records unchanged). | `id` | mutate |
+| `device_set_presence_opt_in` | Enable/disable presence tracking for a device (server-side, off by default). | `device`, `enabled` | mutate |
+| `device_set_home_site` | Set a device's usual place (baseline for presence/departure). Must be a registered site. | `device`, `home_site` | mutate |
+| `site_bind_fingerprint` | Bind a device's currently reported network fingerprint to a site, so future reports place it there. | `device`, `site` | mutate |
+| `presence_show` | Devices at a site + a probabilistic "is a person present" signal with confidence, reasons, and a caveat. | `site` | read |
+| `device_presence` | A device's current site, home site, and a probabilistic departure signal. | `device` | read |
+
+> Presence tools are opt-in and probabilistic. Nothing is recorded for a device
+> until it opts in (`device_set_presence_opt_in`) **and** its daemon runs with
+> `FLEETY_PRESENCE=on`. Every presence answer carries a confidence — reachability
+> is not presence.
 
 > Device-scoped handles: anything `device_exec` hands back (a session, a PID,
 > a handle) is bound to its device. The runtime rejects using a handle against

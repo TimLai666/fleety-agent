@@ -59,6 +59,7 @@ impl ProviderEditor {
             stream: false,
             modalities: None,
             effort: None,
+            auth: None,
         });
         Ok(())
     }
