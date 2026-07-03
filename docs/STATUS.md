@@ -183,6 +183,7 @@ is on `main`; see commit history for the exact change.
 - [`docs/env.md`](env.md) — every `FLEETY_*` variable.
 - [`docs/eval.md`](eval.md) — golden harness format + how to add goldens.
 - [`docs/roadmap.md`](roadmap.md) — open gaps + implementation plans.
+- [`docs/acp.md`](acp.md) — using Fleety from an editor (ACP): setup, `fleety acp install`, updates, troubleshooting.
 
 ## Remaining gaps
 

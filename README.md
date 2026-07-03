@@ -132,6 +132,13 @@ polling, and on-device tool routing.
 
 ## Connecting & configuring
 
+### Use Fleety from an editor (ACP)
+
+An ACP-capable editor (Zed, …) can drive Fleety from its agent panel: it launches
+`fleety acp` as a subprocess, which bridges to your server. Auto-configure Zed
+with `fleety acp install zed`. Full guide (setup, other editors, remote server,
+updates, troubleshooting): [`docs/acp.md`](docs/acp.md).
+
 ### Point the CLI at a server
 
 `fleety` resolves the server URL in this order:
