@@ -206,6 +206,41 @@ pub fn merge_zed_settings(
     Ok((pretty, updated))
 }
 
+/// Re-point any *already-installed* ACP agent configs at the current binary, for
+/// `fleety update` to call. This self-heals a changed binary path or an evolved
+/// `acp` invocation. It NEVER newly installs — only editors already set up for
+/// Fleety are touched; missing or unparseable (JSONC) configs are left alone.
+pub fn refresh_installed(server: Option<&str>) {
+    let Some(path) = zed_settings_path() else {
+        return;
+    };
+    let Ok(existing) = std::fs::read_to_string(&path) else {
+        return; // not configured here
+    };
+    if let Some(merged) = refresh_zed_settings(&existing, &current_exe_str(), server) {
+        if std::fs::write(&path, merged).is_ok() {
+            println!("Refreshed the Fleety ACP agent in Zed ({}).", path.display());
+        }
+    }
+}
+
+/// Pure refresh decision for Zed: return the updated JSON only when a Fleety entry
+/// is already present AND re-pointing it at `command` changes something. Returns
+/// `None` when Fleety isn't installed, the file is unparseable (JSONC), or nothing
+/// would change — so a refresh never newly-installs or rewrites needlessly.
+pub fn refresh_zed_settings(existing: &str, command: &str, server: Option<&str>) -> Option<String> {
+    let has_fleety = serde_json::from_str::<Value>(existing)
+        .ok()?
+        .get("agent_servers")
+        .and_then(|s| s.get("Fleety"))
+        .is_some();
+    if !has_fleety {
+        return None;
+    }
+    let (merged, _) = merge_zed_settings(existing, command, server).ok()?;
+    (merged != existing).then_some(merged)
+}
+
 /// This binary's path, for launching it as an ACP agent.
 fn current_exe_str() -> String {
     std::env::current_exe()
@@ -1170,6 +1205,24 @@ mod tests {
 
         // JSONC with comments is refused (never clobbered).
         assert!(merge_zed_settings("// my settings\n{\"theme\":\"dark\"}", "/bin/fleety", None).is_err());
+    }
+
+    #[test]
+    fn refresh_only_repoints_when_already_installed() {
+        // Not installed → no refresh (never newly installs).
+        assert_eq!(refresh_zed_settings(r#"{"theme":"dark"}"#, "/bin/fleety", None), None);
+        assert_eq!(refresh_zed_settings("", "/bin/fleety", None), None);
+        // Unparseable (JSONC) → no refresh (never clobbers).
+        assert_eq!(refresh_zed_settings("// c\n{}", "/bin/fleety", None), None);
+
+        // Installed at an old path → refresh re-points it at the current binary.
+        let old = r#"{"agent_servers":{"Fleety":{"type":"custom","command":"/old/fleety","args":["acp"],"env":{}}}}"#;
+        let refreshed = refresh_zed_settings(old, "/new/fleety", None).expect("should refresh");
+        let v: Value = serde_json::from_str(&refreshed).unwrap();
+        assert_eq!(v["agent_servers"]["Fleety"]["command"], "/new/fleety");
+
+        // Already pointing at the current binary → nothing changes → no rewrite.
+        assert_eq!(refresh_zed_settings(&refreshed, "/new/fleety", None), None);
     }
 
     #[test]

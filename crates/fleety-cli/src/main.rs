@@ -311,6 +311,10 @@ async fn update_all() -> Result<()> {
     if let Some(exe) = sibling_bin("fleetyd") {
         let _ = std::process::Command::new(&exe).arg("update").status();
     }
+
+    // Self-heal any already-installed ACP agent configs (e.g. Zed) so they point
+    // at this binary — in case the path changed or the `acp` invocation evolved.
+    acp::refresh_installed(None);
     Ok(())
 }
 
