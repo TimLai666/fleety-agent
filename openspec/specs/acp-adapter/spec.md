@@ -2,13 +2,16 @@
 
 ## Purpose
 
-TBD - created by archiving change 'acp-adapter'. Update Purpose after archive.
+Let an ACP-capable editor (Zed, …) drive Fleety from its agent panel. `fleety acp`
+is a thin stdio bridge that maps the Agent Client Protocol to the fleety-server
+conversation protocol — the real agent (model, tools, memory) runs in the server.
+Verified end-to-end against Zed 1.9.
 
 ## Requirements
 
 ### Requirement: Fleety runs as an ACP agent over stdio
 
-The CLI SHALL provide an `acp` subcommand that runs an Agent Client Protocol agent: it reads JSON-RPC 2.0 messages from stdin and writes responses and notifications to stdout, so an ACP-capable editor can launch it as a subprocess. stdout SHALL carry only protocol messages; all logging SHALL go to stderr. Malformed input SHALL produce a JSON-RPC error response, never a crash or stray stdout output.
+The CLI SHALL provide an `acp` subcommand that runs an Agent Client Protocol agent: it exchanges JSON-RPC 2.0 messages over stdio, **delimited by newlines — one JSON object per line, with no Content-Length headers and no embedded newlines, per the ACP transport** — so an ACP-capable editor can launch it as a subprocess. stdout SHALL carry only protocol messages; all logging SHALL go to stderr. Malformed input SHALL produce a JSON-RPC error response (parse error), never a crash or stray stdout output; a failed operation SHALL use the internal-error code, not the `-32000` code some editors treat as "authentication required".
 
 #### Scenario: editor drives a prompt turn
 
@@ -55,7 +58,7 @@ code:
 ---
 ### Requirement: ACP methods map to the fleety-server agent
 
-The adapter SHALL bridge ACP to the existing fleety-server rather than reimplementing the agent. It SHALL handle `initialize` (version + capability negotiation), `session/new`, `session/load`, `session/prompt`, and `session/cancel`, translating them to the server's conversation protocol and streaming the server's assistant output back as `session/update`. Unknown methods SHALL return a JSON-RPC method-not-found error.
+The adapter SHALL bridge ACP to the existing fleety-server rather than reimplementing the agent. It SHALL handle `initialize` (version + capability negotiation), `session/new`, `session/load`, `session/prompt`, and `session/cancel`, translating them to the server's conversation protocol and streaming the server's assistant output back as `session/update` notifications — each tagged by `sessionUpdate: "agent_message_chunk"` and carrying a text content block, as ACP editors require. Unknown methods SHALL return a JSON-RPC method-not-found error; inbound frames with no `method` (an editor's response/error) SHALL be ignored, not answered.
 
 #### Scenario: new session opens a server conversation rooted at the editor's directory
 
@@ -197,4 +200,32 @@ code:
   - crates/fleety-server/src/auth.rs
   - crates/fleety-cli/src/main.rs
   - crates/fleety-tools/src/lib.rs
+-->
+
+---
+### Requirement: The CLI configures editors to launch the agent
+
+The CLI SHALL provide `acp install [<editor>]` to register itself as an ACP agent. With no editor, it SHALL print the generic launch details (the command, `["acp"]`, and an optional `FLEETY_AGENT_URL`) that any ACP-capable editor uses. For a supported editor (`zed`), it SHALL merge an entry into that editor's config pointing at the current binary, preserving the editor's other settings and other agents, backing up the prior file, and SHALL NOT clobber a config it cannot safely parse (e.g. JSONC with comments) — printing the snippet to paste instead. Re-running SHALL overwrite an existing entry (an update, not a duplicate). `fleety update` SHALL re-point already-installed entries at the current binary without newly installing any.
+
+#### Scenario: install configures a supported editor
+
+- **WHEN** the user runs `fleety acp install zed`
+- **THEN** an `agent_servers.Fleety` entry pointing at the current binary is written to Zed's settings, the editor's other settings are preserved, and the prior file is backed up
+
+#### Scenario: re-run updates in place
+
+- **WHEN** `fleety acp install zed` is run again (e.g. after the binary moved)
+- **THEN** the existing Fleety entry is overwritten with the current binary path rather than duplicated
+
+#### Scenario: an unparseable config is not clobbered
+
+- **WHEN** the editor config cannot be parsed as plain JSON (it has comments)
+- **THEN** the config is left unchanged and the entry to add is printed for manual use
+
+<!-- @trace
+source: acp-adapter
+updated: 2026-07-04
+code:
+  - crates/fleety-cli/src/acp.rs
+  - crates/fleety-cli/src/main.rs
 -->
