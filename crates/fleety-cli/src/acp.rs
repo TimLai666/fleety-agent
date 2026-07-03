@@ -176,13 +176,16 @@ pub fn fleety_agent_entry(command: &str, server: Option<&str>) -> Value {
 }
 
 /// Merge the Fleety `agent_servers` entry into existing Zed settings JSON,
-/// returning the updated pretty JSON. Errors (without touching the file) when the
-/// input is not plain JSON — Zed allows JSONC comments, which we won't clobber.
+/// returning the updated pretty JSON and whether an existing Fleety entry was
+/// replaced (an update vs a fresh add). Errors (without touching the file) when
+/// the input is not plain JSON — Zed allows JSONC comments, which we won't
+/// clobber. Re-running always overwrites the Fleety entry (e.g. a new binary path
+/// after `cargo install`), leaving other settings and other agents intact.
 pub fn merge_zed_settings(
     existing: &str,
     command: &str,
     server: Option<&str>,
-) -> std::result::Result<String, String> {
+) -> std::result::Result<(String, bool), String> {
     let mut root: Value = if existing.trim().is_empty() {
         json!({})
     } else {
@@ -197,8 +200,10 @@ pub fn merge_zed_settings(
         .or_insert_with(|| json!({}))
         .as_object_mut()
         .ok_or_else(|| "`agent_servers` is not a JSON object".to_string())?;
+    let updated = servers.contains_key("Fleety");
     servers.insert("Fleety".to_string(), fleety_agent_entry(command, server));
-    serde_json::to_string_pretty(&root).map_err(|e| e.to_string())
+    let pretty = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
+    Ok((pretty, updated))
 }
 
 /// This binary's path, for launching it as an ACP agent.
@@ -262,7 +267,7 @@ pub fn install_zed(server: Option<String>) -> agent_core::Result<()> {
     };
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
     match merge_zed_settings(&existing, &command, server.as_deref()) {
-        Ok(merged) => {
+        Ok((merged, updated)) => {
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
@@ -271,8 +276,9 @@ pub fn install_zed(server: Option<String>) -> agent_core::Result<()> {
             }
             std::fs::write(&path, merged)
                 .map_err(|e| CoreError::Message(format!("cannot write {}: {e}", path.display())))?;
+            let verb = if updated { "Updated" } else { "Configured" };
             println!(
-                "Configured Zed at {}.\nRestart Zed, then pick \"Fleety\" in the agent panel.\n\
+                "{verb} the Fleety agent in Zed at {}.\nRestart Zed, then pick \"Fleety\" in the agent panel.\n\
                  (Agent binary: {command})",
                 path.display()
             );
@@ -1140,18 +1146,27 @@ mod tests {
         let e2 = fleety_agent_entry("/bin/fleety", None);
         assert!(e2["env"].as_object().unwrap().is_empty());
 
-        // Merge into empty settings.
-        let out = merge_zed_settings("", "/bin/fleety", None).expect("merge empty");
+        // Merge into empty settings → a fresh add (not an update).
+        let (out, updated) = merge_zed_settings("", "/bin/fleety", None).expect("merge empty");
+        assert!(!updated, "empty settings → fresh add");
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["agent_servers"]["Fleety"]["command"], "/bin/fleety");
 
-        // Merge preserves other keys and other agent servers, updates Fleety.
+        // Merge preserves other keys and other agent servers; adds Fleety.
         let existing = r#"{"theme":"dark","agent_servers":{"Other":{"type":"custom","command":"x"}}}"#;
-        let out = merge_zed_settings(existing, "/new/fleety", None).expect("merge existing");
+        let (out, updated) = merge_zed_settings(existing, "/new/fleety", None).expect("merge existing");
+        assert!(!updated, "no prior Fleety entry → add");
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["theme"], "dark");
         assert_eq!(v["agent_servers"]["Other"]["command"], "x");
         assert_eq!(v["agent_servers"]["Fleety"]["command"], "/new/fleety");
+
+        // Re-running over an existing Fleety entry overwrites it (update path).
+        let (out, updated) = merge_zed_settings(&out, "/updated/fleety", None).expect("re-merge");
+        assert!(updated, "existing Fleety entry → update");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["agent_servers"]["Fleety"]["command"], "/updated/fleety");
+        assert_eq!(v["agent_servers"]["Other"]["command"], "x", "other agents preserved");
 
         // JSONC with comments is refused (never clobbered).
         assert!(merge_zed_settings("// my settings\n{\"theme\":\"dark\"}", "/bin/fleety", None).is_err());
