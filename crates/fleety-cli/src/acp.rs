@@ -1,56 +1,62 @@
 //! `fleety acp` — make Fleety an Agent Client Protocol (ACP) agent.
 //!
 //! An ACP-capable editor (e.g. Zed) launches `fleety acp` as a subprocess and
-//! speaks JSON-RPC 2.0 over stdio (LSP-style `Content-Length` framing). This
-//! adapter bridges ACP to the existing fleety-server: it maps initialize /
-//! session.new / session.load / session.prompt / session.cancel to the server's
-//! conversation protocol, streams the server's assistant output back as
-//! `session/update` notifications, and surfaces tool approvals as
-//! `session/request_permission`. Only JSON-RPC goes to stdout; logs go to stderr.
+//! speaks JSON-RPC 2.0 over stdio, with messages delimited by newlines (one JSON
+//! object per line, per the ACP transport spec). This adapter bridges ACP to the
+//! existing fleety-server: it maps initialize / session.new / session.load /
+//! session.prompt / session.cancel to the server's conversation protocol, streams
+//! the server's assistant output back as `session/update` notifications, and
+//! surfaces tool approvals as `session/request_permission`. Only JSON-RPC goes to
+//! stdout; logs go to stderr.
 //!
 //! The framing + JSON-RPC types and the ACP↔server mappings are pure and
-//! unit-tested; a live editor session is verified manually.
+//! unit-tested. NOTE: the ACP *message shapes* (e.g. the `session/update` body)
+//! still need verification against a live editor — the framing is fixed, the
+//! shapes are the next thing to confirm end-to-end.
 
 use std::io::{BufRead, Write};
 
 use serde_json::{json, Value};
 
-// ---- JSON-RPC 2.0 framing (LSP-style Content-Length) ----
+// ---- JSON-RPC 2.0 framing (ACP: one JSON object per line, newline-delimited) ----
+//
+// ACP over stdio delimits messages by `\n`, with no embedded newlines
+// (agentclientprotocol.com/protocol/v1/transports). `serde_json::to_string`
+// emits single-line JSON, so a trailing `\n` is a conformant frame.
 
-/// Write one framed JSON-RPC message.
+/// One decoded inbound frame: end-of-input, a malformed (non-JSON) line, or a
+/// parsed message.
+pub enum FrameIn {
+    Eof,
+    Malformed,
+    Message(Value),
+}
+
+/// Write one newline-delimited JSON-RPC message.
 pub fn write_frame<W: Write>(w: &mut W, v: &Value) -> std::io::Result<()> {
-    let body = serde_json::to_vec(v)?;
-    write!(w, "Content-Length: {}\r\n\r\n", body.len())?;
-    w.write_all(&body)?;
+    let mut body = serde_json::to_string(v)?;
+    body.push('\n');
+    w.write_all(body.as_bytes())?;
     w.flush()
 }
 
-/// Read one framed JSON-RPC message; `None` on EOF or an unparsable frame.
-/// The runtime loop uses the async variant; this sync one backs the framing
-/// tests and is available for non-async callers.
+/// Read one newline-delimited JSON-RPC message (sync; backs the framing tests).
+/// `None` on EOF; a malformed line parses to `None` here — the async runtime
+/// variant distinguishes malformed input so it can reply with a JSON-RPC error.
 #[allow(dead_code)]
 pub fn read_frame<R: BufRead>(r: &mut R) -> std::io::Result<Option<Value>> {
-    let mut content_length: Option<usize> = None;
     loop {
         let mut line = String::new();
         let n = r.read_line(&mut line)?;
         if n == 0 {
             return Ok(None); // EOF
         }
-        let line = line.trim_end_matches(['\r', '\n']);
+        let line = line.trim();
         if line.is_empty() {
-            break; // end of headers
+            continue; // tolerate blank lines between messages
         }
-        if let Some(rest) = line.strip_prefix("Content-Length:") {
-            content_length = rest.trim().parse::<usize>().ok();
-        }
+        return Ok(serde_json::from_str(line).ok());
     }
-    let Some(len) = content_length else {
-        return Ok(None);
-    };
-    let mut buf = vec![0u8; len];
-    std::io::Read::read_exact(r, &mut buf)?;
-    Ok(serde_json::from_slice(&buf).ok())
 }
 
 // ---- JSON-RPC message builders ----
@@ -69,6 +75,8 @@ pub fn notification(method: &str, params: Value) -> Value {
 
 /// JSON-RPC method-not-found code.
 pub const METHOD_NOT_FOUND: i64 = -32601;
+/// JSON-RPC parse-error code (malformed input).
+pub const PARSE_ERROR: i64 = -32700;
 
 // ---- ACP <-> fleety-server mappings (pure) ----
 
@@ -377,29 +385,23 @@ pub async fn handle_message(msg: &Value, bridge: &dyn AcpBridge) -> Vec<Value> {
 /// Read one framed JSON-RPC message from an async reader (`None` on EOF).
 async fn read_frame_async<R: tokio::io::AsyncBufRead + Unpin>(
     r: &mut R,
-) -> std::io::Result<Option<Value>> {
-    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
-    let mut content_length: Option<usize> = None;
+) -> std::io::Result<FrameIn> {
+    use tokio::io::AsyncBufReadExt;
     loop {
         let mut line = String::new();
         let n = r.read_line(&mut line).await?;
         if n == 0 {
-            return Ok(None);
+            return Ok(FrameIn::Eof);
         }
-        let line = line.trim_end_matches(['\r', '\n']);
+        let line = line.trim();
         if line.is_empty() {
-            break;
+            continue; // tolerate blank lines between messages
         }
-        if let Some(rest) = line.strip_prefix("Content-Length:") {
-            content_length = rest.trim().parse::<usize>().ok();
-        }
+        return Ok(match serde_json::from_str::<Value>(line) {
+            Ok(v) => FrameIn::Message(v),
+            Err(_) => FrameIn::Malformed,
+        });
     }
-    let Some(len) = content_length else {
-        return Ok(None);
-    };
-    let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf).await?;
-    Ok(serde_json::from_slice(&buf).ok())
 }
 
 /// Run the ACP agent over stdio, bridging to the fleety-server. Only JSON-RPC is
@@ -419,7 +421,7 @@ pub async fn run(agent_url: String) -> agent_core::Result<()> {
             read_frame_async(&mut *r).await
         };
         match frame {
-            Ok(Some(msg)) => {
+            Ok(FrameIn::Message(msg)) => {
                 let frames = handle_message(&msg, &bridge).await;
                 let mut stdout = std::io::stdout();
                 for f in frames {
@@ -428,7 +430,16 @@ pub async fn run(agent_url: String) -> agent_core::Result<()> {
                     }
                 }
             }
-            Ok(None) => return Ok(()), // EOF: editor closed
+            Ok(FrameIn::Malformed) => {
+                // Reply with a JSON-RPC parse error and keep running, rather than
+                // silently exiting on a bad line.
+                let err = response_err(Value::Null, PARSE_ERROR, "parse error");
+                let mut stdout = std::io::stdout();
+                if write_frame(&mut stdout, &err).is_err() {
+                    return Ok(());
+                }
+            }
+            Ok(FrameIn::Eof) => return Ok(()), // editor closed
             Err(e) => {
                 tracing::warn!(%e, "acp: stdin read error; exiting");
                 return Ok(());
@@ -483,7 +494,7 @@ impl WsBridge {
         let mut reader = self.reader.lock().await;
         loop {
             match read_frame_async(&mut *reader).await {
-                Ok(Some(v)) => {
+                Ok(FrameIn::Message(v)) => {
                     if v.get("id").and_then(Value::as_i64) == Some(id) {
                         if let Some(err) = v.get("error") {
                             let m = err
@@ -496,7 +507,12 @@ impl WsBridge {
                     }
                     // Not our response — ignore (e.g. a mid-prompt session/cancel).
                 }
-                Ok(None) => return Err(CoreError::Message("editor connection closed".to_string())),
+                Ok(FrameIn::Malformed) => {
+                    // Skip a malformed line while awaiting the editor's response.
+                }
+                Ok(FrameIn::Eof) => {
+                    return Err(CoreError::Message("editor connection closed".to_string()))
+                }
                 Err(e) => return Err(CoreError::Message(format!("read editor response: {e}"))),
             }
         }
@@ -761,9 +777,12 @@ mod tests {
         let msg = json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} });
         let mut buf = Vec::new();
         write_frame(&mut buf, &msg).unwrap();
-        // The wire form has a Content-Length header.
+        // The wire form is one JSON object on a single line, newline-terminated
+        // (ACP transport), with no Content-Length header and no embedded newline.
         let text = String::from_utf8_lossy(&buf);
-        assert!(text.starts_with("Content-Length: "));
+        assert!(!text.contains("Content-Length"));
+        assert!(text.ends_with('\n'));
+        assert_eq!(text.trim_end().matches('\n').count(), 0);
         // ...and reads back to the same value.
         let mut cur = Cursor::new(buf);
         let got = read_frame(&mut cur).unwrap().unwrap();
@@ -773,10 +792,14 @@ mod tests {
     }
 
     #[test]
-    fn malformed_frame_is_none_not_panic() {
-        // Headers but a body that isn't JSON → None (caller emits a JSON-RPC error).
-        let mut cur = Cursor::new(b"Content-Length: 3\r\n\r\nxxx".to_vec());
+    fn malformed_line_is_none_not_panic() {
+        // A line that isn't JSON → None here (the async runtime replies with a
+        // JSON-RPC parse error and keeps going).
+        let mut cur = Cursor::new(b"not json\n".to_vec());
         assert!(read_frame(&mut cur).unwrap().is_none());
+        // Blank lines between messages are tolerated.
+        let mut cur = Cursor::new(b"\n\n{\"jsonrpc\":\"2.0\",\"id\":9}\n".to_vec());
+        assert_eq!(read_frame(&mut cur).unwrap().unwrap()["id"], json!(9));
     }
 
     #[test]
