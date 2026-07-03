@@ -79,10 +79,21 @@ fn is_empty(v: &Value) -> bool {
 impl SmartCrusher {
     /// Crush a JSON value structurally.
     pub fn crush(&self, value: &Value) -> Value {
-        self.crush_at(value, 0)
+        self.crush_tracked(value).0
     }
 
-    fn crush_at(&self, value: &Value, depth: usize) -> Value {
+    /// Crush a value and report whether any *content* was truncated (a long
+    /// string or a long array). Dropping empty fields does not count — nothing
+    /// retrievable is lost. Callers use the flag to attach a fetch-id marker so
+    /// truncated content stays locatable even when the whole result fits the
+    /// character budget.
+    pub fn crush_tracked(&self, value: &Value) -> (Value, bool) {
+        let mut truncated = false;
+        let crushed = self.crush_at(value, 0, &mut truncated);
+        (crushed, truncated)
+    }
+
+    fn crush_at(&self, value: &Value, depth: usize, truncated: &mut bool) -> Value {
         if depth > self.max_depth {
             return Value::String("…(depth limit)".to_string());
         }
@@ -90,6 +101,7 @@ impl SmartCrusher {
             Value::String(s) => {
                 let n = s.chars().count();
                 if n > self.max_string {
+                    *truncated = true;
                     let kept: String = s.chars().take(self.max_string).collect();
                     Value::String(format!("{kept}…(+{} chars)", n - self.max_string))
                 } else {
@@ -98,21 +110,22 @@ impl SmartCrusher {
             }
             Value::Array(items) => {
                 if items.len() > self.max_array {
+                    *truncated = true;
                     let mut out: Vec<Value> = Vec::with_capacity(self.head + self.tail + 1);
                     for it in items.iter().take(self.head) {
-                        out.push(self.crush_at(it, depth + 1));
+                        out.push(self.crush_at(it, depth + 1, truncated));
                     }
                     let omitted = items.len() - self.head - self.tail;
                     out.push(Value::String(format!("…{omitted} more items")));
                     for it in items.iter().skip(items.len() - self.tail) {
-                        out.push(self.crush_at(it, depth + 1));
+                        out.push(self.crush_at(it, depth + 1, truncated));
                     }
                     Value::Array(out)
                 } else {
                     Value::Array(
                         items
                             .iter()
-                            .map(|it| self.crush_at(it, depth + 1))
+                            .map(|it| self.crush_at(it, depth + 1, truncated))
                             .collect(),
                     )
                 }
@@ -120,7 +133,7 @@ impl SmartCrusher {
             Value::Object(map) => {
                 let mut out = Map::new();
                 for (k, v) in map {
-                    let cv = self.crush_at(v, depth + 1);
+                    let cv = self.crush_at(v, depth + 1, truncated);
                     if self.drop_empty && is_empty(&cv) {
                         continue;
                     }
@@ -165,11 +178,26 @@ pub(crate) fn budget_text(text: &str, max_chars: usize, id: Option<&str>) -> Str
 
 /// Compress a tool result for the model: structurally crush the JSON, then
 /// enforce the character budget. The caller keeps the full result in the event
-/// log keyed by `id` (reversible — CCR), and the truncation marker names that id
-/// so the agent can fetch the full result on demand.
+/// log keyed by `id` (reversible — CCR). Whenever anything is dropped — either
+/// the structural crush truncated content, or the budget truncated the text —
+/// the output names `id` so the agent can fetch the full result. A result that
+/// fits the budget and lost nothing is returned unchanged, with no marker.
 pub(crate) fn compress_tool_result(value: &Value, max_chars: usize, id: &str) -> String {
-    let crushed = SmartCrusher::default().crush(value).to_string();
-    budget_text(&crushed, max_chars, Some(id))
+    let (crushed, truncated) = SmartCrusher::default().crush_tracked(value);
+    let text = crushed.to_string();
+    if text.chars().count() > max_chars {
+        // Over budget: budget_text truncates and names the fetch id.
+        return budget_text(&text, max_chars, Some(id));
+    }
+    if truncated {
+        // Within budget, but the structural crush dropped array items / string
+        // chars. Attach the fetch id so that content is still retrievable.
+        return format!(
+            "{text}\n[compressed; fetch the full result with fetch_tool_result id=\"{id}\"]"
+        );
+    }
+    // Nothing dropped and within budget — untouched, no marker.
+    text
 }
 
 /// CacheAligner: assemble a prompt from labelled segments ordered **most stable
@@ -392,6 +420,40 @@ mod tests {
         let big = serde_json::json!("a".repeat(100));
         let out = compress_tool_result(&big, 10, "abc");
         assert!(out.contains("fetch_tool_result id=\"abc\""));
+    }
+
+    #[test]
+    fn small_result_within_budget_is_untouched_no_marker() {
+        let v = json!({ "a": 1, "b": ["x", "y"], "c": "hello" });
+        let out = compress_tool_result(&v, 8000, "id1");
+        // Returned unchanged, no fetch marker.
+        assert_eq!(out, v.to_string());
+        assert!(!out.contains("fetch_tool_result"));
+    }
+
+    #[test]
+    fn within_budget_but_crushed_result_names_fetch_id() {
+        // A small-in-chars result whose inner array exceeds max_array (50): the
+        // crush drops items even though the whole thing fits the char budget, so
+        // the fetch id must be attached so the dropped items stay retrievable.
+        let big: Vec<Value> = (0..60).map(|i| json!(i)).collect();
+        let v = json!({ "items": big });
+        let out = compress_tool_result(&v, 8000, "call_9");
+        assert!(out.chars().count() <= 8000, "the crushed result fits the budget");
+        assert!(out.contains("more items"), "content was actually trimmed");
+        assert!(
+            out.contains("fetch_tool_result id=\"call_9\""),
+            "trimmed-but-within-budget results must still name the fetch id"
+        );
+    }
+
+    #[test]
+    fn dropping_only_empty_fields_is_not_marked() {
+        // drop_empty removes empties losslessly — that is not a truncation, so no
+        // fetch marker should be attached.
+        let (v, truncated) = SmartCrusher::default().crush_tracked(&json!({ "keep": 1, "empty": [] }));
+        assert!(!truncated, "dropping empty fields is lossless");
+        let _ = v;
     }
 
     #[test]

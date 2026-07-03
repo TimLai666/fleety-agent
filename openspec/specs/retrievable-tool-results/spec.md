@@ -8,20 +8,27 @@ TBD - created by archiving change 'retrievable-tool-results'. Update Purpose aft
 
 ### Requirement: Truncated tool results are locatable
 
-When a tool result is truncated for the model, the truncation marker SHALL
-include the result's id (the tool-call id that keys the retained event), so the
-agent can request the full result precisely. When no id is available the marker
-SHALL fall back to today's id-less wording, and the un-truncated case SHALL be
-unchanged.
+Whenever a tool result loses content on the way to the model — whether the
+character budget truncated it OR the structural compression dropped array items
+or string characters — the marker SHALL include the result's id (the tool-call
+id that keys the retained event), so the agent can request the full result
+precisely. When no id is available the marker SHALL fall back to today's id-less
+wording. A result that fits the budget and lost nothing SHALL be returned
+unchanged with no marker.
 
 #### Scenario: a truncated result names how to fetch it
 
 - **WHEN** a tool result exceeds the budget and is truncated with an id available
 - **THEN** the marker names the id to pass to the retrieval tool
 
-#### Scenario: small results are untouched
+#### Scenario: a within-budget result that was structurally compressed names how to fetch it
 
-- **WHEN** a tool result is within the budget
+- **WHEN** a tool result fits the character budget but its structural compression dropped array items or string characters
+- **THEN** the output still carries a marker naming the id to fetch the full result
+
+#### Scenario: results that lost nothing are untouched
+
+- **WHEN** a tool result is within the budget and its structural compression dropped nothing
 - **THEN** it is returned unchanged with no marker
 
 
