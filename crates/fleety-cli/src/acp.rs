@@ -10,9 +10,10 @@
 //! stdout; logs go to stderr.
 //!
 //! The framing + JSON-RPC types and the ACP↔server mappings are pure and
-//! unit-tested. NOTE: the ACP *message shapes* (e.g. the `session/update` body)
-//! still need verification against a live editor — the framing is fixed, the
-//! shapes are the next thing to confirm end-to-end.
+//! unit-tested, and verified end-to-end against Zed 1.9: newline framing, an
+//! `initialize`/`session.new`/`session.prompt` round-trip, and `session/update`
+//! streaming (tagged by `sessionUpdate`, carrying a text ContentBlock) render in
+//! the editor.
 
 use std::io::{BufRead, Write};
 
@@ -86,13 +87,18 @@ pub const INTERNAL_ERROR: i64 = -32603;
 
 // ---- ACP <-> fleety-server mappings (pure) ----
 
-/// `session/update` for streamed assistant text.
+/// `session/update` for streamed assistant text. The update is an ACP
+/// `SessionUpdate` tagged by `sessionUpdate` (NOT `kind`), carrying a ContentBlock
+/// — Zed rejects any other shape with "missing field `sessionUpdate`".
 pub fn assistant_update(session_id: &str, text: &str) -> Value {
     notification(
         "session/update",
         json!({
             "sessionId": session_id,
-            "update": { "kind": "agent_message_chunk", "text": text }
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": text }
+            }
         }),
     )
 }
@@ -319,8 +325,13 @@ fn extract_prompt_text(params: &Value) -> String {
 /// (responses and/or `session/update` notifications). Pure w.r.t. I/O — the
 /// server interaction is behind `bridge`, so this is unit-testable.
 pub async fn handle_message(msg: &Value, bridge: &dyn AcpBridge) -> Vec<Value> {
+    // A frame with no `method` is a response or error from the editor (e.g. it
+    // reporting a bad notification), not a request — ignore it rather than
+    // replying "method not found".
+    let Some(method) = msg.get("method").and_then(Value::as_str) else {
+        return vec![];
+    };
     let id = msg.get("id").cloned();
-    let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
     let params = msg.get("params").cloned().unwrap_or_else(|| json!({}));
     let reply_id = || id.clone().unwrap_or(Value::Null);
     match method {
@@ -859,7 +870,8 @@ mod tests {
         .await;
         assert_eq!(r.len(), 3, "two chunks + one response");
         assert_eq!(r[0]["method"], "session/update");
-        assert_eq!(r[0]["params"]["update"]["text"], "hello");
+        assert_eq!(r[0]["params"]["update"]["sessionUpdate"], "agent_message_chunk");
+        assert_eq!(r[0]["params"]["update"]["content"]["text"], "hello");
         assert_eq!(r[2]["result"]["stopReason"], "end_turn");
         // unknown request → method-not-found error.
         let r = handle_message(&json!({"id":9,"method":"frobnicate","params":{}}), &b).await;
@@ -977,7 +989,10 @@ mod tests {
         let u = assistant_update("s1", "hello");
         assert_eq!(u["method"], "session/update");
         assert_eq!(u["params"]["sessionId"], "s1");
-        assert_eq!(u["params"]["update"]["text"], "hello");
+        // ACP SessionUpdate: tagged by `sessionUpdate`, carrying a ContentBlock.
+        assert_eq!(u["params"]["update"]["sessionUpdate"], "agent_message_chunk");
+        assert_eq!(u["params"]["update"]["content"]["type"], "text");
+        assert_eq!(u["params"]["update"]["content"]["text"], "hello");
         let p = permission_request("s1", "write_file", "edit foo");
         assert_eq!(p["sessionId"], "s1");
         assert_eq!(p["toolCall"]["title"], "write_file");
