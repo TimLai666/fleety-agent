@@ -77,6 +77,12 @@ pub fn notification(method: &str, params: Value) -> Value {
 pub const METHOD_NOT_FOUND: i64 = -32601;
 /// JSON-RPC parse-error code (malformed input).
 pub const PARSE_ERROR: i64 = -32700;
+/// JSON-RPC internal-error code for a failed agent operation. NOT the `-32000`
+/// server-error code: ACP clients (Zed) treat `-32000` as "authentication
+/// required", so a plain failure (e.g. the server is unreachable) sent as
+/// `-32000` is mis-rendered as an auth prompt. Use the standard internal-error
+/// code so the real message is shown.
+pub const INTERNAL_ERROR: i64 = -32603;
 
 // ---- ACP <-> fleety-server mappings (pure) ----
 
@@ -330,7 +336,7 @@ pub async fn handle_message(msg: &Value, bridge: &dyn AcpBridge) -> Vec<Value> {
                 .map(str::to_string);
             match bridge.new_session(cwd).await {
                 Ok(sid) => vec![response_ok(reply_id(), json!({ "sessionId": sid }))],
-                Err(e) => vec![response_err(reply_id(), -32000, &e.report().message)],
+                Err(e) => vec![response_err(reply_id(), INTERNAL_ERROR, &e.report().message)],
             }
         }
         "session/prompt" => {
@@ -350,7 +356,7 @@ pub async fn handle_message(msg: &Value, bridge: &dyn AcpBridge) -> Vec<Value> {
                     ));
                     out
                 }
-                Err(e) => vec![response_err(reply_id(), -32000, &e.report().message)],
+                Err(e) => vec![response_err(reply_id(), INTERNAL_ERROR, &e.report().message)],
             }
         }
         "session/load" => {
@@ -366,7 +372,7 @@ pub async fn handle_message(msg: &Value, bridge: &dyn AcpBridge) -> Vec<Value> {
                     out.push(response_ok(reply_id(), json!({})));
                     out
                 }
-                Err(e) => vec![response_err(reply_id(), -32000, &e.report().message)],
+                Err(e) => vec![response_err(reply_id(), INTERNAL_ERROR, &e.report().message)],
             }
         }
         // Cancel is a notification (no id); the in-flight turn is best-effort.
