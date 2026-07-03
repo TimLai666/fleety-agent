@@ -234,7 +234,11 @@ async fn main() {
                     .position(|a| a == "--server")
                     .and_then(|i| args.get(i + 1))
                     .cloned();
-                if let Err(e) = acp::install_zed(server) {
+                // `fleety acp install [<editor>]` — <editor> (e.g. `zed`) auto-
+                // configures that editor; with none, print the generic setup that
+                // works with any ACP-capable editor.
+                let target = args.get(3).filter(|a| !a.starts_with("--")).cloned();
+                if let Err(e) = acp::install(target, server) {
                     eprintln!("error: {}", e.report().message);
                 }
             } else if let Err(e) = acp::run(agent_url()).await {

@@ -201,8 +201,50 @@ pub fn merge_zed_settings(
     serde_json::to_string_pretty(&root).map_err(|e| e.to_string())
 }
 
-/// `fleety acp install`: register this binary as a custom ACP agent in Zed. Edits
-/// `settings.json` in place (backing it up first); if it can't be parsed safely,
+/// This binary's path, for launching it as an ACP agent.
+fn current_exe_str() -> String {
+    std::env::current_exe()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "fleety".to_string())
+}
+
+/// Dispatch `fleety acp install [<editor>]`. A known editor (currently `zed`) is
+/// auto-configured; with no editor — or an unknown one — print the generic ACP
+/// launch details that work with any ACP-capable client (Zed, JetBrains, neovim,
+/// Emacs, …), since ACP is a shared protocol, not Zed-specific.
+pub fn install(target: Option<String>, server: Option<String>) -> agent_core::Result<()> {
+    match target.as_deref().map(str::to_ascii_lowercase).as_deref() {
+        Some("zed") => install_zed(server),
+        Some(other) => {
+            println!("No built-in auto-config for editor '{other}' (supported: zed).\n");
+            print_generic(server.as_deref());
+            Ok(())
+        }
+        None => {
+            print_generic(server.as_deref());
+            Ok(())
+        }
+    }
+}
+
+/// Print the editor-agnostic ACP setup: the command any ACP client launches.
+fn print_generic(server: Option<&str>) {
+    let cmd = current_exe_str();
+    println!("Fleety is an ACP agent — point any ACP-capable editor at this command:\n");
+    println!("    command: {cmd}");
+    println!("    args:    [\"acp\"]");
+    match server {
+        Some(s) => println!("    env:     FLEETY_AGENT_URL={s}\n"),
+        None => println!("    env:     FLEETY_AGENT_URL=ws://127.0.0.1:8787   (or your server)\n"),
+    }
+    println!("Auto-configure a supported editor:");
+    println!("    fleety acp install zed [--server ws://host:8787]\n");
+    println!("For other editors (JetBrains, neovim, Emacs, …), set their custom-ACP-agent");
+    println!("command to the above — ACP is a shared protocol, the same agent works for all.");
+}
+
+/// Register this binary as a custom ACP agent in Zed. Edits `settings.json` in
+/// place (backing it up first); if it can't be parsed safely (JSONC comments),
 /// prints the snippet to paste instead of clobbering it.
 pub fn install_zed(server: Option<String>) -> agent_core::Result<()> {
     use agent_core::CoreError;
