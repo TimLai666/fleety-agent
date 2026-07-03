@@ -225,10 +225,19 @@ async fn main() {
             }
         }
         Some("acp") => {
-            // ACP agent over stdio: stdout carries only JSON-RPC; logs/errors go
-            // to stderr (tracing is already on stderr), so the editor's parser
-            // is never corrupted.
-            if let Err(e) = acp::run(agent_url()).await {
+            // `fleety acp install [--server <url>]` writes the Zed agent-server
+            // config; plain `fleety acp` runs the adapter over stdio (stdout is
+            // only JSON-RPC, logs go to stderr, so the editor's parser is safe).
+            if args.get(2).map(String::as_str) == Some("install") {
+                let server = args
+                    .iter()
+                    .position(|a| a == "--server")
+                    .and_then(|i| args.get(i + 1))
+                    .cloned();
+                if let Err(e) = acp::install_zed(server) {
+                    eprintln!("error: {}", e.report().message);
+                }
+            } else if let Err(e) = acp::run(agent_url()).await {
                 eprintln!("error: {}", e.report().message);
             }
         }

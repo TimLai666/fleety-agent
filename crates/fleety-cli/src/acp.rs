@@ -143,6 +143,108 @@ pub fn initialize_result() -> Value {
     })
 }
 
+// ---- `fleety acp install`: write the Zed agent-server config ----
+
+/// Zed's `settings.json` path for this platform, if it can be located.
+pub fn zed_settings_path() -> Option<std::path::PathBuf> {
+    #[cfg(windows)]
+    {
+        std::env::var("APPDATA")
+            .ok()
+            .map(|p| std::path::PathBuf::from(p).join("Zed").join("settings.json"))
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var("HOME")
+            .ok()
+            .map(|p| std::path::PathBuf::from(p).join(".config").join("zed").join("settings.json"))
+    }
+}
+
+/// The Zed `agent_servers` entry that launches this binary as a custom ACP agent.
+pub fn fleety_agent_entry(command: &str, server: Option<&str>) -> Value {
+    let mut env = serde_json::Map::new();
+    if let Some(s) = server {
+        env.insert("FLEETY_AGENT_URL".to_string(), json!(s));
+    }
+    json!({
+        "type": "custom",
+        "command": command,
+        "args": ["acp"],
+        "env": Value::Object(env),
+    })
+}
+
+/// Merge the Fleety `agent_servers` entry into existing Zed settings JSON,
+/// returning the updated pretty JSON. Errors (without touching the file) when the
+/// input is not plain JSON — Zed allows JSONC comments, which we won't clobber.
+pub fn merge_zed_settings(
+    existing: &str,
+    command: &str,
+    server: Option<&str>,
+) -> std::result::Result<String, String> {
+    let mut root: Value = if existing.trim().is_empty() {
+        json!({})
+    } else {
+        serde_json::from_str(existing)
+            .map_err(|e| format!("settings.json is not plain JSON ({e}); it may contain comments"))?
+    };
+    let obj = root
+        .as_object_mut()
+        .ok_or_else(|| "settings.json root is not a JSON object".to_string())?;
+    let servers = obj
+        .entry("agent_servers")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| "`agent_servers` is not a JSON object".to_string())?;
+    servers.insert("Fleety".to_string(), fleety_agent_entry(command, server));
+    serde_json::to_string_pretty(&root).map_err(|e| e.to_string())
+}
+
+/// `fleety acp install`: register this binary as a custom ACP agent in Zed. Edits
+/// `settings.json` in place (backing it up first); if it can't be parsed safely,
+/// prints the snippet to paste instead of clobbering it.
+pub fn install_zed(server: Option<String>) -> agent_core::Result<()> {
+    use agent_core::CoreError;
+    let exe = std::env::current_exe()
+        .map_err(|e| CoreError::Message(format!("cannot resolve this binary's path: {e}")))?;
+    let command = exe.to_string_lossy().to_string();
+    let snippet = serde_json::to_string_pretty(
+        &json!({ "agent_servers": { "Fleety": fleety_agent_entry(&command, server.as_deref()) } }),
+    )
+    .unwrap_or_default();
+
+    let Some(path) = zed_settings_path() else {
+        println!("Could not locate Zed's settings.json. Add this to it manually:\n\n{snippet}");
+        return Ok(());
+    };
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    match merge_zed_settings(&existing, &command, server.as_deref()) {
+        Ok(merged) => {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if !existing.trim().is_empty() {
+                let _ = std::fs::write(path.with_extension("json.bak"), &existing);
+            }
+            std::fs::write(&path, merged)
+                .map_err(|e| CoreError::Message(format!("cannot write {}: {e}", path.display())))?;
+            println!(
+                "Configured Zed at {}.\nRestart Zed, then pick \"Fleety\" in the agent panel.\n\
+                 (Agent binary: {command})",
+                path.display()
+            );
+        }
+        Err(e) => {
+            println!(
+                "Couldn't safely edit {} ({e}).\nAdd this to your Zed settings.json manually:\n\n{snippet}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 // ---- editor delegation: capability gating + tool→ACP-method mapping (pure) ----
 //
 // NOTE: the ACP method and capability field names below follow the Agent Client
@@ -982,6 +1084,35 @@ mod tests {
     fn prompt_text_joins_blocks() {
         let p = json!({"prompt":[{"type":"text","text":"a"},{"type":"text","text":"b"}]});
         assert_eq!(extract_prompt_text(&p), "ab");
+    }
+
+    #[test]
+    fn zed_agent_entry_and_merge() {
+        // Entry shape: custom command + acp arg; server → FLEETY_AGENT_URL env.
+        let e = fleety_agent_entry("/bin/fleety", Some("ws://host:8787"));
+        assert_eq!(e["type"], "custom");
+        assert_eq!(e["command"], "/bin/fleety");
+        assert_eq!(e["args"][0], "acp");
+        assert_eq!(e["env"]["FLEETY_AGENT_URL"], "ws://host:8787");
+        // No server → no env var.
+        let e2 = fleety_agent_entry("/bin/fleety", None);
+        assert!(e2["env"].as_object().unwrap().is_empty());
+
+        // Merge into empty settings.
+        let out = merge_zed_settings("", "/bin/fleety", None).expect("merge empty");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["agent_servers"]["Fleety"]["command"], "/bin/fleety");
+
+        // Merge preserves other keys and other agent servers, updates Fleety.
+        let existing = r#"{"theme":"dark","agent_servers":{"Other":{"type":"custom","command":"x"}}}"#;
+        let out = merge_zed_settings(existing, "/new/fleety", None).expect("merge existing");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["theme"], "dark");
+        assert_eq!(v["agent_servers"]["Other"]["command"], "x");
+        assert_eq!(v["agent_servers"]["Fleety"]["command"], "/new/fleety");
+
+        // JSONC with comments is refused (never clobbered).
+        assert!(merge_zed_settings("// my settings\n{\"theme\":\"dark\"}", "/bin/fleety", None).is_err());
     }
 
     #[test]
