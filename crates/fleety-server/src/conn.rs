@@ -4072,6 +4072,126 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
+    async fn user_prompt_submit_hook_blocks_the_turn_end_to_end() {
+        // End-to-end through the serve loop: a same-host conversation whose origin
+        // cwd declares a UserPromptSubmit hook that exits non-zero must have its
+        // prompt blocked — the provider is never reached, and the client is told a
+        // hook blocked it. Exercises bind → collect_conversation_hooks →
+        // conv_hook_ctx → run_conversation_event_hooks → block/emit/continue with
+        // the real local shell runner.
+        let home = std::env::temp_dir().join(format!("fleety-upshook-{}", uuid::Uuid::new_v4()));
+        let ws_root = home.join("ws");
+        let project = home.join("proj");
+        std::fs::create_dir_all(&ws_root).expect("mk ws");
+        std::fs::create_dir_all(project.join(".claude")).expect("mk proj/.claude");
+        std::fs::write(
+            project.join(".claude").join("settings.json"),
+            r#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"exit 1"}]}]}}"#,
+        )
+        .expect("w settings");
+
+        // Isolate the user-scope home read so the serve loop can't touch the real
+        // ~/.claude, and make sure project hooks aren't disabled by a stray env.
+        let saved_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
+        std::env::remove_var("FLEETY_DISABLE_PROJECT_HOOKS");
+
+        // If the block fails, the provider would answer "processed" — a clear
+        // failure signal versus the expected "blocked" notice.
+        let provider: Arc<dyn ModelProvider> =
+            Arc::new(MockProvider::new(vec![ModelResponse {
+                message: Message::assistant("PROVIDER_REACHED_SENTINEL"),
+            }]));
+        let storage = Arc::new(Storage::new(home.clone()));
+        let workspace = Arc::new(ws_root.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let _ = handle_conn(
+                    stream,
+                    storage,
+                    provider,
+                    workspace,
+                    Policy::FullAccess,
+                    bridge::new_hub(),
+                    bridge::new_pending(),
+                    bridge::new_handles(),
+                    open_auth(),
+                    bridge::new_device_tools(),
+                )
+                .await;
+            }
+        });
+
+        let url = format!("ws://{addr}");
+        let (client, _) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("connect");
+        let (mut ctx, mut crx) = client.split();
+
+        send_client(&mut ctx, &hello("d")).await;
+        assert!(matches!(
+            recv_server(&mut crx).await,
+            Some(ServerMsg::Welcome { .. })
+        ));
+
+        send_client(
+            &mut ctx,
+            &ClientMsg::UserMessage {
+                conversation_id: None,
+                text: "please do the thing".into(),
+                // Same host (hostname == server) so hooks are collected locally,
+                // rooted at the project dir holding the UserPromptSubmit hook.
+                origin: fleety_protocol::OriginContext {
+                    hostname: Some(server_hostname()),
+                    os: Some("test".into()),
+                    cwd: Some(project.to_string_lossy().into_owned()),
+                    home: None,
+                },
+                attachments: Vec::new(),
+                voice: false,
+                acting_user: None,
+            },
+        )
+        .await;
+
+        let mut reply = None;
+        for _ in 0..10 {
+            match recv_server(&mut crx).await {
+                Some(ServerMsg::Assistant { text, .. }) => {
+                    reply = Some(text);
+                    break;
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+
+        // Restore the env before asserting so a failure can't leak it.
+        match saved_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+
+        let reply = reply.expect("server should reply");
+        assert!(
+            reply.contains("blocked"),
+            "UserPromptSubmit hook should block the prompt, got: {reply}"
+        );
+        assert!(
+            !reply.contains("PROVIDER_REACHED_SENTINEL"),
+            "the provider must not run when the prompt is blocked"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
     async fn device_exec_routes_to_daemon_and_returns() {
         // The user's agent calls device_exec -> server routes RunTool to the "pi"
         // daemon connection -> daemon replies -> the result returns to the agent
