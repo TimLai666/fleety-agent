@@ -4192,6 +4192,131 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
+    async fn pretooluse_hook_denies_a_tool_end_to_end() {
+        // End-to-end: a same-host conversation whose origin declares a PreToolUse
+        // hook (via the Claude name "Write", exercising the tool-name alias) that
+        // exits non-zero must have the agent's write_file call denied — the file
+        // is never written — while the turn still finishes. Exercises the tool
+        // wrapper inside a live turn with the real local shell runner.
+        let provider: Arc<dyn ModelProvider> = Arc::new(MockProvider::new(vec![
+            ModelResponse {
+                message: Message {
+                    role: CoreRole::Assistant,
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "c1".to_string(),
+                        name: "write_file".to_string(),
+                        arguments: serde_json::json!({ "path": "x.txt", "content": "hi" }),
+                    }],
+                    tool_call_id: None,
+                    attachments: Vec::new(),
+                },
+            },
+            ModelResponse {
+                message: Message::assistant("done"),
+            },
+        ]));
+
+        let home = std::env::temp_dir().join(format!("fleety-pretool-{}", uuid::Uuid::new_v4()));
+        let ws_root = home.join("ws");
+        let project = home.join("proj");
+        std::fs::create_dir_all(&ws_root).expect("mk ws");
+        std::fs::create_dir_all(project.join(".claude")).expect("mk proj/.claude");
+        std::fs::write(
+            project.join(".claude").join("settings.json"),
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Write","hooks":[{"type":"command","command":"exit 1"}]}]}}"#,
+        )
+        .expect("w settings");
+
+        let saved_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &home);
+        std::env::remove_var("FLEETY_DISABLE_PROJECT_HOOKS");
+
+        let storage = Arc::new(Storage::new(home.clone()));
+        let workspace = Arc::new(ws_root.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let _ = handle_conn(
+                    stream,
+                    storage,
+                    provider,
+                    workspace,
+                    Policy::FullAccess,
+                    bridge::new_hub(),
+                    bridge::new_pending(),
+                    bridge::new_handles(),
+                    open_auth(),
+                    bridge::new_device_tools(),
+                )
+                .await;
+            }
+        });
+
+        let url = format!("ws://{addr}");
+        let (client, _) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("connect");
+        let (mut ctx, mut crx) = client.split();
+
+        send_client(&mut ctx, &hello("d")).await;
+        assert!(matches!(
+            recv_server(&mut crx).await,
+            Some(ServerMsg::Welcome { .. })
+        ));
+
+        send_client(
+            &mut ctx,
+            &ClientMsg::UserMessage {
+                conversation_id: None,
+                text: "please write the file".into(),
+                origin: fleety_protocol::OriginContext {
+                    hostname: Some(server_hostname()),
+                    os: Some("test".into()),
+                    cwd: Some(project.to_string_lossy().into_owned()),
+                    home: None,
+                },
+                attachments: Vec::new(),
+                voice: false,
+                acting_user: None,
+            },
+        )
+        .await;
+
+        let mut saw_done = false;
+        for _ in 0..12 {
+            match recv_server(&mut crx).await {
+                Some(ServerMsg::Done { .. }) | None => {
+                    saw_done = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        match saved_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(saw_done, "turn should complete");
+        // Same-host tools are rooted at the origin cwd; the denied write must not
+        // have created the file there (nor in the server workspace fallback).
+        assert!(
+            !project.join("x.txt").exists(),
+            "PreToolUse-denied write must not happen"
+        );
+        assert!(!ws_root.join("x.txt").exists(), "no write in the fallback either");
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
     async fn device_exec_routes_to_daemon_and_returns() {
         // The user's agent calls device_exec -> server routes RunTool to the "pi"
         // daemon connection -> daemon replies -> the result returns to the agent
