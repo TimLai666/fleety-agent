@@ -255,6 +255,21 @@ impl SubagentHost for FleetyHost {
         state: SubagentState,
         output: String,
     ) {
+        // SubagentStop hooks (origin device): this subagent has finished.
+        // Best-effort, audited under the parent conversation; runs regardless of
+        // whether a coordinator wake turn follows.
+        if let Some(ctx) = self.hook_ctx.get() {
+            let _ = crate::conn::run_conversation_event_hooks(
+                crate::hooks_compat::HookEvent::SubagentStop,
+                ctx,
+                &self.hub,
+                &self.pending,
+                &self.storage,
+                &self.device_id,
+                &context,
+            )
+            .await;
+        }
         let Some(manager) = self.manager.get().and_then(Weak::upgrade) else {
             return;
         };

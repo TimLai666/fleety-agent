@@ -295,6 +295,36 @@ pub(crate) fn wrap_registry_with_hooks(
     }
 }
 
+/// Run a conversation's lifecycle-event hooks (`UserPromptSubmit` / `Stop` /
+/// `SubagentStop`) for `event`, auditing each. Returns whether to proceed — only
+/// a non-zero `UserPromptSubmit` blocks. A no-op returning `true` when `ctx` has
+/// no hook for this event (so callers pay nothing on the common path).
+pub(crate) async fn run_conversation_event_hooks(
+    event: crate::hooks_compat::HookEvent,
+    ctx: &HookContext,
+    hub: &Hub,
+    pending: &Pending,
+    storage: &Arc<Storage>,
+    device_id: &str,
+    conversation: &str,
+) -> bool {
+    if !ctx.hooks.iter().any(|h| h.event == event) {
+        return true;
+    }
+    let runner: Arc<dyn crate::hooks_compat::HookRunner> = Arc::new(OriginHookRunner {
+        device: ctx.device.clone(),
+        cwd: ctx.cwd.clone(),
+        hub: Arc::clone(hub),
+        pending: Arc::clone(pending),
+    });
+    let audit: Arc<dyn crate::hooks_compat::HookAudit> = Arc::new(HistoryHookAudit {
+        storage: Arc::clone(storage),
+        device_id: device_id.to_string(),
+        conversation: conversation.to_string(),
+    });
+    crate::hooks_compat::run_event_hooks(event, &ctx.hooks, &runner, &audit).await
+}
+
 /// Build the per-connection tool stack rooted at `root`: the full registry plus
 /// the subagent orchestration, dynamic-workflow, and goal tools (registered only
 /// at this top level). Returns the registry, the subagent host, and the shared
@@ -639,6 +669,9 @@ async fn serve(
         Vec::new(),
     );
     let mut workspace_bound = false;
+    // The bound conversation's hooks, retained for lifecycle-event hooks
+    // (UserPromptSubmit / Stop) fired around each user message in this loop.
+    let mut conv_hook_ctx: Option<Arc<HookContext>> = None;
     let goal_max_continues = goal_max_continues_from_env();
     let skill_reflect_min_steps = skill_reflect_min_steps_from_env();
 
@@ -847,6 +880,7 @@ async fn serve(
                             &conversation,
                         );
                         subagent_host.set_hook_context(Arc::clone(&ctx));
+                        conv_hook_ctx = Some(ctx);
                     }
                 }
 
@@ -899,6 +933,42 @@ async fn serve(
                 } else {
                     Message::user_with_attachments(text, attachments)
                 };
+                // UserPromptSubmit hooks (origin device): run before processing;
+                // a non-zero hook blocks this prompt entirely (its turn is not
+                // run and the message is not stored), mirroring PreToolUse deny.
+                if let Some(ctx) = &conv_hook_ctx {
+                    let proceed = run_conversation_event_hooks(
+                        crate::hooks_compat::HookEvent::UserPromptSubmit,
+                        ctx,
+                        hub,
+                        pending,
+                        storage,
+                        device_id,
+                        &conversation,
+                    )
+                    .await;
+                    if !proceed {
+                        let _ = emit(
+                            out,
+                            &ServerMsg::Assistant {
+                                conversation_id: conversation.clone(),
+                                text: "A UserPromptSubmit hook blocked this prompt \
+                                       (non-zero exit); it was not processed."
+                                    .to_string(),
+                                seq: 0,
+                                speech: None,
+                                attention: None,
+                            },
+                        );
+                        let _ = emit(
+                            out,
+                            &ServerMsg::Done {
+                                conversation_id: conversation.clone(),
+                            },
+                        );
+                        continue;
+                    }
+                }
                 let steps = if matches!(policy, Policy::FullAccess) {
                     // Parallel-read interruption (full-access only — the approval
                     // gate doesn't read inbound here, so we can read a mid-turn
@@ -1036,6 +1106,22 @@ async fn serve(
                 // (fast, storage-only): set the old aside, switch active, tell the
                 // client. Transparent redirect handles clients that ignore it.
                 apply_rollover(storage, out, &conversation, &acting, &rollover_state).await;
+
+                // Stop hooks (origin device): the agent finished handling this
+                // user message. Best-effort, audited; never blocks or alters the
+                // reply already sent.
+                if let Some(ctx) = &conv_hook_ctx {
+                    let _ = run_conversation_event_hooks(
+                        crate::hooks_compat::HookEvent::Stop,
+                        ctx,
+                        hub,
+                        pending,
+                        storage,
+                        device_id,
+                        &conversation,
+                    )
+                    .await;
+                }
 
                 // Learning loop + lifecycle distillation run as BACKGROUND
                 // housekeeping — off the connection loop so the user's next
@@ -2491,6 +2577,38 @@ mod tests {
         let out = tools.call("Bash", serde_json::json!({})).await.unwrap();
         assert_eq!(out["ok"], serde_json::json!(true), "tool runs normally");
         assert!(*ran.lock().unwrap(), "no hooks ⇒ unwrapped ⇒ tool ran");
+    }
+
+    #[tokio::test]
+    async fn run_conversation_event_hooks_proceeds_when_no_such_event() {
+        // A context with only a PostToolUse hook: a UserPromptSubmit event has no
+        // matching hook, so it proceeds and runs (audits) nothing.
+        let ctx = HookContext {
+            hooks: vec![crate::hooks_compat::HookEntry {
+                event: crate::hooks_compat::HookEvent::PostToolUse,
+                matcher: "*".into(),
+                command: "post".into(),
+                scope: crate::hooks_compat::HookScope::User,
+            }],
+            device: None,
+            cwd: None,
+        };
+        let hub = crate::bridge::new_hub();
+        let pending = crate::bridge::new_pending();
+        let storage = temp_storage();
+        let proceed = run_conversation_event_hooks(
+            crate::hooks_compat::HookEvent::UserPromptSubmit,
+            &ctx,
+            &hub,
+            &pending,
+            &storage,
+            "dev-1",
+            "conv-1",
+        )
+        .await;
+        assert!(proceed, "no matching event ⇒ proceed");
+        let audit = storage.list_audit("dev-1", None, None).unwrap();
+        assert!(audit.is_empty(), "no hook ran ⇒ nothing audited");
     }
 
     #[test]

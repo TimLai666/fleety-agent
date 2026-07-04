@@ -18,11 +18,16 @@ use agent_core::{Result, Tool};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-/// Which point in a tool call a hook fires at.
+/// A Claude Code hook event. `PreToolUse` / `PostToolUse` are tool-scoped (they
+/// wrap tool calls); `UserPromptSubmit` / `Stop` / `SubagentStop` are lifecycle
+/// events that fire at conversation checkpoints rather than around a tool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookEvent {
     PreToolUse,
     PostToolUse,
+    UserPromptSubmit,
+    Stop,
+    SubagentStop,
 }
 
 impl HookEvent {
@@ -30,8 +35,20 @@ impl HookEvent {
         match self {
             HookEvent::PreToolUse => "PreToolUse",
             HookEvent::PostToolUse => "PostToolUse",
+            HookEvent::UserPromptSubmit => "UserPromptSubmit",
+            HookEvent::Stop => "Stop",
+            HookEvent::SubagentStop => "SubagentStop",
         }
     }
+
+    /// Every event, for parsers that iterate the settings' `hooks` sections.
+    const ALL: [HookEvent; 5] = [
+        HookEvent::PreToolUse,
+        HookEvent::PostToolUse,
+        HookEvent::UserPromptSubmit,
+        HookEvent::Stop,
+        HookEvent::SubagentStop,
+    ];
 }
 
 /// Where a hook came from — sets audit tagging and the env kill-switch scope.
@@ -77,7 +94,7 @@ pub fn parse_hooks(settings: &Value, scope: HookScope) -> Vec<HookEntry> {
         return Vec::new();
     };
     let mut out = Vec::new();
-    for event in [HookEvent::PreToolUse, HookEvent::PostToolUse] {
+    for event in HookEvent::ALL {
         let Some(arr) = hooks.get(event.as_str()).and_then(Value::as_array) else {
             continue;
         };
@@ -283,6 +300,33 @@ pub fn wrap_tools(
         .collect()
 }
 
+/// Run the lifecycle-event hooks (`UserPromptSubmit` / `Stop` / `SubagentStop`)
+/// matching `event`, auditing each. Returns whether to proceed: only a
+/// `UserPromptSubmit` hook that exits non-zero blocks (returns `false`, the
+/// prompt-level analog of a `PreToolUse` denial); `Stop` / `SubagentStop` always
+/// proceed (they run best-effort and never force continuation in this release).
+/// These events are not tool-scoped, so `matcher` is not consulted.
+pub async fn run_event_hooks(
+    event: HookEvent,
+    hooks: &[HookEntry],
+    runner: &Arc<dyn HookRunner>,
+    audit: &Arc<dyn HookAudit>,
+) -> bool {
+    let mut proceed = true;
+    for h in hooks.iter().filter(|h| h.event == event) {
+        let outcome = runner.run(h).await;
+        audit.record(h, &outcome);
+        if event == HookEvent::UserPromptSubmit {
+            if let HookOutcome::Exited(code) = outcome {
+                if code != 0 {
+                    proceed = false;
+                }
+            }
+        }
+    }
+    proceed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,6 +374,66 @@ mod tests {
             parse_hooks(&weird, HookScope::User).is_empty(),
             "non-command hook entries are skipped"
         );
+    }
+
+    #[test]
+    fn parse_all_five_events() {
+        let settings = json!({
+            "hooks": {
+                "PreToolUse": [ { "hooks": [ { "type": "command", "command": "pre" } ] } ],
+                "PostToolUse": [ { "hooks": [ { "type": "command", "command": "post" } ] } ],
+                "UserPromptSubmit": [ { "hooks": [ { "type": "command", "command": "ups" } ] } ],
+                "Stop": [ { "hooks": [ { "type": "command", "command": "stop" } ] } ],
+                "SubagentStop": [ { "hooks": [ { "type": "command", "command": "sstop" } ] } ]
+            }
+        });
+        let got = parse_hooks(&settings, HookScope::User);
+        assert_eq!(got.len(), 5, "all five events parsed");
+        for (event, cmd) in [
+            (HookEvent::PreToolUse, "pre"),
+            (HookEvent::PostToolUse, "post"),
+            (HookEvent::UserPromptSubmit, "ups"),
+            (HookEvent::Stop, "stop"),
+            (HookEvent::SubagentStop, "sstop"),
+        ] {
+            let e = got.iter().find(|h| h.event == event).expect("event present");
+            assert_eq!(e.command, cmd);
+        }
+    }
+
+    #[tokio::test]
+    async fn user_prompt_submit_blocks_on_nonzero() {
+        let audit = Arc::new(FakeAudit::default());
+        let audit_dyn: Arc<dyn HookAudit> = Arc::clone(&audit) as Arc<dyn HookAudit>;
+        // UserPromptSubmit exiting non-zero blocks; Stop exiting non-zero does not.
+        let hooks = vec![
+            HookEntry {
+                event: HookEvent::UserPromptSubmit,
+                matcher: "*".into(),
+                command: "ups".into(),
+                scope: HookScope::User,
+            },
+            HookEntry {
+                event: HookEvent::Stop,
+                matcher: "*".into(),
+                command: "stop".into(),
+                scope: HookScope::User,
+            },
+        ];
+        let runner_ups: Arc<dyn HookRunner> = Arc::new(FakeRunner(
+            [
+                ("ups".to_string(), HookOutcome::Exited(1)),
+                ("stop".to_string(), HookOutcome::Exited(1)),
+            ]
+            .into(),
+        ));
+        let proceed_ups =
+            run_event_hooks(HookEvent::UserPromptSubmit, &hooks, &runner_ups, &audit_dyn).await;
+        assert!(!proceed_ups, "non-zero UserPromptSubmit blocks");
+        let proceed_stop =
+            run_event_hooks(HookEvent::Stop, &hooks, &runner_ups, &audit_dyn).await;
+        assert!(proceed_stop, "non-zero Stop still proceeds");
+        assert_eq!(audit.0.lock().unwrap().len(), 2, "both events audited");
     }
 
     #[test]
