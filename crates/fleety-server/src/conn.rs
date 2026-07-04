@@ -104,6 +104,7 @@ fn build_connection_stack(
     acting: &crate::identity::ActingUser,
     rollover_state: &crate::conversation_lifecycle::RolloverState,
     editor_specs: &[agent_core::ToolSpec],
+    conversation_sources: &[std::path::PathBuf],
 ) -> (
     agent_core::ToolRegistry,
     Arc<crate::subagent::FleetyHost>,
@@ -119,6 +120,7 @@ fn build_connection_stack(
         handles,
         auth,
         device_tools,
+        conversation_sources,
     );
     // Conversation recall, scoped to the acting user (per-user history).
     crate::conversation_recall::register(
@@ -421,6 +423,7 @@ async fn serve(
         &connect_acting,
         &rollover_state,
         &editor_specs,
+        &[],
     );
     let mut workspace_bound = false;
     let goal_max_continues = goal_max_continues_from_env();
@@ -501,6 +504,7 @@ async fn serve(
                             let b = crate::workspace::resolve_binding(
                                 origin.cwd.as_deref(),
                                 origin.hostname.as_deref(),
+                                origin.os.as_deref(),
                                 device_id,
                                 &server_host,
                                 workspace,
@@ -514,6 +518,29 @@ async fn serve(
                     }
                     // Rebuild the stack once with the resolved acting user (so
                     // recall is scoped to them) and the chosen root.
+                    // Conversation-scoped skill sources: same-host origins only
+                    // (deeper project/user .claude/.agents skills); cross-device
+                    // and absent origins fall back to the global tiers.
+                    let conversation_sources: Vec<std::path::PathBuf> =
+                        if binding.device.is_none() {
+                            match (
+                                binding.origin_cwd.as_deref(),
+                                std::env::var("HOME")
+                                    .ok()
+                                    .or_else(|| std::env::var("USERPROFILE").ok()),
+                            ) {
+                                (Some(cwd), Some(home)) => crate::skill_sources::skill_sources(
+                                    std::path::Path::new(cwd),
+                                    std::path::Path::new(&home),
+                                )
+                                .into_iter()
+                                .filter(|d| d.is_dir())
+                                .collect(),
+                                _ => Vec::new(),
+                            }
+                        } else {
+                            Vec::new()
+                        };
                     let (t, h, g, se) = build_connection_stack(
                         storage,
                         &current_root,
@@ -528,6 +555,7 @@ async fn serve(
                         &acting,
                         &rollover_state,
                         &editor_specs,
+                        &conversation_sources,
                     );
                     tools = t;
                     subagent_host = h;
@@ -761,6 +789,7 @@ async fn serve(
                             &handles_bg,
                             &auth_bg,
                             &device_tools_bg,
+                            &[],
                         );
                         crate::conversation_lifecycle::register(
                             &mut tools,
@@ -1313,6 +1342,84 @@ pub(crate) async fn drive_to_goal(
 /// `emit_terminal` is true the user-facing `Assistant` + `Done` frames are sent
 /// here; when false the turn is silent (the caller emits on the terminal turn)
 /// while progress still streams as `AssistantDelta`. Returns the reply + seq.
+/// Format collected instruction files into one injected block, or `None` when
+/// nothing was collected.
+fn format_instruction_files(files: &[crate::instructions::InstructionFile]) -> Option<String> {
+    if files.is_empty() {
+        return None;
+    }
+    let mut s = String::from(
+        "Project & user instruction files, auto-loaded for this workspace (deeper / more \
+         specific files override shallower ones):",
+    );
+    for f in files {
+        s.push_str(&format!("\n\n===== {} =====\n{}", f.path.display(), f.content));
+    }
+    Some(s)
+}
+
+/// Build the per-turn instruction-file preamble for a conversation from its
+/// bound origin: the project-layer AGENTS.md / CLAUDE.md (cwd up to
+/// `server_home`) plus the user-global files. Re-read every turn so edits
+/// hot-reload, and never persisted. Same-host origins only here; cross-device
+/// origins read via `device_exec` are wired separately. `None` when the
+/// conversation has no usable origin.
+fn build_instruction_preamble(
+    storage: &Storage,
+    conversation: &str,
+    server_home: &std::path::Path,
+) -> Option<String> {
+    let binding = storage.conversation_workspace(conversation)?;
+    if binding.device.is_some() {
+        return None;
+    }
+    let cwd_str = binding.origin_cwd.as_deref()?;
+    let cwd = std::path::Path::new(cwd_str);
+    let paths = crate::instructions::collect_instruction_paths(server_home, cwd, server_home);
+    let files = crate::instructions::read_instruction_files(
+        &paths,
+        crate::instructions::per_file_cap(),
+        crate::instructions::total_cap(),
+        |p| std::fs::read_to_string(p).ok(),
+    );
+    format_instruction_files(&files)
+}
+
+/// Cross-device version: when the conversation's origin is another device, read
+/// that device's cwd `AGENTS.md` / `CLAUDE.md` via `device_exec` (best-effort —
+/// an offline or failed read is skipped, never fatal). Re-read each turn like
+/// the local path. `None` for same-host or no-origin conversations.
+async fn build_instruction_preamble_remote(
+    storage: &Storage,
+    conversation: &str,
+    tools: &ToolRegistry,
+) -> Option<String> {
+    let binding = storage.conversation_workspace(conversation)?;
+    let device = binding.device.clone()?; // Some(_) → cross-device
+    let cwd_str = binding.origin_cwd.as_deref()?;
+    let cwd = std::path::Path::new(cwd_str);
+    let mut items = Vec::new();
+    for name in ["AGENTS.md", "CLAUDE.md"] {
+        let path = cwd.join(name);
+        let args = serde_json::json!({
+            "device": device,
+            "tool": "read_file",
+            "args": { "file": path.to_string_lossy() },
+        });
+        if let Ok(res) = tools.call("device_exec", args).await {
+            if let Some(content) = res.get("content").and_then(|c| c.as_str()) {
+                items.push((path, content.to_string()));
+            }
+        }
+    }
+    let files = crate::instructions::cap_instruction_contents(
+        items,
+        crate::instructions::per_file_cap(),
+        crate::instructions::total_cap(),
+    );
+    format_instruction_files(&files)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn drive_turn(
     out: &Out,
@@ -1348,6 +1455,34 @@ pub(crate) async fn drive_turn(
         "Current time: {}",
         crate::tz::format_for_user(now_secs, tz)
     )));
+    // Ephemeral per-turn origin context: which device + directory this
+    // conversation was started from. Rebuilt each turn from the persisted
+    // binding and never appended to the conversation, so long-context
+    // compaction can't drop it. Same-host vs cross-device wording differs; a
+    // conversation with no usable origin injects nothing.
+    if let Some(origin) = storage
+        .conversation_workspace(conversation)
+        .and_then(|b| crate::workspace::origin_preamble(&b))
+    {
+        messages.push(Message::system(origin));
+    }
+    // Auto-loaded project & user instruction files, re-read each turn (so edits
+    // hot-reload) and never persisted. Same-host origins only for now.
+    if let Some(home) = std::env::var("HOME")
+        .ok()
+        .or_else(|| std::env::var("USERPROFILE").ok())
+    {
+        if let Some(instr) =
+            build_instruction_preamble(storage, conversation, std::path::Path::new(&home))
+        {
+            messages.push(Message::system(instr));
+        }
+    }
+    // Cross-device origin: read the origin device's cwd instruction files via
+    // device_exec (best-effort; offline / failed reads are skipped).
+    if let Some(instr) = build_instruction_preamble_remote(storage, conversation, tools).await {
+        messages.push(Message::system(instr));
+    }
     messages.extend(storage.load(device_id, conversation)?);
     let mut events = storage.journaling_log(device_id, conversation);
     let delta_out = out.clone();
@@ -1551,6 +1686,7 @@ pub(crate) fn build_full_registry(
     handles: &Handles,
     auth: &Arc<AuthStore>,
     device_tools: &DeviceTools,
+    conversation_sources: &[std::path::PathBuf],
 ) -> ToolRegistry {
     let mut tools = crate::tools::build_registry(
         workspace,
@@ -1567,6 +1703,7 @@ pub(crate) fn build_full_registry(
         &storage.skills_authored_dir(),
         &storage.skills_installed_dir(),
         &storage.skills_synced_dir(),
+        conversation_sources,
     );
     crate::web::register(&mut tools, &storage.cookies_dir(), workspace);
     crate::mcp::register(
@@ -1679,6 +1816,7 @@ async fn recover_one_interactive(
         handles,
         auth,
         device_tools,
+        &[],
     );
     let config = LoopConfig::default();
     let mut messages = vec![Message::system(
@@ -2467,6 +2605,234 @@ mod tests {
         assert!(steps >= 1, "a completed turn reports its step count");
         let _ = drain(&mut rx);
         let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn turn_injects_ephemeral_origin() {
+        let (storage, tools, goal_state, home, out, mut rx) = goal_env();
+        // A cross-device binding: the conversation was started on another device.
+        let binding = crate::workspace::WorkspaceBinding {
+            root: home.clone(),
+            device: Some("dev2".to_string()),
+            origin_cwd: Some("/home/bob/proj".to_string()),
+            origin_hostname: Some("bob-laptop".to_string()),
+            origin_os: Some("macos".to_string()),
+        };
+        storage
+            .set_conversation_workspace("c1", &binding)
+            .expect("set binding");
+        // This binding produces a cross-device origin preamble (what the turn
+        // injects). Same signal the drive_turn injection point reads.
+        let pre = crate::workspace::origin_preamble(&binding).expect("preamble");
+        assert!(pre.contains("device_exec") && pre.contains("/home/bob/proj"));
+
+        let provider = MockProvider::new(vec![text_resp("ok")]);
+        let mut gate = agent_core::AutoApprove;
+        drive_to_goal(
+            &out,
+            &storage,
+            &provider,
+            &tools,
+            Policy::FullAccess,
+            "dev",
+            "c1",
+            Message::user("hi"),
+            &mut gate,
+            &goal_state,
+            5,
+            false,
+            &crate::identity::ActingUser::Guest,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .await
+        .unwrap();
+
+        // The origin preamble is ephemeral: injected into the turn's messages
+        // but NEVER appended to the persisted conversation. If it leaked into
+        // history, its `device_exec` marker would show up here.
+        let history = storage.load("dev", "c1").expect("load");
+        let dump = format!("{history:?}");
+        assert!(
+            !dump.contains("device_exec"),
+            "origin preamble must not be persisted to the conversation history"
+        );
+        let _ = drain(&mut rx);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[tokio::test]
+    async fn resume_reinjects_persisted_origin() {
+        let (storage, tools, goal_state, home, out, mut rx) = goal_env();
+        // Resume: the binding was persisted earlier; the resuming message carries
+        // no origin. The preamble is rebuilt from the persisted binding, not the
+        // message, so it stays identical across a resume reload.
+        let binding = crate::workspace::WorkspaceBinding {
+            root: home.clone(),
+            device: Some("dev2".to_string()),
+            origin_cwd: Some("/home/bob/proj".to_string()),
+            origin_hostname: Some("bob-laptop".to_string()),
+            origin_os: Some("macos".to_string()),
+        };
+        storage
+            .set_conversation_workspace("c1", &binding)
+            .expect("set");
+        let before = crate::workspace::origin_preamble(&binding);
+        let after = crate::workspace::origin_preamble(
+            &storage.conversation_workspace("c1").expect("reload"),
+        );
+        assert_eq!(
+            before, after,
+            "origin preamble is identical after a resume reload"
+        );
+        assert!(after.expect("some").contains("dev2"));
+
+        // A resume message with no origin still drives a turn cleanly.
+        let provider = MockProvider::new(vec![text_resp("ok")]);
+        let mut gate = agent_core::AutoApprove;
+        drive_to_goal(
+            &out,
+            &storage,
+            &provider,
+            &tools,
+            Policy::FullAccess,
+            "dev",
+            "c1",
+            Message::user("resume"),
+            &mut gate,
+            &goal_state,
+            5,
+            false,
+            &crate::identity::ActingUser::Guest,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .await
+        .unwrap();
+
+        // A legacy binding (persisted before origin fields existed) has no origin
+        // fields → the preamble is omitted and the resume does not error.
+        let legacy = crate::workspace::WorkspaceBinding {
+            root: home.clone(),
+            device: None,
+            origin_cwd: None,
+            origin_hostname: None,
+            origin_os: None,
+        };
+        storage
+            .set_conversation_workspace("c2", &legacy)
+            .expect("set legacy");
+        assert!(crate::workspace::origin_preamble(&legacy).is_none());
+        let provider2 = MockProvider::new(vec![text_resp("ok2")]);
+        let mut gate2 = agent_core::AutoApprove;
+        drive_to_goal(
+            &out,
+            &storage,
+            &provider2,
+            &tools,
+            Policy::FullAccess,
+            "dev",
+            "c2",
+            Message::user("resume legacy"),
+            &mut gate2,
+            &goal_state,
+            5,
+            false,
+            &crate::identity::ActingUser::Guest,
+            &std::sync::atomic::AtomicBool::new(false),
+        )
+        .await
+        .unwrap();
+
+        let _ = drain(&mut rx);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn instruction_preamble_injects_layered_files_per_conversation() {
+        let home =
+            std::env::temp_dir().join(format!("fleety-instr-{}", uuid::Uuid::new_v4()));
+        let proj = home.join("proj");
+        std::fs::create_dir_all(&proj).expect("mk proj");
+        std::fs::write(home.join("AGENTS.md"), "root-rule").expect("w root");
+        std::fs::write(proj.join("CLAUDE.md"), "proj-rule").expect("w proj");
+        let storage = Arc::new(Storage::new(
+            std::env::temp_dir().join(format!("fleety-instr-s-{}", uuid::Uuid::new_v4())),
+        ));
+        let binding = crate::workspace::WorkspaceBinding {
+            root: proj.clone(),
+            device: None,
+            origin_cwd: Some(proj.to_string_lossy().to_string()),
+            origin_hostname: None,
+            origin_os: None,
+        };
+        storage
+            .set_conversation_workspace("c1", &binding)
+            .expect("set");
+        // The bound conversation gets both the shallow (root AGENTS.md) and deep
+        // (proj CLAUDE.md) instruction files, re-read live.
+        let out = build_instruction_preamble(&storage, "c1", &home).expect("preamble");
+        assert!(out.contains("root-rule"), "shallow layer injected");
+        assert!(out.contains("proj-rule"), "deep layer injected");
+        // Per-conversation: an unbound conversation gets nothing.
+        assert!(build_instruction_preamble(&storage, "c2", &home).is_none());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    fn cross_device_binding() -> crate::workspace::WorkspaceBinding {
+        crate::workspace::WorkspaceBinding {
+            root: std::env::temp_dir(),
+            device: Some("dev2".to_string()),
+            origin_cwd: Some("/home/bob/proj".to_string()),
+            origin_hostname: None,
+            origin_os: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn cross_device_reads_via_device_exec() {
+        use agent_core::{RiskLevel, Tool, ToolSpec};
+        struct MockExec;
+        #[async_trait::async_trait]
+        impl Tool for MockExec {
+            fn spec(&self) -> ToolSpec {
+                ToolSpec {
+                    name: "device_exec".to_string(),
+                    description: String::new(),
+                    parameters: serde_json::json!({}),
+                    risk: RiskLevel::Read,
+                }
+            }
+            async fn call(&self, _args: serde_json::Value) -> agent_core::Result<serde_json::Value> {
+                Ok(serde_json::json!({ "content": "remote-rule" }))
+            }
+        }
+        let home =
+            std::env::temp_dir().join(format!("fleety-xdev-{}", uuid::Uuid::new_v4()));
+        let storage = Arc::new(Storage::new(home.clone()));
+        storage
+            .set_conversation_workspace("c1", &cross_device_binding())
+            .expect("set");
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(MockExec));
+        let out = build_instruction_preamble_remote(&storage, "c1", &tools)
+            .await
+            .expect("remote preamble");
+        assert!(out.contains("remote-rule"), "cross-device content injected");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn cross_device_read_failure_is_skipped() {
+        let home =
+            std::env::temp_dir().join(format!("fleety-xdev2-{}", uuid::Uuid::new_v4()));
+        let storage = Arc::new(Storage::new(home.clone()));
+        storage
+            .set_conversation_workspace("c1", &cross_device_binding())
+            .expect("set");
+        // No device_exec registered → every read errors → all skipped, no panic.
+        let tools = ToolRegistry::new();
+        let out = build_instruction_preamble_remote(&storage, "c1", &tools).await;
+        assert!(out.is_none(), "failed reads are skipped without panicking");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[tokio::test]

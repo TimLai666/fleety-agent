@@ -126,6 +126,7 @@ impl FleetyHost {
             &self.handles,
             &self.auth,
             &self.device_tools,
+            &[],
         )
     }
 }

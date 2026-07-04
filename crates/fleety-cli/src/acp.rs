@@ -130,6 +130,9 @@ pub fn cwd_to_origin(cwd: Option<&str>) -> fleety_protocol::OriginContext {
             .ok(),
         os: Some(std::env::consts::OS.to_string()),
         cwd: cwd.map(str::to_string),
+        home: std::env::var("HOME")
+            .ok()
+            .or_else(|| std::env::var("USERPROFILE").ok()),
     }
 }
 

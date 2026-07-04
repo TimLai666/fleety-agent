@@ -2021,6 +2021,9 @@ mod tests {
         let b = WorkspaceBinding {
             root: std::path::PathBuf::from("/home/alice/proj"),
             device: None,
+            origin_cwd: None,
+            origin_hostname: None,
+            origin_os: None,
         };
         storage.set_conversation_workspace("c1", &b).unwrap();
         assert_eq!(storage.conversation_workspace("c1"), Some(b.clone()));
@@ -2028,6 +2031,9 @@ mod tests {
         let other = WorkspaceBinding {
             root: std::path::PathBuf::from("/elsewhere"),
             device: Some("dev2".into()),
+            origin_cwd: None,
+            origin_hostname: None,
+            origin_os: None,
         };
         storage.set_conversation_workspace("c1", &other).unwrap();
         assert_eq!(storage.conversation_workspace("c1"), Some(b));

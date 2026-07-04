@@ -1,10 +1,4 @@
-# skills-management Specification
-
-## Purpose
-
-TBD - created by archiving change 'baseline-tool-surface-specs'. Update Purpose after archive.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Three-tier skill store
 
@@ -25,82 +19,8 @@ The system SHALL load `SKILL.md` skill packs from three tiers — builtin (shipp
 - **WHEN** `list_skills` or `use_skill` returns a skill
 - **THEN** the result includes a `device` field identifying where the skill's `path` lives (null for the server host, otherwise the device id)
 
+## ADDED Requirements
 
-<!-- @trace
-source: conversation-scoped-skills
-updated: 2026-07-04
-code:
-  - crates/fleety-server/src/conn.rs
-  - crates/fleety-server/src/instructions.rs
-  - crates/fleety-server/src/scheduler.rs
-  - crates/fleety-cli/src/main.rs
-  - crates/fleety-server/src/skill_sources.rs
-  - crates/fleety-server/src/subagent.rs
-  - crates/fleety-server/src/tools.rs
-  - crates/fleety-cli/src/acp.rs
-  - crates/fleety-server/src/skills.rs
-  - crates/agent-core/src/compress.rs
-  - crates/fleety-server/src/workspace.rs
-  - crates/fleety-protocol/src/lib.rs
-  - crates/fleety-server/src/main.rs
-  - crates/fleety-server/src/storage.rs
--->
-
----
-### Requirement: File-level skill editing with tier rules
-
-The system SHALL provide `skill_install`, `skill_remove`, `skill_list_files`, `skill_read_file`, `skill_write_file`, `skill_edit_file`, and `skill_delete_file` operating on individual files within a skill directory. Builtin skills SHALL NEVER be mutated. A write to a not-yet-existing skill SHALL land in the authored tier. In-skill file paths SHALL be rejected if they contain `..`, are absolute, or otherwise escape the skill directory.
-
-#### Scenario: refuse to edit a builtin skill
-
-- **WHEN** `skill_write_file` targets a file inside a builtin-only skill
-- **THEN** the call is refused because builtin skills are read-only
-
-#### Scenario: reject an escaping in-skill path
-
-- **WHEN** `skill_read_file` is given a `file` containing `..`
-- **THEN** the call is refused with an invalid-path error
-
-<!-- @trace
-source: baseline-tool-surface-specs
-updated: 2026-06-28
-code:
-  - .agents/skills/spectra-commit/SKILL.md
-  - .opencode/skills/spectra-commit/SKILL.md
-  - CLAUDE.md
-  - .agents/skills/spectra-ingest/SKILL.md
-  - .agents/skills/spectra-debug/SKILL.md
-  - .opencode/skills/spectra-audit/SKILL.md
-  - .spectra.yaml
-  - .opencode/skills/spectra-ask/SKILL.md
-  - .opencode/commands/spectra-drift.md
-  - .opencode/skills/spectra-propose/SKILL.md
-  - AGENTS.md
-  - .opencode/skills/spectra-discuss/SKILL.md
-  - .agents/skills/spectra-propose/SKILL.md
-  - .agents/skills/spectra-archive/SKILL.md
-  - .agents/skills/spectra-apply/SKILL.md
-  - .agents/skills/spectra-ask/SKILL.md
-  - .opencode/commands/spectra-discuss.md
-  - .opencode/commands/spectra-ingest.md
-  - .opencode/skills/spectra-apply/SKILL.md
-  - .opencode/skills/spectra-archive/SKILL.md
-  - .opencode/commands/spectra-propose.md
-  - .opencode/skills/spectra-drift/SKILL.md
-  - .opencode/commands/spectra-archive.md
-  - .agents/skills/spectra-audit/SKILL.md
-  - .opencode/commands/spectra-audit.md
-  - .opencode/commands/spectra-apply.md
-  - .opencode/skills/spectra-ingest/SKILL.md
-  - .opencode/commands/spectra-ask.md
-  - .opencode/commands/spectra-debug.md
-  - .agents/skills/spectra-discuss/SKILL.md
-  - .opencode/skills/spectra-debug/SKILL.md
-  - .opencode/commands/spectra-commit.md
-  - .agents/skills/spectra-drift/SKILL.md
--->
-
----
 ### Requirement: Conversation-scoped project and user skill tiers
 
 The system SHALL, per conversation, overlay two conversation-scoped skill tiers on top of the global tiers: a `project` tier collected from the origin path's own `.claude/skills` and `.agents/skills` directories (each level from the origin cwd upward), and a `user` tier collected from the originating device's user-global `~/.claude/skills` and `~/.agents/skills`. These conversation-scoped tiers SHALL take precedence over all global tiers, giving the order project > user > installed > authored > builtin > synced. The conversation-scoped skills SHALL be visible only within that conversation (they SHALL NOT enter the global skill store and SHALL NOT be visible to other conversations); this is achieved by overlaying the sources only onto that conversation's per-connection registry. In the first release the conversation-scoped tiers SHALL be collected only when the origin is on the server host (device null); when the origin is another device or absent, the conversation-scoped tiers SHALL be empty and the conversation SHALL fall back to the global tiers.
@@ -133,23 +53,3 @@ The system SHALL, per conversation, overlay two conversation-scoped skill tiers 
 | user + installed | user |
 | installed + builtin | installed |
 | synced only | synced |
-
-<!-- @trace
-source: conversation-scoped-skills
-updated: 2026-07-04
-code:
-  - crates/fleety-server/src/conn.rs
-  - crates/fleety-server/src/instructions.rs
-  - crates/fleety-server/src/scheduler.rs
-  - crates/fleety-cli/src/main.rs
-  - crates/fleety-server/src/skill_sources.rs
-  - crates/fleety-server/src/subagent.rs
-  - crates/fleety-server/src/tools.rs
-  - crates/fleety-cli/src/acp.rs
-  - crates/fleety-server/src/skills.rs
-  - crates/agent-core/src/compress.rs
-  - crates/fleety-server/src/workspace.rs
-  - crates/fleety-protocol/src/lib.rs
-  - crates/fleety-server/src/main.rs
-  - crates/fleety-server/src/storage.rs
--->

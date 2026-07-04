@@ -59,6 +59,11 @@ pub struct OriginContext {
     pub os: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// The originating device's home directory, so the server can locate the
+    /// origin's user-global instruction files (`~/.claude`, `~/.agents`) even
+    /// when the origin is another device than the server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home: Option<String>,
 }
 
 /// Which host a remote `ConfigExec` operates on. `Local` is handled by the CLI

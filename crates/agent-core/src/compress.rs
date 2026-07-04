@@ -37,6 +37,12 @@ pub trait ContextCompressor: Send + Sync {
     fn compress(&self, text: &str) -> String;
 }
 
+/// The default per-string truncation threshold: strings longer than this are
+/// head/tail-trimmed. Exposed as a single source so retrieval
+/// (`fetch_tool_result`) can cap a page to a size that survives being fed back
+/// through compression without being re-truncated.
+pub const DEFAULT_MAX_STRING: usize = 4000;
+
 /// Structural JSON compressor. Defaults are generous so ordinary small tool
 /// results are returned byte-for-byte; only genuinely large structures shrink.
 #[derive(Debug, Clone)]
@@ -59,7 +65,7 @@ impl Default for SmartCrusher {
             max_array: 50,
             head: 20,
             tail: 5,
-            max_string: 4000,
+            max_string: DEFAULT_MAX_STRING,
             drop_empty: false,
             max_depth: 24,
         }
@@ -102,8 +108,16 @@ impl SmartCrusher {
                 let n = s.chars().count();
                 if n > self.max_string {
                     *truncated = true;
-                    let kept: String = s.chars().take(self.max_string).collect();
-                    Value::String(format!("{kept}…(+{} chars)", n - self.max_string))
+                    // Keep a head and a tail (like long arrays), so the end of a
+                    // long single-string output — where errors/summaries often
+                    // sit — stays visible. Head ~3/4, tail ~1/4; char-wise slices
+                    // are UTF-8 safe.
+                    let head_len = self.max_string * 3 / 4;
+                    let tail_len = self.max_string - head_len;
+                    let omitted = n - head_len - tail_len;
+                    let head: String = s.chars().take(head_len).collect();
+                    let tail: String = s.chars().skip(n - tail_len).collect();
+                    Value::String(format!("{head}…(+{omitted} chars omitted){tail}"))
                 } else {
                     value.clone()
                 }
@@ -372,8 +386,32 @@ mod tests {
         let s = "x".repeat(5000);
         let crushed = SmartCrusher::default().crush(&json!(s));
         let out = crushed.as_str().expect("str");
-        assert!(out.ends_with("…(+1000 chars)"));
+        // Head+tail retained with an omission marker (not head-only).
+        assert!(out.contains("chars omitted"));
         assert!(out.chars().count() < 5000);
+    }
+
+    #[test]
+    fn long_string_keeps_head_and_tail() {
+        // Spec example: 10000 identical head chars followed by a distinct
+        // 4-char tail, threshold 4000. Both ends must survive.
+        let s = format!("{}WXYZ", "A".repeat(10000));
+        let crushed = SmartCrusher::default().crush(&json!(s));
+        let out = crushed.as_str().expect("str");
+        assert!(out.starts_with("AAAA"), "head retained");
+        assert!(out.ends_with("WXYZ"), "tail retained");
+        assert!(out.contains("omitted"), "omission marker present");
+        assert!(
+            out.chars().count() < s.chars().count(),
+            "shorter than the original"
+        );
+    }
+
+    #[test]
+    fn short_string_unchanged() {
+        let s = "x".repeat(100);
+        let crushed = SmartCrusher::default().crush(&json!(s));
+        assert_eq!(crushed, json!(s));
     }
 
     #[test]
@@ -444,6 +482,20 @@ mod tests {
         assert!(
             out.contains("fetch_tool_result id=\"call_9\""),
             "trimmed-but-within-budget results must still name the fetch id"
+        );
+    }
+
+    #[test]
+    fn fetch_page_survives_compression() {
+        // A fetched page is capped to the string threshold, so feeding it back
+        // through compression neither re-truncates its content nor grows a
+        // self-referential fetch marker.
+        let page = json!({ "content": "a".repeat(DEFAULT_MAX_STRING), "total_chars": 9999 });
+        let out = compress_tool_result(&page, 8000, "call_x");
+        assert!(!out.contains("chars omitted"), "content not re-truncated");
+        assert!(
+            !out.contains("fetch_tool_result"),
+            "no self-referential fetch marker"
         );
     }
 

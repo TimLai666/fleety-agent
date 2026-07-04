@@ -427,12 +427,16 @@ impl Tool for FetchToolResult {
     async fn call(&self, args: Value) -> Result<Value> {
         let id = require_str(&args, "id")?;
         let offset = args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
+        // Cap a page to the string-compression threshold (not the full budget),
+        // so the returned window survives being fed back through compression
+        // without being re-truncated or growing a self-referential marker.
+        let cap = self.budget.min(agent_core::compress::DEFAULT_MAX_STRING);
         let limit = args
             .get("limit")
             .and_then(Value::as_u64)
             .map(|n| n as usize)
-            .unwrap_or(self.budget)
-            .clamp(1, self.budget);
+            .unwrap_or(cap)
+            .clamp(1, cap);
 
         let grants = self.storage.grants();
         let resolved = self.storage.tool_result_for(
@@ -647,6 +651,42 @@ mod tests {
         // Unknown id → uniform not-found.
         let r = tool.call(json!({ "id": "nope" })).await.expect("call");
         assert_eq!(r["found"], false);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn fetch_page_capped_to_threshold() {
+        use agent_core::Event;
+        let home = temp_dir();
+        let storage = std::sync::Arc::new(crate::storage::Storage::new(home.clone()));
+        storage
+            .append_history_tagged(
+                "dev",
+                "conv",
+                &Event::ToolResult {
+                    id: "big2".to_string(),
+                    result: json!("b".repeat(6000)),
+                },
+            )
+            .expect("tag");
+        let tool = FetchToolResult {
+            storage,
+            device_id: "dev".to_string(),
+            acting: crate::identity::ActingUser::Guest,
+            conversation_hint: Some("conv".to_string()),
+            budget: 8000,
+        };
+        // Even with a large budget and a larger requested limit, one page is
+        // capped to the string-compression threshold so it survives being fed
+        // back through compression intact.
+        let r = tool
+            .call(json!({ "id": "big2", "limit": 8000 }))
+            .await
+            .expect("call");
+        assert_eq!(
+            r["returned_chars"],
+            agent_core::compress::DEFAULT_MAX_STRING
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 

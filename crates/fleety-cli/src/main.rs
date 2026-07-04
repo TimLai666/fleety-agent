@@ -602,6 +602,9 @@ fn origin() -> OriginContext {
         cwd: std::env::current_dir()
             .ok()
             .map(|p| p.display().to_string()),
+        home: std::env::var("HOME")
+            .ok()
+            .or_else(|| std::env::var("USERPROFILE").ok()),
     }
 }
 

@@ -32,12 +32,14 @@ pub fn register(
     authored: &Path,
     installed: &Path,
     synced: &Path,
+    conversation: &[PathBuf],
 ) {
     let tiers = || Tiers {
         builtin: builtin.to_path_buf(),
         authored: authored.to_path_buf(),
         installed: installed.to_path_buf(),
         synced: synced.to_path_buf(),
+        conversation: conversation.to_vec(),
     };
     registry.register(Box::new(ListSkills(tiers())));
     registry.register(Box::new(UseSkill(tiers())));
@@ -60,6 +62,10 @@ struct Tiers {
     installed: PathBuf,
     /// Runtime-synced from an external repo; lowest precedence.
     synced: PathBuf,
+    /// Conversation-scoped project/user skill source dirs (highest precedence),
+    /// ordered deep → shallow then user-global. Empty for a plain (non-scoped)
+    /// registry.
+    conversation: Vec<PathBuf>,
 }
 
 impl Tiers {
@@ -90,6 +96,10 @@ struct SkillInfo {
     description: String,
     path: PathBuf, // the SKILL.md path
     source: &'static str,
+    /// Where the skill's `path` lives: `None` = the server host, `Some(id)` =
+    /// that device (a conversation-scoped skill read from another device). A
+    /// bare path is not a usable handle without its device.
+    device: Option<String>,
 }
 
 /// Reject skill names that could escape the skills store.
@@ -122,41 +132,66 @@ fn valid_file(file: &str) -> Result<String> {
 }
 
 /// Collect skills by name across the four tiers; installed > authored > builtin > synced.
+/// Scan one skill source directory, inserting each skill dir (a dir with a
+/// non-symlink `SKILL.md`) into `map` under `source`/`device`. Later calls
+/// override earlier ones by name.
+fn scan_dir(
+    dir: &Path,
+    source: &'static str,
+    device: Option<&str>,
+    map: &mut BTreeMap<String, SkillInfo>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.file_type().map(|ft| ft.is_symlink()).unwrap_or(false) {
+            continue;
+        }
+        let path = entry.path();
+        let skill_md = path.join("SKILL.md");
+        let md_is_symlink = skill_md
+            .symlink_metadata()
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false);
+        if path.is_dir() && skill_md.is_file() && !md_is_symlink {
+            let name = entry.file_name().to_string_lossy().to_string();
+            map.insert(
+                name,
+                SkillInfo {
+                    description: skill_description_of(&skill_md),
+                    path: skill_md,
+                    source,
+                    device: device.map(str::to_string),
+                },
+            );
+        }
+    }
+}
+
+/// Collect skills by name across the four global tiers; installed > authored >
+/// builtin > synced (lowest precedence scanned first so higher tiers override).
 fn collect(t: &Tiers) -> BTreeMap<String, SkillInfo> {
     let mut map = BTreeMap::new();
-    // Insert lowest precedence first (synced), then builtin, authored, installed,
-    // so later (higher) tiers override.
     for (dir, source) in [
         (&t.synced, "synced"),
         (&t.builtin, "builtin"),
         (&t.authored, "authored"),
         (&t.installed, "installed"),
     ] {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            if entry.file_type().map(|ft| ft.is_symlink()).unwrap_or(false) {
-                continue;
-            }
-            let path = entry.path();
-            let skill_md = path.join("SKILL.md");
-            let md_is_symlink = skill_md
-                .symlink_metadata()
-                .map(|m| m.file_type().is_symlink())
-                .unwrap_or(false);
-            if path.is_dir() && skill_md.is_file() && !md_is_symlink {
-                let name = entry.file_name().to_string_lossy().to_string();
-                map.insert(
-                    name,
-                    SkillInfo {
-                        description: skill_description_of(&skill_md),
-                        path: skill_md,
-                        source,
-                    },
-                );
-            }
-        }
+        scan_dir(dir, source, None, &mut map);
+    }
+    map
+}
+
+/// Like [`collect`] but overlays the conversation-scoped sources on top
+/// (highest precedence: project > user > installed > authored > builtin >
+/// synced). Sources are scanned in reverse order so the earliest (deepest
+/// project) source wins. Same-host sources carry `device: None`.
+fn collect_scoped(t: &Tiers) -> BTreeMap<String, SkillInfo> {
+    let mut map = collect(t);
+    for dir in t.conversation.iter().rev() {
+        scan_dir(dir, "conversation", None, &mut map);
     }
     map
 }
@@ -373,7 +408,7 @@ impl Tool for ListSkills {
     }
 
     async fn call(&self, _args: Value) -> Result<Value> {
-        let skills: Vec<Value> = collect(&self.0)
+        let skills: Vec<Value> = collect_scoped(&self.0)
             .into_iter()
             .map(|(name, info)| {
                 let dir = info
@@ -386,6 +421,7 @@ impl Tool for ListSkills {
                     "description": info.description,
                     "source": info.source,
                     "path": dir,
+                    "device": info.device,
                 })
             })
             .collect();
@@ -417,7 +453,7 @@ impl Tool for UseSkill {
     async fn call(&self, args: Value) -> Result<Value> {
         let name = require_str(&args, "name")?;
         valid_name(name)?;
-        let skills = collect(&self.0);
+        let skills = collect_scoped(&self.0);
         let info = skills
             .get(name)
             .ok_or_else(|| CoreError::ToolNotFound(format!("skill '{name}'")))?;
@@ -430,7 +466,7 @@ impl Tool for UseSkill {
             .parent()
             .map(|p| p.display().to_string())
             .unwrap_or_default();
-        Ok(json!({ "name": name, "source": info.source, "path": dir, "content": content }))
+        Ok(json!({ "name": name, "source": info.source, "path": dir, "content": content, "device": info.device.clone() }))
     }
 }
 
@@ -1008,7 +1044,7 @@ mod tests {
         write_skill(&b, "docker", "# Docker\nbuild");
         write_skill(&s, "synced-only", "# Synced Only\nfrom the repo"); // only in synced
         let mut reg = ToolRegistry::new();
-        register(&mut reg, &b, &a, &i, &s);
+        register(&mut reg, &b, &a, &i, &s, &[]);
 
         let listed = reg.call("list_skills", json!({})).await.expect("list");
         let arr = listed["skills"].as_array().expect("arr");
@@ -1043,7 +1079,7 @@ mod tests {
         let (b, a, i, s) = (temp(), temp(), temp(), temp());
         write_skill(&b, "shipped", "# Shipped\nbuiltin");
         let mut reg = ToolRegistry::new();
-        register(&mut reg, &b, &a, &i, &s);
+        register(&mut reg, &b, &a, &i, &s, &[]);
 
         // Writing a new skill's SKILL.md creates it in authored.
         reg.call(
@@ -1134,7 +1170,7 @@ mod tests {
     async fn install_from_content_then_remove() {
         let (b, a, i, s) = (temp(), temp(), temp(), temp());
         let mut reg = ToolRegistry::new();
-        register(&mut reg, &b, &a, &i, &s);
+        register(&mut reg, &b, &a, &i, &s, &[]);
 
         reg.call(
             "skill_install",
@@ -1171,7 +1207,7 @@ mod tests {
     async fn rejects_unsafe_names_and_files() {
         let (b, a, i, s) = (temp(), temp(), temp(), temp());
         let mut reg = ToolRegistry::new();
-        register(&mut reg, &b, &a, &i, &s);
+        register(&mut reg, &b, &a, &i, &s, &[]);
         for bad in ["../etc", "a/b", ".hidden", ""] {
             assert!(reg
                 .call("skill_write_file", json!({ "name": bad, "content": "x" }))
@@ -1195,7 +1231,7 @@ mod tests {
     async fn validate_draft_content() {
         let (b, a, i, s) = (temp(), temp(), temp(), temp());
         let mut reg = ToolRegistry::new();
-        register(&mut reg, &b, &a, &i, &s);
+        register(&mut reg, &b, &a, &i, &s, &[]);
 
         // A well-formed draft (proper frontmatter) passes with no errors.
         let good = reg
@@ -1271,7 +1307,7 @@ mod tests {
             "---\nname: good\ndescription: Does a useful thing; use when the user needs that thing.\n---\n\n# Good\n\nsteps\n",
         );
         let mut reg = ToolRegistry::new();
-        register(&mut reg, &b, &a, &i, &s);
+        register(&mut reg, &b, &a, &i, &s, &[]);
 
         let ok = reg
             .call("skill_validate", json!({ "name": "good" }))
@@ -1303,7 +1339,7 @@ mod tests {
             "---\nname: demo\ndescription: A demo skill that does a thing; use when demoing.\n---\n\n# Demo\n\nsteps\n",
         );
         let mut reg = ToolRegistry::new();
-        register(&mut reg, &b, &a, &i, &s);
+        register(&mut reg, &b, &a, &i, &s, &[]);
         let used = reg
             .call("use_skill", json!({ "name": "demo" }))
             .await
@@ -1333,5 +1369,141 @@ mod tests {
         assert_eq!(skill_description(text), "real description here");
         // Legacy (no frontmatter) falls back to the first body line.
         assert_eq!(skill_description("# legacy desc\nbody"), "legacy desc");
+    }
+
+    #[test]
+    fn collect_carries_device() {
+        let (b, a, i, s) = (temp(), temp(), temp(), temp());
+        write_skill(&a, "demo", "# Demo\nx");
+        let t = Tiers {
+            builtin: b.clone(),
+            authored: a.clone(),
+            installed: i.clone(),
+            synced: s.clone(),
+            conversation: Vec::new(),
+        };
+        // A global-tier skill carries device = None (server host).
+        assert_eq!(collect(&t).get("demo").expect("demo").device, None);
+        for d in [&b, &a, &i, &s] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[tokio::test]
+    async fn list_and_use_report_device() {
+        let (b, a, i, s) = (temp(), temp(), temp(), temp());
+        write_skill(
+            &a,
+            "demo",
+            "---\nname: demo\ndescription: A demo skill; use it when demoing here now.\n---\n# Demo\n",
+        );
+        let mut reg = ToolRegistry::new();
+        register(&mut reg, &b, &a, &i, &s, &[]);
+        let listed = reg.call("list_skills", json!({})).await.expect("list");
+        let entry = &listed["skills"].as_array().expect("arr")[0];
+        assert!(entry.get("device").is_some(), "list reports a device field");
+        assert!(entry["device"].is_null(), "a global skill's device is null");
+        let used = reg
+            .call("use_skill", json!({ "name": "demo" }))
+            .await
+            .expect("use");
+        assert!(used.get("device").is_some() && used["device"].is_null());
+        for d in [&b, &a, &i, &s] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[tokio::test]
+    async fn conversation_scoped_skill_is_isolated() {
+        let (b, a, i, s) = (temp(), temp(), temp(), temp());
+        let proj = temp();
+        write_skill(
+            &proj,
+            "projskill",
+            "---\nname: projskill\ndescription: A project-only skill for this conversation here.\n---\n# P\n",
+        );
+        let mut reg_a = ToolRegistry::new();
+        register(&mut reg_a, &b, &a, &i, &s, std::slice::from_ref(&proj));
+        let mut reg_b = ToolRegistry::new();
+        register(&mut reg_b, &b, &a, &i, &s, &[]);
+        let list_a = reg_a.call("list_skills", json!({})).await.expect("a");
+        let list_b = reg_b.call("list_skills", json!({})).await.expect("b");
+        let has = |v: &Value| {
+            v["skills"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["name"] == json!("projskill"))
+        };
+        assert!(has(&list_a), "conversation A sees its project skill");
+        assert!(!has(&list_b), "conversation B does not see A's project skill");
+        for d in [&b, &a, &i, &s, &proj] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[tokio::test]
+    async fn conversation_tier_overrides_global() {
+        let (b, a, i, s) = (temp(), temp(), temp(), temp());
+        write_skill(
+            &i,
+            "dup",
+            "---\nname: dup\ndescription: The installed version of the dup skill here now.\n---\ninstalled-body\n",
+        );
+        let proj = temp();
+        write_skill(
+            &proj,
+            "dup",
+            "---\nname: dup\ndescription: The project version of the dup skill here now.\n---\nproject-body\n",
+        );
+        let mut reg = ToolRegistry::new();
+        register(&mut reg, &b, &a, &i, &s, std::slice::from_ref(&proj));
+        let listed = reg.call("list_skills", json!({})).await.expect("list");
+        let dup = listed["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == json!("dup"))
+            .expect("dup");
+        assert_eq!(
+            dup["source"],
+            json!("conversation"),
+            "the conversation (project) tier overrides installed"
+        );
+        let used = reg
+            .call("use_skill", json!({ "name": "dup" }))
+            .await
+            .expect("use");
+        assert!(used["content"].as_str().unwrap().contains("project-body"));
+        for d in [&b, &a, &i, &s, &proj] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[tokio::test]
+    async fn cross_device_or_absent_falls_back_to_global() {
+        let (b, a, i, s) = (temp(), temp(), temp(), temp());
+        write_skill(
+            &i,
+            "gg",
+            "---\nname: gg\ndescription: A global installed skill present regardless of origin here.\n---\n# G\n",
+        );
+        // Cross-device / absent origin → empty conversation sources → only the
+        // global tiers are served.
+        let mut reg = ToolRegistry::new();
+        register(&mut reg, &b, &a, &i, &s, &[]);
+        let listed = reg.call("list_skills", json!({})).await.expect("list");
+        let arr = listed["skills"].as_array().unwrap();
+        assert!(
+            arr.iter().all(|e| e["source"] != json!("conversation")),
+            "no conversation-tier skills when sources are empty"
+        );
+        assert!(
+            arr.iter().any(|e| e["name"] == json!("gg")),
+            "global tiers are still served"
+        );
+        for d in [&b, &a, &i, &s] {
+            let _ = std::fs::remove_dir_all(d);
+        }
     }
 }

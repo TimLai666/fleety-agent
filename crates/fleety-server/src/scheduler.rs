@@ -62,6 +62,7 @@ pub async fn tick(
         &storage.skills_authored_dir(),
         &storage.skills_installed_dir(),
         &storage.skills_synced_dir(),
+        &[],
     );
     crate::web::register(&mut tools, &storage.cookies_dir(), workspace);
     crate::mcp::register(
