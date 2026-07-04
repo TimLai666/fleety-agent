@@ -253,6 +253,48 @@ async fn collect_conversation_hooks(
     apply_env_policy(hooks)
 }
 
+/// A conversation's collected hooks plus the origin location needed to run them.
+/// Shared (via `Arc`) between the primary conversation registry and subagent
+/// registries so a safety hook can't be bypassed by delegating to a subagent.
+pub(crate) struct HookContext {
+    pub hooks: Vec<crate::hooks_compat::HookEntry>,
+    pub device: Option<String>,
+    pub cwd: Option<String>,
+}
+
+/// Wrap a freshly built registry with `ctx`'s hooks, auditing under
+/// `conversation`. A no-op when there are no hooks. The single place both the
+/// primary conversation and subagent registries go through, so their hook
+/// semantics stay identical.
+pub(crate) fn wrap_registry_with_hooks(
+    tools: &mut ToolRegistry,
+    ctx: &HookContext,
+    hub: &Hub,
+    pending: &Pending,
+    storage: &Arc<Storage>,
+    device_id: &str,
+    conversation: &str,
+) {
+    if ctx.hooks.is_empty() {
+        return;
+    }
+    let runner: Arc<dyn crate::hooks_compat::HookRunner> = Arc::new(OriginHookRunner {
+        device: ctx.device.clone(),
+        cwd: ctx.cwd.clone(),
+        hub: Arc::clone(hub),
+        pending: Arc::clone(pending),
+    });
+    let audit: Arc<dyn crate::hooks_compat::HookAudit> = Arc::new(HistoryHookAudit {
+        storage: Arc::clone(storage),
+        device_id: device_id.to_string(),
+        conversation: conversation.to_string(),
+    });
+    let wrapped = crate::hooks_compat::wrap_tools(tools.drain(), &ctx.hooks, runner, audit);
+    for w in wrapped {
+        tools.register(w);
+    }
+}
+
 /// Build the per-connection tool stack rooted at `root`: the full registry plus
 /// the subagent orchestration, dynamic-workflow, and goal tools (registered only
 /// at this top level). Returns the registry, the subagent host, and the shared
@@ -787,28 +829,24 @@ async fn serve(
                     )
                     .await;
                     if !hooks.is_empty() {
-                        let runner: Arc<dyn crate::hooks_compat::HookRunner> =
-                            Arc::new(OriginHookRunner {
-                                device: binding.device.clone(),
-                                cwd: binding.origin_cwd.clone(),
-                                hub: Arc::clone(hub),
-                                pending: Arc::clone(pending),
-                            });
-                        let audit: Arc<dyn crate::hooks_compat::HookAudit> =
-                            Arc::new(HistoryHookAudit {
-                                storage: Arc::clone(storage),
-                                device_id: device_id.to_string(),
-                                conversation: conversation.clone(),
-                            });
-                        let wrapped = crate::hooks_compat::wrap_tools(
-                            tools.drain(),
-                            &hooks,
-                            runner,
-                            audit,
+                        // One shared HookContext: the primary registry and every
+                        // subagent registry wrap through it, so a safety hook
+                        // can't be bypassed by delegating to a subagent.
+                        let ctx = Arc::new(HookContext {
+                            hooks,
+                            device: binding.device.clone(),
+                            cwd: binding.origin_cwd.clone(),
+                        });
+                        wrap_registry_with_hooks(
+                            &mut tools,
+                            &ctx,
+                            hub,
+                            pending,
+                            storage,
+                            device_id,
+                            &conversation,
                         );
-                        for w in wrapped {
-                            tools.register(w);
-                        }
+                        subagent_host.set_hook_context(Arc::clone(&ctx));
                     }
                 }
 
@@ -2381,6 +2419,78 @@ mod tests {
         assert_eq!(got[0].command, "p.sh");
         assert_eq!(got[0].scope, crate::hooks_compat::HookScope::Project);
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // A minimal tool to wrap in the hook-registry tests below.
+    struct RanTool(Arc<std::sync::Mutex<bool>>);
+    #[async_trait::async_trait]
+    impl agent_core::Tool for RanTool {
+        fn spec(&self) -> agent_core::ToolSpec {
+            agent_core::ToolSpec {
+                name: "Bash".to_string(),
+                description: "test".into(),
+                parameters: serde_json::json!({ "type": "object" }),
+                risk: agent_core::RiskLevel::Read,
+            }
+        }
+        async fn call(&self, _args: serde_json::Value) -> Result<serde_json::Value> {
+            *self.0.lock().unwrap() = true;
+            Ok(serde_json::json!({ "ok": true }))
+        }
+    }
+
+    fn temp_storage() -> Arc<Storage> {
+        let dir = std::env::temp_dir().join(format!("fleety-hookreg-{}", uuid::Uuid::new_v4()));
+        Arc::new(Storage::new(dir))
+    }
+
+    #[tokio::test]
+    async fn wrap_registry_with_hooks_denies_on_nonzero_pre() {
+        // A same-host (device None) PreToolUse hook whose command exits non-zero
+        // must deny the wrapped tool. `exit 1` works under both `sh -c` and
+        // `cmd /C`.
+        let ran = Arc::new(std::sync::Mutex::new(false));
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(RanTool(Arc::clone(&ran))));
+        let ctx = HookContext {
+            hooks: vec![crate::hooks_compat::HookEntry {
+                event: crate::hooks_compat::HookEvent::PreToolUse,
+                matcher: "*".into(),
+                command: "exit 1".into(),
+                scope: crate::hooks_compat::HookScope::User,
+            }],
+            device: None,
+            cwd: None,
+        };
+        let hub = crate::bridge::new_hub();
+        let pending = crate::bridge::new_pending();
+        let storage = temp_storage();
+        wrap_registry_with_hooks(&mut tools, &ctx, &hub, &pending, &storage, "dev-1", "conv-1");
+        let out = tools.call("Bash", serde_json::json!({})).await.unwrap();
+        assert_eq!(out["denied"], serde_json::json!(true));
+        assert!(!*ran.lock().unwrap(), "denied tool must not run");
+        // The hook execution was audited under the conversation.
+        let audit = storage.list_audit("dev-1", None, None).unwrap();
+        assert!(!audit.is_empty(), "hook execution is audited");
+    }
+
+    #[tokio::test]
+    async fn empty_hook_context_leaves_registry_unwrapped() {
+        let ran = Arc::new(std::sync::Mutex::new(false));
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(RanTool(Arc::clone(&ran))));
+        let ctx = HookContext {
+            hooks: Vec::new(),
+            device: None,
+            cwd: None,
+        };
+        let hub = crate::bridge::new_hub();
+        let pending = crate::bridge::new_pending();
+        let storage = temp_storage();
+        wrap_registry_with_hooks(&mut tools, &ctx, &hub, &pending, &storage, "dev-1", "conv-1");
+        let out = tools.call("Bash", serde_json::json!({})).await.unwrap();
+        assert_eq!(out["ok"], serde_json::json!(true), "tool runs normally");
+        assert!(*ran.lock().unwrap(), "no hooks ⇒ unwrapped ⇒ tool ran");
     }
 
     #[test]

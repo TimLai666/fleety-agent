@@ -59,6 +59,10 @@ pub struct FleetyHost {
     /// Serializes user turns and wake turns on this connection.
     turn_lock: Mutex<()>,
     manager: OnceLock<Weak<SubagentManager>>,
+    /// The conversation's Claude Code hooks (set once at bind, after collection).
+    /// Present ⇒ subagent registries are wrapped so a safety hook can't be
+    /// bypassed by delegating a tool call to a subagent.
+    hook_ctx: OnceLock<Arc<crate::conn::HookContext>>,
 }
 
 impl FleetyHost {
@@ -93,12 +97,20 @@ impl FleetyHost {
             active_conversation: Mutex::new(String::new()),
             turn_lock: Mutex::new(()),
             manager: OnceLock::new(),
+            hook_ctx: OnceLock::new(),
         })
     }
 
     /// Wire the manager back-reference (set once, right after construction).
     pub fn set_manager(&self, manager: Weak<SubagentManager>) {
         let _ = self.manager.set(manager);
+    }
+
+    /// Give this host the conversation's collected hooks (set once at bind).
+    /// Subagent registries then wrap through the same context as the primary
+    /// conversation.
+    pub fn set_hook_context(&self, ctx: Arc<crate::conn::HookContext>) {
+        let _ = self.hook_ctx.set(ctx);
     }
 
     /// Record which conversation the parent is driving (for `fork` + wakes).
@@ -143,7 +155,22 @@ impl SubagentHost for FleetyHost {
     }
 
     async fn child_registry(&self, workspace: Option<&str>) -> ToolRegistry {
-        self.registry_at(workspace)
+        let mut tools = self.registry_at(workspace);
+        // Apply the conversation's hooks to the subagent's tools too, auditing
+        // under the parent conversation this subagent is running within.
+        if let Some(ctx) = self.hook_ctx.get() {
+            let conversation = self.active_conversation.lock().await.clone();
+            crate::conn::wrap_registry_with_hooks(
+                &mut tools,
+                ctx,
+                &self.hub,
+                &self.pending,
+                &self.storage,
+                &self.device_id,
+                &conversation,
+            );
+        }
+        tools
     }
 
     async fn initial_messages(
@@ -246,6 +273,18 @@ impl SubagentHost for FleetyHost {
         // A real parent turn: full tools PLUS orchestration, so it may spawn again.
         let mut tools = self.registry_at(None);
         register_orchestration(&mut tools, manager);
+        // Wrap the wake-turn registry with the conversation's hooks too.
+        if let Some(ctx) = self.hook_ctx.get() {
+            crate::conn::wrap_registry_with_hooks(
+                &mut tools,
+                ctx,
+                &self.hub,
+                &self.pending,
+                &self.storage,
+                &self.device_id,
+                &context,
+            );
+        }
         let provider = self.providers.main();
         let mut gate = AutoApprove;
         if let Err(e) = drive_turn(
