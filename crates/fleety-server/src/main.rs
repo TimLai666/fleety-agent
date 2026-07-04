@@ -22,6 +22,7 @@ mod editor_tools;
 mod effort;
 mod embed;
 mod gc;
+mod hooks_compat;
 mod http;
 mod identity;
 mod instructions;

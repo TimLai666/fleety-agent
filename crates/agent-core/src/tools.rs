@@ -37,6 +37,14 @@ impl ToolRegistry {
         self.tools.values().map(|tool| tool.spec()).collect()
     }
 
+    /// Remove and return every registered tool, leaving the registry empty. A
+    /// neutral accessor for callers that need to transform tools in bulk (e.g.
+    /// wrap them) and re-[`register`](Self::register) the results; carries no
+    /// policy of its own.
+    pub fn drain(&mut self) -> Vec<Box<dyn Tool>> {
+        self.tools.drain().map(|(_, tool)| tool).collect()
+    }
+
     pub fn contains(&self, name: &str) -> bool {
         self.tools.contains_key(name)
     }

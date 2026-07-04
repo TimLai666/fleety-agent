@@ -85,6 +85,174 @@ fn housekeeping_inflight() -> &'static tokio::sync::Mutex<std::collections::Hash
     S.get_or_init(|| tokio::sync::Mutex::new(std::collections::HashSet::new()))
 }
 
+// ---- Claude Code hooks compatibility: conn-layer production wiring ----------
+//
+// The pure hook engine (parse / match / wrap / deny / audit / env policy) lives
+// in `hooks_compat`. Here we supply the production runner (local shell for a
+// same-host origin, `run_command` routed to the origin device for cross-device)
+// and the audit sink (append to the device history), then wrap the bound
+// conversation's tools. Everything is best-effort: a hook that cannot run is
+// recorded and skipped; only a completed non-zero `PreToolUse` run denies.
+
+/// Runs a hook command on the origin device. Same-host (`device` is `None`) runs
+/// a local shell; cross-device routes `run_command` to the origin device.
+struct OriginHookRunner {
+    device: Option<String>,
+    cwd: Option<String>,
+    hub: Hub,
+    pending: Pending,
+}
+
+/// Modest ceiling so a hung hook can't block a tool call forever (local path;
+/// the cross-device path inherits the origin's `run_command` timeout).
+const HOOK_LOCAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+async fn run_local_hook(command: &str, cwd: Option<&str>) -> crate::hooks_compat::HookOutcome {
+    use crate::hooks_compat::HookOutcome;
+    let (shell, flag) = if cfg!(windows) { ("cmd", "/C") } else { ("sh", "-c") };
+    let mut child = tokio::process::Command::new(shell);
+    child
+        .arg(flag)
+        .arg(command)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    if let Some(cwd) = cwd {
+        child.current_dir(cwd);
+    }
+    let spawned = match child.spawn() {
+        Ok(c) => c,
+        Err(e) => return HookOutcome::Failed(format!("cannot run hook: {e}")),
+    };
+    match tokio::time::timeout(HOOK_LOCAL_TIMEOUT, spawned.wait_with_output()).await {
+        Ok(Ok(out)) => HookOutcome::Exited(out.status.code().unwrap_or(-1)),
+        Ok(Err(e)) => HookOutcome::Failed(format!("hook failed: {e}")),
+        Err(_) => HookOutcome::Failed("hook timed out".to_string()),
+    }
+}
+
+/// Interpret an on-device `run_command` result (`{ exit_code, timed_out }`) as a
+/// [`HookOutcome`](crate::hooks_compat::HookOutcome).
+fn outcome_from_run_command(v: &serde_json::Value) -> crate::hooks_compat::HookOutcome {
+    use crate::hooks_compat::HookOutcome;
+    if v.get("timed_out").and_then(serde_json::Value::as_bool).unwrap_or(false) {
+        return HookOutcome::Failed("hook timed out on origin device".to_string());
+    }
+    match v.get("exit_code") {
+        Some(c) if c.is_null() => HookOutcome::Failed("hook produced no exit code".to_string()),
+        Some(c) => HookOutcome::Exited(c.as_i64().unwrap_or(-1) as i32),
+        None => HookOutcome::Exited(0),
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::hooks_compat::HookRunner for OriginHookRunner {
+    async fn run(
+        &self,
+        entry: &crate::hooks_compat::HookEntry,
+    ) -> crate::hooks_compat::HookOutcome {
+        use crate::hooks_compat::HookOutcome;
+        match &self.device {
+            None => run_local_hook(&entry.command, self.cwd.as_deref()).await,
+            Some(dev) => {
+                let sender = self.hub.lock().await.get(dev).cloned();
+                let Some(sender) = sender else {
+                    return HookOutcome::Failed(format!("origin device '{dev}' not connected"));
+                };
+                let mut args = serde_json::json!({ "command": entry.command });
+                if let Some(cwd) = &self.cwd {
+                    args["cwd"] = serde_json::json!(cwd);
+                }
+                match bridge::route_run_tool_via(&sender, &self.pending, "run_command", args).await
+                {
+                    Ok(v) => outcome_from_run_command(&v),
+                    Err(e) => HookOutcome::Failed(e.report().message),
+                }
+            }
+        }
+    }
+}
+
+/// Audits each hook execution by appending it to the device history (the same
+/// stream `history_list` / the audit CLI read), tagged with its conversation.
+struct HistoryHookAudit {
+    storage: Arc<Storage>,
+    device_id: String,
+    conversation: String,
+}
+
+impl crate::hooks_compat::HookAudit for HistoryHookAudit {
+    fn record(
+        &self,
+        entry: &crate::hooks_compat::HookEntry,
+        outcome: &crate::hooks_compat::HookOutcome,
+    ) {
+        let ev = agent_core::Event::ToolResult {
+            id: uuid::Uuid::new_v4().to_string(),
+            result: crate::hooks_compat::audit_payload(entry, outcome),
+        };
+        // Best-effort: an audit write failure must not break the tool call.
+        let _ = self
+            .storage
+            .append_history_tagged(&self.device_id, &self.conversation, &ev);
+    }
+}
+
+/// Collect the conversation's Claude Code hooks and apply the env policy.
+/// Same-host reads local `.claude/settings.json` (origin cwd + local home);
+/// cross-device reads the origin device's project + user `settings.json` via the
+/// bridge. Best-effort throughout: an offline device or missing/bad file yields
+/// no hooks, never an error.
+async fn collect_conversation_hooks(
+    device: Option<&str>,
+    origin_cwd: Option<&str>,
+    origin_home: Option<&str>,
+    local_home: Option<&str>,
+    hub: &Hub,
+    pending: &Pending,
+) -> Vec<crate::hooks_compat::HookEntry> {
+    use crate::hooks_compat::{apply_env_policy, collect_hooks, parse_hooks, HookScope};
+    let hooks = match device {
+        None => match (origin_cwd, local_home) {
+            (Some(cwd), Some(home)) => {
+                collect_hooks(std::path::Path::new(cwd), std::path::Path::new(home))
+            }
+            _ => Vec::new(),
+        },
+        Some(dev) => {
+            let sender = hub.lock().await.get(dev).cloned();
+            let Some(sender) = sender else {
+                return Vec::new();
+            };
+            let mut out = Vec::new();
+            for (scope, base) in [
+                (HookScope::Project, origin_cwd),
+                (HookScope::User, origin_home),
+            ] {
+                let Some(base) = base else {
+                    continue;
+                };
+                let path = std::path::Path::new(base)
+                    .join(".claude")
+                    .join("settings.json");
+                let args = serde_json::json!({ "file": path.to_string_lossy() });
+                if let Ok(res) =
+                    bridge::route_run_tool_via(&sender, pending, "read_file", args).await
+                {
+                    if let Some(content) = res.get("content").and_then(serde_json::Value::as_str) {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(content) {
+                            out.extend(parse_hooks(&v, scope));
+                        }
+                    }
+                }
+            }
+            out
+        }
+    };
+    apply_env_policy(hooks)
+}
+
 /// Build the per-connection tool stack rooted at `root`: the full registry plus
 /// the subagent orchestration, dynamic-workflow, and goal tools (registered only
 /// at this top level). Returns the registry, the subagent host, and the shared
@@ -598,6 +766,50 @@ async fn serve(
                     goal_state = g;
                     session_effort = se;
                     workspace_bound = true;
+
+                    // Claude Code hooks: collect the origin device's
+                    // Pre/PostToolUse hooks and wrap this conversation's tools so
+                    // they run around each tool call (a non-zero PreToolUse run
+                    // denies; every run is audited; project hooks are env
+                    // kill-switchable). Same-host reads local settings; cross-
+                    // device reads the origin's via the bridge. Best-effort — no
+                    // hooks leaves the tools unwrapped (zero overhead).
+                    let local_home = std::env::var("HOME")
+                        .ok()
+                        .or_else(|| std::env::var("USERPROFILE").ok());
+                    let hooks = collect_conversation_hooks(
+                        binding.device.as_deref(),
+                        binding.origin_cwd.as_deref(),
+                        origin.home.as_deref(),
+                        local_home.as_deref(),
+                        hub,
+                        pending,
+                    )
+                    .await;
+                    if !hooks.is_empty() {
+                        let runner: Arc<dyn crate::hooks_compat::HookRunner> =
+                            Arc::new(OriginHookRunner {
+                                device: binding.device.clone(),
+                                cwd: binding.origin_cwd.clone(),
+                                hub: Arc::clone(hub),
+                                pending: Arc::clone(pending),
+                            });
+                        let audit: Arc<dyn crate::hooks_compat::HookAudit> =
+                            Arc::new(HistoryHookAudit {
+                                storage: Arc::clone(storage),
+                                device_id: device_id.to_string(),
+                                conversation: conversation.clone(),
+                            });
+                        let wrapped = crate::hooks_compat::wrap_tools(
+                            tools.drain(),
+                            &hooks,
+                            runner,
+                            audit,
+                        );
+                        for w in wrapped {
+                            tools.register(w);
+                        }
+                    }
                 }
 
                 // Hold the per-connection turn lock across BOTH recovery and this
@@ -2117,6 +2329,61 @@ mod tests {
     type ClientWs = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
     #[test]
+    fn outcome_from_run_command_maps_exit_and_timeout() {
+        use crate::hooks_compat::HookOutcome;
+        assert_eq!(
+            outcome_from_run_command(&serde_json::json!({ "exit_code": 0 })),
+            HookOutcome::Exited(0)
+        );
+        assert_eq!(
+            outcome_from_run_command(&serde_json::json!({ "exit_code": 2 })),
+            HookOutcome::Exited(2)
+        );
+        assert!(matches!(
+            outcome_from_run_command(&serde_json::json!({ "exit_code": null })),
+            HookOutcome::Failed(_)
+        ));
+        assert!(
+            matches!(
+                outcome_from_run_command(
+                    &serde_json::json!({ "timed_out": true, "exit_code": 0 })
+                ),
+                HookOutcome::Failed(_)
+            ),
+            "a timed-out origin run is a Failed outcome, not a spurious success"
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_conversation_hooks_same_host_reads_local_settings() {
+        let home =
+            std::env::temp_dir().join(format!("fleety-connhook-{}", uuid::Uuid::new_v4()));
+        let proj = home.join("proj");
+        std::fs::create_dir_all(proj.join(".claude")).expect("mk proj/.claude");
+        std::fs::write(
+            proj.join(".claude").join("settings.json"),
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"p.sh"}]}]}}"#,
+        )
+        .expect("w settings");
+        let hub = crate::bridge::new_hub();
+        let pending = crate::bridge::new_pending();
+        // device None → same-host: reads local project + user settings, no hub use.
+        let got = collect_conversation_hooks(
+            None,
+            proj.to_str(),
+            None,
+            home.to_str(),
+            &hub,
+            &pending,
+        )
+        .await;
+        assert_eq!(got.len(), 1, "the project hook is collected");
+        assert_eq!(got[0].command, "p.sh");
+        assert_eq!(got[0].scope, crate::hooks_compat::HookScope::Project);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn valid_token_authenticates_even_when_a_used_pairing_code_is_resent() {
         // A daemon keeps FLEETY_PAIRING_CODE set across reconnects and sends both
         // the (now-redeemed) code and its saved token. Auth must accept the token
@@ -3061,7 +3328,7 @@ mod tests {
         assistant.tool_calls = vec![ToolCall {
             id: "t1".into(),
             name: "run_command".into(),
-            arguments: json!({ "command": "echo hi" }),
+            arguments: serde_json::json!({ "command": "echo hi" }),
         }];
         storage
             .journal_event("dev", "c1", &Event::Assistant(assistant))
@@ -3073,7 +3340,7 @@ mod tests {
                 &Event::ToolCall(ToolCall {
                     id: "t1".into(),
                     name: "run_command".into(),
-                    arguments: json!({ "command": "echo hi" }),
+                    arguments: serde_json::json!({ "command": "echo hi" }),
                 }),
             )
             .expect("ev2");
