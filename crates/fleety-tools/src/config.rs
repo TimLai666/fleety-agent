@@ -1059,7 +1059,14 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn rows_cover_registry() {
+        // `rows` reads the real process env, so isolate from other env-mutating
+        // tests: run serially and clear any registry keys the ambient
+        // environment (or a prior test) may have set, so every row is `default`.
+        for s in registry() {
+            std::env::remove_var(s.key);
+        }
         let r = rows(&ConfigMap::new());
         assert_eq!(r.len(), registry().len());
         assert!(r.iter().all(|(_, _, _, source)| source == "default"));
