@@ -77,11 +77,35 @@ pub struct HookEntry {
     pub scope: HookScope,
 }
 
-/// Match a hook `matcher` against a tool name. First release: `*` or empty
-/// matches every tool; otherwise an exact tool-name match. Advanced matcher
-/// syntax (regex, input predicates, alternation) is out of scope.
+/// Map a Claude Code built-in tool name to the runtime's equivalent tool, so a
+/// hook `matcher` written against Claude's names (which is what a user's
+/// `settings.json` contains) fires on the corresponding Fleety tool. Unknown
+/// names return `None` and fall back to exact matching. Best-effort: only the
+/// common built-ins the runtime has an equivalent for are mapped.
+fn claude_alias(matcher: &str) -> Option<&'static str> {
+    Some(match matcher {
+        "Bash" => "run_command",
+        "Read" => "read_file",
+        "Write" => "write_file",
+        "Edit" | "MultiEdit" => "edit_file",
+        "LS" => "list_dir",
+        "Glob" | "Grep" => "search_files",
+        "WebFetch" => "fetch_url",
+        _ => return None,
+    })
+}
+
+/// Match a hook `matcher` against a Fleety tool name. `*` or empty matches every
+/// tool; otherwise the matcher matches when it equals the tool name OR when it
+/// is a known Claude Code tool name whose runtime equivalent is that tool (so a
+/// `"Bash"` matcher fires on `run_command`). An unknown matcher falls back to
+/// exact comparison. Advanced matcher syntax (regex, input predicates,
+/// alternation) is out of scope.
 pub fn matches(matcher: &str, tool_name: &str) -> bool {
-    matcher.is_empty() || matcher == "*" || matcher == tool_name
+    matcher.is_empty()
+        || matcher == "*"
+        || matcher == tool_name
+        || claude_alias(matcher) == Some(tool_name)
 }
 
 /// Parse the `PreToolUse` / `PostToolUse` hooks from a parsed settings JSON,
@@ -442,6 +466,25 @@ mod tests {
         assert!(matches("", "Bash"));
         assert!(matches("Bash", "Bash"));
         assert!(!matches("Bash", "Read"));
+    }
+
+    #[test]
+    fn matcher_maps_claude_tool_names() {
+        // A Claude Code named matcher fires on the corresponding Fleety tool.
+        assert!(matches("Bash", "run_command"));
+        assert!(matches("Read", "read_file"));
+        assert!(matches("Write", "write_file"));
+        assert!(matches("Edit", "edit_file"));
+        assert!(matches("MultiEdit", "edit_file"));
+        assert!(matches("LS", "list_dir"));
+        assert!(matches("Glob", "search_files"));
+        assert!(matches("WebFetch", "fetch_url"));
+        // Wrong pairing does not match.
+        assert!(!matches("Bash", "read_file"));
+        // Unknown matcher falls back to exact comparison.
+        assert!(!matches("Frobnicate", "run_command"));
+        // The runtime's own name still matches exactly.
+        assert!(matches("run_command", "run_command"));
     }
 
     #[test]
