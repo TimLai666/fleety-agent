@@ -504,6 +504,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codex_mcp_in_conversation() {
+        // A Codex config.toml server → collect_codex_mcp → ServerCfg → mcp_list.
+        let home = std::env::temp_dir().join(format!("fleety-cx-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(home.join(".codex")).expect("mk codex dir");
+        std::fs::write(
+            home.join(".codex").join("config.toml"),
+            "[mcp_servers.cx]\ncommand = \"node\"\nargs = [\"c.js\"]\n",
+        )
+        .expect("w config");
+        let conv: Vec<ServerCfg> = crate::codex_sources::collect_codex_mcp(&home)
+            .into_iter()
+            .map(|m| ServerCfg {
+                name: m.name,
+                command: m.command,
+                args: m.args,
+                builtin: false,
+            })
+            .collect();
+        let (builtin, installed) = temp_paths();
+        let mut reg = ToolRegistry::new();
+        register(&mut reg, &builtin, &installed, conv);
+        let listed = reg.call("mcp_list", json!({})).await.expect("list");
+        assert!(
+            listed["servers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s["name"] == json!("cx")),
+            "a Codex config.toml server appears in mcp_list"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
     async fn mcp_exchange_handshake_and_call() {
         use tokio::io::{AsyncWriteExt, BufReader};
         // Client <-> mock-server over an in-memory duplex (no subprocess).

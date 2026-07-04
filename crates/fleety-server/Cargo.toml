@@ -34,6 +34,8 @@ chrono-tz = { workspace = true }
 mdns-sd = { workspace = true }
 flume = "0.11"
 sha2 = "0.10"
+# Parse the originating device's Codex `~/.codex/config.toml` (codex_sources).
+toml = "0.8"
 # Embed whole built-in skill directories (SKILL.md + references/…) into the
 # binary without hardcoding their file list — the set of files in a skill can
 # change upstream; only SKILL.md is guaranteed.

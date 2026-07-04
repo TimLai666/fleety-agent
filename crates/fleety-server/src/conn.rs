@@ -548,7 +548,7 @@ async fn serve(
                                 let plugins =
                                     crate::plugin_sources::collect_plugin_sources(cwd_p, home_p);
                                 dirs.extend(plugins.skill_dirs.into_iter().map(|(_s, d)| d));
-                                let mcp = plugins
+                                let mut mcp: Vec<crate::mcp::ServerCfg> = plugins
                                     .mcp_servers
                                     .into_iter()
                                     .map(|(_s, m)| crate::mcp::ServerCfg {
@@ -558,6 +558,17 @@ async fn serve(
                                         builtin: false,
                                     })
                                     .collect();
+                                // Codex config.toml MCP servers (user scope), after plugins.
+                                mcp.extend(
+                                    crate::codex_sources::collect_codex_mcp(home_p)
+                                        .into_iter()
+                                        .map(|m| crate::mcp::ServerCfg {
+                                            name: m.name,
+                                            command: m.command,
+                                            args: m.args,
+                                            builtin: false,
+                                        }),
+                                );
                                 (dirs, mcp)
                             }
                             _ => (Vec::new(), Vec::new()),

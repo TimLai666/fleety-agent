@@ -143,3 +143,25 @@ code:
   - crates/fleety-server/src/skill_sources.rs
   - crates/fleety-server/src/instructions.rs
 -->
+
+---
+### Requirement: The Codex user-global AGENTS.md is injected
+
+The conversation's user-global instruction files SHALL include the originating device's `~/.codex/AGENTS.md`, alongside `~/.claude/CLAUDE.md` and `~/.agents/AGENTS.md`, when it is present. It joins the user-global layer as a soft overlay like the other user-global files. Best-effort: an absent `~/.codex/AGENTS.md` is simply skipped.
+
+#### Scenario: Codex AGENTS.md joins the user-global instruction files
+
+- **WHEN** a same-host conversation binds and `~/.codex/AGENTS.md` exists on the originating device
+- **THEN** its content is injected as part of the conversation's user-global instruction files
+
+<!-- @trace
+source: codex-declarative-reuse
+updated: 2026-07-04
+code:
+  - crates/fleety-server/src/instructions.rs
+  - crates/fleety-server/Cargo.toml
+  - crates/fleety-server/src/codex_sources.rs
+  - crates/fleety-server/src/conn.rs
+  - crates/fleety-server/src/main.rs
+  - crates/fleety-server/src/mcp.rs
+-->

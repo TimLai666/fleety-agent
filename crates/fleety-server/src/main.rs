@@ -13,6 +13,7 @@ mod backup;
 mod bridge;
 mod builtin_mcp;
 mod builtin_skills;
+mod codex_sources;
 mod conn;
 mod conversation_embed;
 mod conversation_lifecycle;

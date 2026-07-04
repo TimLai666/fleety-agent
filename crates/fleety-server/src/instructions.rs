@@ -65,7 +65,11 @@ pub fn collect_instruction_paths(
             }
         }
     }
-    for (sub, name) in [(".claude", "CLAUDE.md"), (".agents", "AGENTS.md")] {
+    for (sub, name) in [
+        (".claude", "CLAUDE.md"),
+        (".agents", "AGENTS.md"),
+        (".codex", "AGENTS.md"),
+    ] {
         let p = user_home.join(sub).join(name);
         if seen.insert(p.clone()) {
             out.push(p);
@@ -173,6 +177,7 @@ mod tests {
             "/a/b/c/AGENTS.md",
             "/home/u/.claude/CLAUDE.md",
             "/home/u/.agents/AGENTS.md",
+            "/home/u/.codex/AGENTS.md",
         ]
         .iter()
         .map(PathBuf::from)
@@ -184,8 +189,8 @@ mod tests {
     fn collect_single_layer_when_root_equals_cwd() {
         let got =
             collect_instruction_paths(Path::new("/a"), Path::new("/a"), Path::new("/home/u"));
-        // One layer (/a) → 2 files, plus 2 user-global files.
-        assert_eq!(got.len(), 4);
+        // One layer (/a) → 2 files, plus 3 user-global files (.claude/.agents/.codex).
+        assert_eq!(got.len(), 5);
         assert_eq!(got[0], PathBuf::from("/a/CLAUDE.md"));
         assert_eq!(got[1], PathBuf::from("/a/AGENTS.md"));
     }
