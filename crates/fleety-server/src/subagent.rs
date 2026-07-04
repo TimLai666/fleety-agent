@@ -127,6 +127,7 @@ impl FleetyHost {
             &self.auth,
             &self.device_tools,
             &[],
+            Vec::new(),
         )
     }
 }

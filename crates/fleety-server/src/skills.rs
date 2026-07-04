@@ -1481,6 +1481,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agents_skill_overrides_claude_same_layer() {
+        let (b, a, i, s) = (temp(), temp(), temp(), temp());
+        // Two conversation sources for the same layer: .agents/skills then
+        // .claude/skills (the order skill_sources now emits). collect_scoped
+        // reverse-scans, so .agents is scanned last and wins.
+        let agents_dir = temp();
+        let claude_dir = temp();
+        write_skill(
+            &agents_dir,
+            "dup",
+            "---\nname: dup\ndescription: the agents version of the dup skill here now.\n---\nagents-body\n",
+        );
+        write_skill(
+            &claude_dir,
+            "dup",
+            "---\nname: dup\ndescription: the claude version of the dup skill here now.\n---\nclaude-body\n",
+        );
+        let mut reg = ToolRegistry::new();
+        register(&mut reg, &b, &a, &i, &s, &[agents_dir.clone(), claude_dir.clone()]);
+        let used = reg
+            .call("use_skill", json!({ "name": "dup" }))
+            .await
+            .expect("use");
+        assert!(
+            used["content"].as_str().unwrap().contains("agents-body"),
+            ".agents/skills overrides .claude/skills at the same layer"
+        );
+        for d in [&b, &a, &i, &s, &agents_dir, &claude_dir] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[tokio::test]
     async fn cross_device_or_absent_falls_back_to_global() {
         let (b, a, i, s) = (temp(), temp(), temp(), temp());
         write_skill(
@@ -1503,6 +1536,30 @@ mod tests {
             "global tiers are still served"
         );
         for d in [&b, &a, &i, &s] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_skill_joins_conversation() {
+        // A plugin's skills dir, passed as a conversation source, surfaces in
+        // list_skills — same mechanism the conn binding uses for enabled plugins.
+        let (b, a, i, s) = (temp(), temp(), temp(), temp());
+        let plugin_skills = temp();
+        write_skill(
+            &plugin_skills,
+            "pskill",
+            "---\nname: pskill\ndescription: a plugin-provided skill for this conversation now.\n---\n# P\n",
+        );
+        let mut reg = ToolRegistry::new();
+        register(&mut reg, &b, &a, &i, &s, std::slice::from_ref(&plugin_skills));
+        let listed = reg.call("list_skills", json!({})).await.expect("list");
+        assert!(listed["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["name"] == json!("pskill")));
+        for d in [&b, &a, &i, &s, &plugin_skills] {
             let _ = std::fs::remove_dir_all(d);
         }
     }

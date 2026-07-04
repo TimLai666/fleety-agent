@@ -69,6 +69,7 @@ pub async fn tick(
         &mut tools,
         &storage.mcp_builtin_config_path(),
         &storage.mcp_installed_config_path(),
+        Vec::new(),
     );
     crate::wiki::register(
         &mut tools,

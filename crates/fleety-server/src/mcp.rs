@@ -24,10 +24,16 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// builtin by name. `mcp_add` writes only to `installed`; `mcp_remove` refuses
 /// to delete a built-in (the operator overrides one by `mcp_add`-ing a server
 /// of the same name).
-pub fn register(registry: &mut ToolRegistry, builtin: &Path, installed: &Path) {
+pub fn register(
+    registry: &mut ToolRegistry,
+    builtin: &Path,
+    installed: &Path,
+    conversation: Vec<ServerCfg>,
+) {
     registry.register(Box::new(McpList {
         builtin: builtin.to_path_buf(),
         installed: installed.to_path_buf(),
+        conversation: conversation.clone(),
     }));
     registry.register(Box::new(McpAdd {
         installed: installed.to_path_buf(),
@@ -39,6 +45,7 @@ pub fn register(registry: &mut ToolRegistry, builtin: &Path, installed: &Path) {
     registry.register(Box::new(McpCall {
         builtin: builtin.to_path_buf(),
         installed: installed.to_path_buf(),
+        conversation,
     }));
 }
 
@@ -102,12 +109,22 @@ fn load_one(config: &Path, builtin: bool) -> Result<Vec<ServerCfg>> {
 }
 
 /// Merge builtin + installed; installed shadows builtin by name.
-pub(crate) fn load_merged(builtin: &Path, installed: &Path) -> Result<Vec<ServerCfg>> {
+pub(crate) fn load_merged(
+    builtin: &Path,
+    installed: &Path,
+    conversation: &[ServerCfg],
+) -> Result<Vec<ServerCfg>> {
     let mut out = load_one(builtin, true)?;
     let user = load_one(installed, false)?;
-    let names: std::collections::HashSet<String> = user.iter().map(|s| s.name.clone()).collect();
-    out.retain(|s| !names.contains(&s.name));
+    // Precedence by name: conversation (plugin) > installed > builtin.
+    let user_names: std::collections::HashSet<String> =
+        user.iter().map(|s| s.name.clone()).collect();
+    out.retain(|s| !user_names.contains(&s.name));
     out.extend(user);
+    let conv_names: std::collections::HashSet<String> =
+        conversation.iter().map(|s| s.name.clone()).collect();
+    out.retain(|s| !conv_names.contains(&s.name));
+    out.extend(conversation.iter().cloned());
     Ok(out)
 }
 
@@ -234,6 +251,8 @@ where
 struct McpList {
     builtin: PathBuf,
     installed: PathBuf,
+    /// Per-conversation servers (e.g. from enabled plugins); highest precedence.
+    conversation: Vec<ServerCfg>,
 }
 
 #[async_trait]
@@ -248,7 +267,7 @@ impl Tool for McpList {
     }
 
     async fn call(&self, _args: Value) -> Result<Value> {
-        let servers: Vec<Value> = load_merged(&self.builtin, &self.installed)?
+        let servers: Vec<Value> = load_merged(&self.builtin, &self.installed, &self.conversation)?
             .into_iter()
             .map(|s| {
                 json!({
@@ -356,6 +375,8 @@ impl Tool for McpRemove {
 struct McpCall {
     builtin: PathBuf,
     installed: PathBuf,
+    /// Per-conversation servers (e.g. from enabled plugins); highest precedence.
+    conversation: Vec<ServerCfg>,
 }
 
 #[async_trait]
@@ -383,7 +404,7 @@ impl Tool for McpCall {
         let tool = require_str(&args, "tool")?.to_string();
         let arguments = args.get("arguments").cloned().unwrap_or_else(|| json!({}));
 
-        let server = load_merged(&self.builtin, &self.installed)?
+        let server = load_merged(&self.builtin, &self.installed, &self.conversation)?
             .into_iter()
             .find(|s| s.name == server_name)
             .ok_or_else(|| CoreError::ToolNotFound(format!("mcp server '{server_name}'")))?;
@@ -428,6 +449,58 @@ mod tests {
         let base = std::env::temp_dir().join(format!("fleety-mcp-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&base).expect("mk temp");
         (base.join("builtin.json"), base.join("installed.json"))
+    }
+
+    #[test]
+    fn load_merged_conversation_shadows() {
+        let (builtin, installed) = temp_paths();
+        std::fs::write(
+            &installed,
+            r#"{"servers":[{"name":"s","command":"old","args":[]}]}"#,
+        )
+        .expect("w installed");
+        let conv = vec![ServerCfg {
+            name: "s".to_string(),
+            command: "new".to_string(),
+            args: vec![],
+            builtin: false,
+        }];
+        let merged = load_merged(&builtin, &installed, &conv).expect("merge");
+        assert_eq!(
+            merged.iter().filter(|x| x.name == "s").count(),
+            1,
+            "a conversation server shadows the installed one by name"
+        );
+        assert_eq!(
+            merged.iter().find(|x| x.name == "s").unwrap().command,
+            "new"
+        );
+    }
+
+    #[tokio::test]
+    async fn conversation_server_in_mcp_list() {
+        let (builtin, installed) = temp_paths();
+        let mut reg = ToolRegistry::new();
+        register(
+            &mut reg,
+            &builtin,
+            &installed,
+            vec![ServerCfg {
+                name: "ps".to_string(),
+                command: "node".to_string(),
+                args: vec![],
+                builtin: false,
+            }],
+        );
+        let listed = reg.call("mcp_list", json!({})).await.expect("list");
+        assert!(
+            listed["servers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s["name"] == json!("ps")),
+            "a per-conversation (plugin) server appears in mcp_list"
+        );
     }
 
     #[tokio::test]
@@ -503,7 +576,7 @@ mod tests {
     async fn config_crud() {
         let (builtin, installed) = temp_paths();
         let mut registry = ToolRegistry::new();
-        register(&mut registry, &builtin, &installed);
+        register(&mut registry, &builtin, &installed, Vec::new());
 
         registry
             .call(
@@ -544,7 +617,7 @@ mod tests {
         .expect("seed");
 
         let mut registry = ToolRegistry::new();
-        register(&mut registry, &builtin, &installed);
+        register(&mut registry, &builtin, &installed, Vec::new());
 
         // mcp_list shows the builtin with source flag.
         let listed = registry.call("mcp_list", json!({})).await.expect("list");

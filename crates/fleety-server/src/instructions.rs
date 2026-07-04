@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 /// The instruction file names looked for at each project layer, in fixed order
 /// (AGENTS.md before CLAUDE.md at the same layer).
-const LAYER_FILES: [&str; 2] = ["AGENTS.md", "CLAUDE.md"];
+const LAYER_FILES: [&str; 2] = ["CLAUDE.md", "AGENTS.md"];
 
 /// Per-file byte cap for an injected instruction file. Overridable with
 /// `FLEETY_INSTRUCTION_FILE_MAX_BYTES`.
@@ -165,12 +165,12 @@ mod tests {
             Path::new("/home/u"),
         );
         let expect: Vec<PathBuf> = [
-            "/a/AGENTS.md",
             "/a/CLAUDE.md",
-            "/a/b/AGENTS.md",
+            "/a/AGENTS.md",
             "/a/b/CLAUDE.md",
-            "/a/b/c/AGENTS.md",
+            "/a/b/AGENTS.md",
             "/a/b/c/CLAUDE.md",
+            "/a/b/c/AGENTS.md",
             "/home/u/.claude/CLAUDE.md",
             "/home/u/.agents/AGENTS.md",
         ]
@@ -186,8 +186,8 @@ mod tests {
             collect_instruction_paths(Path::new("/a"), Path::new("/a"), Path::new("/home/u"));
         // One layer (/a) → 2 files, plus 2 user-global files.
         assert_eq!(got.len(), 4);
-        assert_eq!(got[0], PathBuf::from("/a/AGENTS.md"));
-        assert_eq!(got[1], PathBuf::from("/a/CLAUDE.md"));
+        assert_eq!(got[0], PathBuf::from("/a/CLAUDE.md"));
+        assert_eq!(got[1], PathBuf::from("/a/AGENTS.md"));
     }
 
     #[test]

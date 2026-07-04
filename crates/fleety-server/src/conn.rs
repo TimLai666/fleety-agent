@@ -105,6 +105,7 @@ fn build_connection_stack(
     rollover_state: &crate::conversation_lifecycle::RolloverState,
     editor_specs: &[agent_core::ToolSpec],
     conversation_sources: &[std::path::PathBuf],
+    conversation_mcp: Vec<crate::mcp::ServerCfg>,
 ) -> (
     agent_core::ToolRegistry,
     Arc<crate::subagent::FleetyHost>,
@@ -121,6 +122,7 @@ fn build_connection_stack(
         auth,
         device_tools,
         conversation_sources,
+        conversation_mcp,
     );
     // Conversation recall, scoped to the acting user (per-user history).
     crate::conversation_recall::register(
@@ -424,6 +426,7 @@ async fn serve(
         &rollover_state,
         &editor_specs,
         &[],
+        Vec::new(),
     );
     let mut workspace_bound = false;
     let goal_max_continues = goal_max_continues_from_env();
@@ -521,26 +524,47 @@ async fn serve(
                     // Conversation-scoped skill sources: same-host origins only
                     // (deeper project/user .claude/.agents skills); cross-device
                     // and absent origins fall back to the global tiers.
-                    let conversation_sources: Vec<std::path::PathBuf> =
-                        if binding.device.is_none() {
-                            match (
-                                binding.origin_cwd.as_deref(),
-                                std::env::var("HOME")
-                                    .ok()
-                                    .or_else(|| std::env::var("USERPROFILE").ok()),
-                            ) {
-                                (Some(cwd), Some(home)) => crate::skill_sources::skill_sources(
-                                    std::path::Path::new(cwd),
-                                    std::path::Path::new(&home),
-                                )
-                                .into_iter()
-                                .filter(|d| d.is_dir())
-                                .collect(),
-                                _ => Vec::new(),
+                    // Plus enabled-plugin resources: direct .agents/.claude
+                    // skills first, then enabled-plugin skills (lower); plugin
+                    // MCP servers become per-conversation servers.
+                    let (conversation_sources, conversation_mcp): (
+                        Vec<std::path::PathBuf>,
+                        Vec<crate::mcp::ServerCfg>,
+                    ) = if binding.device.is_none() {
+                        match (
+                            binding.origin_cwd.as_deref(),
+                            std::env::var("HOME")
+                                .ok()
+                                .or_else(|| std::env::var("USERPROFILE").ok()),
+                        ) {
+                            (Some(cwd), Some(home)) => {
+                                let cwd_p = std::path::Path::new(cwd);
+                                let home_p = std::path::Path::new(&home);
+                                let mut dirs: Vec<std::path::PathBuf> =
+                                    crate::skill_sources::skill_sources(cwd_p, home_p)
+                                        .into_iter()
+                                        .filter(|d| d.is_dir())
+                                        .collect();
+                                let plugins =
+                                    crate::plugin_sources::collect_plugin_sources(cwd_p, home_p);
+                                dirs.extend(plugins.skill_dirs.into_iter().map(|(_s, d)| d));
+                                let mcp = plugins
+                                    .mcp_servers
+                                    .into_iter()
+                                    .map(|(_s, m)| crate::mcp::ServerCfg {
+                                        name: m.name,
+                                        command: m.command,
+                                        args: m.args,
+                                        builtin: false,
+                                    })
+                                    .collect();
+                                (dirs, mcp)
                             }
-                        } else {
-                            Vec::new()
-                        };
+                            _ => (Vec::new(), Vec::new()),
+                        }
+                    } else {
+                        (Vec::new(), Vec::new())
+                    };
                     let (t, h, g, se) = build_connection_stack(
                         storage,
                         &current_root,
@@ -556,6 +580,7 @@ async fn serve(
                         &rollover_state,
                         &editor_specs,
                         &conversation_sources,
+                        conversation_mcp,
                     );
                     tools = t;
                     subagent_host = h;
@@ -790,6 +815,7 @@ async fn serve(
                             &auth_bg,
                             &device_tools_bg,
                             &[],
+                            Vec::new(),
                         );
                         crate::conversation_lifecycle::register(
                             &mut tools,
@@ -1687,6 +1713,7 @@ pub(crate) fn build_full_registry(
     auth: &Arc<AuthStore>,
     device_tools: &DeviceTools,
     conversation_sources: &[std::path::PathBuf],
+    conversation_mcp: Vec<crate::mcp::ServerCfg>,
 ) -> ToolRegistry {
     let mut tools = crate::tools::build_registry(
         workspace,
@@ -1710,6 +1737,7 @@ pub(crate) fn build_full_registry(
         &mut tools,
         &storage.mcp_builtin_config_path(),
         &storage.mcp_installed_config_path(),
+        conversation_mcp,
     );
     crate::wiki::register(
         &mut tools,
@@ -1817,6 +1845,7 @@ async fn recover_one_interactive(
         auth,
         device_tools,
         &[],
+        Vec::new(),
     );
     let config = LoopConfig::default();
     let mut messages = vec![Message::system(

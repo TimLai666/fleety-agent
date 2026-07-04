@@ -153,3 +153,52 @@ code:
   - crates/fleety-server/src/main.rs
   - crates/fleety-server/src/storage.rs
 -->
+
+---
+### Requirement: Same-layer skill precedence favors .agents over .claude
+
+At any single directory layer (a project cwd layer or the user-global layer), when a skill of the same name exists in both that layer's `.agents/skills` and `.claude/skills`, the `.agents/skills` version SHALL be the one served — the generic Agents standard overrides the Claude-specific one. This same-layer rule applies within every scope; the scope ordering (project > user > global tiers) and the depth ordering (deeper cwd layer > shallower) are unchanged.
+
+#### Scenario: an .agents skill overrides a same-named .claude skill
+
+- **WHEN** a directory layer holds a skill of the same name in both `.agents/skills` and `.claude/skills`
+- **THEN** `list_skills` and `use_skill` serve the `.agents/skills` version
+
+<!-- @trace
+source: agents-over-claude-precedence
+updated: 2026-07-04
+code:
+  - crates/fleety-server/src/skills.rs
+  - crates/fleety-server/src/skill_sources.rs
+  - crates/fleety-server/src/instructions.rs
+-->
+
+---
+### Requirement: Enabled plugin skills join the conversation-scoped tiers
+
+The `skills/` directory of each enabled Claude Code plugin on the originating device SHALL be included among that conversation's skill sources, in the scope where the plugin is enabled: a project-enabled plugin contributes to the project scope, a user-enabled plugin to the user scope. Plugin-provided skills SHALL rank below directly-placed `.agents` / `.claude` skills within the same scope, and follow the overall precedence (project > user > global tiers). This reuses the existing conversation-scoped overlay — it adds skill sources, not a new tier.
+
+#### Scenario: an enabled plugin's skill is available in the conversation
+
+- **WHEN** a same-host conversation binds and a project- or user-enabled plugin has a skill under its `skills/` directory
+- **THEN** that skill appears in `list_skills` for that conversation, ranked below same-scope directly-placed skills
+
+#### Scenario: a directly-placed skill outranks a same-named plugin skill
+
+- **WHEN** the same scope has a same-named skill both directly (in `.agents/skills` or `.claude/skills`) and inside an enabled plugin
+- **THEN** the directly-placed skill is the one served
+
+<!-- @trace
+source: claude-plugin-declarative-reuse
+updated: 2026-07-04
+code:
+  - crates/fleety-server/src/subagent.rs
+  - crates/fleety-server/src/skills.rs
+  - crates/fleety-server/src/instructions.rs
+  - crates/fleety-server/src/conn.rs
+  - crates/fleety-server/src/skill_sources.rs
+  - crates/fleety-server/src/scheduler.rs
+  - crates/fleety-server/src/plugin_sources.rs
+  - crates/fleety-server/src/mcp.rs
+  - crates/fleety-server/src/main.rs
+-->

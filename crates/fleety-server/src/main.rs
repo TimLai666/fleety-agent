@@ -25,6 +25,7 @@ mod http;
 mod identity;
 mod instructions;
 mod mdns;
+mod plugin_sources;
 mod presence;
 mod privacy;
 mod sidecar;
