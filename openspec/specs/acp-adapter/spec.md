@@ -58,7 +58,7 @@ code:
 ---
 ### Requirement: ACP methods map to the fleety-server agent
 
-The adapter SHALL bridge ACP to the existing fleety-server rather than reimplementing the agent. It SHALL handle `initialize` (version + capability negotiation), `session/new`, `session/load`, `session/prompt`, and `session/cancel`, translating them to the server's conversation protocol and streaming the server's assistant output back as `session/update` notifications — each tagged by `sessionUpdate: "agent_message_chunk"` and carrying a text content block, as ACP editors require. Unknown methods SHALL return a JSON-RPC method-not-found error; inbound frames with no `method` (an editor's response/error) SHALL be ignored, not answered.
+The adapter SHALL bridge ACP to the existing fleety-server rather than reimplementing the agent. It SHALL handle `initialize` (version + capability negotiation), `session/new`, `session/load`, `session/prompt`, and `session/cancel`, translating them to the server's conversation protocol and streaming the server's assistant output back as `session/update` notifications — each tagged by `sessionUpdate: "agent_message_chunk"` and carrying a text content block, as ACP editors require. `session/cancel` SHALL be translated to the server's `CancelTurn` frame (it is a notification and gets no direct response); the session SHALL be marked cancelled so the in-flight `session/prompt` completes with `stopReason: "cancelled"` once the server's cancelled turn closes, instead of the normal `end_turn`. Unknown methods SHALL return a JSON-RPC method-not-found error; inbound frames with no `method` (an editor's response/error) SHALL be ignored, not answered.
 
 #### Scenario: new session opens a server conversation rooted at the editor's directory
 
@@ -73,39 +73,7 @@ The adapter SHALL bridge ACP to the existing fleety-server rather than reimpleme
 #### Scenario: cancel stops the turn
 
 - **WHEN** the editor sends `session/cancel` during a turn
-- **THEN** the in-flight server turn is stopped and no further `session/update` for that turn is emitted
-
-
-<!-- @trace
-source: acp-adapter
-updated: 2026-06-29
-code:
-  - crates/fleety-server/src/conn.rs
-  - crates/fleety-server/src/storage.rs
-  - prompts/policy.md
-  - crates/fleety-server/src/privacy.rs
-  - crates/fleety-server/src/subagent.rs
-  - crates/fleety-tools/src/config.rs
-  - crates/fleety-tools/src/lib.rs
-  - crates/fleety-cli/src/main.rs
-  - crates/fleety-tools/Cargo.toml
-  - crates/fleety-cli/src/config.rs
-  - crates/fleety-server/src/conversation_lifecycle.rs
-  - crates/fleety-server/src/workspace.rs
-  - prompts/memory.md
-  - crates/fleety-server/src/conversation_recall.rs
-  - crates/fleety-daemon/src/main.rs
-  - prompts/rules.md
-  - crates/fleety-cli/Cargo.toml
-  - Cargo.toml
-  - crates/fleety-server/src/identity.rs
-  - crates/fleety-server/src/main.rs
-  - crates/fleety-server/src/tz.rs
-  - crates/fleety-server/src/scheduler.rs
-  - crates/fleety-cli/src/acp.rs
-  - docs/env.md
-  - crates/fleety-protocol/src/lib.rs
--->
+- **THEN** the adapter forwards `CancelTurn` to the server, the in-flight server turn stops at its next checkpoint, and the pending `session/prompt` responds with `stopReason: "cancelled"`
 
 ---
 ### Requirement: Tool approvals surface as ACP permission requests
