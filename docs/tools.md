@@ -491,9 +491,10 @@ see `fleety audit list`.
 ## Planned (not yet shipped)
 
 The earlier draft of this file listed `harness`, `capability_probe`,
-`conversation_list/search/read`, `project_*`, `workspace_*` aliases, and
-built-in `browser` skill action vocabulary. Those are still planned but not in
-the runtime today. (Desktop control shipped natively as the `computer_*`
-tools — see the Computer-use section above.) See `docs/spec-v0.md`
-for scope and `docs/roadmap.md` for next-up implementation plans. When they
-land, they belong in this file in the corresponding section.
+`project_*`, `workspace_*` aliases, and built-in `browser` skill action
+vocabulary. Those are still planned but not in the runtime today. (Desktop
+control shipped natively as the `computer_*` tools — see the Computer-use
+section above; `conversation_list` / `conversation_search` shipped as the
+conversation-recall tools.) See `docs/spec-v0.md` for scope and
+`docs/roadmap.md` for next-up implementation plans. When they land, they
+belong in this file in the corresponding section.

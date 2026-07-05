@@ -337,6 +337,15 @@ impl Tool for ScheduleList {
                         if let Ok(text) = std::fs::read_to_string(entry.path()) {
                             if let Ok(mut value) = serde_json::from_str::<Value>(&text) {
                                 annotate_next_fire(&mut value, now);
+                                // Where this schedule's runs are recorded — without
+                                // this the results are undiscoverable (`fleety
+                                // resume <conversation_id>` replays them).
+                                if let Some(id) = value.get("id").and_then(|v| v.as_str()) {
+                                    let conv = format!("schedule-{id}");
+                                    if let Some(obj) = value.as_object_mut() {
+                                        obj.insert("conversation_id".to_string(), json!(conv));
+                                    }
+                                }
                                 schedules.push(value);
                             }
                         }

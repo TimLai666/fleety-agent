@@ -70,7 +70,7 @@ fn clear_saved_token() {
     }
 }
 
-fn main() {
+fn main() -> std::process::ExitCode {
     obs::init();
     // Seed env from ~/.fleety/config.toml before reading env (env still wins;
     // only unset keys are filled). Best-effort.
@@ -84,9 +84,14 @@ fn main() {
     if cmd.as_deref() == Some("config") {
         let args: Vec<String> = std::env::args().skip(2).collect();
         if let Err(e) = fleety_tools::config::run(&args) {
-            tracing::error!(report = ?e.report(), "config failed");
+            let report = e.report();
+            eprintln!("error: {}", report.message);
+            if let Some(hint) = report.remediation {
+                eprintln!("hint: {hint}");
+            }
+            return std::process::ExitCode::FAILURE;
         }
-        return;
+        return std::process::ExitCode::SUCCESS;
     }
 
     // On Windows, `run-service` is the SCM entry point: it must talk the service
@@ -101,8 +106,9 @@ fn main() {
                 "windows service dispatcher failed; `run-service` only works when started \
                  by the Service Control Manager (use `fleetyd start` after `fleetyd install`)"
             );
+            return std::process::ExitCode::FAILURE;
         }
-        return;
+        return std::process::ExitCode::SUCCESS;
     }
 
     let rt = match tokio::runtime::Builder::new_multi_thread()
@@ -111,11 +117,11 @@ fn main() {
     {
         Ok(rt) => rt,
         Err(e) => {
-            tracing::error!(%e, "cannot start tokio runtime");
-            return;
+            eprintln!("error: cannot start tokio runtime: {e}");
+            return std::process::ExitCode::FAILURE;
         }
     };
-    rt.block_on(async_main(cmd));
+    rt.block_on(async_main(cmd))
 }
 
 /// Forward-only fleet convergence. Bring this host's fleety binaries to the
@@ -182,26 +188,28 @@ async fn converge_to_server_version(server_version: &str) {
     }
 }
 
-async fn async_main(cmd: Option<String>) {
+async fn async_main(cmd: Option<String>) -> std::process::ExitCode {
     // Lifecycle subcommands act on the OS service manager and exit; `run-service`
     // and no subcommand fall through to actually run the daemon.
     match cmd.as_deref() {
         Some("install") => {
             if let Err(e) = service::install() {
-                tracing::error!(report = ?e.report(), "install failed");
+                return log_verb("install", Err(e));
             }
-            // Provision the data-analysis sidecar (best-effort).
+            // Provision the data-analysis sidecar (best-effort — the daemon
+            // works without it, but say so on the console: otherwise the user
+            // first learns at an `insyra_exec` failure much later).
             if let Err(e) = provision::ensure_insyra(false).await {
-                tracing::warn!(report = ?e.report(), "could not provision fleety-insyra sidecar");
+                eprintln!(
+                    "note: could not provision the fleety-insyra sidecar ({}); data analysis \
+                     (insyra_exec) will be unavailable on this device until `fleetyd update` \
+                     succeeds",
+                    e.report().message
+                );
             }
-            return;
+            return std::process::ExitCode::SUCCESS;
         }
-        Some("uninstall") => {
-            if let Err(e) = service::uninstall() {
-                tracing::error!(report = ?e.report(), "uninstall failed");
-            }
-            return;
-        }
+        Some("uninstall") => return log_verb("uninstall", service::uninstall()),
         Some("start") => return log_verb("start", service::start()),
         Some("stop") => return log_verb("stop", service::stop()),
         Some("restart") => return log_verb("restart", service::restart()),
@@ -209,27 +217,32 @@ async fn async_main(cmd: Option<String>) {
         Some("disable") => return log_verb("disable", service::disable()),
         Some("status") => return log_verb("status", service::status()),
         Some("update") => {
+            let mut code = std::process::ExitCode::SUCCESS;
             match fleety_tools::update::self_update().await {
                 Ok(true) => {
                     // We swapped the binary; restart the installed service (best
                     // effort) so it runs the new exe. The manager stop is graceful
                     // (SIGTERM / SCM Stop handled between frames).
                     if let Err(e) = service::restart() {
-                        tracing::warn!(
-                            report = ?e.report(),
-                            "updated, but could not restart the service automatically — \
-                             restart fleetyd to apply"
+                        eprintln!(
+                            "updated, but could not restart the service automatically ({}) — \
+                             restart fleetyd to apply",
+                            e.report().message
                         );
                     }
                 }
                 Ok(false) => {}
-                Err(e) => tracing::error!(report = ?e.report(), "update failed"),
+                Err(e) => code = log_verb("update", Err(e)),
             }
             // Refresh the data-analysis sidecar alongside fleetyd (best-effort).
             if let Err(e) = provision::ensure_insyra(true).await {
-                tracing::warn!(report = ?e.report(), "could not refresh fleety-insyra sidecar");
+                eprintln!(
+                    "note: could not refresh the fleety-insyra sidecar ({}); insyra_exec may \
+                     stay on the old version or be unavailable",
+                    e.report().message
+                );
             }
-            return;
+            return code;
         }
         _ => {}
     }
@@ -244,7 +257,7 @@ async fn async_main(cmd: Option<String>) {
             Ok(fleety_tools::service::Acquire::Started(g)) => Some(g),
             Ok(fleety_tools::service::Acquire::AlreadyRunning(pid)) => {
                 tracing::error!(pid, "another fleetyd is already running; exiting");
-                return;
+                return std::process::ExitCode::FAILURE;
             }
             Err(e) => {
                 tracing::warn!(report = ?e.report(), "pidfile check failed; continuing without it");
@@ -261,13 +274,24 @@ async fn async_main(cmd: Option<String>) {
     poll_updates::spawn();
     if let Err(e) = run(None).await {
         tracing::error!(report = ?e.report(), "fleetyd exited with error");
+        return std::process::ExitCode::FAILURE;
     }
+    std::process::ExitCode::SUCCESS
 }
 
-/// Log the outcome of a one-shot lifecycle verb (used by the CLI arms).
-fn log_verb(verb: &str, res: Result<()>) {
-    if let Err(e) = res {
-        tracing::error!(report = ?e.report(), "{verb} failed");
+/// Report the outcome of a one-shot lifecycle verb: a clean stderr line (plus
+/// hint) on failure, and a non-zero exit code so users and scripts can tell.
+fn log_verb(verb: &str, res: Result<()>) -> std::process::ExitCode {
+    match res {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            let report = e.report();
+            eprintln!("error: {verb} failed: {}", report.message);
+            if let Some(hint) = report.remediation {
+                eprintln!("hint: {hint}");
+            }
+            std::process::ExitCode::FAILURE
+        }
     }
 }
 

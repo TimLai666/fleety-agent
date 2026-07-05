@@ -82,7 +82,7 @@ data-analysis DSL, driven by the `insyra_exec` tool over stdin/stdout JSON.
 
 ## What it can do
 
-The agent exposes ~42 tools: workspace files + git (`read_file`, `list_dir`,
+The agent exposes 80+ tools: workspace files + git (`read_file`, `list_dir`,
 `search_files`, `write_file`, `edit_file`, `delete_file`, `move_file`, `make_dir`,
 `rollback`, `run_command`, `git_*`) — mutations back up + return a unified diff
 (any device, not just git repos), `run_command` can `track` paths to diff what a
@@ -94,6 +94,10 @@ scheduling (`schedule_*` with a fire loop + per-schedule mandate), a skills + MC
 runtime, and **cross-device execution** — run tools on another connected device
 (`device_exec`, via the daemon), over SSH (`ssh_exec`), or drive a Chrome over the
 DevTools Protocol (`browser_navigate` / `browser_eval` / `browser_screenshot`).
+Also: **subagent delegation** (spawn focused helpers, optionally on a cheaper
+economy model tier), goal tracking (`set_goal` / `complete_goal`), **semantic
+recall across past conversations**, interactive PTY terminal sessions, and
+opt-in presence/site awareness for the fleet.
 Safety throughout: risk classes + approval gating, workspace path-escape and SSRF
 guards, rollback backups, and device-scoped handles. The loop never crashes —
 errors come back as messages.
@@ -152,7 +156,9 @@ So on one machine `fleety tui` just works; for a remote server run
 `fleety init ws://host:8787` once and every later command uses it. If the server
 requires auth (`FLEETY_REQUIRE_AUTH=1`), enroll this device with
 `fleety pair <code>` — the code comes from `pair_create` on an already-paired
-device, or the server console for the very first device.
+device. The very first device has no code yet: set the server's bootstrap admin
+token in the client's environment (`FLEETY_TOKEN`, the same value configured on
+the server) and connect — from there, `pair_create` mints codes for the rest.
 
 ### Configure the model (server side)
 
@@ -244,8 +250,8 @@ launchd / Windows SCM).
 | `fleety status` | Server health: version, uptime, connected devices. |
 | `fleety config <list\|get\|set\|unset\|edit>` | Inspect/edit settings; secrets masked. Targets the connected **server** by default; `--target local` edits this host's `~/.fleety/config.toml`. `edit` is local + interactive (ratatui on a TTY, line-based otherwise). |
 | `fleety config provider\|group\|role <…>` | Manage the named provider pool (`providers.toml`): `provider add\|set\|remove\|list`, `group set\|remove\|list`, `role set\|unset\|list`. Same `--target` rule (default server). `config provider edit` is a local interactive editor on a TTY. |
-| `fleety audit [device]` | List a device's audit-log entries (tool calls/results/replies). |
-| `fleety rollback <...>` | List backups / restore a file from a backup. |
+| `fleety audit list [<limit>]` / `fleety audit show <index>` | List this device's audit-log entries (tool calls/results/replies) / show one in full. |
+| `fleety rollback list` / `fleety rollback apply <backup_id>` | List backups / restore a file from a backup. |
 | `fleety pair` | Enroll this device with a pairing code (auth-required servers). |
 | `fleety daemon <verb>` | Manage the local daemon from the unified CLI — forwards to `fleetyd` (`install`/`start`/`stop`/`restart`/`status`/`update`/…). |
 | `fleety update` | Update **every** fleety component installed on this host (CLI + any local server + daemon, incl. the `fleety-insyra` sidecar). One command. |
@@ -261,7 +267,7 @@ verbs register/run it as a background service:
 | `fleety-server up` | install + enable + start (one shot, `docker compose up -d` style). |
 | `fleety-server down` | stop the running service. |
 | `fleety-server install` / `uninstall` | register / remove the OS service (install also enables boot autostart). |
-| `fleety-server start` / `stop` / `restart` | run now / stop now / restart (restart defers until idle — never interrupts a turn). |
+| `fleety-server start` / `stop` / `restart` | run now / stop now / restart. Note: a manual restart is immediate — an in-flight turn is interrupted (and then recovered from the journal, not lost). |
 | `fleety-server enable` / `disable` | turn boot autostart on / off. |
 | `fleety-server status` | running? autostart on? |
 | `fleety-server config <list\|get\|set\|unset\|edit>` | Inspect/edit **this host's** settings (e.g. `set FLEETY_MODEL …`, `set FLEETY_TOKEN …`); also `config provider\|group\|role …` for the provider pool. Same surface as `fleety config`, applied where the server boots. |
@@ -277,7 +283,7 @@ server, plus self-update:
 | Command | What it does |
 |---|---|
 | `fleetyd install` / `uninstall` | register / remove the daemon service (install leaves autostart off until `enable`). |
-| `fleetyd start` / `stop` / `restart` / `enable` / `disable` / `status` | as above (restart defers until any running on-device tool finishes). |
+| `fleetyd start` / `stop` / `restart` / `enable` / `disable` / `status` | as above. A manual restart is immediate; only the *self-update* path defers its restart until the daemon is idle (no running on-device tool). |
 | `fleetyd config <list\|get\|set\|unset\|edit>` | Inspect/edit **this host's** settings (incl. `config provider\|group\|role …`); same surface as `fleety config`. |
 | `fleetyd update` | self-update to the latest release (also refreshes the `fleety-insyra` sidecar). For a host-wide update of all components, prefer `fleety update`. |
 | `fleetyd run-service` | internal service entry point. |

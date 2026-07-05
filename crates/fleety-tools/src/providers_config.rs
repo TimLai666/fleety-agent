@@ -108,15 +108,19 @@ pub fn providers_path() -> PathBuf {
 }
 
 /// Load and parse a `providers.toml` at `path`, failing soft: a missing file or
-/// any read/parse error yields `None` (a parse error is logged as a warning), so
-/// a broken file never blocks startup — the caller falls back to env tiers.
+/// any read/parse error yields `None` (a parse error is logged loudly), so a
+/// broken file never blocks startup — the caller falls back to env tiers.
 pub fn load_from(path: &Path) -> Option<ProvidersConfig> {
     let text = std::fs::read_to_string(path).ok()?;
     match parse(&text) {
         Ok(cfg) => Some(cfg),
         Err(e) => {
-            tracing::warn!(path = %path.display(), error = %e,
-                "ignoring providers.toml (falling back to environment)");
+            // Error-level on purpose: the user configured a provider pool and is
+            // silently NOT getting it — that must not drown in info-level noise.
+            tracing::error!(path = %path.display(), error = %e,
+                "providers.toml is broken and was IGNORED — the provider pool is not \
+                 active; the runtime fell back to the FLEETY_MODEL_* env tiers. Fix the \
+                 file (e.g. `fleety config provider edit` or `config provider list`)");
             None
         }
     }

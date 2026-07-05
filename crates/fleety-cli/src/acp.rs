@@ -105,10 +105,12 @@ pub fn assistant_update(session_id: &str, text: &str) -> Value {
 
 /// `session/request_permission` params from a server approval request — emitted
 /// to the editor when the server asks for tool approval (require-approval policy).
-pub fn permission_request(session_id: &str, tool: &str, summary: &str) -> Value {
+/// `tool_call_id` (we use the server's approval id) lets the editor associate
+/// the permission dialog with a tool call — ACP's ToolCallUpdate requires it.
+pub fn permission_request(session_id: &str, tool_call_id: &str, tool: &str, summary: &str) -> Value {
     json!({
         "sessionId": session_id,
-        "toolCall": { "title": tool, "summary": summary },
+        "toolCall": { "toolCallId": tool_call_id, "title": tool, "summary": summary },
         "options": [
             { "optionId": "allow", "name": "Allow", "kind": "allow_once" },
             { "optionId": "reject", "name": "Reject", "kind": "reject_once" }
@@ -919,7 +921,7 @@ impl WsBridge {
                     summary,
                     ..
                 } => {
-                    let params = permission_request(conversation, &tool, &summary);
+                    let params = permission_request(conversation, &approval_id, &tool, &summary);
                     let allow = self
                         .editor_call("session/request_permission", params)
                         .await
@@ -1237,8 +1239,9 @@ mod tests {
         assert_eq!(u["params"]["update"]["sessionUpdate"], "agent_message_chunk");
         assert_eq!(u["params"]["update"]["content"]["type"], "text");
         assert_eq!(u["params"]["update"]["content"]["text"], "hello");
-        let p = permission_request("s1", "write_file", "edit foo");
+        let p = permission_request("s1", "appr-1", "write_file", "edit foo");
         assert_eq!(p["sessionId"], "s1");
+        assert_eq!(p["toolCall"]["toolCallId"], "appr-1");
         assert_eq!(p["toolCall"]["title"], "write_file");
         assert!(p["options"].as_array().is_some());
         assert_eq!(stop_reason(), "end_turn");

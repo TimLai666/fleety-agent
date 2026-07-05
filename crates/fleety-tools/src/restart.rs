@@ -6,8 +6,10 @@
 //! `src/infra/restart.ts` (pending intent + defer-until-idle + cooldown).
 //!
 //! The decision is pure ([`decide`]); the idle signal and the actual manager
-//! restart are supplied by the caller (fleety-server: no in-flight turn;
-//! fleetyd: no running on-device tool).
+//! restart are supplied by the caller. Today only fleetyd's self-update path
+//! wires this up (idle = no running on-device tool); fleety-server does not
+//! yet — its manual `restart` verb and update-triggered restarts are immediate
+//! (an interrupted turn is recovered from the journal, not lost).
 
 use std::time::{Duration, Instant};
 

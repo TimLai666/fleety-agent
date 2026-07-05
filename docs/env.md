@@ -1,13 +1,16 @@
 # Fleety environment variables
 
-> **Config file.** Every `FLEETY_*` setting below is also a **config key** you can
-> set without exporting env: `fleety config list` / `get` / `set <KEY> <VALUE>` /
-> `unset`, or `fleety config edit` interactively. Values persist to
+> **Config file.** The most-used `FLEETY_*` settings are also **config keys** you
+> can set without exporting env: `fleety config list` / `get` / `set <KEY>
+> <VALUE>` / `unset`, or `fleety config edit` interactively. Values persist to
 > `~/.fleety/config.toml` (override with `FLEETY_CONFIG`), sectioned by scope
 > (`[server]` / `[daemon]` / `[cli]` / `[shared]`). **Read precedence is env →
 > config → default**: an explicit environment variable always wins, so config
 > only fills what env leaves unset; the server and daemon load it at boot.
 > Secret-flagged keys (tokens/model keys) are masked in `list`/`edit`.
+> `fleety config list` shows exactly which keys are settable this way —
+> variables not in that list are **env-only** (`config set` rejects them with
+> `unknown setting`).
 
 The complete reference for every `FLEETY_*` variable the runtime reads.
 Grouped by which binary cares about it. Anything unset uses the default.
@@ -206,6 +209,9 @@ The defaults work out of the box; override only for a non-default install.
 | `FLEETY_CODEX_TOKEN_URL` | `https://auth.openai.com/oauth/token` | Token endpoint. |
 | `FLEETY_CODEX_BACKEND_URL` | `https://chatgpt.com/backend-api/codex` | Codex backend base; the provider calls `<base>/responses`. |
 | `FLEETY_CODEX_ORIGINATOR` | `codex_cli_rs` | Originator sent on the Responses call (`fleety` is used on the authorize request). |
+| `FLEETY_CODEX_TOKENS` | `~/.fleety/codex-oauth.json` | Override the token-store path (tests / non-default installs). |
+| `FLEETY_CODEX_AUDIT` | `~/.fleety/` (auth audit file) | Override the auth-audit log path (login/logout events, never token values). |
+| `FLEETY_MODEL_AUTH` / `FLEETY_CHEAP_MODEL_AUTH` | unset | Env twin of the `providers.toml` `auth` field: set `oauth:codex` to route the main / economy tier through the Codex Responses backend without a providers.toml. |
 
 Setting a provider to `auth = "oauth:codex"` builds a **Codex Responses provider**:
 it calls `<FLEETY_CODEX_BACKEND_URL>/responses` (the OpenAI Responses API, not
@@ -354,7 +360,7 @@ closing, single-instance) via the platform service manager — **systemd `--user
 | Verb | Meaning |
 |---|---|
 | `install` / `uninstall` | register / remove the service. `fleety-server install` also enables boot autostart by default; `fleetyd install` leaves autostart off until `enable`. On Windows, install/uninstall need a one-time **Administrator** terminal. |
-| `start` / `stop` / `restart` | run now / stop now / restart. `restart` (and self-update) is **deferred until idle** so it never interrupts an in-flight turn (fleety-server) or a running on-device tool (fleetyd); a deadline (~300 s) and cooldown (~30 s) bound the wait. |
+| `start` / `stop` / `restart` | run now / stop now / restart. A **manual `restart` is immediate** — an in-flight turn (fleety-server) is interrupted and then recovered from the journal, not lost. Only fleetyd's **self-update** path defers its restart until idle (no running on-device tool; deadline ~300 s, cooldown ~30 s). |
 | `enable` / `disable` | turn boot/login autostart on / off (without uninstalling or stopping the current run). |
 | `status` | report whether it is running and whether autostart is on. |
 | `up` / `down` (`fleety-server` only) | `up` = install + enable + start (one command, `docker compose up -d` style); `down` = stop. |
@@ -409,6 +415,18 @@ server; under the default full-access policy no prompts are raised.
 
 Example editor config: run `fleety acp` as the agent command (a fleety-server
 must be reachable).
+
+## Instruction files & hooks (per-conversation project context)
+
+The server folds `CLAUDE.md` / `AGENTS.md` from the project layers (project root
+down to the origin cwd) plus the device's user-global files into each turn, and
+discovers Claude-compatible hooks the same way.
+
+| Var | Default | Meaning |
+|---|---|---|
+| `FLEETY_INSTRUCTION_FILE_MAX_BYTES` | `8000` | Per-file byte cap for an injected instruction file (larger files are truncated). |
+| `FLEETY_INSTRUCTION_TOTAL_MAX_BYTES` | `24000` | Total byte cap across all instruction files injected in one collection. |
+| `FLEETY_DISABLE_PROJECT_HOOKS` | unset | Set `1` to drop **project-scope** hooks (user-scope hooks still run) — the supply-chain kill-switch when the workspace is an untrusted repo. |
 
 ## Context compaction
 

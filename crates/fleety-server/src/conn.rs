@@ -1373,7 +1373,10 @@ async fn serve(
                 // unauthenticated clients are rejected at `Hello`, so remote config
                 // is implicitly gated by the connection's auth.
                 let reply = config_apply(target, &args);
-                // A successful mutation (effect present) is auditable.
+                // A successful mutation (effect present) is auditable — with
+                // secret values masked: the audit log is readable via
+                // `fleety audit`, so `set FLEETY_MODEL_KEY sk-…` must not land
+                // there in plaintext (list/get/edit all mask; so must this).
                 if let ServerMsg::ConfigResult {
                     ok: true,
                     effect: Some(_),
@@ -1382,7 +1385,7 @@ async fn serve(
                 {
                     let event = agent_core::Event::ToolResult {
                         id: "config".to_string(),
-                        result: serde_json::json!({ "config": args }),
+                        result: serde_json::json!({ "config": redact_config_args(&args) }),
                     };
                     let _ = storage.append_history(device_id, &event);
                 }
@@ -1413,6 +1416,33 @@ async fn serve(
     }
 
     Ok(())
+}
+
+/// Mask secret values in `ConfigExec` args before they enter the audit log:
+/// `set <KEY> <value…>` where the registry marks KEY secret, and any value
+/// following a `--key` flag in the provider subcommands.
+fn redact_config_args(args: &[String]) -> Vec<String> {
+    let mut out = args.to_vec();
+    if out.first().map(String::as_str) == Some("set") {
+        let secret = out
+            .get(1)
+            .and_then(|k| fleety_tools::config::find(k))
+            .map(|s| s.secret)
+            .unwrap_or(false);
+        if secret {
+            for v in out.iter_mut().skip(2) {
+                *v = "********".to_string();
+            }
+        }
+    }
+    let mut mask_next = false;
+    for v in out.iter_mut() {
+        if mask_next {
+            *v = "********".to_string();
+        }
+        mask_next = v == "--key";
+    }
+    out
 }
 
 /// Run a remote `config` request against this (the server's) own config files

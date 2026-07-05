@@ -106,7 +106,7 @@ fn policy_from_env() -> agent_core::Policy {
     }
 }
 
-fn main() {
+fn main() -> std::process::ExitCode {
     obs::init();
     // Seed env from ~/.fleety/config.toml before anything reads env: an explicit
     // env var always wins (we only fill what's unset), so existing deployments
@@ -121,9 +121,14 @@ fn main() {
     if cmd.as_deref() == Some("config") {
         let args: Vec<String> = std::env::args().skip(2).collect();
         if let Err(e) = fleety_tools::config::run(&args) {
-            tracing::error!(report = ?e.report(), "config failed");
+            let report = e.report();
+            eprintln!("error: {}", report.message);
+            if let Some(hint) = report.remediation {
+                eprintln!("hint: {hint}");
+            }
+            return std::process::ExitCode::FAILURE;
         }
-        return;
+        return std::process::ExitCode::SUCCESS;
     }
 
     // On Windows, `run-service` is the SCM entry point and must speak the service
@@ -136,8 +141,9 @@ fn main() {
                 "windows service dispatcher failed; `run-service` only works when started by \
                  the Service Control Manager (use `fleety-server start` after `install`)"
             );
+            return std::process::ExitCode::FAILURE;
         }
-        return;
+        return std::process::ExitCode::SUCCESS;
     }
 
     let rt = match tokio::runtime::Builder::new_multi_thread()
@@ -146,17 +152,26 @@ fn main() {
     {
         Ok(rt) => rt,
         Err(e) => {
-            tracing::error!(%e, "cannot start tokio runtime");
-            return;
+            eprintln!("error: cannot start tokio runtime: {e}");
+            return std::process::ExitCode::FAILURE;
         }
     };
-    rt.block_on(async_main(cmd));
+    rt.block_on(async_main(cmd))
 }
 
-/// Log the outcome of a one-shot lifecycle verb.
-fn log_action(name: &str, res: agent_core::Result<()>) {
-    if let Err(e) = res {
-        tracing::error!(report = ?e.report(), "{name} failed");
+/// Report a one-shot lifecycle verb: quiet on success (the verb itself prints),
+/// a clean stderr line + non-zero exit on failure so users and scripts can tell.
+fn log_action(name: &str, res: agent_core::Result<()>) -> std::process::ExitCode {
+    match res {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            let report = e.report();
+            eprintln!("error: {name} failed: {}", report.message);
+            if let Some(hint) = report.remediation {
+                eprintln!("hint: {hint}");
+            }
+            std::process::ExitCode::FAILURE
+        }
     }
 }
 
@@ -197,20 +212,18 @@ async fn wait_stop(shutdown: Option<tokio::sync::watch::Receiver<bool>>) {
     }
 }
 
-async fn async_main(cmd: Option<String>) {
+async fn async_main(cmd: Option<String>) -> std::process::ExitCode {
     // Service lifecycle subcommands (install/uninstall/start/stop/restart/
     // enable/disable/status/up/down) act on the manager and exit.
     if let Some(action) = cmd.as_deref().and_then(service::action_from_arg) {
-        log_action(cmd.as_deref().unwrap_or("?"), service::run(action));
-        return;
+        return log_action(cmd.as_deref().unwrap_or("?"), service::run(action));
     }
 
     // `backup now` / `backup restore` run once against the user-configured repo
     // and exit (runtime needed for git/network). Restore is meant to be run with
     // the server stopped.
     if cmd.as_deref() == Some("backup") {
-        run_backup_command(std::env::args().nth(2)).await;
-        return;
+        return run_backup_command(std::env::args().nth(2)).await;
     }
 
     // Service mode (non-Windows run-service) claims the single-instance pidfile;
@@ -221,7 +234,7 @@ async fn async_main(cmd: Option<String>) {
             Ok(fleety_tools::service::Acquire::Started(g)) => Some(g),
             Ok(fleety_tools::service::Acquire::AlreadyRunning(pid)) => {
                 tracing::error!(pid, "another fleety-server is already running; exiting");
-                return;
+                return std::process::ExitCode::FAILURE;
             }
             Err(e) => {
                 tracing::warn!(report = ?e.report(), "pidfile check failed; continuing without it");
@@ -233,11 +246,22 @@ async fn async_main(cmd: Option<String>) {
     };
 
     run_server(None).await;
+    std::process::ExitCode::SUCCESS
+}
+
+/// Print a failed backup/restore as a clean stderr line (not a raw log record).
+fn backup_fail(what: &str, e: agent_core::CoreError) -> std::process::ExitCode {
+    let report = e.report();
+    eprintln!("error: {what} failed: {}", report.message);
+    if let Some(hint) = report.remediation {
+        eprintln!("hint: {hint}");
+    }
+    std::process::ExitCode::FAILURE
 }
 
 /// Handle `fleety-server backup <now|restore>`: run once against the
 /// user-configured repo, then exit. Prints a clear message when no repo is set.
-async fn run_backup_command(sub: Option<String>) {
+async fn run_backup_command(sub: Option<String>) -> std::process::ExitCode {
     let home = agent_home();
     let mirror = Storage::new(home.clone()).backup_mirror_dir();
     let config_path = fleety_tools::config::config_path();
@@ -245,10 +269,11 @@ async fn run_backup_command(sub: Option<String>) {
     let env = match backup::config_from_env() {
         Some(e) => e,
         None => {
-            println!(
-                "未設定備份 repo:請先設定 FLEETY_BACKUP_REPO(與 FLEETY_BACKUP_TOKEN),見 docs/env.md。"
+            eprintln!(
+                "no backup repo configured: set FLEETY_BACKUP_REPO (and FLEETY_BACKUP_TOKEN) \
+                 first — see docs/env.md."
             );
-            return;
+            return std::process::ExitCode::from(2);
         }
     };
     match sub.as_deref() {
@@ -263,15 +288,24 @@ async fn run_backup_command(sub: Option<String>) {
             )
             .await
             {
-                Ok(backup::BackupOutcome::Pushed) => println!("備份完成並已推送到 {}。", env.repo),
-                Ok(backup::BackupOutcome::NothingChanged) => {
-                    println!("狀態未變更,無需備份。")
+                Ok(backup::BackupOutcome::Pushed) => {
+                    println!("backup complete and pushed to {}.", env.repo);
+                    std::process::ExitCode::SUCCESS
                 }
-                Ok(backup::BackupOutcome::RefusedNotPrivate) => println!(
-                    "已在本地建立備份快照,但 repo {} 非私人(或無法確認),拒絕推送。請確認 repo 為私人。",
-                    env.repo
-                ),
-                Err(e) => tracing::error!(report = ?e.report(), "backup now failed"),
+                Ok(backup::BackupOutcome::NothingChanged) => {
+                    println!("nothing changed since the last backup; nothing to push.");
+                    std::process::ExitCode::SUCCESS
+                }
+                Ok(backup::BackupOutcome::RefusedNotPrivate) => {
+                    eprintln!(
+                        "a local backup snapshot was created, but {} is not private (or its \
+                         visibility could not be confirmed) — refusing to push. Make the repo \
+                         private and retry.",
+                        env.repo
+                    );
+                    std::process::ExitCode::FAILURE
+                }
+                Err(e) => backup_fail("backup now", e),
             }
         }
         Some("restore") => {
@@ -286,13 +320,20 @@ async fn run_backup_command(sub: Option<String>) {
             )
             .await
             {
-                Ok(()) => println!(
-                    "已從備份還原。請重新啟動 server;原有資料已保留在 .pre-restore-{ts}(未刪除)。"
-                ),
-                Err(e) => tracing::error!(report = ?e.report(), "backup restore failed"),
+                Ok(()) => {
+                    println!(
+                        "restored from backup. Restart the server; the previous data was kept \
+                         at .pre-restore-{ts} (not deleted)."
+                    );
+                    std::process::ExitCode::SUCCESS
+                }
+                Err(e) => backup_fail("backup restore", e),
             }
         }
-        _ => println!("用法:fleety-server backup <now|restore>"),
+        _ => {
+            eprintln!("usage: fleety-server backup <now|restore>");
+            std::process::ExitCode::from(2)
+        }
     }
 }
 
@@ -449,6 +490,12 @@ async fn run_server(shutdown: Option<tokio::sync::watch::Receiver<bool>>) {
         }
     };
     tracing::info!(%addr, "listening");
+    if addr.starts_with("127.0.0.1") || addr.starts_with("localhost") {
+        tracing::info!(
+            "bound to loopback — other devices cannot reach this server; set \
+             FLEETY_ADDR=0.0.0.0:8787 to expose it on the LAN"
+        );
+    }
     // Announce ourselves via mDNS so daemons / the CLI on the same LAN can
     // find us without a hand-typed URL. No-op when disabled.
     mdns::spawn_advertise(&addr);

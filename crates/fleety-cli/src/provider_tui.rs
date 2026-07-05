@@ -22,6 +22,8 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Paragraph};
 use ratatui::Frame;
 
+use crate::input::LineEditor;
+
 /// The editable `providers.toml` model. Mutations validate references lazily
 /// (full validation runs on [`save`](Self::save)); the immediate guards here
 /// give friendly errors for the common mistakes.
@@ -141,7 +143,7 @@ enum Mode {
     Input {
         action: Action,
         prompt: &'static str,
-        buffer: String,
+        buffer: LineEditor,
     },
 }
 
@@ -215,19 +217,23 @@ impl App {
 fn on_key(app: &mut App, code: KeyCode) {
     match &mut app.mode {
         Mode::Input { buffer, .. } => match code {
-            KeyCode::Char(c) => buffer.push(c),
-            KeyCode::Backspace => {
-                buffer.pop();
-            }
+            KeyCode::Char(c) => buffer.insert(c),
+            KeyCode::Backspace => buffer.backspace(),
+            KeyCode::Delete => buffer.delete(),
+            KeyCode::Left => buffer.left(),
+            KeyCode::Right => buffer.right(),
+            KeyCode::Home => buffer.home(),
+            KeyCode::End => buffer.end(),
             KeyCode::Esc => {
                 app.mode = Mode::Browse;
                 app.status = "cancelled".to_string();
             }
             KeyCode::Enter => {
-                if let Mode::Input { action, buffer, .. } =
-                    std::mem::replace(&mut app.mode, Mode::Browse)
+                if let Mode::Input {
+                    action, mut buffer, ..
+                } = std::mem::replace(&mut app.mode, Mode::Browse)
                 {
-                    app.submit(&action, &buffer);
+                    app.submit(&action, &buffer.take());
                 }
             }
             _ => {}
@@ -244,21 +250,21 @@ fn on_key(app: &mut App, code: KeyCode) {
                 app.mode = Mode::Input {
                     action: Action::AddProvider,
                     prompt: "add provider — name, base_url, model[, key]",
-                    buffer: String::new(),
+                    buffer: LineEditor::default(),
                 };
             }
             KeyCode::Char('g') => {
                 app.mode = Mode::Input {
                     action: Action::SetGroup,
                     prompt: "set group — name, member1|member2, strategy",
-                    buffer: String::new(),
+                    buffer: LineEditor::default(),
                 };
             }
             KeyCode::Char('r') => {
                 app.mode = Mode::Input {
                     action: Action::SetRole,
                     prompt: "set role — role, target",
-                    buffer: String::new(),
+                    buffer: LineEditor::default(),
                 };
             }
             KeyCode::Char('d') => {
@@ -311,19 +317,41 @@ fn render(f: &mut Frame, app: &App) {
     for (r, t) in &app.ed.cfg.roles {
         lines.push(Line::from(format!("  {r} → {t}")));
     }
+    // Keep the selected provider row visible when the list outgrows the pane
+    // (selection is line 1 + sel; line 0 is the "Providers:" header).
+    let inner_h = chunks[0].height.saturating_sub(2);
+    let sel_line = 1 + app.sel as u16;
+    let offset = (sel_line + 1).saturating_sub(inner_h);
     f.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title("providers.toml")),
+        Paragraph::new(lines)
+            .block(Block::bordered().title("providers.toml"))
+            .scroll((offset, 0)),
         chunks[0],
     );
 
-    let footer = match &app.mode {
-        Mode::Browse => app.status.clone(),
-        Mode::Input { prompt, buffer, .. } => format!("{prompt}\n> {buffer}"),
-    };
-    f.render_widget(
-        Paragraph::new(footer).block(Block::bordered().title("input · Enter save · Esc cancel")),
-        chunks[1],
-    );
+    // The footer's inner area is a single row, so the prompt goes in the block
+    // title and the row shows the buffer being typed (with the cursor on it).
+    match &app.mode {
+        Mode::Browse => f.render_widget(
+            Paragraph::new(app.status.clone()).block(Block::bordered()),
+            chunks[1],
+        ),
+        Mode::Input { prompt, buffer, .. } => {
+            // "> " takes two columns; the editor windows the rest so the
+            // cursor stays visible when the value outgrows the footer.
+            let max_w = chunks[1].width.saturating_sub(2) as usize;
+            let (view, x) = buffer.display_window(max_w.saturating_sub(2));
+            f.render_widget(
+                Paragraph::new(format!("> {view}"))
+                    .block(Block::bordered().title(format!("{prompt} · Enter save · Esc cancel"))),
+                chunks[1],
+            );
+            f.set_cursor_position((
+                chunks[1].x + 1 + (2 + x as usize).min(max_w) as u16,
+                chunks[1].y + 1,
+            ));
+        }
+    }
 }
 
 /// Open the interactive providers editor over `path`.
@@ -415,6 +443,33 @@ mod tests {
         assert_eq!(back.groups.len(), 1);
         assert_eq!(back.roles.get("main").map(String::as_str), Some("g"));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn input_mode_shows_the_typed_buffer() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut app = App::new(ProvidersConfig::default());
+        on_key(&mut app, KeyCode::Char('a')); // enter add-provider input mode
+        for c in "abc".chars() {
+            on_key(&mut app, KeyCode::Char(c));
+        }
+        // Cursor editing works mid-buffer (Left + insert, not append).
+        on_key(&mut app, KeyCode::Left);
+        on_key(&mut app, KeyCode::Char('X'));
+        let mut terminal = Terminal::new(TestBackend::new(70, 10)).expect("term");
+        terminal.draw(|f| render(f, &app)).expect("draw");
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        // The buffer being typed must be visible (it used to be clipped by the
+        // 3-row footer whose inner area is a single row).
+        assert!(content.contains("> abXc"), "typed buffer visible");
+        assert!(content.contains("add provider"), "prompt visible in title");
     }
 
     #[test]

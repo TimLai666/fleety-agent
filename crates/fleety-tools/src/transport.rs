@@ -198,9 +198,15 @@ pub async fn connect(agent_url: &str, token: Option<&str>) -> Result<Connection>
 }
 
 async fn connect_ws(agent_url: &str) -> Result<Connection> {
-    let (ws, _) = connect_async(agent_url)
-        .await
-        .map_err(|e| CoreError::Provider(format!("cannot connect (ws) to {agent_url}: {e}")))?;
+    // Deliberately NOT CoreError::Provider: that variant's remediation says to
+    // check the model endpoint/key, which is misleading for a connection-layer
+    // failure (the most common first-run error is simply "server not running").
+    let (ws, _) = connect_async(agent_url).await.map_err(|e| {
+        CoreError::Message(format!(
+            "cannot connect (ws) to {agent_url}: {e} — is the Fleety server running at this \
+             address? (CLI: save the right URL with `fleety init <ws-url>`)"
+        ))
+    })?;
     let (tx, rx) = ws.split();
     Ok(Connection {
         sender: Sender::Ws(tx),
@@ -218,15 +224,22 @@ async fn connect_sse(agent_url: &str, token: Option<&str>) -> Result<Connection>
     if let Some(t) = token {
         req = req.bearer_auth(t);
     }
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| CoreError::Provider(format!("cannot open SSE at {sse_url}: {e}")))?;
+    let resp = req.send().await.map_err(|e| {
+        CoreError::Message(format!(
+            "cannot open SSE at {sse_url}: {e} — is the Fleety server running at this \
+             address? (CLI: save the right URL with `fleety init <ws-url>`)"
+        ))
+    })?;
     if !resp.status().is_success() {
-        return Err(CoreError::Provider(format!(
-            "SSE open rejected: {}",
-            resp.status()
-        )));
+        let status = resp.status();
+        let hint = if status == reqwest::StatusCode::UNAUTHORIZED
+            || status == reqwest::StatusCode::FORBIDDEN
+        {
+            " — the server requires auth; enroll this device with `fleety pair <code>`"
+        } else {
+            ""
+        };
+        return Err(CoreError::Message(format!("SSE open rejected: {status}{hint}")));
     }
     let (tx, rx) = mpsc::unbounded_channel::<String>();
     tokio::spawn(read_sse(resp, tx));

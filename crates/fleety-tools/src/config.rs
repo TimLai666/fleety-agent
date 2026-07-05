@@ -419,17 +419,33 @@ pub fn resolve(key: &str, map: &ConfigMap) -> Option<Resolved> {
 /// present in config, set the env var. Env always wins (we never overwrite a set
 /// var), so existing env deployments are unaffected. Call once, early at boot.
 pub fn seed_env_from_config(map: &ConfigMap) {
+    let mut explicit = std::collections::HashSet::new();
     for setting in registry() {
         let already = std::env::var(setting.key)
             .map(|v| !v.is_empty())
             .unwrap_or(false);
         if already {
+            // A real env var (not our seeding) — remember it so `set` can warn
+            // that the env keeps overriding the config value.
+            explicit.insert(setting.key.to_string());
             continue;
         }
         if let Some(v) = map.get(&(setting.scope, setting.key.to_string())) {
             std::env::set_var(setting.key, v);
         }
     }
+    let _ = EXPLICIT_ENV.set(explicit);
+}
+
+/// Registry keys that were present as real environment variables at process
+/// start (before boot seeding). Empty until `seed_env_from_config` runs.
+static EXPLICIT_ENV: std::sync::OnceLock<std::collections::HashSet<String>> =
+    std::sync::OnceLock::new();
+
+/// Whether `key` was an explicit env var at process start. Such a var takes
+/// precedence over the config file, so a `config set` of it never bites.
+pub fn explicitly_in_env(key: &str) -> bool {
+    EXPLICIT_ENV.get().map(|s| s.contains(key)).unwrap_or(false)
 }
 
 /// Mask a value for display when its setting is secret.
@@ -594,7 +610,22 @@ pub fn run_rendered(args: &[String]) -> Result<String> {
             let mut map = load(&path);
             map.insert((setting.scope, key.clone()), value);
             save(&path, &map)?;
-            format!("set {key} (scope {})", setting.scope.as_str())
+            let mut out = format!("set {key} (scope {})", setting.scope.as_str());
+            // Tell the user which process must restart for the change to bite —
+            // "takes effect after a restart" alone leaves them guessing.
+            out.push_str(match setting.scope {
+                Scope::Server => " — restart the server to apply (`fleety-server restart`)",
+                Scope::Daemon => " — restart the daemon to apply (`fleetyd restart`)",
+                Scope::Cli => " — applies on the next fleety command",
+                Scope::Shared => " — restart the affected fleety process(es) to apply",
+            });
+            if explicitly_in_env(&key) {
+                out.push_str(&format!(
+                    "\nnote: {key} is currently set as an environment variable, which takes \
+                     precedence over this config value — it only wins once the env var is removed"
+                ));
+            }
+            out
         }
         Command::Unset(key) => {
             let setting =

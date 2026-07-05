@@ -173,7 +173,16 @@ fn effort_scheme_for(model: &str) -> agent_core::model::EffortScheme {
 /// The main model provider (`FLEETY_MODEL_*`), falling back to the offline echo
 /// stub when unset.
 pub fn build_main() -> Arc<dyn ModelProvider> {
-    build("FLEETY_MODEL").unwrap_or_else(|| Arc::new(EchoProvider))
+    build("FLEETY_MODEL").unwrap_or_else(|| {
+        // Loud on purpose: without this, a first `docker compose up` looks
+        // broken (the agent only parrots input) and the logs show no error.
+        tracing::warn!(
+            "FLEETY_MODEL is not set — running in ECHO mode: the agent will only echo input, \
+             no real model is called. Set FLEETY_MODEL_BASE_URL + FLEETY_MODEL (env or \
+             `fleety-server config set …`) to enable one."
+        );
+        Arc::new(EchoProvider)
+    })
 }
 
 /// A named registry of model providers plus a role→name map. A subagent (or the

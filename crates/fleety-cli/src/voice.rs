@@ -104,7 +104,11 @@ fn audio_size_cap() -> usize {
 /// `(bytes, mime)`, or `None` when capture fails or the payload exceeds the cap
 /// (the caller then falls back to local transcription).
 pub fn capture_audio() -> Option<(Vec<u8>, &'static str)> {
-    let pcm16 = record_pcm16(stt_seconds())?;
+    let secs = stt_seconds();
+    // Say when the fixed-length capture starts — without this the user has no
+    // idea when to speak or why it stopped listening.
+    eprintln!("● recording {secs}s — speak now (FLEETY_STT_SECONDS adjusts)");
+    let pcm16 = record_pcm16(secs)?;
     if pcm16.is_empty() {
         return None;
     }
@@ -134,7 +138,10 @@ fn stt_seconds() -> u64 {
 /// missing piece (no device, no engine, empty result) yields `None`. The temp
 /// WAV is always removed.
 fn whisper_listen() -> Option<String> {
-    let wav = record_wav(stt_seconds())?;
+    let secs = stt_seconds();
+    eprintln!("● recording {secs}s — speak now (FLEETY_STT_SECONDS adjusts)");
+    let wav = record_wav(secs)?;
+    eprintln!("… transcribing");
     let text = transcribe(&wav);
     let _ = std::fs::remove_file(&wav);
     text

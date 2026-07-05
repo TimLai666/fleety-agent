@@ -10,6 +10,7 @@ mod acp;
 mod auth;
 mod clipboard;
 mod config;
+mod input;
 mod provider_tui;
 mod tui;
 mod voice;
@@ -24,8 +25,60 @@ use fleety_protocol::{
 // `Tx`/`Rx` are its split halves so the existing connect sites barely change.
 use fleety_tools::transport::{self, Receiver as Rx, Sender as Tx};
 
+/// Print an error report (message + hint when present); yields the failure code
+/// so every command reports failure the same way — and scripts can rely on it.
+fn fail(e: CoreError) -> std::process::ExitCode {
+    let report = e.report();
+    eprintln!("error: {}", report.message);
+    if let Some(hint) = report.remediation {
+        eprintln!("hint: {hint}");
+    }
+    std::process::ExitCode::FAILURE
+}
+
+/// Map a command result to the process exit code (0 ok, 1 failure).
+fn done(res: Result<()>) -> std::process::ExitCode {
+    match res {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => fail(e),
+    }
+}
+
+/// Usage error: print to stderr, exit 2 (distinct from runtime failures).
+fn usage(msg: &str) -> std::process::ExitCode {
+    eprintln!("{msg}");
+    std::process::ExitCode::from(2)
+}
+
+/// The full command list (aligned with the README command reference).
+fn print_help() {
+    println!("fleety {} — the Fleety CLI", agent_core::VERSION);
+    println!();
+    println!("usage: fleety <command> [args]");
+    println!();
+    println!("  init <ws-url>                    save the agent URL (e.g. ws://host:8787)");
+    println!("  ask \"<text>\" [--image|--audio|--video|--file PATH]...");
+    println!("                                   one-shot prompt (with attachments)");
+    println!("  resume <conversation_id> [after_seq]");
+    println!("                                   continue an existing conversation");
+    println!("  tui                              interactive terminal UI");
+    println!("  voice                            voice conversation");
+    println!("  status                           server health: version, uptime, devices");
+    println!("  config <list|get|set|unset|edit> [--target server|local|<device-id>]");
+    println!("  config provider|group|role <...> manage the provider pool (providers.toml)");
+    println!("  auth <login|status|logout>       ChatGPT/Codex OAuth sign-in");
+    println!("  audit list [<limit>]             this device's audit-log entries");
+    println!("  audit show <index>               one audit entry in full");
+    println!("  rollback list                    backups available to restore");
+    println!("  rollback apply <backup_id>       restore a file from a backup");
+    println!("  pair <code>                      enroll this device (auth-required servers)");
+    println!("  daemon <verb>                    manage the local daemon (install/start/...)");
+    println!("  update                           update every fleety component on this host");
+    println!("  acp [install [zed]]              run as an ACP agent (editors launch this)");
+}
+
 #[tokio::main]
-async fn main() {
+async fn main() -> std::process::ExitCode {
     obs::init();
     // Seed env from ~/.fleety/config.toml so client settings (e.g. transport mode)
     // set via `fleety config` apply; an explicit env var still wins.
@@ -37,16 +90,23 @@ async fn main() {
         Some("init") => {
             let url = args.get(2).cloned().unwrap_or_default();
             if url.is_empty() {
-                eprintln!("usage: fleety init <agent-url>   (e.g. ws://host:8787)");
-                return;
+                return usage("usage: fleety init <agent-url>   (e.g. ws://host:8787)");
             }
-            if let Err(e) = init(url).await {
-                let report = e.report();
-                eprintln!("error: {}", report.message);
-                if let Some(hint) = report.remediation {
-                    eprintln!("hint: {hint}");
+            // Catch the common scheme mistakes before any network work — the
+            // raw connect error that would follow is much harder to act on.
+            if !url.starts_with("ws://") && !url.starts_with("wss://") {
+                if url.starts_with("http://") || url.starts_with("https://") {
+                    eprintln!(
+                        "error: '{url}' is an http(s) URL — the agent URL uses the WebSocket scheme"
+                    );
+                    eprintln!("hint: use ws:// (or wss:// behind TLS), e.g. ws://host:8787");
+                } else {
+                    eprintln!("error: '{url}' is not a ws:// or wss:// URL");
+                    eprintln!("hint: e.g. fleety init ws://192.168.1.10:8787");
                 }
+                return std::process::ExitCode::from(2);
             }
+            done(init(url).await)
         }
         Some("ask") => {
             // Parse: fleety ask [--image P]* [--audio P]* [--video P]* [--file P]* "<text>"
@@ -83,98 +143,56 @@ async fn main() {
                 }
             }
             if text.is_empty() && attachment_paths.is_empty() {
-                eprintln!(
-                    "usage: fleety ask [--image PATH]... [--audio PATH]... [--video PATH]... [--file PATH]... \"<message>\""
+                return usage(
+                    "usage: fleety ask [--image PATH]... [--audio PATH]... [--video PATH]... [--file PATH]... \"<message>\"",
                 );
-                return;
             }
             let attachments = match load_attachments(&attachment_paths) {
                 Ok(a) => a,
-                Err(e) => {
-                    eprintln!("error: {}", e.report().message);
-                    return;
-                }
+                Err(e) => return fail(e),
             };
-            if let Err(e) = ask(text, attachments).await {
-                let report = e.report();
-                eprintln!("error: {}", report.message);
-                if let Some(hint) = report.remediation {
-                    eprintln!("hint: {hint}");
-                }
-            }
+            done(ask(text, attachments).await)
         }
         Some("resume") => {
             let conversation_id = args.get(2).cloned().unwrap_or_default();
             let after_seq = args.get(3).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
             if conversation_id.is_empty() {
-                eprintln!("usage: fleety resume <conversation_id> [after_seq]");
-                return;
+                return usage("usage: fleety resume <conversation_id> [after_seq]");
             }
-            if let Err(e) = resume(conversation_id, after_seq).await {
-                eprintln!("error: {}", e.report().message);
-            }
+            done(resume(conversation_id, after_seq).await)
         }
-        Some("tui") => {
-            if let Err(e) = run_tui().await {
-                eprintln!("error: {}", e.report().message);
-            }
-        }
+        Some("tui") => done(run_tui().await),
         Some("audit") => {
             let sub = args.get(2).cloned().unwrap_or_default();
             match sub.as_str() {
                 "list" => {
                     let limit = args.get(3).and_then(|s| s.parse::<u32>().ok());
-                    if let Err(e) = audit_list(limit).await {
-                        eprintln!("error: {}", e.report().message);
-                    }
+                    done(audit_list(limit).await)
                 }
-                "show" => {
-                    let index = args.get(3).and_then(|s| s.parse::<u64>().ok());
-                    match index {
-                        Some(i) => {
-                            if let Err(e) = audit_show(i).await {
-                                eprintln!("error: {}", e.report().message);
-                            }
-                        }
-                        None => eprintln!("usage: fleety audit show <index>"),
-                    }
-                }
-                _ => eprintln!("usage: fleety audit list [<limit>]  |  fleety audit show <index>"),
+                "show" => match args.get(3).and_then(|s| s.parse::<u64>().ok()) {
+                    Some(i) => done(audit_show(i).await),
+                    None => usage("usage: fleety audit show <index>"),
+                },
+                _ => usage("usage: fleety audit list [<limit>]  |  fleety audit show <index>"),
             }
         }
         Some("rollback") => {
             let sub = args.get(2).cloned().unwrap_or_default();
             match sub.as_str() {
-                "list" => {
-                    if let Err(e) = rollback_list().await {
-                        eprintln!("error: {}", e.report().message);
-                    }
-                }
+                "list" => done(rollback_list().await),
                 "apply" => {
                     let id = args.get(3).cloned().unwrap_or_default();
                     if id.is_empty() {
-                        eprintln!("usage: fleety rollback apply <backup_id>");
-                    } else if let Err(e) = rollback_apply(id).await {
-                        eprintln!("error: {}", e.report().message);
+                        usage("usage: fleety rollback apply <backup_id>")
+                    } else {
+                        done(rollback_apply(id).await)
                     }
                 }
-                _ => eprintln!("usage: fleety rollback list  |  fleety rollback apply <backup_id>"),
+                _ => usage("usage: fleety rollback list  |  fleety rollback apply <backup_id>"),
             }
         }
-        Some("status") => {
-            if let Err(e) = status().await {
-                eprintln!("error: {}", e.report().message);
-            }
-        }
-        Some("voice") => {
-            if let Err(e) = voice_chat().await {
-                let report = e.report();
-                eprintln!("error: {}", report.message);
-                if let Some(hint) = report.remediation {
-                    eprintln!("hint: {hint}");
-                }
-            }
-        }
+        Some("status") => done(status().await),
+        Some("voice") => done(voice_chat().await),
         Some("config") => {
             // `--target server` (default) manages the connected server's config
             // over the connection; `--target local` (and interactive `edit`) edit
@@ -187,42 +205,28 @@ async fn main() {
             } else {
                 config_remote(target, &rest).await
             };
-            if let Err(e) = res {
-                let report = e.report();
-                eprintln!("error: {}", report.message);
-                if let Some(hint) = report.remediation {
-                    eprintln!("hint: {hint}");
-                }
-            }
+            done(res)
         }
         Some("auth") => {
             // `fleety auth <login|status|logout>` — Codex ChatGPT OAuth sign-in.
-            if let Err(e) = auth::run(&args[2..]).await {
-                let report = e.report();
-                eprintln!("error: {}", report.message);
-                if let Some(hint) = report.remediation {
-                    eprintln!("hint: {hint}");
-                }
-            }
+            done(auth::run(&args[2..]).await)
         }
         Some("daemon") => {
             // Drive the local daemon from the unified CLI: `fleety daemon <verb>`
             // forwards to the `fleetyd` binary (install/start/stop/status/update/…).
             let sub = &args[2..];
             if sub.is_empty() {
-                eprintln!(
-                    "usage: fleety daemon <install|uninstall|start|stop|restart|enable|disable|status|up|down|update>"
-                );
-            } else if let Err(e) = daemon_delegate(sub) {
-                eprintln!("error: {}", e.report().message);
+                usage(
+                    "usage: fleety daemon <install|uninstall|start|stop|restart|enable|disable|status|up|down|update>",
+                )
+            } else {
+                done(daemon_delegate(sub))
             }
         }
         Some("update") => {
             // Update every fleety component installed on this host (CLI + any
             // local server + daemon). One command, per the unified update model.
-            if let Err(e) = update_all().await {
-                eprintln!("error: {}", e.report().message);
-            }
+            done(update_all().await)
         }
         Some("acp") => {
             // `fleety acp install [--server <url>]` writes the Zed agent-server
@@ -238,30 +242,31 @@ async fn main() {
                 // configures that editor; with none, print the generic setup that
                 // works with any ACP-capable editor.
                 let target = args.get(3).filter(|a| !a.starts_with("--")).cloned();
-                if let Err(e) = acp::install(target, server) {
-                    eprintln!("error: {}", e.report().message);
-                }
-            } else if let Err(e) = acp::run(agent_url()).await {
-                eprintln!("error: {}", e.report().message);
+                done(acp::install(target, server))
+            } else {
+                done(acp::run(agent_url()).await)
             }
         }
         Some("pair") => {
             let code = args.get(2).cloned().unwrap_or_default();
             if code.is_empty() {
-                eprintln!(
-                    "usage: fleety pair <pairing-code>   (from `pair_create` on a paired device)"
+                return usage(
+                    "usage: fleety pair <pairing-code>   (from `pair_create` on a paired device)",
                 );
-                return;
             }
-            if let Err(e) = pair(code).await {
-                eprintln!("error: {}", e.report().message);
-            }
+            done(pair(code).await)
         }
-        _ => {
-            println!(
-                "fleety {} — try: fleety ask \"hello\"  |  fleety voice  |  fleety tui  |  fleety pair <code>",
-                agent_core::VERSION
-            );
+        Some("help") | Some("--help") | Some("-h") => {
+            print_help();
+            std::process::ExitCode::SUCCESS
+        }
+        Some(other) => {
+            eprintln!("unknown command '{other}' — run `fleety help` for the full list");
+            std::process::ExitCode::from(2)
+        }
+        None => {
+            print_help();
+            std::process::ExitCode::SUCCESS
         }
     }
 }
@@ -290,6 +295,11 @@ async fn update_all() -> Result<()> {
         if fleety_tools::update::manifest_is_templated() {
             match fleety_tools::update::update_named("fleety-server", &exe).await {
                 Ok(true) => {
+                    println!(
+                        "fleety-server updated — restarting its service now. An in-flight \
+                         turn may be interrupted; it is recovered from the journal and \
+                         continued, not lost."
+                    );
                     let _ = std::process::Command::new(&exe).arg("restart").status();
                 }
                 Ok(false) => {}
@@ -401,12 +411,22 @@ async fn run_tui() -> Result<()> {
                                 app.attach(att);
                             }
                             clipboard::ClipboardPaste::Text(text) => {
-                                app.input.push_str(&text);
+                                app.input.insert_str(&text);
                                 app.status = "pasted text".to_string();
                             }
                             clipboard::ClipboardPaste::Empty => {
                                 app.status = "clipboard empty / unavailable".to_string();
                             }
+                        }
+                    }
+                    tui::Action::Approve(approval_id) => {
+                        if let Err(e) = send(&mut tx, &ClientMsg::Approve { approval_id }).await {
+                            app.status = format!("approve failed: {}", e.report().message);
+                        }
+                    }
+                    tui::Action::Deny(approval_id) => {
+                        if let Err(e) = send(&mut tx, &ClientMsg::Deny { approval_id }).await {
+                            app.status = format!("deny failed: {}", e.report().message);
                         }
                     }
                     tui::Action::Quit => app.should_quit = true,
@@ -420,9 +440,35 @@ async fn run_tui() -> Result<()> {
                         app.push_delta(&chunk);
                         app.status = "streaming…".to_string();
                     }
-                    Ok(ServerMsg::Assistant { text, .. }) => {
+                    Ok(ServerMsg::Assistant { text, conversation_id, .. }) => {
                         app.finish_assistant(text);
-                        app.status = "ready".to_string();
+                        // Surface the id — it's what `fleety resume` needs later.
+                        app.status = format!("ready — conversation {conversation_id}");
+                    }
+                    Ok(ServerMsg::ApprovalRequested { approval_id, tool, risk, summary }) => {
+                        app.request_approval(approval_id, &tool, &risk, &summary);
+                    }
+                    Ok(ServerMsg::RunTool { call_id, tool, .. }) => {
+                        // Viewer connection, no daemon: decline instead of letting
+                        // the server wait out its 30 s dispatch timeout.
+                        let error = fleety_protocol::WireError {
+                            kind: "unsupported".to_string(),
+                            message: format!(
+                                "'{tool}' was dispatched to this device, but it is connected \
+                                 via the TUI, which does not run on-device tools"
+                            ),
+                            remediation: Some(
+                                "run fleetyd on this device, or target a device that runs \
+                                 the daemon"
+                                    .to_string(),
+                            ),
+                        };
+                        if let Err(e) = send(&mut tx, &ClientMsg::ToolError { call_id, error }).await {
+                            app.status = format!("send failed: {}", e.report().message);
+                        } else {
+                            app.status =
+                                format!("declined on-device tool '{tool}' (no daemon here)");
+                        }
                     }
                     Ok(ServerMsg::Error { error }) => {
                         app.status = format!("agent error: {}", error.message);
@@ -465,8 +511,15 @@ fn agent_url() -> String {
         }
     }
     if let Some(url) = discover_via_mdns(std::time::Duration::from_secs(2)) {
+        eprintln!("discovered agent on the LAN: {url}");
         return url;
     }
+    // Say which URL we fell back to — otherwise a fresh machine just sees a
+    // baffling localhost connection error with no next step.
+    eprintln!(
+        "no agent configured and none found on the LAN — trying the local default \
+         ws://127.0.0.1:8787 (point at a server with `fleety init <ws-url>`)"
+    );
     "ws://127.0.0.1:8787".to_string()
 }
 
@@ -728,10 +781,33 @@ async fn ask(text: String, attachments: Vec<WireAttachment>) -> Result<()> {
     loop {
         match recv(&mut rx).await? {
             Some(ServerMsg::Assistant { text, .. }) => println!("{text}"),
-            Some(ServerMsg::Done { .. }) | None => break,
+            Some(ServerMsg::Done { conversation_id }) => {
+                // stderr, so piping the reply stays clean — without this line
+                // the id `fleety resume` needs is never shown anywhere.
+                eprintln!("(conversation {conversation_id} — continue with: fleety resume {conversation_id})");
+                break;
+            }
+            None => break,
             Some(ServerMsg::Error { error }) => {
                 eprintln!("agent error: {}", error.message);
                 break;
+            }
+            Some(ServerMsg::RunTool { call_id, tool, .. }) => {
+                // This connection is a viewer (no daemon): decline instead of
+                // letting the server wait out its 30 s dispatch timeout.
+                let error = fleety_protocol::WireError {
+                    kind: "unsupported".to_string(),
+                    message: format!(
+                        "'{tool}' was dispatched to this device, but it is connected via the \
+                         CLI, which does not run on-device tools"
+                    ),
+                    remediation: Some(
+                        "run fleetyd on this device (`fleetyd install` + `fleetyd start`), or \
+                         target a device that runs the daemon"
+                            .to_string(),
+                    ),
+                };
+                send(&mut tx, &ClientMsg::ToolError { call_id, error }).await?;
             }
             Some(ServerMsg::ApprovalRequested {
                 approval_id,
@@ -752,7 +828,6 @@ async fn ask(text: String, attachments: Vec<WireAttachment>) -> Result<()> {
             }
             Some(ServerMsg::Welcome { .. })
             | Some(ServerMsg::Replay { .. })
-            | Some(ServerMsg::RunTool { .. })
             | Some(ServerMsg::AssistantDelta { .. })
             | Some(ServerMsg::AuditListResult { .. })
             | Some(ServerMsg::AuditShowResult { .. })
@@ -1008,7 +1083,9 @@ async fn config_remote(target: ConfigTarget, args: &[String]) -> Result<()> {
                         match eff {
                             Effect::NextConnection =>
                                 "(applied — takes effect on the next connection)",
-                            Effect::Restart => "(applied — takes effect after a server restart)",
+                            Effect::Restart =>
+                                "(applied — takes effect after a server restart: run \
+                                 `fleety-server restart` on the server host)",
                         }
                     );
                 }
@@ -1138,6 +1215,10 @@ async fn rollback_list() -> Result<()> {
             if backups.is_empty() {
                 println!("(no backups)");
             } else {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
                 for b in &backups {
                     let id = b.get("id").and_then(|v| v.as_str()).unwrap_or("?");
                     let path = b
@@ -1145,7 +1226,9 @@ async fn rollback_list() -> Result<()> {
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
                     let ts = b.get("ts_secs").and_then(|v| v.as_u64()).unwrap_or(0);
-                    println!("{id}  ({ts})  {path}");
+                    // Same relative rendering as `audit list` — the two history
+                    // commands should read the same way.
+                    println!("{id}  {:>8}  {path}", format_relative(now, ts));
                 }
             }
         }

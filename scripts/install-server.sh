@@ -125,18 +125,21 @@ echo
 echo "Run it (listens on FLEETY_ADDR, default 127.0.0.1:8787 — set 0.0.0.0:8787 to expose):"
 echo "  FLEETY_ADDR=0.0.0.0:8787 $BIN"
 echo
+# Note: the unit lines are printed flush-left on purpose — indented content
+# would end up inside the .service file, and an indented EOF never terminates
+# the heredoc, so a copy-paste of an indented block would hang the shell.
 echo "Autostart with systemd (Linux), as the current user:"
 echo "  mkdir -p ~/.config/systemd/user"
-echo "  cat > ~/.config/systemd/user/fleety-server.service <<EOF"
-echo "  [Unit]"
-echo "  Description=Fleety Agent server"
-echo "  [Service]"
-echo "  ExecStart=$dir/$BIN"
-echo "  Environment=FLEETY_ADDR=0.0.0.0:8787"
-echo "  Restart=on-failure"
-echo "  [Install]"
-echo "  WantedBy=default.target"
-echo "  EOF"
+echo "  cat > ~/.config/systemd/user/fleety-server.service <<'EOF'"
+echo "[Unit]"
+echo "Description=Fleety Agent server"
+echo "[Service]"
+echo "ExecStart=$dir/$BIN"
+echo "Environment=FLEETY_ADDR=0.0.0.0:8787"
+echo "Restart=on-failure"
+echo "[Install]"
+echo "WantedBy=default.target"
+echo "EOF"
 echo "  systemctl --user daemon-reload && systemctl --user enable --now fleety-server"
 case ":$PATH:" in
   *":$dir:"*) ;;

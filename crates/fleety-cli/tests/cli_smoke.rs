@@ -117,8 +117,24 @@ fn no_args_prints_top_level_help() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("fleety"));
-    assert!(stdout.contains("fleety ask"));
+    assert!(stdout.contains("usage: fleety"));
+    // The full command surface is listed, not just a teaser.
+    for cmd in ["ask", "tui", "config", "audit", "rollback", "pair", "update"] {
+        assert!(stdout.contains(cmd), "help lists {cmd}");
+    }
+
+    // `help` / `--help` / `-h` print the same thing.
+    let output = run(&["--help"]);
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("usage: fleety"));
+}
+
+#[test]
+fn unknown_command_errors_to_stderr_with_nonzero_exit() {
+    let output = run(&["frobnicate"]);
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unknown command 'frobnicate'"), "{stderr}");
 }
 
 #[test]
@@ -134,7 +150,8 @@ fn usage_errors_return_before_network_work() {
         &["pair"][..],
     ] {
         let output = run(args);
-        assert!(output.status.success(), "{args:?}");
+        // Usage mistakes exit 2 so scripts can tell them from runtime failures.
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("usage:"), "{args:?}: {stderr}");
     }
@@ -383,7 +400,8 @@ fn network_commands_report_connection_errors_without_panicking() {
         &["pair", "PAIR-1"][..],
     ] {
         let output = run_with_rejecting_agent(args);
-        assert!(output.status.success(), "{args:?}");
+        // Connection failures exit non-zero so `fleety … && next` behaves.
+        assert!(!output.status.success(), "{args:?}");
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             stderr.contains("cannot connect") || stderr.contains("cannot open SSE"),
@@ -393,7 +411,7 @@ fn network_commands_report_connection_errors_without_panicking() {
 
     let url = rejecting_ws_url();
     let output = run(&["init", &url]);
-    assert!(output.status.success());
+    assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("cannot connect") || stderr.contains("cannot open SSE"),
@@ -414,16 +432,16 @@ fn init_pair_and_ask_report_unexpected_server_frames() {
 
     let (url, rx) = start_ws_server(vec![vec![server_error.clone()]]);
     let (output, _) = run_against_server(&["init", &url], &url, &home, rx);
-    assert!(output.status.success());
+    assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected reply during init"));
 
     let (url, rx) = start_ws_server(vec![vec![server_error]]);
     let (output, _) = run_against_server(&["ask", "hi"], &url, &home, rx);
-    assert!(output.status.success());
+    assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("expected welcome"));
 
     let (url, rx) = start_ws_server(vec![vec![welcome(None)]]);
     let (output, _) = run_against_server(&["pair", "PAIR-2"], &url, &home, rx);
-    assert!(output.status.success());
+    assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("server returned no token"));
 }

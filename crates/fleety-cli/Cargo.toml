@@ -23,7 +23,10 @@ futures = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 reqwest = { workspace = true }
-ratatui = "0.29"
+# unstable-rendered-line-info: Paragraph::line_count, used to bottom-anchor the
+# TUI conversation (the version stays pinned to 0.29 so the unstable API can't
+# drift under us).
+ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 base64 = { workspace = true }
 arboard = { workspace = true }
 png = { workspace = true }

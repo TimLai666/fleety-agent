@@ -57,6 +57,8 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Paragraph};
 use ratatui::Frame;
 
+use crate::input::LineEditor;
+
 /// Run a `config` subcommand. The dispatch (list/get/set/unset/help + the
 /// line-based edit) is shared in `fleety_tools::config` so `fleety-server` and
 /// `fleetyd` expose the same `config` command; the CLI only overrides `edit` to
@@ -119,8 +121,8 @@ struct ConfigApp {
     rows: Vec<Row>,
     map: ConfigMap,
     sel: usize,
-    /// `Some(buffer)` while editing the selected row's value.
-    edit: Option<String>,
+    /// `Some(editor)` while editing the selected row's value.
+    edit: Option<LineEditor>,
     status: String,
     quit: bool,
 }
@@ -140,24 +142,21 @@ impl ConfigApp {
 
 /// Handle one key. Returns `true` when the map changed and should be saved.
 fn on_key(app: &mut ConfigApp, key: KeyCode) -> bool {
-    if app.edit.is_some() {
+    if let Some(ed) = app.edit.as_mut() {
         match key {
-            KeyCode::Char(c) => {
-                if let Some(b) = app.edit.as_mut() {
-                    b.push(c);
-                }
-            }
-            KeyCode::Backspace => {
-                if let Some(b) = app.edit.as_mut() {
-                    b.pop();
-                }
-            }
+            KeyCode::Char(c) => ed.insert(c),
+            KeyCode::Backspace => ed.backspace(),
+            KeyCode::Delete => ed.delete(),
+            KeyCode::Left => ed.left(),
+            KeyCode::Right => ed.right(),
+            KeyCode::Home => ed.home(),
+            KeyCode::End => ed.end(),
             KeyCode::Esc => {
                 app.edit = None;
                 app.status = "edit cancelled".to_string();
             }
             KeyCode::Enter => {
-                let buf = app.edit.take().unwrap_or_default();
+                let buf = app.edit.take().map(|mut e| e.take()).unwrap_or_default();
                 let Some(row) = app.rows.get(app.sel) else {
                     return false;
                 };
@@ -190,13 +189,19 @@ fn on_key(app: &mut ConfigApp, key: KeyCode) -> bool {
             }
         }
         KeyCode::Enter => {
-            // Edit the raw value (never the mask), so secrets edit cleanly.
+            // Prefill the raw value (never the mask) only when it really comes
+            // from the config file — env values and placeholder defaults like
+            // `(heuristic)` must not be one Enter away from being saved as if
+            // they were literal values.
             let raw = app
                 .rows
                 .get(app.sel)
+                .filter(|r| r.source == "config")
                 .map(|r| r.value.clone())
                 .unwrap_or_default();
-            app.edit = Some(raw);
+            let mut ed = LineEditor::default();
+            ed.set_text(raw);
+            app.edit = Some(ed);
             app.status = "type a value · Enter save · empty=unset · Esc cancel".to_string();
         }
         KeyCode::Char('q') | KeyCode::Esc => app.quit = true,
@@ -210,11 +215,16 @@ fn render(f: &mut Frame, app: &ConfigApp) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(1), Constraint::Length(3)])
         .split(f.area());
+    let inner_w = chunks[0].width.saturating_sub(2) as usize;
     let mut lines: Vec<Line> = Vec::with_capacity(app.rows.len());
     for (i, r) in app.rows.iter().enumerate() {
-        let editing_this = i == app.sel && app.edit.is_some();
-        let shown = if editing_this {
-            app.edit.clone().unwrap_or_default()
+        let shown = if let (true, Some(ed)) = (i == app.sel, &app.edit) {
+            // Show the editor's window so the cursor stays visible even when
+            // a long value outgrows the row (prefix width mirrors the format
+            // string below with the ">" marker).
+            let prefix = format!("> [{:7}] {:<28} = ", r.scope, r.key);
+            let avail = inner_w.saturating_sub(Line::from(prefix.as_str()).width());
+            ed.display_window(avail).0.to_string()
         } else if r.secret && !r.value.is_empty() {
             "********".to_string()
         } else {
@@ -226,10 +236,27 @@ fn render(f: &mut Frame, app: &ConfigApp) {
             r.scope, r.key, r.source
         )));
     }
+    // Scroll so the selected row stays visible when the registry outgrows the
+    // pane (row i renders on content line i).
+    let inner_h = chunks[0].height.saturating_sub(2);
+    let offset = (app.sel as u16 + 1).saturating_sub(inner_h);
     f.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title("fleety config — settings")),
+        Paragraph::new(lines)
+            .block(Block::bordered().title("fleety config — settings"))
+            .scroll((offset, 0)),
         chunks[0],
     );
+    // While editing, put the terminal cursor at its column inside the value
+    // (same window as the row above, so cursor and glyphs line up).
+    if let (Some(ed), Some(r)) = (&app.edit, app.rows.get(app.sel)) {
+        let prefix = format!("> [{:7}] {:<28} = ", r.scope, r.key);
+        let prefix_w = Line::from(prefix.as_str()).width();
+        let (_, x) = ed.display_window(inner_w.saturating_sub(prefix_w));
+        f.set_cursor_position((
+            chunks[0].x + 1 + (prefix_w + x as usize).min(inner_w) as u16,
+            chunks[0].y + 1 + (app.sel as u16).saturating_sub(offset),
+        ));
+    }
     f.render_widget(
         Paragraph::new(app.status.clone()).block(Block::bordered()),
         chunks[1],
@@ -309,7 +336,7 @@ mod tests {
 
         // Edit then commit a value → saved + map updated.
         on_key(&mut app, KeyCode::Enter);
-        app.edit = Some(String::new()); // clear the prefilled default for a clean assert
+        app.edit = Some(LineEditor::default()); // clear the prefilled default for a clean assert
         on_key(&mut app, KeyCode::Char('z'));
         assert!(on_key(&mut app, KeyCode::Enter));
         assert_eq!(
@@ -321,12 +348,34 @@ mod tests {
 
         // Empty buffer → unset (removed from map).
         on_key(&mut app, KeyCode::Enter);
-        app.edit = Some(String::new());
+        app.edit = Some(LineEditor::default());
         assert!(on_key(&mut app, KeyCode::Enter));
         assert!(!app.map.contains_key(&(setting.scope, key0.to_string())));
 
         // Quit.
         on_key(&mut app, KeyCode::Char('q'));
         assert!(app.quit);
+    }
+
+    #[test]
+    fn config_edit_cursor_keys() {
+        let mut app = ConfigApp::new(ConfigMap::new());
+        on_key(&mut app, KeyCode::Enter);
+        app.edit = Some(LineEditor::default()); // start from a clean buffer
+        for c in "abc".chars() {
+            on_key(&mut app, KeyCode::Char(c));
+        }
+        // Left + insert edits mid-value; Home/Delete removes the first char.
+        on_key(&mut app, KeyCode::Left);
+        on_key(&mut app, KeyCode::Char('X'));
+        on_key(&mut app, KeyCode::Home);
+        on_key(&mut app, KeyCode::Delete);
+        assert_eq!(app.edit.as_ref().map(|e| e.text()), Some("bXc"));
+        // End puts the cursor back for a tail backspace.
+        on_key(&mut app, KeyCode::End);
+        on_key(&mut app, KeyCode::Backspace);
+        assert_eq!(app.edit.as_ref().map(|e| e.text()), Some("bX"));
+        on_key(&mut app, KeyCode::Esc);
+        assert!(app.edit.is_none());
     }
 }

@@ -13,6 +13,9 @@ services:
       FLEETY_POLICY: ${FLEETY_POLICY:-full_access}
       # Uncomment + set to use a real model (any OpenAI-compatible endpoint).
       # On Docker Desktop, reach a model on the host via host.docker.internal.
+      # Left unset the server still boots, but in ECHO mode: the agent only
+      # parrots your input back. That's not a malfunction — set a model here
+      # to make it real (the server also logs a warning at boot).
       # FLEETY_MODEL_BASE_URL: http://host.docker.internal:1234/v1
       # FLEETY_MODEL: your-model
       # FLEETY_MODEL_KEY: your-key
