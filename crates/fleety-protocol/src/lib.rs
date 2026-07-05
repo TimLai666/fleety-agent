@@ -147,6 +147,14 @@ pub enum ClientMsg {
     Approve { approval_id: String },
     /// Deny a pending tool call (reply to `ApprovalRequested`).
     Deny { approval_id: String },
+    /// Cancel the connection's in-flight turn without submitting a new message
+    /// (no triage). The conversation id is informational — one connection has a
+    /// single in-flight turn today; carrying it keeps the wire shape stable if
+    /// conversations ever run concurrently.
+    CancelTurn {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conversation_id: Option<String>,
+    },
     /// Result of an on-device tool the server dispatched (reply to `RunTool`).
     /// `result_json` is the JSON-encoded tool result.
     ToolResult {
@@ -423,6 +431,23 @@ mod tests {
         };
         let json = serde_json::to_string(&result).expect("serialize");
         assert_eq!(result, serde_json::from_str(&json).expect("deserialize"));
+    }
+
+    #[test]
+    fn cancel_turn_roundtrips() {
+        let cancel = ClientMsg::CancelTurn {
+            conversation_id: Some("c1".into()),
+        };
+        let json = serde_json::to_string(&cancel).expect("serialize");
+        assert_eq!(cancel, serde_json::from_str(&json).expect("deserialize"));
+        // The conversation id is optional: omitted on the wire, defaults on read.
+        let bare: ClientMsg = serde_json::from_str(r#"{"type":"cancel_turn"}"#).expect("bare");
+        assert_eq!(
+            bare,
+            ClientMsg::CancelTurn {
+                conversation_id: None
+            }
+        );
     }
 
     #[test]

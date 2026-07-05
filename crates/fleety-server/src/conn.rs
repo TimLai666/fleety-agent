@@ -972,10 +972,10 @@ async fn serve(
                 let steps = if matches!(policy, Policy::FullAccess) {
                     // Parallel-read interruption (full-access only — the approval
                     // gate doesn't read inbound here, so we can read a mid-turn
-                    // message while the turn runs). A triaged interjection either
-                    // cancels the run at its next checkpoint or queues for after.
-                    use std::sync::atomic::{AtomicBool, Ordering};
-                    let cancel = AtomicBool::new(false);
+                    // message while the turn runs). A triaged interjection or an
+                    // explicit CancelTurn cancels the run at its next checkpoint;
+                    // a queued interjection runs after.
+                    let cancel = CancelFlag::new();
                     let mut gate = agent_core::AutoApprove;
                     let turn = drive_to_goal(
                         out,
@@ -1017,7 +1017,7 @@ async fn serve(
                                         .collect();
                                     let (ack, store) = match action {
                                         crate::triage::TriageAction::InterruptNow => {
-                                            cancel.store(true, Ordering::Relaxed);
+                                            cancel.request_triage();
                                             ("interrupting the current task to handle your new message", true)
                                         }
                                         crate::triage::TriageAction::QueueAfter => {
@@ -1036,11 +1036,25 @@ async fn serve(
                                         pending = Some((t2, atts));
                                     }
                                 }
+                                Ok(Some(ClientMsg::CancelTurn { .. })) => {
+                                    // Explicit cancel: stop at the next checkpoint
+                                    // and acknowledge immediately so the user sees
+                                    // a response the moment they press cancel.
+                                    cancel.request_explicit();
+                                    let _ = emit(out, &ServerMsg::Assistant {
+                                        conversation_id: conversation.to_string(),
+                                        text: "cancelling — stopping at the next safe point (a \
+                                               running tool finishes first)".to_string(),
+                                        seq: 0,
+                                        speech: None,
+                                        attention: None,
+                                    });
+                                }
                                 Ok(Some(_)) => {} // other kinds mid-turn: ignore (MVP)
                                 Ok(None) | Err(_) => {
                                     // Client went away mid-turn; wind down cleanly.
                                     client_open = false;
-                                    cancel.store(true, Ordering::Relaxed);
+                                    cancel.request_triage();
                                 }
                             },
                         }
@@ -1053,7 +1067,7 @@ async fn serve(
                         } else {
                             Message::user_with_attachments(t, atts)
                         };
-                        let cancel2 = AtomicBool::new(false);
+                        let cancel2 = CancelFlag::new();
                         let mut gate2 = agent_core::AutoApprove;
                         let s2 = drive_to_goal(
                             out,
@@ -1078,8 +1092,9 @@ async fn serve(
                     }
                 } else {
                     // Require-approval: the gate reads inbound for Approve/Deny, so
-                    // we keep the sequential path (no mid-turn interjection yet).
-                    let cancel = std::sync::atomic::AtomicBool::new(false);
+                    // we keep the sequential path (no mid-turn interjection yet,
+                    // hence CancelTurn has no effect here — documented in env.md).
+                    let cancel = CancelFlag::new();
                     let mut gate = ConnGate {
                         out: out.clone(),
                         inbound,
@@ -1391,6 +1406,12 @@ async fn serve(
                 }
                 emit(out, &reply)?;
             }
+            ClientMsg::CancelTurn { .. } => {
+                // Reached only when no turn is in flight (the mid-turn select
+                // loop consumes CancelTurn while one runs): ignore silently — a
+                // cancel racing a just-finished turn must not produce a stray
+                // message.
+            }
             ClientMsg::Colocation {
                 fingerprint,
                 subnet,
@@ -1597,6 +1618,49 @@ pub(crate) struct TurnReply {
     /// Device-deixis attention hint when voice is on and the model produced one;
     /// emitted only on the terminal turn.
     pub attention: Option<agent_core::AttentionHint>,
+    /// Whether the turn stopped at a cancellation checkpoint (the flag was set
+    /// while it ran). Distinguishes a cancelled turn from a naturally short one.
+    pub cancelled: bool,
+}
+
+/// The cancellation signal shared across one user turn. `stop` is the actual
+/// "halt at the next checkpoint" flag — read between goal iterations here and,
+/// handed to agent-core, before each tool/model call. `explicit` records *why*
+/// it was set: a user-pressed cancel (`CancelTurn` / ACP `session/cancel`)
+/// versus a triaged mid-turn interjection or a disconnect — so the closing
+/// message can word it correctly. Two `AtomicBool`s rather than one `AtomicU8`
+/// so `stop` hands straight to agent-core's `Option<&AtomicBool>` with no proxy.
+#[derive(Default)]
+pub(crate) struct CancelFlag {
+    stop: std::sync::atomic::AtomicBool,
+    explicit: std::sync::atomic::AtomicBool,
+}
+
+impl CancelFlag {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+    /// The stop signal to hand to agent-core / check between iterations.
+    fn stop_flag(&self) -> &std::sync::atomic::AtomicBool {
+        &self.stop
+    }
+    fn is_stopped(&self) -> bool {
+        self.stop.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn is_explicit(&self) -> bool {
+        self.explicit.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    /// A triaged interjection or a client disconnect: stop, framed as switching
+    /// to the new message.
+    fn request_triage(&self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    /// An explicit user cancel (`CancelTurn` / ACP `session/cancel`).
+    fn request_explicit(&self) {
+        self.explicit
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Map a core attention hint to its wire form (the two structs are identical but
@@ -1659,7 +1723,7 @@ pub(crate) async fn drive_to_goal(
     max_continues: u32,
     voice: bool,
     acting: &crate::identity::ActingUser,
-    cancel: &std::sync::atomic::AtomicBool,
+    cancel: &CancelFlag,
 ) -> Result<usize> {
     // Fresh goal state for this user message.
     *goal_state.lock().await = GoalState::new();
@@ -1683,6 +1747,7 @@ pub(crate) async fn drive_to_goal(
             false,
             voice,
             acting,
+            Some(cancel.stop_flag()),
         )
         .await?;
         total_steps += turn.steps;
@@ -1692,19 +1757,30 @@ pub(crate) async fn drive_to_goal(
         };
         let premature = active && matches!(terminal, Terminal::None);
         let hit_cap = continues >= max_continues;
-        // Cancellation checkpoint (between goal iterations): a mid-turn message
-        // triaged as `interrupt_now` sets this; we stop after the current turn
-        // rather than starting another iteration. The in-flight turn is never
-        // interrupted mid-tool.
-        let cancelled = cancel.load(std::sync::atomic::Ordering::Relaxed);
+        // Cancellation checkpoint (between goal iterations): the flag is set by a
+        // triaged `interrupt_now`, an explicit `CancelTurn`, or a disconnect;
+        // `turn.cancelled` additionally catches a stop that agent-core took at a
+        // per-tool-call checkpoint inside the turn just run. Either way we stop
+        // after the current turn rather than starting another iteration; a
+        // running tool is never interrupted mid-flight.
+        let cancelled = cancel.is_stopped() || turn.cancelled;
         if !premature || hit_cap || cancelled {
             // Terminal turn: emit the real reply (and Done). On a cap stop with an
             // unmet goal, tell the user it may be incomplete.
-            let text = if cancelled && premature {
-                format!(
-                    "{}\n\n[Stopped between steps to handle your new message.]",
-                    turn.reply
-                )
+            let text = if cancelled {
+                // Distinct wording: an explicit user cancel vs. switching to a
+                // triaged mid-turn message. A cancelled turn may have no partial
+                // reply (stopped before any text), so the note can stand alone.
+                let note = if cancel.is_explicit() {
+                    "[Cancelled at your request — work completed so far is preserved.]"
+                } else {
+                    "[Stopped between steps to handle your new message.]"
+                };
+                if turn.reply.trim().is_empty() {
+                    note.to_string()
+                } else {
+                    format!("{}\n\n{note}", turn.reply)
+                }
             } else if premature && hit_cap {
                 format!(
                     "{}\n\n[Reached the auto-continue cap of {max_continues}; the goal may be \
@@ -1837,6 +1913,7 @@ pub(crate) async fn drive_turn(
     emit_terminal: bool,
     voice: bool,
     acting: &crate::identity::ActingUser,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<TurnReply> {
     storage.append(device_id, conversation, &user_msg)?;
     storage.journal_begin(device_id, conversation, &user_msg)?;
@@ -1917,6 +1994,9 @@ pub(crate) async fn drive_turn(
         gate,
         on_delta.as_mut(),
         &mut compaction,
+        // Per-tool-call / per-model-call cancellation checkpoint. `None` (the
+        // reflection turn) keeps run-to-completion behavior.
+        cancel,
     )
     .await?;
     if let Some(cache) = &compaction {
@@ -1996,6 +2076,7 @@ pub(crate) async fn drive_turn(
         speech,
         steps,
         attention,
+        cancelled: outcome.cancelled,
     })
 }
 
@@ -2047,6 +2128,8 @@ pub(crate) async fn maybe_reflect(
         true,
         false,
         &storage.acting_for_device(device_id),
+        // Reflection is not user-cancellable — run to completion.
+        None,
     )
     .await?;
     Ok(())
@@ -2477,7 +2560,8 @@ async fn send_error_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_core::{Event, MockProvider, ModelResponse, Role as CoreRole, ToolCall};
+    use agent_core::{Event, MockProvider, ModelResponse, Role as CoreRole, ToolCall, ToolSpec};
+    use fleety_protocol::OriginContext;
     use tokio_tungstenite::MaybeTlsStream;
 
     type ClientWs = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -2796,21 +2880,20 @@ mod tests {
         }
     }
 
-    /// A pre-set cancel flag stops the goal loop after the current turn rather
-    /// than continuing — proving the mid-turn interruption checkpoint. With only
-    /// one turn scripted, a non-cancelled run would loop and exhaust the provider.
+    /// A pre-set cancel flag stops the run cleanly rather than looping and
+    /// exhausting the (single-scripted) provider. With agent-core's per-checkpoint
+    /// cancellation, a flag already set when the turn begins is observed at the
+    /// first pre-model checkpoint, so the turn stops before spending a call — the
+    /// run still returns Ok, emits Done, and carries the triage stop wording.
     #[tokio::test]
     async fn cancel_stops_goal_loop_between_iterations() {
         let (storage, tools, goal_state, _home, out, mut rx) = goal_env();
-        // Turn 1 sets a goal (so the run is "premature" and would continue) then
-        // replies. No further turns are scripted.
-        let provider = MockProvider::new(vec![
-            call_resp("a", "set_goal", serde_json::json!({ "goal": "keep going" })),
-            text_resp("did the first step"),
-        ]);
+        // One scripted reply only: a non-cancelled run that looped would exhaust it.
+        let provider = MockProvider::new(vec![text_resp("did the first step")]);
         let mut gate = agent_core::AutoApprove;
-        let cancel = std::sync::atomic::AtomicBool::new(true); // interrupted
-        let steps = drive_to_goal(
+        let cancel = CancelFlag::new();
+        cancel.request_triage(); // a triaged interjection interrupted the run
+        let _steps = drive_to_goal(
             &out,
             &storage,
             &provider,
@@ -2828,13 +2911,49 @@ mod tests {
         )
         .await
         .expect("cancelled run still returns Ok (did not loop/exhaust the provider)");
-        assert!(steps >= 1);
         let frames = drain(&mut rx);
         // Stopped cleanly: a terminal Done was emitted, and the reply notes the stop.
         assert!(frames.iter().any(|m| matches!(m, ServerMsg::Done { .. })));
         assert!(frames.iter().any(|m| matches!(
             m,
             ServerMsg::Assistant { text, .. } if text.contains("Stopped between steps")
+        )));
+    }
+
+    /// An explicit cancel (vs. a triaged interjection) uses distinct wording so
+    /// the user knows the turn was cancelled at their request.
+    #[tokio::test]
+    async fn explicit_cancel_uses_at_your_request_wording() {
+        let (storage, tools, goal_state, _home, out, mut rx) = goal_env();
+        let provider = MockProvider::new(vec![
+            call_resp("a", "set_goal", serde_json::json!({ "goal": "keep going" })),
+            text_resp("did the first step"),
+        ]);
+        let mut gate = agent_core::AutoApprove;
+        let cancel = CancelFlag::new();
+        cancel.request_explicit();
+        drive_to_goal(
+            &out,
+            &storage,
+            &provider,
+            &tools,
+            Policy::FullAccess,
+            "dev",
+            "c1",
+            Message::user("do the work"),
+            &mut gate,
+            &goal_state,
+            5,
+            false,
+            &crate::identity::ActingUser::Guest,
+            &cancel,
+        )
+        .await
+        .expect("explicit cancel returns Ok");
+        let frames = drain(&mut rx);
+        assert!(frames.iter().any(|m| matches!(
+            m,
+            ServerMsg::Assistant { text, .. } if text.contains("Cancelled at your request")
         )));
     }
 
@@ -2908,7 +3027,7 @@ mod tests {
             5,
             false,
             &crate::identity::ActingUser::Guest,
-            &std::sync::atomic::AtomicBool::new(false),
+            &CancelFlag::new(),
         )
         .await
         .unwrap();
@@ -2949,7 +3068,7 @@ mod tests {
             5,
             false,
             &crate::identity::ActingUser::Guest,
-            &std::sync::atomic::AtomicBool::new(false),
+            &CancelFlag::new(),
         )
         .await
         .unwrap();
@@ -2984,7 +3103,7 @@ mod tests {
             5,
             false,
             &crate::identity::ActingUser::Guest,
-            &std::sync::atomic::AtomicBool::new(false),
+            &CancelFlag::new(),
         )
         .await
         .unwrap();
@@ -3021,7 +3140,7 @@ mod tests {
             2,
             false,
             &crate::identity::ActingUser::Guest,
-            &std::sync::atomic::AtomicBool::new(false),
+            &CancelFlag::new(),
         )
         .await
         .unwrap();
@@ -3089,7 +3208,7 @@ mod tests {
             5,
             true,
             &crate::identity::ActingUser::Guest,
-            &std::sync::atomic::AtomicBool::new(false),
+            &CancelFlag::new(),
         )
         .await
         .unwrap();
@@ -3121,7 +3240,7 @@ mod tests {
             5,
             false,
             &crate::identity::ActingUser::Guest,
-            &std::sync::atomic::AtomicBool::new(false),
+            &CancelFlag::new(),
         )
         .await
         .unwrap();
@@ -3163,7 +3282,7 @@ mod tests {
             5,
             false,
             &crate::identity::ActingUser::Guest,
-            &std::sync::atomic::AtomicBool::new(false),
+            &CancelFlag::new(),
         )
         .await
         .unwrap();
@@ -3207,7 +3326,7 @@ mod tests {
             5,
             false,
             &crate::identity::ActingUser::Guest,
-            &std::sync::atomic::AtomicBool::new(false),
+            &CancelFlag::new(),
         )
         .await
         .unwrap();
@@ -3268,7 +3387,7 @@ mod tests {
             5,
             false,
             &crate::identity::ActingUser::Guest,
-            &std::sync::atomic::AtomicBool::new(false),
+            &CancelFlag::new(),
         )
         .await
         .unwrap();
@@ -3302,7 +3421,7 @@ mod tests {
             5,
             false,
             &crate::identity::ActingUser::Guest,
-            &std::sync::atomic::AtomicBool::new(false),
+            &CancelFlag::new(),
         )
         .await
         .unwrap();
@@ -3503,7 +3622,7 @@ mod tests {
             5,
             true,
             &crate::identity::ActingUser::Guest,
-            &std::sync::atomic::AtomicBool::new(false),
+            &CancelFlag::new(),
         )
         .await
         .unwrap();
@@ -3535,7 +3654,7 @@ mod tests {
             5,
             false,
             &crate::identity::ActingUser::Guest,
-            &std::sync::atomic::AtomicBool::new(false),
+            &CancelFlag::new(),
         )
         .await
         .unwrap();
@@ -4344,6 +4463,221 @@ mod tests {
         assert!(!ws_root.join("x.txt").exists(), "no write in the fallback either");
 
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A provider that parks the first model call on a `Notify` so a turn is
+    /// guaranteed in flight when the test sends `CancelTurn`; once released it
+    /// returns a terminal reply. Deterministic mid-turn timing without a
+    /// platform-specific slow tool.
+    struct GateProvider {
+        gate: Arc<tokio::sync::Notify>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for GateProvider {
+        async fn complete(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+        ) -> agent_core::Result<ModelResponse> {
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                self.gate.notified().await;
+            }
+            Ok(ModelResponse {
+                message: Message::assistant("partial work before cancel"),
+            })
+        }
+    }
+
+    /// End-to-end: while a turn is in flight (provider parked), an explicit
+    /// `CancelTurn` frame produces an immediate ack, then the turn closes with
+    /// the "Cancelled at your request" wording and a Done.
+    #[tokio::test]
+    async fn cancel_turn_acks_then_closes_with_cancelled_wording() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let provider: Arc<dyn ModelProvider> = Arc::new(GateProvider {
+            gate: Arc::clone(&gate),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let home = std::env::temp_dir().join(format!("fleety-cancel-{}", uuid::Uuid::new_v4()));
+        let ws_root = home.join("ws");
+        std::fs::create_dir_all(&ws_root).expect("mk ws");
+        let storage = Arc::new(Storage::new(home.clone()));
+        let workspace = Arc::new(ws_root.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let _ = handle_conn(
+                    stream,
+                    storage,
+                    provider,
+                    workspace,
+                    Policy::FullAccess,
+                    bridge::new_hub(),
+                    bridge::new_pending(),
+                    bridge::new_handles(),
+                    open_auth(),
+                    bridge::new_device_tools(),
+                )
+                .await;
+            }
+        });
+
+        let url = format!("ws://{addr}");
+        let (client, _) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("connect");
+        let (mut ctx, mut crx) = client.split();
+
+        send_client(&mut ctx, &hello("d")).await;
+        assert!(matches!(
+            recv_server(&mut crx).await,
+            Some(ServerMsg::Welcome { .. })
+        ));
+
+        send_client(
+            &mut ctx,
+            &ClientMsg::UserMessage {
+                conversation_id: None,
+                text: "do a long thing".into(),
+                origin: OriginContext::default(),
+                attachments: Vec::new(),
+                voice: false,
+                acting_user: None,
+            },
+        )
+        .await;
+
+        // The turn is now parked at the model call. Cancel it.
+        send_client(
+            &mut ctx,
+            &ClientMsg::CancelTurn {
+                conversation_id: None,
+            },
+        )
+        .await;
+
+        // First frame back is the immediate ack.
+        let ack = recv_server(&mut crx).await;
+        assert!(
+            matches!(&ack, Some(ServerMsg::Assistant { text, .. }) if text.contains("cancelling")),
+            "expected a cancelling ack, got {ack:?}"
+        );
+
+        // Release the provider so the turn winds down.
+        gate.notify_one();
+
+        // The closing reply carries the explicit-cancel wording, then Done.
+        let mut saw_cancelled = false;
+        let mut saw_done = false;
+        for _ in 0..8 {
+            match recv_server(&mut crx).await {
+                Some(ServerMsg::Assistant { text, .. })
+                    if text.contains("Cancelled at your request") =>
+                {
+                    saw_cancelled = true;
+                }
+                Some(ServerMsg::Done { .. }) => {
+                    saw_done = true;
+                    break;
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+        assert!(saw_cancelled, "closing reply should say it was cancelled at the user's request");
+        assert!(saw_done, "turn should complete with Done");
+
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = ctx.close().await;
+    }
+
+    /// An idle `CancelTurn` (no turn running) is ignored silently — the server
+    /// emits nothing for it, so a following ping-like turn still works.
+    #[tokio::test]
+    async fn idle_cancel_turn_is_ignored_silently() {
+        let provider: Arc<dyn ModelProvider> =
+            Arc::new(MockProvider::new(vec![ModelResponse {
+                message: Message::assistant("hello there"),
+            }]));
+        let home = std::env::temp_dir().join(format!("fleety-idlecancel-{}", uuid::Uuid::new_v4()));
+        let ws_root = home.join("ws");
+        std::fs::create_dir_all(&ws_root).expect("mk ws");
+        let storage = Arc::new(Storage::new(home.clone()));
+        let workspace = Arc::new(ws_root.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let _ = handle_conn(
+                    stream,
+                    storage,
+                    provider,
+                    workspace,
+                    Policy::FullAccess,
+                    bridge::new_hub(),
+                    bridge::new_pending(),
+                    bridge::new_handles(),
+                    open_auth(),
+                    bridge::new_device_tools(),
+                )
+                .await;
+            }
+        });
+
+        let url = format!("ws://{addr}");
+        let (client, _) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("connect");
+        let (mut ctx, mut crx) = client.split();
+
+        send_client(&mut ctx, &hello("d")).await;
+        assert!(matches!(
+            recv_server(&mut crx).await,
+            Some(ServerMsg::Welcome { .. })
+        ));
+
+        // Cancel with nothing running — must produce no frame.
+        send_client(
+            &mut ctx,
+            &ClientMsg::CancelTurn {
+                conversation_id: None,
+            },
+        )
+        .await;
+
+        // A real turn afterward still works (proving the idle cancel neither
+        // emitted a frame nor wedged the connection).
+        send_client(
+            &mut ctx,
+            &ClientMsg::UserMessage {
+                conversation_id: None,
+                text: "hi".into(),
+                origin: OriginContext::default(),
+                attachments: Vec::new(),
+                voice: false,
+                acting_user: None,
+            },
+        )
+        .await;
+
+        // The very next frame is the turn's reply — not a stray cancel artifact.
+        let first = recv_server(&mut crx).await;
+        assert!(
+            matches!(&first, Some(ServerMsg::Assistant { text, .. }) if text.contains("hello there")),
+            "idle cancel must emit nothing; first frame should be the new turn's reply, got {first:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+        let _ = ctx.close().await;
     }
 
     #[tokio::test]

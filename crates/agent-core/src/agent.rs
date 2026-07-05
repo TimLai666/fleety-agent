@@ -4,6 +4,8 @@
 //! tool calls it requests, feed the results back, and repeat until the model
 //! returns a final answer (or `max_steps` is hit).
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use serde_json::json;
 
 use crate::approval::{ApprovalDecision, ApprovalGate, Policy};
@@ -57,6 +59,11 @@ pub struct TurnOutcome {
     /// model emitted an [`ATTENTION_SENTINEL`]-delimited block.
     pub attention: Option<AttentionHint>,
     pub steps: usize,
+    /// True when the turn ended early because the caller's cancel flag was set
+    /// at a checkpoint: remaining tool calls were skipped with sentinel results
+    /// and no further model call was made. Work completed before the checkpoint
+    /// is preserved. Always false when no flag was passed or it was never set.
+    pub cancelled: bool,
 }
 
 /// A device-deixis attention hint parsed from a voice-mode reply: which device
@@ -215,9 +222,10 @@ pub async fn run_turn_streaming(
     gate: &mut dyn ApprovalGate,
     on_delta: &mut (dyn for<'a> FnMut(&'a str) + Send),
 ) -> Result<TurnOutcome> {
-    // No compaction cache: each call summarizes from scratch (today's behavior).
+    // No compaction cache: each call summarizes from scratch (today's behavior),
+    // and no cancel flag: the turn always runs to completion.
     run_turn_streaming_cached(
-        provider, tools, messages, events, config, policy, gate, on_delta, &mut None,
+        provider, tools, messages, events, config, policy, gate, on_delta, &mut None, None,
     )
     .await
 }
@@ -226,6 +234,14 @@ pub async fn run_turn_streaming(
 /// long conversation reuses its rolling summary and only summarizes new messages.
 /// The caller (which persists the cache) passes it in and reads it back out; the
 /// core itself does no I/O.
+///
+/// `cancel` is an optional cooperative cancellation flag, consulted only at safe
+/// checkpoints: before each model call and before each tool call. A tool that is
+/// already running is never interrupted. When the flag is found set, tool calls
+/// not yet started are skipped with a sentinel result (so every ToolCall keeps a
+/// matching ToolResult for journal replay and compaction), the turn ends without
+/// another model call, and [`TurnOutcome::cancelled`] is true. `None` or a flag
+/// that is never set leaves behavior exactly as before.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_turn_streaming_cached(
     provider: &dyn ModelProvider,
@@ -237,6 +253,7 @@ pub async fn run_turn_streaming_cached(
     gate: &mut dyn ApprovalGate,
     on_delta: &mut (dyn for<'a> FnMut(&'a str) + Send),
     cache: &mut Option<CompactionCache>,
+    cancel: Option<&AtomicBool>,
 ) -> Result<TurnOutcome> {
     let specs = tools.specs();
 
@@ -247,6 +264,18 @@ pub async fn run_turn_streaming_cached(
     }
 
     for step in 1..=config.max_steps {
+        // Cancellation checkpoint: before each model call (compaction included —
+        // it also spends a provider call). `steps` counts completed provider
+        // calls, so a turn cancelled here reports `step - 1`.
+        if cancel_requested(cancel) {
+            return Ok(TurnOutcome {
+                output: String::new(),
+                speech: None,
+                attention: None,
+                steps: step - 1,
+                cancelled: true,
+            });
+        }
         compact_if_needed(provider, messages, config, cache).await?;
         let response = provider
             .complete_streaming(messages, &specs, on_delta)
@@ -268,10 +297,35 @@ pub async fn run_turn_streaming_cached(
                 speech,
                 attention,
                 steps: step,
+                cancelled: false,
             });
         }
 
-        for call in &assistant.tool_calls {
+        for (idx, call) in assistant.tool_calls.iter().enumerate() {
+            // Cancellation checkpoint: before each tool call. A running tool is
+            // never interrupted — the flag is only consulted between calls. When
+            // set, this call and the rest of the batch are skipped, each with a
+            // sentinel result (mirroring the `interrupted_tool_result` pattern)
+            // so no ToolCall is left without a ToolResult, and the turn ends
+            // without another model call.
+            if cancel_requested(cancel) {
+                for skipped in &assistant.tool_calls[idx..] {
+                    events.push(Event::ToolCall(skipped.clone()));
+                    let sentinel = cancelled_tool_result();
+                    events.push(Event::ToolResult {
+                        id: skipped.id.clone(),
+                        result: sentinel.clone(),
+                    });
+                    messages.push(Message::tool_result(skipped.id.clone(), sentinel.to_string()));
+                }
+                return Ok(TurnOutcome {
+                    output: String::new(),
+                    speech: None,
+                    attention: None,
+                    steps: step,
+                    cancelled: true,
+                });
+            }
             events.push(Event::ToolCall(call.clone()));
 
             // Gate the call by policy/risk; a denial is fed back, not executed.
@@ -316,6 +370,24 @@ pub async fn run_turn_streaming_cached(
         "reached max steps ({}) without a final answer; raise max_steps or simplify the task",
         config.max_steps
     )))
+}
+
+/// Whether the caller's cooperative cancel flag is present and set. `Relaxed`
+/// suffices: the flag is a monotonic bool consulted only at checkpoints, with
+/// no other memory it must synchronize with.
+fn cancel_requested(cancel: Option<&AtomicBool>) -> bool {
+    cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false)
+}
+
+/// The result fed back for a tool call skipped at a cancellation checkpoint.
+/// Mirrors the [`crate::interrupted_tool_result`] sentinel shape so journal
+/// replay, compaction, and the model treat it uniformly — but unlike a restart
+/// interruption, this tool definitively did NOT run.
+fn cancelled_tool_result() -> serde_json::Value {
+    json!({
+        "cancelled": true,
+        "reason": "this tool call was cancelled by user before execution; it did not run and had no effect. Do not retry it unless the user asks again."
+    })
 }
 
 /// Look up a tool's declared risk by name (defaults to read if unknown).
@@ -1310,5 +1382,196 @@ mod tests {
         .expect("turn ok");
         assert_eq!(outcome.attention, None);
         assert_eq!(outcome.output, raw);
+    }
+
+    /// A tool that sets the shared cancel flag while it executes, simulating a
+    /// user cancelling mid-batch (between tool calls of the same model reply).
+    struct SetFlagTool {
+        flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for SetFlagTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "set_flag".to_string(),
+                description: "sets the cancel flag while executing".to_string(),
+                parameters: json!({ "type": "object", "properties": {} }),
+                risk: RiskLevel::Read,
+            }
+        }
+
+        async fn call(&self, _args: Value) -> Result<Value> {
+            self.flag
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            Ok(json!({ "flag_set": true }))
+        }
+    }
+
+    /// Counts provider calls so a test can assert the loop made no further
+    /// model call after cancellation. `complete_streaming`'s default impl
+    /// delegates to `complete`, so one counter covers both paths.
+    struct CountingProvider {
+        inner: MockProvider,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::model::ModelProvider for CountingProvider {
+        async fn complete(
+            &self,
+            messages: &[Message],
+            tools: &[crate::model::ToolSpec],
+        ) -> Result<ModelResponse> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.complete(messages, tools).await
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_between_tool_calls_skips_rest_with_sentinels() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // One model reply with two tool calls: the first sets the cancel flag
+        // while executing, so the checkpoint before the second must skip it.
+        let two_calls = ModelResponse {
+            message: Message {
+                role: Role::Assistant,
+                content: None,
+                tool_calls: vec![
+                    ToolCall {
+                        id: "c1".to_string(),
+                        name: "set_flag".to_string(),
+                        arguments: json!({}),
+                    },
+                    ToolCall {
+                        id: "c2".to_string(),
+                        name: "echo".to_string(),
+                        arguments: json!({ "text": "hi" }),
+                    },
+                ],
+                tool_call_id: None,
+                attachments: Vec::new(),
+            },
+        };
+        // A final response is scripted on purpose: a buggy second model call
+        // would succeed and be caught by the call-count assertion below,
+        // instead of masquerading as an out-of-script provider error.
+        let provider = CountingProvider {
+            inner: MockProvider::new(vec![two_calls, final_response()]),
+            calls: AtomicUsize::new(0),
+        };
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(SetFlagTool {
+            flag: Arc::clone(&flag),
+        }));
+        tools.register(Box::new(EchoTool));
+
+        let mut messages = vec![Message::user("do two things")];
+        let mut events = EventLog::new();
+        let mut noop: Box<dyn FnMut(&str) + Send> = Box::new(|_| {});
+
+        let outcome = run_turn_streaming_cached(
+            &provider,
+            &tools,
+            &mut messages,
+            &mut events,
+            &LoopConfig::default(),
+            Policy::FullAccess,
+            &mut AutoApprove,
+            noop.as_mut(),
+            &mut None,
+            Some(flag.as_ref()),
+        )
+        .await
+        .expect("turn ok");
+
+        assert!(outcome.cancelled);
+        // The first tool really executed and kept its real result.
+        let first = messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("c1"))
+            .expect("c1 result message");
+        assert!(first
+            .content
+            .as_deref()
+            .unwrap_or_default()
+            .contains("flag_set"));
+        // The second was skipped with the cancellation sentinel.
+        let second = messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("c2"))
+            .expect("c2 result message");
+        assert!(second
+            .content
+            .as_deref()
+            .unwrap_or_default()
+            .contains("cancelled by user before execution"));
+        // No second model call after cancellation.
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 1);
+        // Journal consistency: every ToolCall in messages has a matching
+        // tool-result message (no orphans for replay/compaction).
+        for m in &messages {
+            for call in &m.tool_calls {
+                assert!(
+                    messages
+                        .iter()
+                        .any(|r| r.tool_call_id.as_deref() == Some(call.id.as_str())),
+                    "tool call {} has no result message",
+                    call.id
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn never_cancelled_flag_changes_nothing() {
+        // Some(flag) that is never set must behave exactly like None (zero
+        // regression): normal tool execution, same event shape, cancelled=false.
+        use std::sync::atomic::AtomicBool;
+
+        let provider = MockProvider::new(vec![tool_call_response("echo"), final_response()]);
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(EchoTool));
+        let mut messages = vec![Message::user("please echo hi")];
+        let mut events = EventLog::new();
+        let flag = AtomicBool::new(false);
+        let mut noop: Box<dyn FnMut(&str) + Send> = Box::new(|_| {});
+
+        let outcome = run_turn_streaming_cached(
+            &provider,
+            &tools,
+            &mut messages,
+            &mut events,
+            &LoopConfig::default(),
+            Policy::FullAccess,
+            &mut AutoApprove,
+            noop.as_mut(),
+            &mut None,
+            Some(&flag),
+        )
+        .await
+        .expect("turn ok");
+
+        assert_eq!(outcome.output, "done");
+        assert_eq!(outcome.steps, 2);
+        assert!(!outcome.cancelled);
+        // Same event shape as the flagless run in loop_calls_tool_then_finishes:
+        // Assistant(tool_call) + ToolCall + ToolResult + Assistant(final) = 4.
+        assert_eq!(events.len(), 4);
+        // The tool really executed (real result, no sentinel anywhere).
+        let fed = messages
+            .iter()
+            .find(|m| m.tool_call_id.as_deref() == Some("c1"))
+            .expect("tool result message");
+        assert!(fed.content.as_deref().unwrap_or_default().contains("echoed"));
+        assert!(!messages.iter().any(|m| m
+            .content
+            .as_deref()
+            .map(|c| c.contains("cancelled by user before execution"))
+            .unwrap_or(false)));
     }
 }

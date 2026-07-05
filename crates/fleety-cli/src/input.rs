@@ -121,16 +121,22 @@ impl LineEditor {
         self.text = text;
     }
 
+    // Accessors used by the editors' tests and available to future callers of
+    // this small reusable editor; allow(dead_code) so the bin build (which only
+    // exercises some paths) doesn't warn.
+    #[allow(dead_code)]
     pub fn text(&self) -> &str {
         &self.text
     }
 
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.text.is_empty()
     }
 
     /// Cursor position in display columns from the start of the text. For
     /// callers that render the whole text after a prefix (config rows).
+    #[allow(dead_code)]
     pub fn cursor_col(&self) -> usize {
         self.text.chars().take(self.cursor).map(ch_width).sum()
     }

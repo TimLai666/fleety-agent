@@ -429,6 +429,13 @@ async fn run_tui() -> Result<()> {
                             app.status = format!("deny failed: {}", e.report().message);
                         }
                     }
+                    tui::Action::CancelTurn => {
+                        if let Err(e) = send(&mut tx, &ClientMsg::CancelTurn {
+                            conversation_id: None,
+                        }).await {
+                            app.status = format!("cancel failed: {}", e.report().message);
+                        }
+                    }
                     tui::Action::Quit => app.should_quit = true,
                     tui::Action::None => {}
                 },
@@ -471,11 +478,15 @@ async fn run_tui() -> Result<()> {
                         }
                     }
                     Ok(ServerMsg::Error { error }) => {
+                        // The turn ended (with an error): clear the in-flight
+                        // state so Esc goes back to quitting.
+                        app.turn_in_flight = false;
                         app.status = format!("agent error: {}", error.message);
                     }
                     _ => {}
                 },
                 None => {
+                    app.turn_in_flight = false;
                     app.status = "disconnected".to_string();
                     app.should_quit = true;
                 }

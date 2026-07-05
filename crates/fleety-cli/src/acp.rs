@@ -118,9 +118,15 @@ pub fn permission_request(session_id: &str, tool_call_id: &str, tool: &str, summ
     })
 }
 
-/// The stop reason for a completed prompt turn.
-pub fn stop_reason() -> &'static str {
-    "end_turn"
+/// The stop reason for a completed prompt turn: a turn the user cancelled
+/// (`session/cancel` → CancelTurn) reports `"cancelled"`, a turn that ran to
+/// completion reports `"end_turn"`.
+pub fn stop_reason(cancelled: bool) -> &'static str {
+    if cancelled {
+        "cancelled"
+    } else {
+        "end_turn"
+    }
 }
 
 /// Build the `OriginContext` for a session's cwd so the server roots the
@@ -485,6 +491,18 @@ pub trait AcpBridge: Send + Sync {
     /// Resume a session; returns its history as text chunks to replay.
     async fn load(&self, session_id: &str) -> agent_core::Result<Vec<String>>;
 
+    /// Forward the editor's `session/cancel` to the server (best-effort — a
+    /// cancel must never fail the adapter) and mark the session cancelled so
+    /// an in-flight prompt closes with stopReason `"cancelled"`.
+    async fn cancel(&self, _session_id: &str) {}
+
+    /// Whether the session's current turn was cancelled; reading consumes the
+    /// flag, and starting a new turn resets it, so one cancel affects exactly
+    /// one prompt response.
+    fn take_cancelled(&self, _session_id: &str) -> bool {
+        false
+    }
+
     /// Note the editor's advertised capabilities (from the `initialize` request)
     /// so the bridge can gate which `editor_*` tools it offers the server.
     fn note_capabilities(&self, _init_params: &Value) {}
@@ -551,9 +569,12 @@ pub async fn handle_message(msg: &Value, bridge: &dyn AcpBridge) -> Vec<Value> {
                 Ok(chunks) => {
                     let mut out: Vec<Value> =
                         chunks.iter().map(|c| assistant_update(&sid, c)).collect();
+                    // A turn the user cancelled mid-flight closes with
+                    // "cancelled"; reading the flag consumes it, so the
+                    // session's next prompt is back to normal.
                     out.push(response_ok(
                         reply_id(),
-                        json!({ "stopReason": stop_reason() }),
+                        json!({ "stopReason": stop_reason(bridge.take_cancelled(&sid)) }),
                     ));
                     out
                 }
@@ -576,8 +597,19 @@ pub async fn handle_message(msg: &Value, bridge: &dyn AcpBridge) -> Vec<Value> {
                 Err(e) => vec![response_err(reply_id(), INTERNAL_ERROR, &e.report().message)],
             }
         }
-        // Cancel is a notification (no id); the in-flight turn is best-effort.
-        "session/cancel" => vec![],
+        // Cancel is a notification (no id → no response). Forward it to the
+        // server as a CancelTurn frame and flag the session so an in-flight
+        // prompt closes with stopReason "cancelled" once the server winds the
+        // turn down; with no turn in flight the server ignores the frame
+        // silently, and the stale flag is reset when the next turn starts.
+        "session/cancel" => {
+            let sid = params
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            bridge.cancel(sid).await;
+            vec![]
+        }
         _ => match id {
             Some(id) => vec![response_err(
                 id,
@@ -615,12 +647,13 @@ async fn read_frame_async<R: tokio::io::AsyncBufRead + Unpin>(
 /// written to stdout; logs go to stderr (configured by the caller).
 pub async fn run(agent_url: String) -> agent_core::Result<()> {
     // The stdin reader is shared: the main loop reads requests from it, and during
-    // a prompt the bridge borrows it to read the editor's responses to the agent's
-    // fs/terminal calls (the editor is awaiting our prompt reply then, so stdin
-    // carries only those responses — no contention).
-    let reader = std::sync::Arc::new(tokio::sync::Mutex::new(tokio::io::BufReader::new(
-        tokio::io::stdin(),
-    )));
+    // a prompt the bridge borrows it — to read the editor's responses to the
+    // agent's fs/terminal calls, and to watch for a mid-turn `session/cancel`
+    // (the editor is awaiting our prompt reply then, so stdin carries only those
+    // frames — no contention).
+    let reader: SharedReader = std::sync::Arc::new(tokio::sync::Mutex::new(
+        tokio::io::BufReader::new(tokio::io::stdin()),
+    ));
     let bridge = WsBridge::new(agent_url, std::sync::Arc::clone(&reader));
     loop {
         let frame = {
@@ -658,30 +691,60 @@ pub async fn run(agent_url: String) -> agent_core::Result<()> {
 /// A shared, lockable stdin reader (see [`run`]).
 type SharedReader = std::sync::Arc<tokio::sync::Mutex<tokio::io::BufReader<tokio::io::Stdin>>>;
 
+/// The Hello frame that opens any adapter→server connection.
+fn hello_json(local_tools_json: Option<String>) -> serde_json::Result<String> {
+    serde_json::to_string(&fleety_protocol::ClientMsg::Hello {
+        device_id: crate::device_id(),
+        protocol: fleety_protocol::PROTOCOL_VERSION,
+        token: std::env::var("FLEETY_TOKEN").ok().filter(|s| !s.is_empty()),
+        pairing_code: None,
+        local_tools_json,
+        hostname: fleety_tools::device::hostname(),
+    })
+}
+
 /// Real bridge: each prompt opens a short-lived WebSocket to the server, sends
 /// the user message rooted at the session's cwd, and collects the assistant
 /// reply. Stateless per prompt (the server persists the conversation by id).
-struct WsBridge {
+/// While a turn runs, the editor's input is also watched for `session/cancel`,
+/// forwarded to the server as a CancelTurn frame on the turn's connection.
+/// Generic over the editor-input reader (stdin in production, in-memory in
+/// tests).
+struct WsBridge<R> {
     agent_url: String,
     cwds: tokio::sync::Mutex<std::collections::HashMap<String, Option<String>>>,
+    /// Sessions whose current turn the editor cancelled (`session/cancel`).
+    /// Set when a cancel is seen, consumed by `take_cancelled`, reset when a
+    /// new turn starts — so one cancel affects exactly one prompt.
+    cancelled: std::sync::Mutex<std::collections::HashSet<String>>,
     /// The editor's advertised capabilities (from `initialize`), gating which
     /// `editor_*` tools we offer the server.
     caps: std::sync::Mutex<EditorCapabilities>,
-    /// Shared stdin reader, for reading the editor's fs/terminal responses.
-    reader: SharedReader,
+    /// Shared editor-input reader, for the editor's fs/terminal responses and
+    /// the mid-turn `session/cancel` watch.
+    reader: std::sync::Arc<tokio::sync::Mutex<R>>,
     /// JSON-RPC request id counter for our calls to the editor.
     next_req: std::sync::atomic::AtomicI64,
 }
 
-impl WsBridge {
-    fn new(agent_url: String, reader: SharedReader) -> Self {
+impl<R: tokio::io::AsyncBufRead + Unpin + Send> WsBridge<R> {
+    fn new(agent_url: String, reader: std::sync::Arc<tokio::sync::Mutex<R>>) -> Self {
         Self {
             agent_url,
             cwds: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            cancelled: std::sync::Mutex::new(std::collections::HashSet::new()),
             caps: std::sync::Mutex::new(EditorCapabilities::default()),
             reader,
             next_req: std::sync::atomic::AtomicI64::new(1),
         }
+    }
+
+    /// Whether the editor cancelled `session_id`'s current turn.
+    fn session_cancelled(&self, session_id: &str) -> bool {
+        self.cancelled
+            .lock()
+            .map(|c| c.contains(session_id))
+            .unwrap_or(false)
     }
 
     /// Call one ACP client method on the editor and await its response. Borrows
@@ -712,7 +775,22 @@ impl WsBridge {
                         }
                         return Ok(v.get("result").cloned().unwrap_or(Value::Null));
                     }
-                    // Not our response — ignore (e.g. a mid-prompt session/cancel).
+                    // Not our response. A `session/cancel` seen here (while a
+                    // tool or approval was in flight) must not be lost: flag
+                    // its session — the turn loop forwards a CancelTurn to the
+                    // server once this editor call returns. Anything else is
+                    // dropped, as before.
+                    if v.get("method").and_then(Value::as_str) == Some("session/cancel") {
+                        if let Some(sid) = v
+                            .get("params")
+                            .and_then(|p| p.get("sessionId"))
+                            .and_then(Value::as_str)
+                        {
+                            if let Ok(mut c) = self.cancelled.lock() {
+                                c.insert(sid.to_string());
+                            }
+                        }
+                    }
                 }
                 Ok(FrameIn::Malformed) => {
                     // Skip a malformed line while awaiting the editor's response.
@@ -818,6 +896,12 @@ impl WsBridge {
         use futures::{SinkExt, StreamExt};
         use tokio_tungstenite::tungstenite::Message as WsMessage;
 
+        // A stale cancel (e.g. one that arrived while idle) must not poison
+        // this turn: the flag only reflects cancels seen while it runs.
+        if let Ok(mut c) = self.cancelled.lock() {
+            c.remove(conversation);
+        }
+
         let (ws, _) = tokio_tungstenite::connect_async(&self.agent_url)
             .await
             .map_err(|e| {
@@ -836,15 +920,8 @@ impl WsBridge {
         } else {
             serde_json::to_string(&editor_specs).ok()
         };
-        let hello = serde_json::to_string(&fleety_protocol::ClientMsg::Hello {
-            device_id: crate::device_id(),
-            protocol: fleety_protocol::PROTOCOL_VERSION,
-            token: std::env::var("FLEETY_TOKEN").ok().filter(|s| !s.is_empty()),
-            pairing_code: None,
-            local_tools_json,
-            hostname: fleety_tools::device::hostname(),
-        })
-        .map_err(|e| CoreError::Message(format!("serialize hello: {e}")))?;
+        let hello = hello_json(local_tools_json)
+            .map_err(|e| CoreError::Message(format!("serialize hello: {e}")))?;
         tx.send(WsMessage::Text(hello))
             .await
             .map_err(|e| CoreError::Provider(format!("send hello: {e}")))?;
@@ -870,7 +947,77 @@ impl WsBridge {
             .map_err(|e| CoreError::Provider(format!("send message: {e}")))?;
 
         let mut chunks = Vec::new();
-        while let Some(frame) = rx.next().await {
+        // Mid-turn cancellation (design decision seven): while the turn runs,
+        // this task is the editor's only reader (the dispatch loop is blocked
+        // awaiting our prompt reply), so the editor's `session/cancel` has to
+        // be picked up here, alongside the server socket. A seen cancel flags
+        // the session and is forwarded as one CancelTurn frame on THIS
+        // connection; the server acks, stops at its next checkpoint, and ends
+        // the turn with Done — which ends this loop normally, and the flag
+        // turns the prompt's stop reason into "cancelled".
+        enum Race {
+            Server(Option<Result<WsMessage, tokio_tungstenite::tungstenite::Error>>),
+            EditorReady(bool),
+        }
+        let mut cancel_sent = false;
+        let mut editor_open = true; // stop watching the editor after EOF/error
+        loop {
+            // Forward a cancel flagged for this conversation — by the editor
+            // watch below, or by editor_call while a tool/approval ran.
+            if !cancel_sent && self.session_cancelled(conversation) {
+                cancel_sent = true;
+                if let Ok(t) = serde_json::to_string(&fleety_protocol::ClientMsg::CancelTurn {
+                    conversation_id: Some(conversation.to_string()),
+                }) {
+                    let _ = tx.send(WsMessage::Text(t)).await;
+                }
+            }
+            // Race the server socket against editor input. The editor side
+            // only signals readiness (`fill_buf`, which is cancellation-safe);
+            // the frame is read after the race is decided, so a concurrent
+            // server frame can never cost us a half-read line.
+            let server_frame = if editor_open {
+                let mut r = self.reader.lock().await;
+                let race = {
+                    use tokio::io::AsyncBufReadExt;
+                    tokio::select! {
+                        f = rx.next() => Race::Server(f),
+                        b = r.fill_buf() => Race::EditorReady(matches!(b, Ok(x) if !x.is_empty())),
+                    }
+                };
+                match race {
+                    Race::Server(f) => Some(f),
+                    Race::EditorReady(false) => {
+                        editor_open = false; // editor input closed/errored
+                        None
+                    }
+                    Race::EditorReady(true) => {
+                        match read_frame_async(&mut *r).await {
+                            Ok(FrameIn::Message(v))
+                                if v.get("method").and_then(Value::as_str)
+                                    == Some("session/cancel") =>
+                            {
+                                // One turn is in flight per connection, so a
+                                // mid-turn cancel targets this conversation.
+                                if let Ok(mut c) = self.cancelled.lock() {
+                                    c.insert(conversation.to_string());
+                                }
+                            }
+                            Ok(FrameIn::Message(_) | FrameIn::Malformed) => {
+                                tracing::warn!(
+                                    "acp: dropped a mid-turn editor frame (only session/cancel is handled during a turn)"
+                                );
+                            }
+                            Ok(FrameIn::Eof) | Err(_) => editor_open = false,
+                        }
+                        None
+                    }
+                }
+            } else {
+                Some(rx.next().await)
+            };
+            let Some(next) = server_frame else { continue };
+            let Some(frame) = next else { break }; // server closed the socket
             let Ok(frame) = frame else { break };
             if !frame.is_text() {
                 continue;
@@ -951,7 +1098,7 @@ impl WsBridge {
 }
 
 #[async_trait::async_trait]
-impl AcpBridge for WsBridge {
+impl<R: tokio::io::AsyncBufRead + Unpin + Send> AcpBridge for WsBridge<R> {
     async fn new_session(&self, cwd: Option<String>) -> agent_core::Result<String> {
         let sid = uuid::Uuid::new_v4().to_string();
         self.cwds.lock().await.insert(sid.clone(), cwd);
@@ -965,6 +1112,44 @@ impl AcpBridge for WsBridge {
 
     async fn load(&self, session_id: &str) -> agent_core::Result<Vec<String>> {
         self.run_turn(session_id, "", None, true).await
+    }
+
+    async fn cancel(&self, session_id: &str) {
+        use futures::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+        // Flag first: were a turn somehow in flight for this session, its
+        // loop would forward the cancel on the live connection.
+        if !session_id.is_empty() {
+            if let Ok(mut c) = self.cancelled.lock() {
+                c.insert(session_id.to_string());
+            }
+        }
+        // This dispatch path only runs between turns (the loop is
+        // sequential; a mid-turn cancel is picked up inside run_turn), so
+        // there is no live turn connection here: best-effort send CancelTurn
+        // on a short-lived one — an idle server ignores it silently, by
+        // design. A cancel never fails the adapter.
+        let Ok((ws, _)) = tokio_tungstenite::connect_async(&self.agent_url).await else {
+            tracing::warn!(url = %self.agent_url, "acp: cancel: server unreachable; nothing to cancel");
+            return;
+        };
+        let (mut tx, _rx) = ws.split();
+        let conversation_id = (!session_id.is_empty()).then(|| session_id.to_string());
+        if let (Ok(hello), Ok(cancel)) = (
+            hello_json(None),
+            serde_json::to_string(&fleety_protocol::ClientMsg::CancelTurn { conversation_id }),
+        ) {
+            let _ = tx.send(WsMessage::Text(hello)).await;
+            let _ = tx.send(WsMessage::Text(cancel)).await;
+        }
+        let _ = tx.close().await;
+    }
+
+    fn take_cancelled(&self, session_id: &str) -> bool {
+        self.cancelled
+            .lock()
+            .map(|mut c| c.remove(session_id))
+            .unwrap_or(false)
     }
 
     fn note_capabilities(&self, init_params: &Value) {
@@ -1244,7 +1429,8 @@ mod tests {
         assert_eq!(p["toolCall"]["toolCallId"], "appr-1");
         assert_eq!(p["toolCall"]["title"], "write_file");
         assert!(p["options"].as_array().is_some());
-        assert_eq!(stop_reason(), "end_turn");
+        assert_eq!(stop_reason(false), "end_turn");
+        assert_eq!(stop_reason(true), "cancelled");
         let origin = cwd_to_origin(Some("/home/alice/proj"));
         assert_eq!(origin.cwd.as_deref(), Some("/home/alice/proj"));
         let origin_none = cwd_to_origin(None);
@@ -1252,5 +1438,265 @@ mod tests {
         assert!(initialize_result()["agentCapabilities"]["loadSession"]
             .as_bool()
             .unwrap());
+    }
+
+    // ---- turn cancellation (design decision seven) ----
+
+    use fleety_protocol::{ClientMsg, ServerMsg};
+
+    /// Bridge double pinning the cancel dispatch semantics `handle_message`
+    /// relies on: a new turn starts with a clean flag, a cancel during the
+    /// turn sets it, and `take_cancelled` consumes it.
+    #[derive(Default)]
+    struct CancelMock {
+        forwarded: std::sync::Mutex<Vec<String>>,
+        flagged: std::sync::Mutex<std::collections::HashSet<String>>,
+        cancel_during_prompt: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl AcpBridge for CancelMock {
+        async fn new_session(&self, _cwd: Option<String>) -> agent_core::Result<String> {
+            Ok("sess-c".to_string())
+        }
+        async fn prompt(&self, session_id: &str, _text: &str) -> agent_core::Result<Vec<String>> {
+            let mut flagged = self.flagged.lock().unwrap();
+            flagged.remove(session_id); // a new turn starts clean
+            if self
+                .cancel_during_prompt
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                flagged.insert(session_id.to_string()); // cancel landed mid-turn
+            }
+            Ok(vec!["chunk".to_string()])
+        }
+        async fn load(&self, _session_id: &str) -> agent_core::Result<Vec<String>> {
+            Ok(vec![])
+        }
+        async fn cancel(&self, session_id: &str) {
+            self.forwarded.lock().unwrap().push(session_id.to_string());
+            self.flagged.lock().unwrap().insert(session_id.to_string());
+        }
+        fn take_cancelled(&self, session_id: &str) -> bool {
+            self.flagged.lock().unwrap().remove(session_id)
+        }
+    }
+
+    fn prompt_msg(sid: &str) -> Value {
+        json!({"id":11,"method":"session/prompt","params":{"sessionId":sid,"prompt":[{"type":"text","text":"go"}]}})
+    }
+
+    #[tokio::test]
+    async fn session_cancel_dispatch_forwards_and_parameterizes_stop_reason() {
+        let b = CancelMock::default();
+        // session/cancel is a notification: forwarded to the bridge, no reply.
+        let r = handle_message(
+            &json!({"method":"session/cancel","params":{"sessionId":"sess-c"}}),
+            &b,
+        )
+        .await;
+        assert!(r.is_empty(), "a notification gets no response");
+        assert_eq!(*b.forwarded.lock().unwrap(), vec!["sess-c".to_string()]);
+        // An idle-time cancel does not poison the next prompt (reset at turn
+        // start — the fixed behavior for the no-prompt-in-flight case).
+        let r = handle_message(&prompt_msg("sess-c"), &b).await;
+        assert_eq!(r.last().unwrap()["result"]["stopReason"], "end_turn");
+        // A cancel landing while the turn runs → stopReason "cancelled"...
+        b.cancel_during_prompt
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let r = handle_message(&prompt_msg("sess-c"), &b).await;
+        assert_eq!(r.last().unwrap()["result"]["stopReason"], "cancelled");
+        // ...consumed with the response: the next prompt is normal again.
+        b.cancel_during_prompt
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let r = handle_message(&prompt_msg("sess-c"), &b).await;
+        assert_eq!(r.last().unwrap()["result"]["stopReason"], "end_turn");
+    }
+
+    /// Scripted WS server (the cli_smoke pattern, multi-connection): per
+    /// connection, each step reads one client frame then sends its responses;
+    /// each connection's received frames are delivered on the channel.
+    fn scripted_server(
+        conns: Vec<Vec<Vec<ServerMsg>>>,
+    ) -> (String, std::sync::mpsc::Receiver<Vec<ClientMsg>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind script server");
+        let addr = listener.local_addr().expect("script server addr");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for steps in conns {
+                let Ok((stream, _)) = listener.accept() else {
+                    return;
+                };
+                let Ok(mut ws) = tokio_tungstenite::tungstenite::accept(stream) else {
+                    return;
+                };
+                let mut received = Vec::new();
+                for responses in steps {
+                    let Ok(frame) = ws.read() else { break };
+                    if let Ok(text) = frame.to_text() {
+                        if let Ok(msg) = serde_json::from_str::<ClientMsg>(text) {
+                            received.push(msg);
+                        }
+                    }
+                    for r in responses {
+                        let _ = ws.send(tokio_tungstenite::tungstenite::Message::Text(
+                            serde_json::to_string(&r).expect("serialize server msg"),
+                        ));
+                    }
+                }
+                let _ = ws.close(None);
+                let _ = tx.send(received);
+            }
+        });
+        (format!("ws://{addr}"), rx)
+    }
+
+    fn assistant(conv: &str, text: &str, seq: u64) -> ServerMsg {
+        ServerMsg::Assistant {
+            conversation_id: conv.to_string(),
+            text: text.to_string(),
+            seq,
+            speech: None,
+            attention: None,
+        }
+    }
+
+    /// A real WsBridge whose editor input is an in-memory duplex; returns the
+    /// write half the test uses to play the editor.
+    fn duplex_bridge(
+        url: &str,
+    ) -> (
+        WsBridge<tokio::io::BufReader<tokio::io::DuplexStream>>,
+        tokio::io::DuplexStream,
+    ) {
+        let (editor_in, editor_out) = tokio::io::duplex(1024);
+        let bridge = WsBridge::new(
+            url.to_string(),
+            std::sync::Arc::new(tokio::sync::Mutex::new(tokio::io::BufReader::new(
+                editor_in,
+            ))),
+        );
+        (bridge, editor_out)
+    }
+
+    /// The editor's stop gesture, end to end against the real bridge: a
+    /// `session/cancel` arriving while the turn runs is written to the turn's
+    /// server connection as a CancelTurn frame, and the prompt closes with
+    /// stopReason "cancelled" once the server's wind-down and Done arrive.
+    #[tokio::test]
+    async fn mid_turn_session_cancel_sends_cancel_turn_and_prompt_stops_cancelled() {
+        let (url, server_rx) = scripted_server(vec![vec![
+            vec![], // Hello
+            vec![], // UserMessage — the server now waits for the CancelTurn
+            vec![
+                // CancelTurn → ack, wind-down, Done (decision five's shape).
+                assistant("c-mid", "cancelling — stopping at the next safe point", 1),
+                assistant(
+                    "c-mid",
+                    "Cancelled at your request — work completed so far is preserved.",
+                    2,
+                ),
+                ServerMsg::Done {
+                    conversation_id: "c-mid".to_string(),
+                },
+            ],
+        ]]);
+        let (bridge, mut editor_out) = duplex_bridge(&url);
+        // The stop gesture: a cancel notification sitting on the editor input
+        // while the prompt turn runs.
+        tokio::io::AsyncWriteExt::write_all(
+            &mut editor_out,
+            b"{\"jsonrpc\":\"2.0\",\"method\":\"session/cancel\",\"params\":{\"sessionId\":\"c-mid\"}}\n",
+        )
+        .await
+        .unwrap();
+        let frames = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            handle_message(
+                &json!({"id":5,"method":"session/prompt","params":{"sessionId":"c-mid","prompt":[{"type":"text","text":"do it"}]}}),
+                &bridge,
+            ),
+        )
+        .await
+        .expect("cancelled prompt must still complete");
+        // The wind-down still streams to the editor...
+        let texts: Vec<&str> = frames
+            .iter()
+            .filter_map(|f| f["params"]["update"]["content"]["text"].as_str())
+            .collect();
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.contains("Cancelled at your request")),
+            "wind-down chunk missing: {texts:?}"
+        );
+        // ...the response closes with "cancelled" (not end_turn)...
+        assert_eq!(frames.last().unwrap()["result"]["stopReason"], "cancelled");
+        // ...and the server connection saw the CancelTurn for this conversation.
+        let received = server_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("server frames");
+        assert!(matches!(received.first(), Some(ClientMsg::Hello { .. })));
+        assert!(matches!(
+            received.get(1),
+            Some(ClientMsg::UserMessage { .. })
+        ));
+        assert!(matches!(
+            received.get(2),
+            Some(ClientMsg::CancelTurn { conversation_id: Some(c) }) if c == "c-mid"
+        ));
+        // One cancel affects exactly one prompt: the flag was consumed.
+        assert!(!bridge.take_cancelled("c-mid"));
+    }
+
+    /// A cancel with no prompt in flight is still forwarded (the idle server
+    /// ignores it silently, by design) and leaves no state behind: the next
+    /// prompt ends normally with end_turn.
+    #[tokio::test]
+    async fn idle_session_cancel_forwards_and_leaves_next_prompt_normal() {
+        let (url, server_rx) = scripted_server(vec![
+            // Connection 1 — the idle cancel: Hello, CancelTurn.
+            vec![vec![], vec![]],
+            // Connection 2 — the next prompt: Hello, UserMessage → reply+Done.
+            vec![
+                vec![],
+                vec![
+                    assistant("c-idle", "fresh answer", 1),
+                    ServerMsg::Done {
+                        conversation_id: "c-idle".to_string(),
+                    },
+                ],
+            ],
+        ]);
+        let (bridge, _editor_out) = duplex_bridge(&url);
+        let frames = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            handle_message(
+                &json!({"method":"session/cancel","params":{"sessionId":"c-idle"}}),
+                &bridge,
+            ),
+        )
+        .await
+        .expect("idle cancel must not hang");
+        assert!(frames.is_empty(), "cancel is a notification — no response");
+        let conn1 = server_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("idle-cancel frames");
+        assert!(matches!(conn1.first(), Some(ClientMsg::Hello { .. })));
+        assert!(matches!(
+            conn1.get(1),
+            Some(ClientMsg::CancelTurn { conversation_id: Some(c) }) if c == "c-idle"
+        ));
+        // The stale flag is reset when the next turn starts: end_turn.
+        let frames = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            handle_message(
+                &json!({"id":6,"method":"session/prompt","params":{"sessionId":"c-idle","prompt":[{"type":"text","text":"hi"}]}}),
+                &bridge,
+            ),
+        )
+        .await
+        .expect("prompt after idle cancel must complete");
+        assert_eq!(frames.last().unwrap()["result"]["stopReason"], "end_turn");
     }
 }

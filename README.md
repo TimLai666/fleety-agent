@@ -245,7 +245,7 @@ launchd / Windows SCM).
 | `fleety init <ws-url>` | Save the agent URL (e.g. `ws://host:8787`) for later commands. |
 | `fleety ask "<text>"` | One-shot prompt; prints the reply. Accepts file paths as attachments. |
 | `fleety resume <conversation_id>` | Continue an existing conversation. |
-| `fleety tui` | Interactive terminal UI (streaming chat). |
+| `fleety tui` | Interactive terminal UI (streaming chat). While a reply is generating, **Esc cancels** the turn (completed work is kept); when idle, Esc quits. Ctrl+C always quits. PgUp/PgDn scroll the history. |
 | `fleety voice` | Voice conversation (speech-to-text in, spoken reply out). |
 | `fleety status` | Server health: version, uptime, connected devices. |
 | `fleety config <list\|get\|set\|unset\|edit>` | Inspect/edit settings; secrets masked. Targets the connected **server** by default; `--target local` edits this host's `~/.fleety/config.toml`. `edit` is local + interactive (ratatui on a TTY, line-based otherwise). |

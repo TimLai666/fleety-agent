@@ -40,6 +40,10 @@ pub struct App {
     /// Approvals awaiting a y/n decision, oldest first: (approval_id, summary).
     /// While non-empty the input is modal — only y / n / Esc act.
     pub pending_approvals: VecDeque<(String, String)>,
+    /// Whether a turn is running (message sent, final reply not yet received).
+    /// Set on `Send`, cleared when the reply, an error, or a disconnect lands.
+    /// Drives Esc = cancel vs. Esc = quit.
+    pub turn_in_flight: bool,
 }
 
 impl App {
@@ -53,6 +57,7 @@ impl App {
             streaming: false,
             scroll_back: 0,
             pending_approvals: VecDeque::new(),
+            turn_in_flight: false,
         }
     }
 
@@ -74,7 +79,8 @@ impl App {
         self.streaming = true;
     }
 
-    /// Finalize the assistant reply with the authoritative full text.
+    /// Finalize the assistant reply with the authoritative full text. This is
+    /// the turn's terminal message, so the in-flight state clears here.
     pub fn finish_assistant(&mut self, text: String) {
         if self.streaming {
             if let Some(last) = self.messages.last_mut() {
@@ -84,6 +90,7 @@ impl App {
         } else {
             self.push("fleety", text);
         }
+        self.turn_in_flight = false;
     }
 
     /// Stage one attachment for the next send. The outer loop calls this after
@@ -113,6 +120,9 @@ impl App {
     pub fn input_title(&self) -> String {
         if let Some((_, desc)) = self.pending_approvals.front() {
             return format!("Approval required — y=approve · n=deny — {desc}");
+        }
+        if self.turn_in_flight {
+            return "Working… (Esc=cancel, Ctrl+C=quit)".to_string();
         }
         if self.pending_attachments.is_empty() {
             "Message (Enter=send, Ctrl+V=paste, PgUp/PgDn=scroll, Esc=quit)".to_string()
@@ -151,6 +161,8 @@ pub enum Action {
     Approve(String),
     /// n/Esc on a pending approval: send `ClientMsg::Deny` for this id.
     Deny(String),
+    /// Esc while a turn is in flight: send `ClientMsg::CancelTurn`.
+    CancelTurn,
 }
 
 /// Apply a keypress to the app, returning the action for the loop to perform.
@@ -158,7 +170,7 @@ pub fn on_key(app: &mut App, key: KeyEvent) -> Action {
     // Ctrl+C always quits, even while an approval is pending.
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         if let KeyCode::Char(c) = key.code {
-            if c.to_ascii_lowercase() == 'c' {
+            if c.eq_ignore_ascii_case(&'c') {
                 app.should_quit = true;
                 return Action::Quit;
             }
@@ -222,8 +234,14 @@ pub fn on_key(app: &mut App, key: KeyEvent) -> Action {
     }
     match key.code {
         KeyCode::Esc => {
-            app.should_quit = true;
-            Action::Quit
+            // A turn in flight: Esc cancels it (does not quit). Idle: Esc quits.
+            if app.turn_in_flight {
+                app.status = "cancelling — stopping at the next safe point…".to_string();
+                Action::CancelTurn
+            } else {
+                app.should_quit = true;
+                Action::Quit
+            }
         }
         KeyCode::Enter => {
             let text = app.input.take();
@@ -239,6 +257,7 @@ pub fn on_key(app: &mut App, key: KeyEvent) -> Action {
                 app.push("you", display);
                 // Sending snaps the conversation back to the newest output.
                 app.scroll_back = 0;
+                app.turn_in_flight = true;
                 Action::Send { text, attachments }
             }
         }
@@ -362,6 +381,9 @@ mod tests {
         );
         assert_eq!(app.input.text(), ""); // cleared on send
         assert_eq!(app.messages.last().map(|(r, _)| r.as_str()), Some("you"));
+        // Sending marks a turn in flight; the reply clears it before we test quit.
+        assert!(app.turn_in_flight);
+        app.finish_assistant("hi back".to_string());
         // Empty Enter with no attachments does nothing.
         assert_eq!(on_key(&mut app, key(KeyCode::Enter)), Action::None);
         assert_eq!(on_key(&mut app, key(KeyCode::Esc)), Action::Quit);
@@ -578,6 +600,42 @@ mod tests {
         );
         on_key(&mut app, key(KeyCode::Char('!')));
         assert_eq!(app.input.text(), "!bX");
+    }
+
+    #[test]
+    fn esc_cancels_while_a_turn_is_in_flight_then_quits_when_idle() {
+        let mut app = App::new("ready");
+        // Sending a message marks a turn in flight.
+        app.input.set_text("hello".into());
+        let Action::Send { .. } = on_key(&mut app, key(KeyCode::Enter)) else {
+            panic!("expected Send");
+        };
+        assert!(app.turn_in_flight);
+        // Esc now cancels the turn (does NOT quit).
+        assert_eq!(on_key(&mut app, key(KeyCode::Esc)), Action::CancelTurn);
+        assert!(!app.should_quit);
+        assert!(app.status.contains("cancel"));
+        // The reply landing clears the in-flight state.
+        app.finish_assistant("done".into());
+        assert!(!app.turn_in_flight);
+        // With no turn in flight, Esc quits as before.
+        assert_eq!(on_key(&mut app, key(KeyCode::Esc)), Action::Quit);
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn approval_deny_takes_priority_over_turn_cancel() {
+        let mut app = App::new("ready");
+        app.input.set_text("go".into());
+        let _ = on_key(&mut app, key(KeyCode::Enter));
+        assert!(app.turn_in_flight);
+        // A mid-turn approval request: Esc is deny (modal wins over cancel).
+        app.request_approval("id1".into(), "write_file", "mutate", "write foo");
+        assert_eq!(
+            on_key(&mut app, key(KeyCode::Esc)),
+            Action::Deny("id1".into())
+        );
+        assert!(!app.should_quit);
     }
 
     #[test]

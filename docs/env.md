@@ -35,7 +35,7 @@ server keeps the fallback root and records the originating device on the binding
 (running tools on that remote device at its cwd is a planned follow-up).
 
 | `FLEETY_FS_SCOPE` | (unset → `full`) | `full` (default): the structured file tools may read/write anywhere on the device (absolute paths allowed; still audited + rollback-backed; a sensitive-path guard refuses SSH keys/`/etc/shadow`/`/dev`/Windows system dirs/etc.). `workspace`: re-confine every path to the workspace/device root (`..`/absolute/symlink-tight sandbox). Set on `fleetyd` too for its `FLEETY_DEVICE_ROOT`. |
-| `FLEETY_POLICY` | `full_access` | `require_approval` gates every non-read tool through the approval flow. |
+| `FLEETY_POLICY` | `full_access` | `require_approval` gates every non-read tool through the approval flow. Limitation: under `require_approval` the server does not read frames mid-turn (the approval gate owns the inbound stream), so a `CancelTurn` sent during a gated turn has no effect — cancel works under the default full-access policy. |
 | `FLEETY_REQUIRE_AUTH` | `0` | Set to `1` to require a valid token / pairing code on every `Hello`. |
 | `FLEETY_TOKEN` | (unset) | Bootstrap admin token. Use it once to pair the first device. |
 | `FLEETY_SCHED_TICK` | `60` | Seconds between scheduler fire-loop ticks. |

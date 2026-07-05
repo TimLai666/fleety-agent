@@ -319,6 +319,8 @@ impl SubagentHost for FleetyHost {
             // Act as the parent's acting user, not the device owner (shared-device
             // isolation): the wake turn's memory + ownership stay scoped correctly.
             &self.acting,
+            // A background wake turn is not user-cancellable.
+            None,
         )
         .await
         {
