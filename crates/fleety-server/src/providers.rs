@@ -41,16 +41,16 @@ pub fn build(prefix: &str) -> Option<Arc<dyn ModelProvider>> {
         .filter(|s| !s.trim().is_empty());
     let effort = std::env::var(format!("{prefix}_EFFORT")).ok();
     let auth = std::env::var(format!("{prefix}_AUTH")).ok();
-    Some(build_provider(
+    Some(build_provider(ProviderBuild {
         base_url,
         model,
         key,
         stream,
-        modalities.as_deref(),
-        effort.as_deref(),
-        auth.as_deref(),
-        prefix,
-    ))
+        modalities,
+        effort,
+        auth,
+        label: prefix.to_string(),
+    }))
 }
 
 /// Whether an auth-mode string selects the Codex OAuth bearer. `None`/`"static"`
@@ -59,22 +59,47 @@ fn auth_is_oauth(auth: Option<&str>) -> bool {
     matches!(auth, Some(a) if a.eq_ignore_ascii_case("oauth:codex"))
 }
 
-/// Build one provider from explicit fields (shared by the env path and the
-/// `providers.toml` path). Picks the native Gemini vs OpenAI-compatible backend
-/// from the model name, resolves modality capabilities (explicit `modalities`
-/// wins, else the model-family heuristic, else text-only with a warning), and
-/// attaches the family's effort scheme + optional default effort. `label` is
-/// only used for log lines (the env prefix or the provider name).
-pub fn build_provider(
-    base_url: String,
-    model: String,
-    key: Option<String>,
-    stream: bool,
-    modalities: Option<&str>,
-    effort: Option<&str>,
-    auth: Option<&str>,
-    label: &str,
-) -> Arc<dyn ModelProvider> {
+/// The fields needed to build one provider (shared by the env path and the
+/// `providers.toml` path). A named struct rather than eight positional
+/// arguments so callers can't transpose the three consecutive `Option`s
+/// (modalities / effort / auth) — a swap the compiler wouldn't catch.
+pub struct ProviderBuild {
+    pub base_url: String,
+    pub model: String,
+    pub key: Option<String>,
+    pub stream: bool,
+    /// Comma-separated input modalities (e.g. `"text,image"`); `None` derives
+    /// from the model-family heuristic.
+    pub modalities: Option<String>,
+    /// Default reasoning effort (`low`/`medium`/`high`); `None` sends none.
+    pub effort: Option<String>,
+    /// Auth mode: `None`/`"static"` uses `key`; `"oauth:codex"` sources the
+    /// bearer from the Codex OAuth token store.
+    pub auth: Option<String>,
+    /// Used only for log lines (the env prefix or the provider name).
+    pub label: String,
+}
+
+/// Build one provider from [`ProviderBuild`]. Picks the native Gemini vs
+/// OpenAI-compatible backend from the model name, resolves modality
+/// capabilities (explicit `modalities` wins, else the model-family heuristic,
+/// else text-only with a warning), and attaches the family's effort scheme +
+/// optional default effort.
+pub fn build_provider(cfg: ProviderBuild) -> Arc<dyn ModelProvider> {
+    let ProviderBuild {
+        base_url,
+        model,
+        key,
+        stream,
+        modalities,
+        effort,
+        auth,
+        label,
+    } = cfg;
+    let modalities = modalities.as_deref();
+    let effort = effort.as_deref();
+    let auth = auth.as_deref();
+    let label = label.as_str();
     // Modality capabilities: explicit `modalities` (e.g. "text,image") wins;
     // otherwise derive from the model-family heuristic. Capable providers route
     // attachments natively; others degrade unsupported ones to a text note.
@@ -143,16 +168,16 @@ fn build_codex_responses(
 
 /// Build one provider from a `providers.toml` entry.
 fn build_from_spec(spec: &fleety_tools::providers_config::ProviderSpec) -> Arc<dyn ModelProvider> {
-    build_provider(
-        spec.base_url.clone(),
-        spec.model.clone(),
-        spec.key.clone(),
-        spec.stream,
-        spec.modalities.as_deref(),
-        spec.effort.as_deref(),
-        spec.auth.as_deref(),
-        &spec.name,
-    )
+    build_provider(ProviderBuild {
+        base_url: spec.base_url.clone(),
+        model: spec.model.clone(),
+        key: spec.key.clone(),
+        stream: spec.stream,
+        modalities: spec.modalities.clone(),
+        effort: spec.effort.clone(),
+        auth: spec.auth.clone(),
+        label: spec.name.clone(),
+    })
 }
 
 /// Which reasoning-effort encoding (if any) a model family accepts. Conservative:
