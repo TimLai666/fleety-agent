@@ -777,12 +777,41 @@ async fn pair(code: String) -> Result<()> {
             "pairing failed: {}",
             error.message
         ))),
-        other => Err(CoreError::Provider(format!(
-            "unexpected reply during pair: {other:?}"
-        ))),
+        other => Err(CoreError::Provider(unexpected_pair_reply(other.as_ref()))),
     };
     let _ = tx.close().await;
     result
+}
+
+/// The wire tag of a server frame (`"assistant"`, `"done"`, …) for human-readable
+/// messages — read from the serde `type` tag, never the Debug form (which would
+/// dump the internal type's fields).
+fn server_msg_kind(msg: &ServerMsg) -> String {
+    serde_json::to_value(msg)
+        .ok()
+        .and_then(|v| {
+            v.get("type")
+                .and_then(|t| t.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "unrecognized".to_string())
+}
+
+/// A concise, human-readable message for a pairing reply that is neither a
+/// successful `Welcome` nor a server `Error` — including the case where the
+/// server closed the connection without replying. It names the frame kind but
+/// never prints the Debug representation of the internal `ServerMsg` type.
+fn unexpected_pair_reply(reply: Option<&ServerMsg>) -> String {
+    match reply {
+        None => "the server closed the connection without replying to the pairing request; \
+                 check the agent URL and that the server is running, then retry"
+            .to_string(),
+        Some(msg) => format!(
+            "the server answered pairing with an unexpected '{}' frame instead of a welcome; \
+             check that the URL points at a Fleety agent running a compatible version, then retry",
+            server_msg_kind(msg)
+        ),
+    }
 }
 
 fn origin() -> OriginContext {
@@ -1753,5 +1782,41 @@ mod tests {
         let value = origin();
         assert_eq!(value.os.as_deref(), Some(std::env::consts::OS));
         assert!(value.cwd.is_some());
+    }
+
+    #[test]
+    fn unexpected_pair_reply_is_readable_not_a_debug_dump() {
+        // A struct-carrying frame that would actually hit the pair `other` arm.
+        // Its Debug form would contain `{ ... }` with the internal fields; the
+        // readable message must not.
+        let frame = ServerMsg::AssistantDelta {
+            conversation_id: "c1".to_string(),
+            chunk: "secret-token-ish".to_string(),
+        };
+        let msg = unexpected_pair_reply(Some(&frame));
+        assert!(!msg.contains('{'), "no Debug struct dump: {msg}");
+        assert!(!msg.contains(":?"), "no Debug format artifact: {msg}");
+        assert!(
+            !msg.contains("secret-token-ish"),
+            "internal field values not leaked: {msg}"
+        );
+        assert!(msg.contains("unexpected"), "message is descriptive: {msg}");
+        assert!(msg.contains("retry"), "message states the next step: {msg}");
+        // It names the frame kind from the wire tag (readable), not the type.
+        assert!(msg.contains("assistant_delta"), "names the frame kind: {msg}");
+
+        // A closed connection (no reply) is its own readable message.
+        let closed = unexpected_pair_reply(None);
+        assert!(!closed.contains('{'));
+        assert!(closed.contains("closed"));
+        assert!(closed.contains("retry"));
+    }
+
+    #[test]
+    fn server_msg_kind_reads_the_wire_tag() {
+        let done = ServerMsg::Done {
+            conversation_id: "c1".to_string(),
+        };
+        assert_eq!(server_msg_kind(&done), "done");
     }
 }

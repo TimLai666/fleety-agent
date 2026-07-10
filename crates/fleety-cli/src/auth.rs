@@ -47,14 +47,14 @@ pub async fn login(no_browser: bool) -> Result<()> {
     let state = oauth::generate_state();
 
     // The Codex client id is registered with a fixed redirect URI, so the
-    // loopback port and path are not free — they must match exactly.
+    // loopback port and path are not free — they must match exactly. Bind the
+    // listener *before* opening the browser: if the fixed port is busy, fail fast
+    // with an actionable message instead of sending the user through the whole
+    // authorization only for the redirect to land on a dead port. This happens
+    // before any token is read or written, so a busy port never touches the
+    // stored tokens.
     let port = oauth::CODEX_LOOPBACK_PORT;
-    let listener = TcpListener::bind(("127.0.0.1", port)).map_err(|e| {
-        CoreError::Message(format!(
-            "cannot open loopback listener on port {port}: {e}. \
-             Close whatever is using it (the Codex OAuth redirect requires this fixed port) and retry."
-        ))
-    })?;
+    let listener = bind_loopback(port)?;
     let redirect_uri = format!("http://localhost:{port}{}", oauth::CODEX_CALLBACK_PATH);
 
     let url = oauth::authorize_url(&config, &redirect_uri, &challenge, &state);
@@ -109,6 +109,22 @@ pub fn logout() -> Result<()> {
     }
     println!("Signed out; local tokens removed.");
     Ok(())
+}
+
+/// Bind the fixed Codex OAuth loopback listener, failing fast with an actionable
+/// message when the port is already in use. The redirect URI is registered to
+/// this exact port, so login cannot fall back to another one — the fix is to
+/// free the port. Split out so the pre-check is unit-testable without running the
+/// full login flow, and does not read or write any tokens.
+fn bind_loopback(port: u16) -> Result<TcpListener> {
+    TcpListener::bind(("127.0.0.1", port)).map_err(|e| {
+        CoreError::Message(format!(
+            "the OAuth loopback port {port} is already in use ({e}). The Codex redirect URI is \
+             registered to this fixed port, so login cannot use a different one. Free it — close a \
+             stuck earlier `fleety auth login`, or stop whatever else is bound to port {port} — and \
+             then retry."
+        ))
+    })
 }
 
 /// Best-effort: open `url` in the platform browser. Failure is non-fatal — the
@@ -241,6 +257,25 @@ mod tests {
         std::env::remove_var("FLEETY_CODEX_TOKENS");
         std::env::remove_var("FLEETY_CODEX_AUDIT");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bind_loopback_fails_fast_when_port_busy() {
+        // Occupy an ephemeral port, then assert the pre-check reports it as busy
+        // with an actionable message — without opening a browser or touching
+        // tokens (the check is pure w.r.t. the token store).
+        let occupied = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = occupied.local_addr().expect("addr").port();
+        let err = bind_loopback(port).expect_err("busy port must fail fast");
+        let msg = err.to_string();
+        assert!(msg.contains("fixed port"), "message not actionable: {msg}");
+        assert!(msg.contains("retry"), "message should tell the user to retry: {msg}");
+        assert!(!msg.contains('{'), "no Debug dump in the message: {msg}");
+
+        // A free port binds successfully (login would proceed).
+        drop(occupied);
+        let listener = bind_loopback(port).expect("free port binds");
+        drop(listener);
     }
 
     #[test]

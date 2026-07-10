@@ -357,7 +357,13 @@ pub fn on_key(app: &mut App, key: KeyEvent) -> Action {
                 } else if let Some(att) = crate::clipboard::attach_path(path) {
                     app.attach(att);
                 } else {
-                    app.status = format!("could not attach '{path}' — no such file");
+                    // `attach_path` returns `None` for a missing/unreadable path
+                    // *or* a file past the size limit — cover both so an oversized
+                    // file is not misreported as "no such file".
+                    app.status = format!(
+                        "could not attach '{path}' — no such file, or larger than the {} MiB limit",
+                        crate::clipboard::MAX_ATTACHMENT_BYTES / (1024 * 1024)
+                    );
                     app.input.set_text(text);
                 }
                 return Action::None;

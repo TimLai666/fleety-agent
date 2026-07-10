@@ -36,10 +36,23 @@ esac
 asset="${BIN}-${target}.tar.gz"
 url="https://github.com/${REPO}/releases/latest/download/${asset}"
 
-# Pick an install dir: explicit override, else /usr/local/bin if writable, else ~/.local/bin.
+# Can we actually create a file in $1? Probe atomically (create then remove a
+# temporary file) instead of a bare `[ -w ]` test — `-w` misreports a directory
+# that is absent or root-owned, sending the install to a path we cannot write.
+can_write_dir() {
+  probe="$1/.fleety-write-probe.$$"
+  if ( umask 077; : > "$probe" ) 2>/dev/null; then
+    rm -f "$probe"
+    return 0
+  fi
+  return 1
+}
+
+# Pick an install dir: explicit override, else /usr/local/bin when it is truly
+# writable, else fall back to the per-user ~/.local/bin.
 if [ -n "${FLEETY_INSTALL_DIR:-}" ]; then
   dir="$FLEETY_INSTALL_DIR"
-elif [ -w /usr/local/bin ]; then
+elif can_write_dir /usr/local/bin; then
   dir="/usr/local/bin"
 else
   dir="$HOME/.local/bin"
@@ -61,7 +74,13 @@ chmod 755 "$tmp/$BIN"
 mv "$tmp/$BIN" "$dir/$BIN"
 
 echo "fleety: installed to $dir/$BIN"
+# Whichever dir we landed on — including the ~/.local/bin fallback — warn when it
+# is not on PATH and show exactly how to add it.
 case ":$PATH:" in
   *":$dir:"*) ;;
-  *) echo "fleety: add $dir to your PATH to run 'fleety' directly" ;;
+  *)
+    echo "fleety: $dir is not on your PATH." >&2
+    echo "        add it by appending this line to your shell profile (~/.profile, ~/.bashrc, or ~/.zshrc):" >&2
+    echo "            export PATH=\"$dir:\$PATH\"" >&2
+    ;;
 esac

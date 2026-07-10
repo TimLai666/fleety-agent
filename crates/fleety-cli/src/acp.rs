@@ -154,6 +154,17 @@ pub fn initialize_result() -> Value {
     })
 }
 
+/// The `session/load` reply, built to the ACP `LoadSessionResponse` shape (sent
+/// after the conversation history is replayed as `session/update`
+/// notifications). Every `LoadSessionResponse` field is optional — `modes`,
+/// `configOptions`, `_meta`. This adapter advertises none of session modes or
+/// config options, so `modes` is explicitly `null` (and the others omitted):
+/// a deliberately-constructed response of the right shape, not an arbitrary
+/// empty object that merely happens to deserialize.
+pub fn load_session_result() -> Value {
+    json!({ "modes": Value::Null })
+}
+
 // ---- `fleety acp install`: write the Zed agent-server config ----
 
 /// Zed's `settings.json` path for this platform, if it can be located.
@@ -591,7 +602,7 @@ pub async fn handle_message(msg: &Value, bridge: &dyn AcpBridge) -> Vec<Value> {
                 Ok(chunks) => {
                     let mut out: Vec<Value> =
                         chunks.iter().map(|c| assistant_update(&sid, c)).collect();
-                    out.push(response_ok(reply_id(), json!({})));
+                    out.push(response_ok(reply_id(), load_session_result()));
                     out
                 }
                 Err(e) => vec![response_err(reply_id(), INTERNAL_ERROR, &e.report().message)],
@@ -1261,6 +1272,33 @@ mod tests {
         )
         .await;
         assert!(r.is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_load_replays_then_returns_conformant_response() {
+        let b = MockBridge; // load replays a single "replayed" chunk
+        let r = handle_message(
+            &json!({"id":7,"method":"session/load","params":{"sessionId":"sess-1"}}),
+            &b,
+        )
+        .await;
+        // The history replay (session/update notifications) comes first...
+        assert_eq!(r.len(), 2, "one replay update + one response");
+        assert_eq!(r[0]["method"], "session/update");
+        assert_eq!(r[0]["params"]["update"]["sessionUpdate"], "agent_message_chunk");
+        assert_eq!(r[0]["params"]["update"]["content"]["text"], "replayed");
+        // ...then the load response, addressed to the request id.
+        assert_eq!(r[1]["jsonrpc"], "2.0");
+        assert_eq!(r[1]["id"], json!(7));
+        // It is a deliberately-built ACP LoadSessionResponse, not an accidental
+        // empty object: it carries the `modes` field (null — no session modes).
+        let result = r[1]["result"].as_object().expect("result is an object");
+        assert!(
+            result.contains_key("modes"),
+            "load response must be the LoadSessionResponse shape, got {result:?}"
+        );
+        assert_eq!(r[1]["result"]["modes"], Value::Null);
+        assert_eq!(r[1]["result"], load_session_result());
     }
 
     #[test]

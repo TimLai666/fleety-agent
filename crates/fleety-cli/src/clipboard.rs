@@ -25,6 +25,14 @@ pub enum ClipboardPaste {
     Empty,
 }
 
+/// Upper bound on a clipboard file we will inline as a base64 attachment. A file
+/// larger than this is not read or encoded — the paste falls back to inserting
+/// the path as text so the user sees why it was not attached, instead of
+/// embedding a large or binary blob into the message. A compile-time constant
+/// (no env knob, by design) with a generous default that still covers ordinary
+/// images, documents, and source files.
+pub const MAX_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
+
 /// Inspect the OS clipboard and decide what to do (see module docs for order).
 /// Soft-fails: any clipboard backend error returns `Empty` with a tracing line
 /// rather than crashing the TUI.
@@ -89,6 +97,13 @@ pub fn attach_path(input: &str) -> Option<WireAttachment> {
     if !path.is_file() {
         return None;
     }
+    // Bound the attachment before reading: an oversized file is not read or
+    // base64-encoded — returning `None` lets the caller fall back to pasting the
+    // path as text (see module docs / `read`).
+    let meta = std::fs::metadata(path).ok()?;
+    if meta.len() > MAX_ATTACHMENT_BYTES {
+        return None;
+    }
     let bytes = std::fs::read(path).ok()?;
     let mime = guess_mime_from_path(path);
     let name = path
@@ -128,7 +143,32 @@ pub fn guess_mime_from_path(path: &Path) -> String {
         "mov" => "video/quicktime",
         "mkv" => "video/x-matroska",
         "pdf" => "application/pdf",
-        "txt" | "md" | "rs" | "py" | "js" | "ts" | "go" | "html" | "css" => "text/plain",
+        // Plain prose / notes.
+        "txt" | "text" | "log" => "text/plain",
+        "md" | "markdown" => "text/markdown",
+        // Source code: a language-specific `text/*` type keeps the language
+        // signal (the original filename with its extension is preserved
+        // separately), so the server can tell it is source, not an opaque blob.
+        // `text/x-*` is the de-facto convention for languages without a
+        // registered media type; a few (`javascript`, `html`, `css`) do have one.
+        "rs" => "text/x-rust",
+        "py" | "pyi" => "text/x-python",
+        "js" | "mjs" | "cjs" | "jsx" => "text/javascript",
+        "ts" | "tsx" => "text/x-typescript",
+        "go" => "text/x-go",
+        "c" | "h" => "text/x-c",
+        "cc" | "cpp" | "cxx" | "hpp" | "hh" => "text/x-c++",
+        "java" => "text/x-java",
+        "rb" => "text/x-ruby",
+        "php" => "text/x-php",
+        "sh" | "bash" | "zsh" => "text/x-shellscript",
+        "toml" => "text/x-toml",
+        "yaml" | "yml" => "text/x-yaml",
+        "sql" => "text/x-sql",
+        "html" | "htm" => "text/html",
+        "css" => "text/css",
+        "csv" => "text/csv",
+        "xml" => "text/xml",
         "json" => "application/json",
         _ => "application/octet-stream",
     }
@@ -211,5 +251,65 @@ mod tests {
             guess_mime_from_path(Path::new("a.unknown")),
             "application/octet-stream"
         );
+    }
+
+    #[test]
+    fn guess_mime_identifies_source_languages() {
+        // Source files map to a language-specific text/* type that preserves the
+        // language signal — never a bare text/plain that discards it.
+        assert_eq!(guess_mime_from_path(Path::new("main.rs")), "text/x-rust");
+        assert_eq!(guess_mime_from_path(Path::new("app.py")), "text/x-python");
+        assert_eq!(guess_mime_from_path(Path::new("lib.go")), "text/x-go");
+        assert_eq!(guess_mime_from_path(Path::new("a.ts")), "text/x-typescript");
+        assert_eq!(guess_mime_from_path(Path::new("a.js")), "text/javascript");
+        // Every source type is under text/* so the server treats it as text, not
+        // an opaque blob. Case-insensitive on the extension.
+        for f in ["main.RS", "app.py", "lib.go", "a.ts", "a.js", "x.c", "y.cpp"] {
+            assert!(
+                guess_mime_from_path(Path::new(f)).starts_with("text/"),
+                "{f} should map to a text/* type"
+            );
+        }
+        // Plain notes stay text/plain; an unrecognized extension stays octet-stream.
+        assert_eq!(guess_mime_from_path(Path::new("notes.txt")), "text/plain");
+        assert_eq!(
+            guess_mime_from_path(Path::new("blob.xyz")),
+            "application/octet-stream"
+        );
+    }
+
+    #[test]
+    fn attach_path_is_size_bounded() {
+        let dir = std::env::temp_dir().join(format!("fleety-clip-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("mk");
+
+        // A file just over the limit is not attached (caller falls back to text).
+        let big = dir.join("big.bin");
+        std::fs::write(&big, vec![0u8; (MAX_ATTACHMENT_BYTES + 1) as usize]).expect("write big");
+        assert!(
+            attach_path(&big.to_string_lossy()).is_none(),
+            "oversized file must not become an attachment"
+        );
+
+        // A within-limit file still attaches as before.
+        let small = dir.join("small.txt");
+        std::fs::write(&small, b"hi clipboard").expect("write small");
+        assert!(attach_path(&small.to_string_lossy()).is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn attach_path_source_file_keeps_name_and_language_mime() {
+        let dir = std::env::temp_dir().join(format!("fleety-clip-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("mk");
+        let path = dir.join("snippet.rs");
+        std::fs::write(&path, b"fn main() {}").expect("write");
+        let att = attach_path(&path.to_string_lossy()).expect("attached");
+        // Language-specific text MIME + the original filename (with extension).
+        assert_eq!(att.mime, "text/x-rust");
+        assert_eq!(att.name.as_deref(), Some("snippet.rs"));
+        assert!(att.bytes_b64.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
