@@ -97,8 +97,8 @@ pub fn registry() -> &'static [Setting] {
         Setting {
             key: "FLEETY_REQUIRE_AUTH",
             scope: Server,
-            default: "0",
-            description: "Require a token to connect (1/0).",
+            default: "1",
+            description: "Require a token to connect, on by default (1/0); set 0 to disable.",
             secret: false,
             validator: Some(v_bool),
         },
@@ -1313,6 +1313,21 @@ mod tests {
     fn unknown_key_is_rejected() {
         assert!(find("FLEETY_NOPE").is_none());
         assert!(find("FLEETY_ADDR").is_some());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn require_auth_defaults_on() {
+        // Connection auth is required by default now: unset → resolves to "1".
+        std::env::remove_var("FLEETY_REQUIRE_AUTH");
+        let r = resolve("FLEETY_REQUIRE_AUTH", &ConfigMap::new()).expect("resolve");
+        assert_eq!(r.value, "1");
+        assert_eq!(r.source, Source::Default);
+        // The validator still only accepts 0/1.
+        let s = find("FLEETY_REQUIRE_AUTH").expect("registered");
+        assert!(validate(s, "1").is_ok());
+        assert!(validate(s, "0").is_ok());
+        assert!(validate(s, "yes").is_err());
     }
 
     #[test]

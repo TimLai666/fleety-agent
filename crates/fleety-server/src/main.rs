@@ -98,6 +98,13 @@ fn build_provider() -> Arc<dyn ModelProvider> {
     providers::build_main()
 }
 
+/// Whether connections must authenticate, from `FLEETY_REQUIRE_AUTH`. Auth is
+/// **on by default** now: any value other than an explicit `0` requires a token.
+/// `seed_env_from_config` runs first, so a `config.toml` value is already in env.
+fn require_auth_from_env() -> bool {
+    std::env::var("FLEETY_REQUIRE_AUTH").as_deref() != Ok("0")
+}
+
 /// Approval policy from `FLEETY_POLICY` (`require_approval` → gate non-read
 /// tools; default full access).
 fn policy_from_env() -> agent_core::Policy {
@@ -479,15 +486,31 @@ async fn run_server(shutdown: Option<tokio::sync::watch::Receiver<bool>>) {
     let handles = bridge::new_handles();
     let device_tools = bridge::new_device_tools();
 
-    // Connection auth: enforced only with FLEETY_REQUIRE_AUTH=1; FLEETY_TOKEN is
-    // a bootstrap admin token for pairing the first device.
-    let require_auth = std::env::var("FLEETY_REQUIRE_AUTH").as_deref() == Ok("1");
+    // Connection auth is on by default (set FLEETY_REQUIRE_AUTH=0 to disable);
+    // FLEETY_TOKEN is a bootstrap admin token for pairing the first device.
+    let require_auth = require_auth_from_env();
     let auth = Arc::new(auth::AuthStore::load(
         storage.auth_path(),
         std::env::var("FLEETY_TOKEN").ok(),
         require_auth,
     ));
     tracing::info!(require_auth, "connection auth");
+    // First-run guidance: an auth-required server with no way in yet (no
+    // bootstrap token, no paired device) would be an unpairable brick — mint a
+    // short-lived pairing code and show the exact next step.
+    if require_auth && auth.is_uninitialized() {
+        match auth.create_pairing() {
+            Ok(code) => tracing::warn!(
+                pairing_code = %code,
+                "first run: authentication is required but no device is paired yet. \
+                 On a device, run `fleety init <this-server-ws-url>` then `fleety pair {code}` \
+                 within 10 minutes to enroll it.",
+            ),
+            Err(e) => {
+                tracing::warn!(report = ?e.report(), "could not mint a first-run pairing code")
+            }
+        }
+    }
 
     // Schedule fire loop (unattended): checks for due schedules periodically.
     let tick_secs = std::env::var("FLEETY_SCHED_TICK")
@@ -611,6 +634,7 @@ mod tests {
                 "FLEETY_AGENT_HOME",
                 "FLEETY_WORKSPACE",
                 "FLEETY_POLICY",
+                "FLEETY_REQUIRE_AUTH",
                 "FLEETY_MODEL_BASE_URL",
                 "FLEETY_MODEL",
                 "FLEETY_MODEL_KEY",
@@ -631,6 +655,7 @@ mod tests {
                 "FLEETY_AGENT_HOME",
                 "FLEETY_WORKSPACE",
                 "FLEETY_POLICY",
+                "FLEETY_REQUIRE_AUTH",
                 "FLEETY_MODEL_BASE_URL",
                 "FLEETY_MODEL",
                 "FLEETY_MODEL_KEY",
@@ -715,6 +740,20 @@ mod tests {
         assert_eq!(policy_from_env(), agent_core::Policy::FullAccess);
         std::env::set_var("FLEETY_POLICY", "require_approval");
         assert_eq!(policy_from_env(), agent_core::Policy::RequireApproval);
+    }
+
+    #[test]
+    fn require_auth_defaults_on_unless_explicitly_zero() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("require-auth");
+
+        // Unset → auth required by default (the security-on default).
+        assert!(require_auth_from_env(), "unset → auth required");
+        // Explicit 0 is the only way to disable it.
+        std::env::set_var("FLEETY_REQUIRE_AUTH", "0");
+        assert!(!require_auth_from_env(), "explicit 0 → disabled");
+        std::env::set_var("FLEETY_REQUIRE_AUTH", "1");
+        assert!(require_auth_from_env(), "explicit 1 → required");
     }
 
     #[tokio::test]

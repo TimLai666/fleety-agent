@@ -57,6 +57,18 @@ impl AuthStore {
         self.required
     }
 
+    /// Whether no device can authenticate yet: no bootstrap token and no paired
+    /// devices. A fresh auth-required server in this state needs a first pairing
+    /// code so it is reachable rather than an unpairable brick.
+    pub fn is_uninitialized(&self) -> bool {
+        self.bootstrap.is_none()
+            && self
+                .state
+                .lock()
+                .map(|s| s.tokens.is_empty())
+                .unwrap_or(false)
+    }
+
     fn save(&self, state: &State) -> Result<()> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)
@@ -182,6 +194,20 @@ mod tests {
         let store = temp_store(true, Some("admin-tok".to_string()));
         assert_eq!(store.verify("admin-tok").as_deref(), Some("admin"));
         assert!(store.verify("nope").is_none());
+    }
+
+    #[test]
+    fn is_uninitialized_tracks_first_run() {
+        // No bootstrap + no paired device → uninitialized (needs a first pairing).
+        let store = temp_store(true, None);
+        assert!(store.is_uninitialized());
+        // A bootstrap token is a way in → initialized.
+        let with_boot = temp_store(true, Some("admin".to_string()));
+        assert!(!with_boot.is_uninitialized());
+        // Once a device pairs, it's no longer a first run.
+        let code = store.create_pairing().expect("code");
+        store.redeem(&code, "laptop").expect("redeem");
+        assert!(!store.is_uninitialized());
     }
 
     #[test]

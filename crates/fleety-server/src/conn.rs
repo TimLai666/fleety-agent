@@ -1410,27 +1410,51 @@ async fn serve(
                 emit(out, &reply)?;
             }
             ClientMsg::ConfigExec { target, args } => {
-                // Reachable only on an authenticated (or auth-disabled) connection —
-                // unauthenticated clients are rejected at `Hello`, so remote config
-                // is implicitly gated by the connection's auth.
-                let reply = config_apply(target, &args);
-                // A successful mutation (effect present) is auditable — with
-                // secret values masked: the audit log is readable via
-                // `fleety audit`, so `set FLEETY_MODEL_KEY sk-…` must not land
-                // there in plaintext (list/get/edit all mask; so must this).
-                if let ServerMsg::ConfigResult {
-                    ok: true,
-                    effect: Some(_),
-                    ..
-                } = &reply
-                {
-                    let event = agent_core::Event::ToolResult {
-                        id: "config".to_string(),
-                        result: serde_json::json!({ "config": redact_config_args(&args) }),
+                // Remote write ⇒ auth must be on. A server not requiring auth
+                // accepts any connection, so a *mutating* config frame on it would
+                // let an unauthenticated peer reconfigure a wide-open server —
+                // refuse it (reads still served) and tell the operator to enable
+                // auth first. When auth is on, the connection was verified at
+                // Hello, so all config frames pass through as before.
+                if remote_mutation_denied(&args, auth.required()) {
+                    let reply = ServerMsg::ConfigResult {
+                        ok: false,
+                        output: String::new(),
+                        effect: None,
+                        error: Some(fleety_protocol::WireError {
+                            kind: "unauthenticated".to_string(),
+                            message: "this server does not require authentication, so remote \
+                                      config changes are refused — enable auth before changing \
+                                      settings remotely"
+                                .to_string(),
+                            remediation: Some(
+                                "on the server host set FLEETY_REQUIRE_AUTH=1 (or `fleety-server \
+                                 config set FLEETY_REQUIRE_AUTH 1`) and restart"
+                                    .to_string(),
+                            ),
+                        }),
                     };
-                    let _ = storage.append_history(device_id, &event);
+                    emit(out, &reply)?;
+                } else {
+                    let reply = config_apply(target, &args);
+                    // A successful mutation (effect present) is auditable — with
+                    // secret values masked: the audit log is readable via
+                    // `fleety audit`, so `set FLEETY_MODEL_KEY sk-…` must not land
+                    // there in plaintext (list/get/edit all mask; so must this).
+                    if let ServerMsg::ConfigResult {
+                        ok: true,
+                        effect: Some(_),
+                        ..
+                    } = &reply
+                    {
+                        let event = agent_core::Event::ToolResult {
+                            id: "config".to_string(),
+                            result: serde_json::json!({ "config": redact_config_args(&args) }),
+                        };
+                        let _ = storage.append_history(device_id, &event);
+                    }
+                    emit(out, &reply)?;
                 }
-                emit(out, &reply)?;
             }
             ClientMsg::CancelTurn { .. } => {
                 // Reached only when no turn is in flight (the mid-turn select
@@ -1490,6 +1514,14 @@ fn redact_config_args(args: &[String]) -> Vec<String> {
         mask_next = v == "--key";
     }
     out
+}
+
+/// Whether a remote `config` frame must be refused because it would *mutate*
+/// settings on a server that does not require auth (reads are always allowed).
+/// "Remote write ⇒ auth must be on": a wide-open server takes any connection, so
+/// an unauthenticated peer must not be able to reconfigure it. Pure.
+fn remote_mutation_denied(args: &[String], require_auth: bool) -> bool {
+    fleety_tools::config::config_effect(args).is_some() && !require_auth
 }
 
 /// Run a remote `config` request against this (the server's) own config files
@@ -2867,6 +2899,22 @@ mod tests {
             }
             other => panic!("got {other:?}"),
         }
+        // Remote-write auth gate (pure): a mutating frame is denied only when the
+        // server does not require auth; reads are always allowed.
+        assert!(remote_mutation_denied(
+            &s(&["set", "FLEETY_POLICY", "require_approval"]),
+            false
+        ));
+        assert!(!remote_mutation_denied(
+            &s(&["set", "FLEETY_POLICY", "require_approval"]),
+            true
+        ));
+        assert!(!remote_mutation_denied(&s(&["list"]), false)); // reads allowed
+        assert!(remote_mutation_denied(
+            &s(&["provider", "add", "p", "--type", "api", "--base-url", "u"]),
+            false
+        ));
+
         // Provider add → ok + NextConnection effect.
         match config_apply(
             ConfigTarget::Server,
