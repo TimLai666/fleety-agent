@@ -30,8 +30,19 @@
 - **deploy-hardening** — Windows 生命週期動詞 elevation 前置檢查、server/daemon sidecar 佈建對稱、Dockerfile 非 root(uid 10001)。
 - **cli-clipboard-acp-polish** — 可讀配對錯誤、OAuth port fail-fast、install.sh 權限判斷、clipboard 大小上限 + 語言別 mime、ACP `session/load` 合規回應。
 
+### CLI 設定架構重設計 Phase 1(2026-07-10 出貨,見 `docs/design-cli-config.md`)
+
+三層徹底分離(連線 / 本機 CLI / server)的 Phase 1(全 additive、不動 wire),四個變更全部實作、測試、archive(`openspec/changes/archive/2026-07-10-{connection-profiles,provider-model-two-tier,auth-default-on,local-config-scope}`):
+- **connection-profiles** — `~/.fleety/connections.toml` + CLI/daemon 共用 resolver(單一優先序、mDNS sticky + fingerprint guard)+ `fleety server` 命令群 + `init`/`pair` sugar + config.json/fleetyd.token 一次性冪等遷移(O_EXCL 閂);`FLEETY_AGENT_URL` 移出 registry,消除三處優先序陷阱。
+- **provider-model-two-tier** — providers.toml 改兩層:type-tagged provider(api / oauth:codex,可擴展註冊)+ main/cheap member pool(stream/modalities/effort 下沉 member);混族 pool 能力取聯集;參照完整性寫前 validate;providers.toml 去重遷移;`FLEETY_MODEL_*` 降為 bootstrap seed、壞結構化設定硬啟動錯誤。
+- **auth-default-on** — `FLEETY_REQUIRE_AUTH` 預設開(顯式 `0` 才關)+ 首啟配對引導 + 遠端寫入⇒認證必開(auth 關閉時拒 mutating config frame)。
+- **local-config-scope** — `fleety config --target local` 只顯示/編輯 Cli/Shared;server/daemon key 導向正確主機。
+
+**Phase 2(remote-config-panel,未做)** — 動 wire:`ConfigSnapshot`/`ConfigApply` frame + revision 樂觀鎖 + 真原子存檔 + 能力協商 + secret tri-state + 互動式全包三區面板(連線 / 本機 / server)+ 遠端互動 edit + 敏感 key 授權/告警/稽核 + 傳輸 wss 要求。交付 G2(一個面板設定任何東西)。
+
 ## 剩餘(should-have)
 
+- **CLI config 重設計 Phase 2(remote-config-panel)** — 見上;Phase 2 交付互動全包面板 + 遠端互動 edit(動 wire、`PROTOCOL_VERSION` +1)。
 - **fleety status 顯示 sidecar 版本 vs 最新版** — 目前只顯示 sidecar 健康(路徑),未做「本機版本 vs release 最新版」對照。小項。
 
 真正未做的多屬 milestone 深度(見下)與待決策略,已無高頻體驗缺口。
@@ -61,15 +72,16 @@
 1. **Presence inference 信號來源**(colocation 上報與 site 記錄已出貨,推論未做)
    - 選項:(a) daemon 主動上報 LAN 鄰居 vs (b) server 主動掃 vs (c) 混合
    - 待決點:回報頻率、假陽性容忍、隱私邊界
-2. **`FLEETY_ADDR` 預設值** — 預設 `127.0.0.1` 讓「跨裝置」開箱即不可達(啟動時已加提示、Docker 映像已預設 `0.0.0.0`)。是否改裸機預設為 `0.0.0.0` 是安全取捨,配合 `FLEETY_REQUIRE_AUTH` 預設值一起決定。適合走 `/spectra-discuss`。
+2. **`FLEETY_ADDR` 預設值** — 預設 `127.0.0.1` 讓「跨裝置」開箱即不可達(啟動時已加提示、Docker 映像已預設 `0.0.0.0`)。是否改裸機預設為 `0.0.0.0` 是安全取捨。`FLEETY_REQUIRE_AUTH` 已於 auth-default-on 改為**預設開**,故「開放 addr + 無認證」的裸奔風險已降;是否連 addr 也預設 `0.0.0.0` 可重新評估。適合走 `/spectra-discuss`。
 
 ## 建議下一動
 
-高頻體驗缺口已清空。建議依序:
-1. **決定 §待決兩項**(`FLEETY_ADDR` 預設 + presence 信號來源)——純產品決策,擋住 presence 推論這條線。
-2. **milestone 深度**擇一開展(browser snapshot-ref act 對 agent 自動化價值最高;wiki 三層對知識沉澱價值最高)。
-3. **fleety status 版本對照**小項可順手收尾。
+高頻體驗缺口已清空,CLI 設定架構重設計 Phase 1 亦已出貨。建議依序:
+1. **CLI config 重設計 Phase 2(remote-config-panel)**——動 wire 的互動全包面板 + 遠端互動 edit,交付 G2;是設定體驗的最後一塊,建議獨立聚焦開展。
+2. **決定 §待決兩項**(`FLEETY_ADDR` 預設 + presence 信號來源)——純產品決策,擋住 presence 推論這條線。
+3. **milestone 深度**擇一開展(browser snapshot-ref act 對 agent 自動化價值最高;wiki 三層對知識沉澱價值最高)。
+4. **fleety status 版本對照**小項可順手收尾。
 
 ---
 
-_最後更新:2026-07-10,產品體驗稽核 backlog 11 個變更全數出貨後重排。進度推進或現實對不上,直接改本檔。_
+_最後更新:2026-07-10,CLI 設定架構重設計 Phase 1(4 個變更)出貨後重排(Phase 2 remote-config-panel 待做)。進度推進或現實對不上,直接改本檔。_
