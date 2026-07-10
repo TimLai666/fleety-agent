@@ -13,6 +13,7 @@ mod config;
 mod input;
 mod markdown;
 mod provider_tui;
+mod server;
 mod tui;
 mod voice;
 
@@ -24,6 +25,7 @@ use fleety_protocol::{
 };
 // The client transport (WebSocket with SSE+POST fallback) lives in fleety-tools;
 // `Tx`/`Rx` are its split halves so the existing connect sites barely change.
+use fleety_tools::connection::{self, Target};
 use fleety_tools::transport::{self, Receiver as Rx, Sender as Tx};
 
 /// Print an error report (message + hint when present); yields the failure code
@@ -57,7 +59,9 @@ fn print_help() {
     println!();
     println!("usage: fleety <command> [args]");
     println!();
-    println!("  init <ws-url>                    save the agent URL (e.g. ws://host:8787)");
+    println!("  init <ws-url>                    add+use a server (sugar for `server add --use`)");
+    println!("  server <add|use|list|show|current|rename|remove|set-url>");
+    println!("                                   manage which server(s) this device connects to");
     println!("  ask \"<text>\" [--image|--audio|--video|--file PATH]...");
     println!("                                   one-shot prompt (with attachments)");
     println!("  resume <conversation_id> [after_seq]");
@@ -87,12 +91,35 @@ async fn main() -> std::process::ExitCode {
     fleety_tools::config::seed_env_from_config(&fleety_tools::config::load(
         &fleety_tools::config::config_path(),
     ));
-    let args: Vec<String> = std::env::args().collect();
+    // One-time, idempotent migration of the legacy config.json into
+    // connections.toml (best-effort — a fresh device has nothing to migrate).
+    let _ = connection::migrate_from_config_json();
+    // Pull a leading per-invocation server override (`fleety -s <name> …` /
+    // `fleety --url <ws> …`) out of the args, so it applies to this command only.
+    let (args, target) = take_server_override(std::env::args().collect());
+    let _ = OVERRIDE.set(target);
     match args.get(1).map(String::as_str) {
         Some("init") => {
-            let url = args.get(2).cloned().unwrap_or_default();
+            // `fleety init <ws-url> [--name <name>]` — positional url plus an
+            // optional profile name (default `default`).
+            let mut url = String::new();
+            let mut name = "default".to_string();
+            let mut it = args.iter().skip(2);
+            while let Some(a) = it.next() {
+                match a.as_str() {
+                    "--name" => {
+                        if let Some(n) = it.next() {
+                            name = n.clone();
+                        }
+                    }
+                    _ if url.is_empty() => url = a.clone(),
+                    _ => {}
+                }
+            }
             if url.is_empty() {
-                return usage("usage: fleety init <agent-url>   (e.g. ws://host:8787)");
+                return usage(
+                    "usage: fleety init <ws-url> [--name <name>]   (e.g. ws://host:8787)",
+                );
             }
             // Catch the common scheme mistakes before any network work — the
             // raw connect error that would follow is much harder to act on.
@@ -108,7 +135,7 @@ async fn main() -> std::process::ExitCode {
                 }
                 return std::process::ExitCode::from(2);
             }
-            done(init(url).await)
+            done(init(url, name).await)
         }
         Some("ask") => {
             // Parse: fleety ask [--image P]* [--audio P]* [--video P]* [--file P]* "<text>"
@@ -199,6 +226,7 @@ async fn main() -> std::process::ExitCode {
                 _ => usage("usage: fleety rollback list  |  fleety rollback apply <backup_id>"),
             }
         }
+        Some("server") => done(server::run(&args[2..])),
         Some("status") => done(status().await),
         Some("voice") => done(voice_chat().await),
         Some("config") => {
@@ -364,12 +392,10 @@ fn daemon_delegate(args: &[String]) -> Result<()> {
 async fn run_tui() -> Result<()> {
     use ratatui::crossterm::event::{Event, KeyEventKind};
 
-    let url = agent_url();
-    let token = saved_token();
-    let (mut tx, mut rx) = transport::connect(&url, token.as_deref())
-        .await?
-        .split();
-    send(&mut tx, &hello(None)).await?;
+    let (mut tx, mut rx, target) = open().await?;
+    let url = target.url.clone();
+    let token = target.token.clone();
+    send(&mut tx, &hello(token.clone(), None)).await?;
 
     // Blocking key reads happen on a thread and arrive over a channel.
     let (key_tx, mut key_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -578,7 +604,7 @@ async fn reconnect(
 
         if let Ok(conn) = transport::connect(url, token).await {
             let (mut tx, rx) = conn.split();
-            if send(&mut tx, &hello(None)).await.is_ok() {
+            if send(&mut tx, &hello(token.map(String::from), None)).await.is_ok() {
                 if let Some(cid) = app.last_conversation_id.clone() {
                     let _ = send(
                         &mut tx,
@@ -626,40 +652,123 @@ async fn reconnect(
     None
 }
 
-fn fleety_dir() -> Option<PathBuf> {
-    let base = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .ok()?;
-    Some(PathBuf::from(base).join(".fleety"))
-}
+/// The per-invocation server override parsed from a leading `-s`/`--server`/
+/// `--url` (set once in `main`; `Target::Current` when none).
+static OVERRIDE: std::sync::OnceLock<Target> = std::sync::OnceLock::new();
 
-/// Resolve the agent URL: `FLEETY_AGENT_URL`, else saved config, else mDNS
-/// discovery on the LAN, else the local default. mDNS probe is short (2 s) so
-/// an offline laptop doesn't pause noticeably before falling through.
-fn agent_url() -> String {
-    if let Ok(url) = std::env::var("FLEETY_AGENT_URL") {
-        return url;
-    }
-    if let Some(dir) = fleety_dir() {
-        if let Ok(text) = std::fs::read_to_string(dir.join("config.json")) {
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
-                if let Some(url) = value.get("agent_url").and_then(|v| v.as_str()) {
-                    return url.to_string();
-                }
+/// Pull a leading per-invocation server override out of the argument list:
+/// `fleety -s <name> …` / `fleety --server <name> …` (select a profile) or
+/// `fleety --url <ws> …` (direct connection). Only leading flags (before the
+/// subcommand) are consumed, so a later `-s` in a message stays untouched.
+/// Returns the cleaned args and the resolved [`Target`].
+fn take_server_override(mut args: Vec<String>) -> (Vec<String>, Target) {
+    let mut target = Target::Current;
+    // args[0] is the program name; overrides come right after it. `i` stays at 1
+    // because each match drains the flag+value, shifting the next token into place.
+    let i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-s" | "--server" if i + 1 < args.len() => {
+                target = Target::Named(args[i + 1].clone());
+                args.drain(i..=i + 1);
             }
+            "--url" if i + 1 < args.len() => {
+                target = Target::Url(args[i + 1].clone());
+                args.drain(i..=i + 1);
+            }
+            _ => break,
         }
     }
-    if let Some(url) = discover_via_mdns(std::time::Duration::from_secs(2)) {
-        eprintln!("discovered agent on the LAN: {url}");
-        return url;
+    (args, target)
+}
+
+/// Resolve which server (url + token) this command connects to, via the shared
+/// [`connection::resolve`] over `connections.toml`, honoring the per-invocation
+/// override and the `FLEETY_AGENT_URL`/`FLEETY_TOKEN` env vars. Prints a one-line
+/// hint when an env override is in effect, when it discovered a server on the
+/// LAN, or when it fell through to the localhost default — so a fresh machine
+/// gets a next step instead of a bare connection error.
+fn resolve_target() -> Result<connection::Resolved> {
+    let conns = connection::load()?;
+    let over = OVERRIDE.get().cloned().unwrap_or(Target::Current);
+    let env_url = std::env::var("FLEETY_AGENT_URL").ok();
+    let env_token = std::env::var("FLEETY_TOKEN").ok();
+    let r = connection::resolve(&conns, &over, env_url, env_token, || {
+        discover_via_mdns(std::time::Duration::from_secs(2)).map(|url| connection::Discovered {
+            url,
+            // Plain mDNS advertises no server fingerprint yet, so a discovered
+            // server never inherits a pinned profile's token (the guard stays
+            // closed). Fingerprinted discovery is a later enhancement.
+            fingerprint: None,
+        })
+    })?;
+    match &r.source {
+        connection::Source::Env => {
+            eprintln!("note: FLEETY_AGENT_URL overrides the current server ({})", r.url)
+        }
+        connection::Source::Mdns => eprintln!("discovered agent on the LAN: {}", r.url),
+        connection::Source::Default => eprintln!(
+            "no server configured and none found on the LAN — trying the local default \
+             {} (point at one with `fleety init <ws-url>`)",
+            r.url
+        ),
+        connection::Source::Override | connection::Source::Profile(_) => {}
     }
-    // Say which URL we fell back to — otherwise a fresh machine just sees a
-    // baffling localhost connection error with no next step.
-    eprintln!(
-        "no agent configured and none found on the LAN — trying the local default \
-         ws://127.0.0.1:8787 (point at a server with `fleety init <ws-url>`)"
-    );
-    "ws://127.0.0.1:8787".to_string()
+    Ok(r)
+}
+
+/// The resolved server URL (used by the ACP bridge, which manages its own
+/// connection). Falls back to the localhost default if resolution errors.
+fn agent_url() -> String {
+    resolve_target()
+        .map(|r| r.url)
+        .unwrap_or_else(|_| connection::DEFAULT_URL.to_string())
+}
+
+/// Resolve + connect in one step: returns the split streams plus the resolved
+/// target (so callers can read its url/token). Every non-`init` connect site
+/// goes through here so they share one resolution (one mDNS probe, one token).
+async fn open() -> Result<(Tx, Rx, connection::Resolved)> {
+    let target = resolve_target()?;
+    let (tx, rx) = transport::connect(&target.url, target.token.as_deref())
+        .await?
+        .split();
+    Ok((tx, rx, target))
+}
+
+/// Add-or-update a named profile's url and make it current — the shared core of
+/// `fleety init` (sugar for `server add <name> <url> --use`). Returns the
+/// profile's existing token, if any (so a re-init of a paired server keeps
+/// authenticating).
+fn upsert_profile_and_use(name: &str, url: &str) -> Result<Option<String>> {
+    let mut conns = connection::load()?;
+    // Persist this device's id on first enrollment so it stays stable regardless
+    // of later hostname/env changes.
+    if conns.device_id.is_empty() {
+        conns.device_id = fleety_tools::device::device_id();
+    }
+    let profile = conns.profiles.entry(name.to_string()).or_default();
+    profile.url = url.to_string();
+    let token = profile.token.clone();
+    conns.current = Some(name.to_string());
+    connection::save(&conns)?;
+    Ok(token)
+}
+
+/// Write a freshly-minted pairing token onto the current profile (replacing the
+/// legacy config.json write). Errors if there is no current server to attach it
+/// to (the user should `fleety init <url>` first).
+fn set_current_token(token: &str) -> Result<()> {
+    let mut conns = connection::load()?;
+    let name = conns.current.clone().ok_or_else(|| {
+        CoreError::Message(
+            "no current server to attach the token to — run `fleety init <ws-url>` first".to_string(),
+        )
+    })?;
+    if let Some(p) = conns.profiles.get_mut(&name) {
+        p.token = Some(token.to_string());
+    }
+    connection::save(&conns)
 }
 
 /// Browse the LAN for a `_fleety._tcp.local.` service and return the first
@@ -693,31 +802,18 @@ fn discover_via_mdns(timeout: std::time::Duration) -> Option<String> {
 }
 
 fn device_id() -> String {
-    fleety_tools::device::device_id()
+    connection::load()
+        .map(|c| c.effective_device_id())
+        .unwrap_or_else(|_| fleety_tools::device::device_id())
 }
 
-/// The auth token saved in config (or `FLEETY_TOKEN`), for authenticated connects.
-fn saved_token() -> Option<String> {
-    if let Ok(tok) = std::env::var("FLEETY_TOKEN") {
-        if !tok.is_empty() {
-            return Some(tok);
-        }
-    }
-    let dir = fleety_dir()?;
-    let text = std::fs::read_to_string(dir.join("config.json")).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-    value
-        .get("token")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-}
-
-/// Build a Hello carrying our saved token (and an optional pairing code).
-fn hello(pairing_code: Option<String>) -> ClientMsg {
+/// Build a Hello carrying the resolved token (and an optional pairing code). The
+/// token is passed in so it matches the one the transport connected with.
+fn hello(token: Option<String>, pairing_code: Option<String>) -> ClientMsg {
     ClientMsg::Hello {
         device_id: device_id(),
         protocol: PROTOCOL_VERSION,
-        token: saved_token(),
+        token,
         pairing_code,
         // CLI sessions have no on-device tool registry to advertise — only
         // fleetyd does (it runs tools locally).
@@ -726,47 +822,17 @@ fn hello(pairing_code: Option<String>) -> ClientMsg {
     }
 }
 
-/// Persist config, preserving fields not being changed.
-fn write_config(agent_url: Option<&str>, token: Option<&str>) -> Result<()> {
-    let dir =
-        fleety_dir().ok_or_else(|| CoreError::Message("no home dir for config".to_string()))?;
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| CoreError::Message(format!("cannot create ~/.fleety: {e}")))?;
-    let path = dir.join("config.json");
-    let mut value: serde_json::Value = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
-    let obj = value
-        .as_object_mut()
-        .ok_or_else(|| CoreError::Message("corrupt config.json".to_string()))?;
-    obj.insert("device_id".to_string(), serde_json::json!(device_id()));
-    if let Some(url) = agent_url {
-        obj.insert("agent_url".to_string(), serde_json::json!(url));
-    }
-    if let Some(tok) = token {
-        obj.insert("token".to_string(), serde_json::json!(tok));
-    }
-    std::fs::write(
-        &path,
-        serde_json::to_string_pretty(&value).unwrap_or_default(),
-    )
-    .map_err(|e| CoreError::Message(format!("cannot write config: {e}")))?;
-    Ok(())
-}
-
-/// `fleety pair <code>`: enroll this device with a pairing code; saves the token.
+/// `fleety pair <code>`: enroll this device against the current server; the
+/// minted token is written onto the current profile in connections.toml.
 async fn pair(code: String) -> Result<()> {
-    let url = agent_url();
-    let (mut tx, mut rx) = transport::connect(&url, saved_token().as_deref())
-        .await?
-        .split();
-    send(&mut tx, &hello(Some(code))).await?;
+    let (mut tx, mut rx, target) = open().await?;
+    let url = target.url.clone();
+    send(&mut tx, &hello(target.token.clone(), Some(code))).await?;
     let result = match recv(&mut rx).await? {
         Some(ServerMsg::Welcome {
             token: Some(tok), ..
         }) => {
-            write_config(Some(&url), Some(&tok))?;
+            set_current_token(&tok)?;
             println!("✓ paired with {url}; token saved");
             Ok(())
         }
@@ -829,19 +895,21 @@ fn origin() -> OriginContext {
     }
 }
 
-/// `fleety init <agent-url>`: connect, register this device, and save config.
-async fn init(url: String) -> Result<()> {
-    let (mut tx, mut rx) = transport::connect(&url, saved_token().as_deref())
-        .await?
-        .split();
+/// `fleety init <ws-url> [--name <name>]`: sugar for `server add <name> <url>
+/// --use` plus enrollment. Records/updates the named profile (default `default`),
+/// makes it current, connects, and registers this device.
+async fn init(url: String, name: String) -> Result<()> {
+    // Persist the profile first (add-or-update + make current), so the connect
+    // below and every later command resolve to it.
+    let token = upsert_profile_and_use(&name, &url)?;
+    let (mut tx, mut rx) = transport::connect(&url, token.as_deref()).await?.split();
 
-    send(&mut tx, &hello(None)).await?;
+    send(&mut tx, &hello(token, None)).await?;
     match recv(&mut rx).await? {
         Some(ServerMsg::Welcome { session_id, .. }) => {
-            write_config(Some(&url), None)?;
             println!("✓ connected to {url}");
             println!(
-                "✓ registered device '{}' (session {session_id})",
+                "✓ registered device '{}' as server '{name}' (session {session_id})",
                 device_id()
             );
         }
@@ -919,12 +987,9 @@ fn guess_mime(path: &Path, kind: &str) -> String {
 }
 
 async fn ask(text: String, attachments: Vec<WireAttachment>) -> Result<()> {
-    let url = agent_url();
-    let (mut tx, mut rx) = transport::connect(&url, saved_token().as_deref())
-        .await?
-        .split();
+    let (mut tx, mut rx, target) = open().await?;
 
-    send(&mut tx, &hello(None)).await?;
+    send(&mut tx, &hello(target.token.clone(), None)).await?;
     match recv(&mut rx).await? {
         Some(ServerMsg::Welcome { .. }) => {}
         other => {
@@ -1038,12 +1103,9 @@ fn capture_voice_text() -> Option<String> {
 }
 
 async fn voice_chat() -> Result<()> {
-    let url = agent_url();
-    let (mut tx, mut rx) = transport::connect(&url, saved_token().as_deref())
-        .await?
-        .split();
+    let (mut tx, mut rx, target) = open().await?;
 
-    send(&mut tx, &hello(None)).await?;
+    send(&mut tx, &hello(target.token.clone(), None)).await?;
     let (conversation, audio_input) = match recv(&mut rx).await? {
         Some(ServerMsg::Welcome {
             conversation_id,
@@ -1164,12 +1226,9 @@ async fn voice_chat() -> Result<()> {
 
 /// Reconnect to a conversation and print events replayed after `after_seq`.
 async fn resume(conversation_id: String, after_seq: u64) -> Result<()> {
-    let url = agent_url();
-    let (mut tx, mut rx) = transport::connect(&url, saved_token().as_deref())
-        .await?
-        .split();
+    let (mut tx, mut rx, target) = open().await?;
 
-    send(&mut tx, &hello(None)).await?;
+    send(&mut tx, &hello(target.token.clone(), None)).await?;
     match recv(&mut rx).await? {
         Some(ServerMsg::Welcome { .. }) => {}
         other => {
@@ -1207,11 +1266,8 @@ async fn resume(conversation_id: String, after_seq: u64) -> Result<()> {
 /// Open a connection, send Hello, await Welcome, return the streams. Common
 /// preamble for audit/rollback commands.
 async fn connect_hello() -> Result<(Tx, Rx)> {
-    let url = agent_url();
-    let (mut tx, mut rx) = transport::connect(&url, saved_token().as_deref())
-        .await?
-        .split();
-    send(&mut tx, &hello(None)).await?;
+    let (mut tx, mut rx, target) = open().await?;
+    send(&mut tx, &hello(target.token.clone(), None)).await?;
     match recv(&mut rx).await? {
         Some(ServerMsg::Welcome { .. }) => Ok((tx, rx)),
         other => Err(CoreError::Provider(format!(
@@ -1621,7 +1677,6 @@ mod coverage_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -1639,6 +1694,8 @@ mod tests {
                 "FLEETY_AGENT_URL",
                 "FLEETY_DEVICE_ID",
                 "FLEETY_TOKEN",
+                "FLEETY_MDNS_DISABLED",
+                "FLEETY_CONNECTIONS",
                 "COMPUTERNAME",
                 "HOSTNAME",
             ];
@@ -1657,6 +1714,8 @@ mod tests {
                 "FLEETY_AGENT_URL",
                 "FLEETY_DEVICE_ID",
                 "FLEETY_TOKEN",
+                "FLEETY_MDNS_DISABLED",
+                "FLEETY_CONNECTIONS",
                 "COMPUTERNAME",
                 "HOSTNAME",
             ] {
@@ -1680,17 +1739,29 @@ mod tests {
     }
 
     #[test]
-    fn agent_url_prefers_env_then_config_then_default() {
+    fn agent_url_prefers_env_then_current_profile_then_default() {
         let _lock = ENV_LOCK.lock().expect("env lock");
-        let guard = EnvGuard::new("agent-url");
+        let _guard = EnvGuard::new("agent-url");
+        // No LAN probe: keep the "nothing configured" case fast and deterministic.
+        std::env::set_var("FLEETY_MDNS_DISABLED", "1");
 
-        assert_eq!(agent_url(), "ws://127.0.0.1:8787");
+        // Nothing configured → the localhost default.
+        assert_eq!(agent_url(), connection::DEFAULT_URL);
 
-        let dir = guard.temp_home.join(".fleety");
-        std::fs::create_dir_all(&dir).expect("config dir");
-        std::fs::write(dir.join("config.json"), r#"{"agent_url":"ws://cfg"}"#).expect("config");
+        // A current profile in connections.toml → its url.
+        let mut conns = connection::Connections::default();
+        conns.profiles.insert(
+            "home".to_string(),
+            connection::Profile {
+                url: "ws://cfg".to_string(),
+                ..Default::default()
+            },
+        );
+        conns.current = Some("home".to_string());
+        connection::save(&conns).expect("save connections");
         assert_eq!(agent_url(), "ws://cfg");
 
+        // The env override wins over the current profile.
         std::env::set_var("FLEETY_AGENT_URL", "ws://env");
         assert_eq!(agent_url(), "ws://env");
     }
@@ -1706,58 +1777,48 @@ mod tests {
     }
 
     #[test]
-    fn saved_token_prefers_nonempty_env_then_config() {
+    fn init_upsert_then_pair_token_land_on_current_profile() {
         let _lock = ENV_LOCK.lock().expect("env lock");
-        let guard = EnvGuard::new("saved-token");
-        let dir = guard.temp_home.join(".fleety");
-        std::fs::create_dir_all(&dir).expect("config dir");
-        std::fs::write(dir.join("config.json"), r#"{"token":"from-config"}"#).expect("config");
+        let _guard = EnvGuard::new("upsert-pair");
+        std::env::set_var("FLEETY_MDNS_DISABLED", "1");
 
-        assert_eq!(saved_token().as_deref(), Some("from-config"));
-        std::env::set_var("FLEETY_TOKEN", "");
-        assert_eq!(saved_token().as_deref(), Some("from-config"));
-        std::env::set_var("FLEETY_TOKEN", "from-env");
-        assert_eq!(saved_token().as_deref(), Some("from-env"));
+        // `init` sugar: add-or-update the profile + make it current; a fresh
+        // profile has no token yet.
+        let token = upsert_profile_and_use("default", "ws://srv:8787").expect("upsert");
+        assert!(token.is_none());
+        let conns = connection::load().expect("load");
+        assert_eq!(conns.current.as_deref(), Some("default"));
+        assert_eq!(
+            conns.current_profile().map(|p| p.url.as_str()),
+            Some("ws://srv:8787")
+        );
+
+        // `pair` writes the minted token onto the current profile.
+        set_current_token("minted-token").expect("set token");
+        let conns = connection::load().expect("reload");
+        assert_eq!(
+            conns.current_profile().and_then(|p| p.token.as_deref()),
+            Some("minted-token")
+        );
+        // A re-init of the same server keeps the token (returns it).
+        let token = upsert_profile_and_use("default", "ws://srv:8787").expect("re-init");
+        assert_eq!(token.as_deref(), Some("minted-token"));
+
+        // With no current server, pairing has nowhere to put the token.
+        let mut empty = connection::Connections::default();
+        empty.current = None;
+        connection::save(&empty).expect("clear");
+        assert!(set_current_token("x").is_err());
     }
 
     #[test]
-    fn write_config_preserves_existing_fields_and_updates_requested_values() {
-        let _lock = ENV_LOCK.lock().expect("env lock");
-        let guard = EnvGuard::new("write-config");
-        std::env::set_var("FLEETY_DEVICE_ID", "dev-1");
-
-        let dir = guard.temp_home.join(".fleety");
-        std::fs::create_dir_all(&dir).expect("config dir");
-        std::fs::write(
-            dir.join("config.json"),
-            serde_json::to_string(&json!({
-                "agent_url": "ws://old",
-                "extra": true,
-                "token": "old-token"
-            }))
-            .expect("json"),
-        )
-        .expect("config");
-
-        write_config(Some("ws://new"), Some("new-token")).expect("write");
-
-        let value: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).expect("read"))
-                .expect("json");
-        assert_eq!(value["agent_url"], json!("ws://new"));
-        assert_eq!(value["token"], json!("new-token"));
-        assert_eq!(value["device_id"], json!(device_id()));
-        assert_eq!(value["extra"], json!(true));
-    }
-
-    #[test]
-    fn hello_includes_protocol_token_pairing_and_device() {
+    fn hello_carries_the_resolved_token_pairing_and_device() {
         let _lock = ENV_LOCK.lock().expect("env lock");
         let _guard = EnvGuard::new("hello");
-        std::env::set_var("FLEETY_TOKEN", "tok-1");
         let expected_device_id = device_id();
 
-        match hello(Some("pair-1".to_string())) {
+        // The token is passed in (resolved by the caller), not read from env.
+        match hello(Some("tok-1".to_string()), Some("pair-1".to_string())) {
             ClientMsg::Hello {
                 device_id,
                 protocol,

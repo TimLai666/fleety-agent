@@ -1,4 +1,5 @@
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -6,9 +7,18 @@ use std::time::Duration;
 use fleety_protocol::{ClientMsg, ServerMsg, WireError, PROTOCOL_VERSION};
 use tokio_tungstenite::tungstenite::{accept, Message};
 
+static RUN_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Run the CLI in an isolated temp HOME so a command never reads or migrates the
+/// developer's real `~/.fleety` (main() runs the one-time config.json migration).
 fn run(args: &[&str]) -> std::process::Output {
+    let n = RUN_SEQ.fetch_add(1, Ordering::Relaxed);
+    let home = TempHome::new(&format!("run-{n}"));
     Command::new(env!("CARGO_BIN_EXE_fleety"))
         .args(args)
+        .env("HOME", &home.0)
+        .env("USERPROFILE", &home.0)
+        .env_remove("FLEETY_AGENT_URL")
         .output()
         .expect("run fleety")
 }
@@ -158,9 +168,12 @@ fn usage_errors_return_before_network_work() {
 }
 
 #[test]
-fn init_and_pair_complete_handshake_and_save_config() {
+fn init_and_pair_write_the_connection_profile() {
     let home = TempHome::new("init-pair");
+    let connections_path = home.0.join(".fleety").join("connections.toml");
 
+    // `fleety init <url>` is sugar for `server add default <url> --use` + enroll:
+    // it records the profile, makes it current, and completes the handshake.
     let (init_url, init_rx) = start_ws_server(vec![vec![welcome(None)]]);
     let (output, received) = run_against_server(&["init", &init_url], &init_url, &home, init_rx);
     assert!(output.status.success());
@@ -173,12 +186,12 @@ fn init_and_pair_complete_handshake_and_save_config() {
         })
     ));
 
-    let config_path = home.0.join(".fleety").join("config.json");
-    let config: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&config_path).expect("config"))
-            .expect("json");
-    assert_eq!(config["agent_url"], init_url);
+    let conns = std::fs::read_to_string(&connections_path).expect("connections.toml");
+    assert!(conns.contains(&init_url), "profile url persisted: {conns}");
+    assert!(conns.contains("current = \"default\""), "made current: {conns}");
 
+    // `fleety pair <code>` enrolls the current server and writes the minted token
+    // onto that profile (here the connect target is the env-override server).
     let (pair_url, pair_rx) = start_ws_server(vec![vec![welcome(Some("pair-token"))]]);
     let (output, received) = run_against_server(&["pair", "PAIR-1"], &pair_url, &home, pair_rx);
     assert!(output.status.success());
@@ -191,11 +204,61 @@ fn init_and_pair_complete_handshake_and_save_config() {
         }) if code == "PAIR-1"
     ));
 
-    let config: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(&config_path).expect("config"))
-            .expect("json");
-    assert_eq!(config["agent_url"], pair_url);
-    assert_eq!(config["token"], "pair-token");
+    let conns = std::fs::read_to_string(&connections_path).expect("connections.toml");
+    assert!(
+        conns.contains("pair-token"),
+        "pair token landed on the current profile: {conns}"
+    );
+}
+
+#[test]
+fn server_commands_manage_connection_profiles() {
+    let home = TempHome::new("server-profiles");
+    let run_srv = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_fleety"))
+            .args(args)
+            .env("HOME", &home.0)
+            .env("USERPROFILE", &home.0)
+            .env_remove("FLEETY_AGENT_URL")
+            .env_remove("FLEETY_CONNECTIONS")
+            .output()
+            .expect("run fleety")
+    };
+
+    // First `add` auto-selects; `current` prints the name + url.
+    let out = run_srv(&["server", "add", "home", "ws://home:8787"]);
+    assert!(
+        out.status.success(),
+        "add home: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let cur = run_srv(&["server", "current"]);
+    let cur_s = String::from_utf8_lossy(&cur.stdout);
+    assert!(
+        cur_s.contains("home") && cur_s.contains("ws://home:8787"),
+        "current names the server: {cur_s}"
+    );
+
+    // A second server, without --use, leaves `home` current; `list` marks it.
+    run_srv(&["server", "add", "work", "ws://work:8787"]);
+    let list = run_srv(&["server", "list"]);
+    let list_s = String::from_utf8_lossy(&list.stdout);
+    assert!(list_s.contains("* home"), "list stars the current: {list_s}");
+    assert!(list_s.contains("work"), "list shows every server: {list_s}");
+
+    // Removing the current server without --force is rejected (non-zero exit).
+    let rm = run_srv(&["server", "remove", "home"]);
+    assert!(!rm.status.success(), "remove current must need --force");
+    assert!(String::from_utf8_lossy(&rm.stderr).contains("--force"));
+
+    // After switching away, removing the former current succeeds.
+    run_srv(&["server", "use", "work"]);
+    let rm2 = run_srv(&["server", "remove", "home"]);
+    assert!(
+        rm2.status.success(),
+        "remove non-current: {}",
+        String::from_utf8_lossy(&rm2.stderr)
+    );
 }
 
 #[test]

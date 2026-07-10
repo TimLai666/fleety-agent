@@ -20,54 +20,42 @@ mod service;
 #[cfg(windows)]
 mod winsvc;
 
-use std::path::PathBuf;
-
-use agent_core::{obs, CoreError, Result};
+use agent_core::{obs, Result};
 
 use fleety_protocol::{ClientMsg, ServerMsg, WireError, PROTOCOL_VERSION};
+use fleety_tools::connection::{self, Target};
 
-/// `~/.fleety/fleetyd.token` — the path where fleetyd persists a token it
-/// received from the server after a successful pair, so a restart can come
-/// straight back without needing `FLEETY_TOKEN` or another pairing code.
-fn token_path() -> Option<PathBuf> {
-    let base = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .ok()?;
-    Some(PathBuf::from(base).join(".fleety").join("fleetyd.token"))
+/// Persist a freshly-minted token onto the current profile in connections.toml
+/// (replacing the legacy `~/.fleety/fleetyd.token`), so a restart reconnects
+/// without re-pairing. If there is no current profile yet — e.g. a pure-env
+/// (`FLEETY_AGENT_URL`) deployment — a `default` profile pointing at `url` is
+/// created and made current so the token has a home.
+fn persist_token(url: &str, token: &str) -> Result<()> {
+    let mut conns = connection::load()?;
+    let name = conns.current.clone().unwrap_or_else(|| "default".to_string());
+    if conns.device_id.is_empty() {
+        conns.device_id = fleety_tools::device::device_id();
+    }
+    let profile = conns.profiles.entry(name.clone()).or_default();
+    if profile.url.is_empty() {
+        profile.url = url.to_string();
+    }
+    profile.token = Some(token.to_string());
+    conns.current = Some(name);
+    connection::save(&conns)
 }
 
-fn read_saved_token() -> Option<String> {
-    let path = token_path()?;
-    let text = std::fs::read_to_string(path).ok()?;
-    let trimmed = text.trim().to_string();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed)
-    }
-}
-
-fn write_saved_token(token: &str) -> Result<()> {
-    let path =
-        token_path().ok_or_else(|| CoreError::Message("no home dir for token".to_string()))?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| CoreError::Message(format!("cannot create ~/.fleety: {e}")))?;
-    }
-    std::fs::write(&path, token)
-        .map_err(|e| CoreError::Message(format!("cannot save token: {e}")))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+/// Clear the current profile's token after the server rejects it, so the next
+/// connect re-pairs rather than retrying a dead token.
+fn clear_current_token() -> Result<()> {
+    let mut conns = connection::load()?;
+    if let Some(name) = conns.current.clone() {
+        if let Some(p) = conns.profiles.get_mut(&name) {
+            p.token = None;
+        }
+        connection::save(&conns)?;
     }
     Ok(())
-}
-
-fn clear_saved_token() {
-    if let Some(path) = token_path() {
-        let _ = std::fs::remove_file(path);
-    }
 }
 
 fn main() -> std::process::ExitCode {
@@ -77,6 +65,9 @@ fn main() -> std::process::ExitCode {
     fleety_tools::config::seed_env_from_config(&fleety_tools::config::load(
         &fleety_tools::config::config_path(),
     ));
+    // One-time, idempotent migration of the legacy config.json / fleetyd.token
+    // into connections.toml (best-effort; a fresh device has nothing to migrate).
+    let _ = connection::migrate_from_config_json();
     let cmd = std::env::args().nth(1);
 
     // `config ...` inspects/edits this host's settings, then exits — no runtime
@@ -365,15 +356,24 @@ fn restart_due_at_idle() -> bool {
     false
 }
 
-fn agent_url() -> String {
-    if let Ok(url) = std::env::var("FLEETY_AGENT_URL") {
-        return url;
-    }
-    if let Some(url) = discover_via_mdns(std::time::Duration::from_secs(2)) {
-        tracing::info!(%url, "discovered fleety server via mDNS");
-        return url;
-    }
-    "ws://127.0.0.1:8787".to_string()
+/// Resolve which server (url + token) to connect to, via the shared resolver
+/// over connections.toml. `FLEETY_AGENT_URL` stays a persistent unit-file source
+/// for the daemon (transient env override in the resolver): env > current
+/// profile > mDNS > localhost. The daemon has no per-invocation override — it
+/// always follows `current`.
+fn resolve_target() -> Result<connection::Resolved> {
+    let conns = connection::load()?;
+    let env_url = std::env::var("FLEETY_AGENT_URL").ok();
+    let env_token = std::env::var("FLEETY_TOKEN").ok();
+    connection::resolve(&conns, &Target::Current, env_url, env_token, || {
+        discover_via_mdns(std::time::Duration::from_secs(2)).map(|url| {
+            tracing::info!(%url, "discovered fleety server via mDNS");
+            connection::Discovered {
+                url,
+                fingerprint: None,
+            }
+        })
+    })
 }
 
 /// Browse the LAN for the fleety server. Mirror of fleety-cli's helper —
@@ -407,7 +407,9 @@ fn discover_via_mdns(timeout: std::time::Duration) -> Option<String> {
 }
 
 fn device_id() -> String {
-    fleety_tools::device::device_id()
+    connection::load()
+        .map(|c| c.effective_device_id())
+        .unwrap_or_else(|_| fleety_tools::device::device_id())
 }
 
 /// What ended one connected session.
@@ -429,22 +431,30 @@ async fn run(shutdown: Option<tokio::sync::watch::Receiver<bool>>) -> Result<()>
     tokio::spawn(ensure_dependencies());
     let mut bo = backoff::Backoff::new();
     loop {
-        let url = agent_url();
-        let token = current_token();
-        // WebSocket first, SSE+POST fallback (unless overridden by env) — so a
-        // device behind a proxy that blocks the WS upgrade still connects.
-        match fleety_tools::transport::connect(&url, token.as_deref()).await {
-            Ok(conn) => {
-                bo.reset();
-                match serve(&url, conn, token, shutdown.clone()).await {
-                    Outcome::Shutdown => return Ok(()),
-                    Outcome::Disconnected => {
-                        tracing::info!("fleetyd disconnected; will reconnect");
+        // Resolve the server (url + token) via the shared resolver over
+        // connections.toml, honoring a persistent FLEETY_AGENT_URL env override.
+        match resolve_target() {
+            Ok(target) => {
+                // WebSocket first, SSE+POST fallback (unless overridden by env) —
+                // so a device behind a proxy that blocks the WS upgrade connects.
+                match fleety_tools::transport::connect(&target.url, target.token.as_deref()).await {
+                    Ok(conn) => {
+                        bo.reset();
+                        match serve(&target.url, conn, target.token, shutdown.clone()).await {
+                            Outcome::Shutdown => return Ok(()),
+                            Outcome::Disconnected => {
+                                tracing::info!("fleetyd disconnected; will reconnect");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(report = ?e.report(), "connect failed; will retry");
                     }
                 }
             }
             Err(e) => {
-                tracing::warn!(report = ?e.report(), "connect failed; will retry");
+                tracing::warn!(report = ?e.report(),
+                    "cannot resolve a server to connect to (is connections.toml valid?); will retry");
             }
         }
         let delay =
@@ -500,15 +510,6 @@ async fn wait_stop(shutdown: Option<tokio::sync::watch::Receiver<bool>>) {
             }
         }
     }
-}
-
-/// The connection token: env override > on-disk persisted token (None starts the
-/// pairing flow). Used both for the SSE/POST `Authorization` header and the Hello.
-fn current_token() -> Option<String> {
-    std::env::var("FLEETY_TOKEN")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .or_else(read_saved_token)
 }
 
 /// Run one connected session: send Hello, then serve frames until the link
@@ -612,10 +613,10 @@ async fn serve(
                 ..
             } => {
                 if let Some(tok) = token {
-                    if let Err(e) = write_saved_token(&tok) {
+                    if let Err(e) = persist_token(url, &tok) {
                         tracing::warn!(report = ?e.report(), "could not persist fleetyd token");
                     } else {
-                        tracing::info!("fleetyd token persisted to ~/.fleety/fleetyd.token");
+                        tracing::info!("fleetyd token persisted to the current profile in connections.toml");
                     }
                 }
                 tracing::info!(%session_id, "registered with agent");
@@ -630,7 +631,9 @@ async fn serve(
                      connect can re-pair",
                     error.message
                 );
-                clear_saved_token();
+                if let Err(e) = clear_current_token() {
+                    tracing::warn!(report = ?e.report(), "could not clear the rejected token");
+                }
                 return Outcome::Disconnected;
             }
             ServerMsg::RunTool {
@@ -678,6 +681,7 @@ async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -694,6 +698,9 @@ mod tests {
                 "USERPROFILE",
                 "FLEETY_AGENT_URL",
                 "FLEETY_DEVICE_ID",
+                "FLEETY_TOKEN",
+                "FLEETY_MDNS_DISABLED",
+                "FLEETY_CONNECTIONS",
                 "COMPUTERNAME",
                 "HOSTNAME",
             ];
@@ -711,6 +718,9 @@ mod tests {
             for key in [
                 "FLEETY_AGENT_URL",
                 "FLEETY_DEVICE_ID",
+                "FLEETY_TOKEN",
+                "FLEETY_MDNS_DISABLED",
+                "FLEETY_CONNECTIONS",
                 "COMPUTERNAME",
                 "HOSTNAME",
             ] {
@@ -734,34 +744,49 @@ mod tests {
     }
 
     #[test]
-    fn token_roundtrip_trims_empty_and_clear_removes_file() {
+    fn persist_and_clear_token_on_current_profile() {
         let _lock = ENV_LOCK.lock().expect("env lock");
         let _guard = EnvGuard::new("token");
 
-        assert!(read_saved_token().is_none());
+        // With no profile yet (a pure-env deployment), persist_token creates a
+        // `default` profile pointing at the connected url and stores the token.
+        persist_token("ws://srv:8787", "daemon-tok").expect("persist");
+        let conns = connection::load().expect("load");
+        assert_eq!(conns.current.as_deref(), Some("default"));
+        let p = conns.current_profile().expect("profile");
+        assert_eq!(p.url, "ws://srv:8787");
+        assert_eq!(p.token.as_deref(), Some("daemon-tok"));
 
-        let path = token_path().expect("token path");
-        std::fs::create_dir_all(path.parent().expect("parent")).expect("token dir");
-        std::fs::write(&path, "  saved-token\n").expect("seed token");
-        assert_eq!(read_saved_token().as_deref(), Some("saved-token"));
-
-        std::fs::write(&path, " \n").expect("empty token");
-        assert!(read_saved_token().is_none());
-
-        write_saved_token("fresh-token").expect("write token");
-        assert_eq!(read_saved_token().as_deref(), Some("fresh-token"));
-        clear_saved_token();
-        assert!(!path.exists());
+        // Clearing after a rejection drops the token but keeps the profile.
+        clear_current_token().expect("clear");
+        let conns = connection::load().expect("reload");
+        assert!(conns
+            .current_profile()
+            .and_then(|p| p.token.as_deref())
+            .is_none());
     }
 
     #[test]
-    fn agent_url_prefers_env_then_default() {
+    fn resolve_target_prefers_env_then_current_then_default() {
         let _lock = ENV_LOCK.lock().expect("env lock");
-        let _guard = EnvGuard::new("agent-url");
+        let _guard = EnvGuard::new("resolve");
+        std::env::set_var("FLEETY_MDNS_DISABLED", "1"); // no LAN probe in the test
 
-        assert_eq!(agent_url(), "ws://127.0.0.1:8787");
-        std::env::set_var("FLEETY_AGENT_URL", "ws://agent");
-        assert_eq!(agent_url(), "ws://agent");
+        // Nothing configured → the localhost default.
+        assert_eq!(
+            resolve_target().expect("resolve").url,
+            connection::DEFAULT_URL
+        );
+
+        // No env + a current profile (a paired device) → its url + token.
+        persist_token("ws://srv:8787", "tok").expect("persist");
+        let r = resolve_target().expect("resolve");
+        assert_eq!(r.url, "ws://srv:8787");
+        assert_eq!(r.token.as_deref(), Some("tok"));
+
+        // An old env deployment still connects: FLEETY_AGENT_URL overrides.
+        std::env::set_var("FLEETY_AGENT_URL", "ws://env:8787");
+        assert_eq!(resolve_target().expect("resolve").url, "ws://env:8787");
     }
 
     #[test]

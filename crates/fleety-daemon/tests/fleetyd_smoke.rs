@@ -108,7 +108,7 @@ fn wait_until(mut predicate: impl FnMut() -> bool) {
 }
 
 #[test]
-fn daemon_session_persists_token_from_welcome_across_disconnect() {
+fn daemon_session_persists_token_from_welcome_to_connections() {
     let home = TempDir::new("session-token");
     let root = TempDir::new("device-root");
     let (url, rx) = start_ws_server(vec![vec![welcome(Some("server-token"))]]);
@@ -124,24 +124,28 @@ fn daemon_session_persists_token_from_welcome_across_disconnect() {
             ..
         }) if device_id == "daemon-smoke"
     ));
-    let token_path = home.0.join(".fleety").join("fleetyd.token");
+    // The minted token is persisted onto the current profile in connections.toml
+    // (not the legacy fleetyd.token), so a restart reconnects without re-pairing.
+    let conns_path = home.0.join(".fleety").join("connections.toml");
     wait_until(|| {
-        matches!(
-            std::fs::read_to_string(&token_path),
-            Ok(token) if token == "server-token"
-        )
+        matches!(std::fs::read_to_string(&conns_path), Ok(s) if s.contains("server-token"))
     });
-    let token = std::fs::read_to_string(token_path).expect("saved token");
-    assert_eq!(token, "server-token");
 }
 
 #[test]
 fn daemon_clears_saved_token_when_server_rejects_auth() {
     let home = TempDir::new("unauth");
     let root = TempDir::new("device-root-unauth");
-    let token_path = home.0.join(".fleety").join("fleetyd.token");
-    std::fs::create_dir_all(token_path.parent().expect("token parent")).expect("token dir");
-    std::fs::write(&token_path, "old-token").expect("token");
+    // Seed a current profile that already holds a token (a previously-paired
+    // device). The daemon reads its token from connections.toml now.
+    let conns_path = home.0.join(".fleety").join("connections.toml");
+    std::fs::create_dir_all(conns_path.parent().expect("parent")).expect("fleety dir");
+    std::fs::write(
+        &conns_path,
+        "device_id = \"daemon-smoke\"\ncurrent = \"default\"\n\n\
+         [profiles.default]\nurl = \"ws://placeholder:8787\"\ntoken = \"old-token\"\n",
+    )
+    .expect("seed connections");
     let (url, rx) = start_ws_server(vec![vec![ServerMsg::Error {
         error: WireError {
             kind: "unauthenticated".into(),
@@ -159,7 +163,10 @@ fn daemon_clears_saved_token_when_server_rejects_auth() {
             ..
         }) if token == "old-token"
     ));
-    wait_until(|| !token_path.exists());
+    // After the rejection the current profile's token is cleared.
+    wait_until(|| {
+        matches!(std::fs::read_to_string(&conns_path), Ok(s) if !s.contains("old-token"))
+    });
 }
 
 #[test]

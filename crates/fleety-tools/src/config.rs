@@ -246,14 +246,12 @@ pub fn registry() -> &'static [Setting] {
             secret: false,
             validator: Some(v_bool),
         },
-        Setting {
-            key: "FLEETY_AGENT_URL",
-            scope: Daemon,
-            default: "(mDNS → ws://127.0.0.1:8787)",
-            description: "Server WebSocket URL the daemon/CLI connects to.",
-            secret: false,
-            validator: None,
-        },
+        // FLEETY_AGENT_URL is deliberately NOT a registry setting: the connection
+        // target lives in ~/.fleety/connections.toml and is managed via
+        // `fleety server` (see fleety_tools::connection). It survives only as a
+        // transient env override in the shared resolver, never seeded from
+        // config.toml — so there is no config.json / config.toml / env precedence
+        // trap. `config set FLEETY_AGENT_URL` is therefore an unknown key.
         Setting {
             key: "FLEETY_DEVICE_ID",
             scope: Daemon,
@@ -1273,6 +1271,28 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn agent_url_is_not_a_registry_key() {
+        // The connection target moved to connections.toml (managed by
+        // `fleety server`); FLEETY_AGENT_URL is no longer a registry setting.
+        assert!(find("FLEETY_AGENT_URL").is_none());
+        assert!(!registry().iter().any(|s| s.key == "FLEETY_AGENT_URL"));
+        // `config set FLEETY_AGENT_URL <url>` is rejected as an unknown key …
+        let args: Vec<String> = ["set", "FLEETY_AGENT_URL", "ws://x"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let err = run_rendered(&args).unwrap_err().to_string();
+        assert!(err.contains("unknown setting"), "got: {err}");
+        // … and it is never seeded into the env from config.toml.
+        std::env::remove_var("FLEETY_AGENT_URL");
+        let mut map = ConfigMap::new();
+        map.insert((Scope::Daemon, "FLEETY_AGENT_URL".into()), "ws://seeded".into());
+        seed_env_from_config(&map);
+        assert!(std::env::var("FLEETY_AGENT_URL").is_err(), "must not seed a non-registry key");
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn precedence_env_then_config_then_default() {
         let mut map = ConfigMap::new();
         map.insert((Scope::Server, "FLEETY_ADDR".into()), "0.0.0.0:9000".into());
@@ -1318,7 +1338,7 @@ mod tests {
         let path = dir.join("config.toml");
         let mut map = ConfigMap::new();
         map.insert((Scope::Server, "FLEETY_ADDR".into()), "0.0.0.0:9000".into());
-        map.insert((Scope::Cli, "FLEETY_AGENT_URL".into()), "ws://x:1".into());
+        map.insert((Scope::Cli, "FLEETY_VOICE_AUDIO".into()), "off".into());
         save(&path, &map).unwrap();
         let loaded = load(&path);
         assert_eq!(
@@ -1329,9 +1349,9 @@ mod tests {
         );
         assert_eq!(
             loaded
-                .get(&(Scope::Cli, "FLEETY_AGENT_URL".into()))
+                .get(&(Scope::Cli, "FLEETY_VOICE_AUDIO".into()))
                 .map(String::as_str),
-            Some("ws://x:1")
+            Some("off")
         );
         // corrupt → empty, no panic.
         std::fs::write(&path, "{ not toml ::").unwrap();

@@ -33,6 +33,7 @@ mod browser;
 mod chrome;
 mod computer;
 pub mod config;
+pub mod connection;
 pub mod deps;
 pub mod device;
 mod insyra;
