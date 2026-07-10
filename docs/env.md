@@ -19,7 +19,7 @@ Grouped by which binary cares about it. Anything unset uses the default.
 
 | Var | Default | Meaning |
 |---|---|---|
-| `FLEETY_ADDR` | `127.0.0.1:8787` | WebSocket listen address. Bind `0.0.0.0:8787` to expose on the LAN. |
+| `FLEETY_ADDR` | `0.0.0.0:8787` | WebSocket listen address. Defaults to all interfaces so it's reachable across devices out of the box (auth is required by default). Set `127.0.0.1:8787` for loopback-only. |
 | `FLEETY_AGENT_HOME` | `$HOME/.fleety/agent` | Durable store root: conversations, history, backups, skills, MCP config, schedules, wiki. |
 | `FLEETY_WORKSPACE` | cwd | Base directory the workspace tools (`read_file`/`write_file`/etc.) resolve **relative** paths against — the *fallback* workspace root (see below). |
 
@@ -297,7 +297,7 @@ last fallback when no URL is configured.
 | Var | Default | Meaning |
 |---|---|---|
 | `FLEETY_MDNS_DISABLED` | (unset) | Set anything to skip both announce and browse. Useful on corporate networks that block mDNS. |
-| `FLEETY_MDNS_HOST_IP` | (auto) | Force the advertised IP. **Required when `FLEETY_ADDR` binds to `0.0.0.0`** — the server doesn't enumerate interfaces. |
+| `FLEETY_MDNS_HOST_IP` | (auto) | Override the advertised IP. When `FLEETY_ADDR` binds `0.0.0.0`, the server **auto-detects** a routable outbound IP; set this to pin a specific one (e.g. multi-homed / VPN hosts). |
 | `FLEETY_MDNS_HOST` | hostname / `COMPUTERNAME` / `HOSTNAME` | mDNS instance name. |
 
 ## Daemon (`fleetyd`)

@@ -8,60 +8,32 @@ TBD - created by archiving change 'baseline-config-specs'. Update Purpose after 
 
 ### Requirement: Server bootstrap configuration
 
-The server SHALL read `FLEETY_ADDR` for its WebSocket listen address (default `127.0.0.1:8787`), `FLEETY_AGENT_HOME` for its durable store root (default `$HOME/.fleety/agent`), `FLEETY_WORKSPACE` for the base directory that workspace tools resolve relative paths against (default the current working directory), and `FLEETY_SCHED_TICK` for the scheduler fire-loop interval in seconds (default `60`). Any unset variable SHALL use its default.
+The server SHALL read `FLEETY_ADDR` for its WebSocket listen address (default `0.0.0.0:8787`), `FLEETY_AGENT_HOME` for its durable store root (default `$HOME/.fleety/agent`), `FLEETY_WORKSPACE` for the base directory that workspace tools resolve relative paths against (default the current working directory), and `FLEETY_SCHED_TICK` for the scheduler fire-loop interval in seconds (default `60`). Any unset variable SHALL use its default. The `FLEETY_ADDR` default exposes the server on all interfaces so it is reachable across devices out of the box; this is paired with authentication being required by default (see access policy), so an exposed address still needs a paired token to connect. An operator who wants loopback-only SHALL set `FLEETY_ADDR=127.0.0.1:8787` explicitly.
 
 #### Scenario: defaults apply when unset
 
 - **WHEN** the server starts with none of these variables set
-- **THEN** it listens on `127.0.0.1:8787`, stores under `$HOME/.fleety/agent`, resolves relative paths against the current directory, and ticks the scheduler every 60 seconds
+- **THEN** it listens on `0.0.0.0:8787`, stores under `$HOME/.fleety/agent`, resolves relative paths against the current directory, and ticks the scheduler every 60 seconds
 
 ##### Example: bootstrap defaults
 
 | Variable | Unset default |
 | -------- | ------------- |
-| `FLEETY_ADDR` | `127.0.0.1:8787` |
+| `FLEETY_ADDR` | `0.0.0.0:8787` |
 | `FLEETY_AGENT_HOME` | `$HOME/.fleety/agent` |
 | `FLEETY_WORKSPACE` | current working directory |
 | `FLEETY_SCHED_TICK` | `60` |
 
 
 <!-- @trace
-source: baseline-config-specs
-updated: 2026-06-28
+source: expose-server-by-default
+updated: 2026-07-11
 code:
-  - .agents/skills/spectra-commit/SKILL.md
-  - .opencode/skills/spectra-debug/SKILL.md
-  - .opencode/commands/spectra-ingest.md
-  - .opencode/skills/spectra-audit/SKILL.md
-  - .agents/skills/spectra-discuss/SKILL.md
-  - .agents/skills/spectra-archive/SKILL.md
-  - .opencode/skills/spectra-ask/SKILL.md
-  - .opencode/commands/spectra-drift.md
-  - .opencode/commands/spectra-propose.md
-  - .opencode/skills/spectra-apply/SKILL.md
-  - .opencode/skills/spectra-commit/SKILL.md
-  - .opencode/commands/spectra-commit.md
-  - .agents/skills/spectra-ask/SKILL.md
-  - .agents/skills/spectra-audit/SKILL.md
-  - .opencode/commands/spectra-debug.md
-  - .agents/skills/spectra-drift/SKILL.md
-  - .opencode/skills/spectra-archive/SKILL.md
-  - .agents/skills/spectra-ingest/SKILL.md
-  - .opencode/commands/spectra-audit.md
-  - .opencode/commands/spectra-apply.md
-  - .opencode/commands/spectra-discuss.md
-  - .spectra.yaml
-  - CLAUDE.md
-  - .opencode/commands/spectra-ask.md
-  - .opencode/skills/spectra-ingest/SKILL.md
-  - .opencode/skills/spectra-discuss/SKILL.md
-  - .opencode/skills/spectra-drift/SKILL.md
-  - .opencode/commands/spectra-archive.md
-  - .agents/skills/spectra-debug/SKILL.md
-  - .agents/skills/spectra-propose/SKILL.md
-  - .agents/skills/spectra-apply/SKILL.md
-  - .opencode/skills/spectra-propose/SKILL.md
-  - AGENTS.md
+  - crates/fleety-tools/src/config.rs
+  - crates/fleety-server/src/main.rs
+  - crates/fleety-server/src/mdns.rs
+  - docs/env.md
+  - docs/roadmap.md
 -->
 
 ---

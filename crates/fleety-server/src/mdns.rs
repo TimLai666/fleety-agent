@@ -18,11 +18,12 @@ fn disabled() -> bool {
 }
 
 /// Local IP address(es) other devices should reach the server on. Used by the
-/// advertisement, since `127.0.0.1` would be useless to peers on the LAN.
+/// advertisement, since `127.0.0.1` / `0.0.0.0` would be useless to peers.
 ///
-/// `FLEETY_MDNS_HOST_IP` lets the operator pin the advertised IP when binding
-/// to `0.0.0.0` (no other dep does interface enumeration here — mDNS just won't
-/// work without a routable address).
+/// Precedence: an explicit `FLEETY_MDNS_HOST_IP` wins (multi-homed hosts); a
+/// concrete non-loopback bind IP is used directly; a wildcard (`0.0.0.0`) bind
+/// auto-detects a routable outbound IP (see [`detect_route_ip`]); a loopback
+/// bind (or a wildcard with no detectable route) advertises nothing.
 fn local_ips(bind_addr: &str) -> Vec<IpAddr> {
     if let Ok(ip) = std::env::var("FLEETY_MDNS_HOST_IP") {
         if let Ok(parsed) = ip.parse::<IpAddr>() {
@@ -31,11 +32,39 @@ fn local_ips(bind_addr: &str) -> Vec<IpAddr> {
     }
     if let Ok(addr) = bind_addr.parse::<SocketAddr>() {
         let ip = addr.ip();
-        if !ip.is_unspecified() && !ip.is_loopback() {
+        if ip.is_loopback() {
+            // Loopback bind: unreachable by peers — never advertise.
+            return Vec::new();
+        }
+        if !ip.is_unspecified() {
             return vec![ip];
+        }
+        // Wildcard bind (`0.0.0.0`): the server didn't pick an interface, so
+        // auto-detect a routable IP to advertise — otherwise peers on the LAN
+        // could not discover the (now exposed-by-default) server.
+        if let Some(routable) = detect_route_ip() {
+            return vec![routable];
         }
     }
     Vec::new()
+}
+
+/// Detect a routable (non-loopback) local IP by asking the OS which interface it
+/// would use to reach a public address: open a UDP socket and `connect` it to a
+/// public IP. No packet is sent — UDP `connect` only sets the default peer — but
+/// the OS assigns the local address of the outbound-route interface, read back
+/// from `local_addr`. Returns `None` on any I/O failure or a loopback/wildcard
+/// result (never panics, never blocks on the network; the target need not be
+/// reachable).
+fn detect_route_ip() -> Option<IpAddr> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect((std::net::Ipv4Addr::new(8, 8, 8, 8), 80)).ok()?;
+    let ip = sock.local_addr().ok()?.ip();
+    if ip.is_loopback() || ip.is_unspecified() {
+        None
+    } else {
+        Some(ip)
+    }
 }
 
 fn port_from(bind_addr: &str) -> u16 {
@@ -150,6 +179,38 @@ mod tests {
     fn port_parsing_picks_addr_port_then_falls_back() {
         assert_eq!(port_from("127.0.0.1:9999"), 9999);
         assert_eq!(port_from("garbage"), 8787);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn local_ips_wildcard_autodetects_loopback_skips_and_host_ip_overrides() {
+        std::env::remove_var("FLEETY_MDNS_HOST_IP");
+        // Loopback bind is never advertised.
+        assert!(local_ips("127.0.0.1:8787").is_empty());
+        // A concrete non-loopback bind IP is used directly.
+        assert_eq!(
+            local_ips("192.168.5.5:8787"),
+            vec!["192.168.5.5".parse::<IpAddr>().expect("ip")]
+        );
+        // Wildcard bind → an auto-detected routable IP, or empty on a box with no
+        // outbound route; never a loopback/wildcard address.
+        for ip in local_ips("0.0.0.0:8787") {
+            assert!(!ip.is_loopback() && !ip.is_unspecified());
+        }
+        // An explicit host IP overrides auto-detection.
+        std::env::set_var("FLEETY_MDNS_HOST_IP", "10.1.2.3");
+        assert_eq!(
+            local_ips("0.0.0.0:8787"),
+            vec!["10.1.2.3".parse::<IpAddr>().expect("ip")]
+        );
+        std::env::remove_var("FLEETY_MDNS_HOST_IP");
+    }
+
+    #[test]
+    fn detect_route_ip_is_none_or_routable_never_panics() {
+        if let Some(ip) = detect_route_ip() {
+            assert!(!ip.is_loopback() && !ip.is_unspecified());
+        }
     }
 
     #[test]

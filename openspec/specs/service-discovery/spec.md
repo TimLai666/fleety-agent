@@ -8,55 +8,33 @@ TBD - created by archiving change 'baseline-config-specs'. Update Purpose after 
 
 ### Requirement: mDNS service discovery
 
-The server SHALL announce `_fleety._tcp.local.` over mDNS, and the CLI and daemon SHALL browse for it as the last fallback when no URL is configured. `FLEETY_MDNS_DISABLED` SHALL, when set to any value, skip both announce and browse. `FLEETY_MDNS_HOST_IP` SHALL force the advertised IP and SHALL be required when `FLEETY_ADDR` binds to `0.0.0.0` (the server does not enumerate interfaces). `FLEETY_MDNS_HOST` SHALL set the mDNS instance name (default the hostname).
+The server SHALL announce `_fleety._tcp.local.` over mDNS, and the CLI and daemon SHALL browse for it as the last fallback when no URL is configured. `FLEETY_MDNS_DISABLED` SHALL, when set to any value, skip both announce and browse. When `FLEETY_ADDR` binds a wildcard address (`0.0.0.0`), the server SHALL auto-detect a single routable (non-loopback, non-wildcard) local IP to advertise — by opening a UDP socket and connecting it to a public address so the OS selects the outbound interface's IP, sending no packet — so discovery works out of the box on the exposed default. `FLEETY_MDNS_HOST_IP` SHALL, when set, force the advertised IP (overriding auto-detection, for multi-homed hosts). When neither an explicit host IP nor an auto-detected routable IP is available, the server SHALL skip the announcement (it never advertises a loopback or wildcard address). `FLEETY_MDNS_HOST` SHALL set the mDNS instance name (default the hostname).
 
 #### Scenario: disabling mDNS skips announce and browse
 
 - **WHEN** `FLEETY_MDNS_DISABLED` is set
 - **THEN** the server does not announce and clients do not browse
 
-#### Scenario: wildcard bind needs an explicit advertised IP
+#### Scenario: wildcard bind auto-detects a routable advertised IP
+
+- **WHEN** `FLEETY_ADDR` binds `0.0.0.0`, `FLEETY_MDNS_HOST_IP` is unset, and the host has an outbound route
+- **THEN** the server advertises the auto-detected routable IP rather than an unusable wildcard address
+
+#### Scenario: an explicit host IP overrides auto-detection
 
 - **WHEN** `FLEETY_ADDR` binds `0.0.0.0` and `FLEETY_MDNS_HOST_IP` is set
-- **THEN** the server advertises that IP rather than an unusable wildcard address
+- **THEN** the server advertises that pinned IP instead of the auto-detected one
+
 
 <!-- @trace
-source: baseline-config-specs
-updated: 2026-06-28
+source: expose-server-by-default
+updated: 2026-07-11
 code:
-  - .agents/skills/spectra-commit/SKILL.md
-  - .opencode/skills/spectra-debug/SKILL.md
-  - .opencode/commands/spectra-ingest.md
-  - .opencode/skills/spectra-audit/SKILL.md
-  - .agents/skills/spectra-discuss/SKILL.md
-  - .agents/skills/spectra-archive/SKILL.md
-  - .opencode/skills/spectra-ask/SKILL.md
-  - .opencode/commands/spectra-drift.md
-  - .opencode/commands/spectra-propose.md
-  - .opencode/skills/spectra-apply/SKILL.md
-  - .opencode/skills/spectra-commit/SKILL.md
-  - .opencode/commands/spectra-commit.md
-  - .agents/skills/spectra-ask/SKILL.md
-  - .agents/skills/spectra-audit/SKILL.md
-  - .opencode/commands/spectra-debug.md
-  - .agents/skills/spectra-drift/SKILL.md
-  - .opencode/skills/spectra-archive/SKILL.md
-  - .agents/skills/spectra-ingest/SKILL.md
-  - .opencode/commands/spectra-audit.md
-  - .opencode/commands/spectra-apply.md
-  - .opencode/commands/spectra-discuss.md
-  - .spectra.yaml
-  - CLAUDE.md
-  - .opencode/commands/spectra-ask.md
-  - .opencode/skills/spectra-ingest/SKILL.md
-  - .opencode/skills/spectra-discuss/SKILL.md
-  - .opencode/skills/spectra-drift/SKILL.md
-  - .opencode/commands/spectra-archive.md
-  - .agents/skills/spectra-debug/SKILL.md
-  - .agents/skills/spectra-propose/SKILL.md
-  - .agents/skills/spectra-apply/SKILL.md
-  - .opencode/skills/spectra-propose/SKILL.md
-  - AGENTS.md
+  - crates/fleety-tools/src/config.rs
+  - crates/fleety-server/src/main.rs
+  - crates/fleety-server/src/mdns.rs
+  - docs/env.md
+  - docs/roadmap.md
 -->
 
 ---

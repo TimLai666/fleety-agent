@@ -73,8 +73,8 @@ pub fn registry() -> &'static [Setting] {
         Setting {
             key: "FLEETY_ADDR",
             scope: Server,
-            default: "127.0.0.1:8787",
-            description: "WebSocket listen address.",
+            default: "0.0.0.0:8787",
+            description: "WebSocket listen address; defaults to all interfaces so it is reachable across devices (auth is required by default). Set 127.0.0.1:8787 for loopback-only.",
             secret: false,
             validator: None,
         },
@@ -1580,6 +1580,16 @@ mod tests {
         assert!(load_strict(&path).is_err(), "broken file errors under load_strict");
         assert!(load(&path).is_empty(), "load() stays fail-soft");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn addr_defaults_to_all_interfaces() {
+        // Reachable across devices out of the box (paired with auth-on default).
+        std::env::remove_var("FLEETY_ADDR");
+        let r = resolve("FLEETY_ADDR", &ConfigMap::new()).expect("resolve");
+        assert_eq!(r.value, "0.0.0.0:8787");
+        assert_eq!(r.source, Source::Default);
     }
 
     #[test]

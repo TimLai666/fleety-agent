@@ -411,7 +411,10 @@ async fn run_server(shutdown: Option<tokio::sync::watch::Receiver<bool>>) {
     }
     // Stamp the start time once so uptime reflects boot, not first status query.
     let _ = server_start();
-    let addr = std::env::var("FLEETY_ADDR").unwrap_or_else(|_| "127.0.0.1:8787".to_string());
+    // Default to all interfaces so a bare-metal server is reachable across
+    // devices out of the box (auth is required by default). Set FLEETY_ADDR=
+    // 127.0.0.1:8787 for loopback-only.
+    let addr = std::env::var("FLEETY_ADDR").unwrap_or_else(|_| "0.0.0.0:8787".to_string());
     let home = agent_home();
     tracing::info!(version = agent_core::VERSION, %addr, home = %home.display(), "fleety-server starting");
 

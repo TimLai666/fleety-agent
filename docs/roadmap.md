@@ -72,12 +72,13 @@
 1. **Presence inference 信號來源**(colocation 上報與 site 記錄已出貨,推論未做)
    - 選項:(a) daemon 主動上報 LAN 鄰居 vs (b) server 主動掃 vs (c) 混合
    - 待決點:回報頻率、假陽性容忍、隱私邊界
-2. **`FLEETY_ADDR` 預設值** — 預設 `127.0.0.1` 讓「跨裝置」開箱即不可達(啟動時已加提示、Docker 映像已預設 `0.0.0.0`)。是否改裸機預設為 `0.0.0.0` 是安全取捨。`FLEETY_REQUIRE_AUTH` 已於 auth-default-on 改為**預設開**,故「開放 addr + 無認證」的裸奔風險已降;是否連 addr 也預設 `0.0.0.0` 可重新評估。適合走 `/spectra-discuss`。
+
+（`FLEETY_ADDR` 預設已於 2026-07-11 拍板出貨:裸機預設改 `0.0.0.0:8787`、綁 0.0.0.0 時自動偵測對外 IP 廣播 mDNS,配合 auth-default-on 的認證預設開。見 expose-server-by-default。）
 
 ## 建議下一動
 
-高頻體驗缺口已清空,CLI 設定架構重設計 Phase 1 + Phase 2(含互動全包面板)皆已出貨(G1+G2)。建議依序:
-1. **決定 §待決兩項**(`FLEETY_ADDR` 預設 + presence 信號來源)——純產品決策,擋住 presence 推論這條線。
+高頻體驗缺口已清空,CLI 設定架構重設計 Phase 1 + Phase 2(含互動全包面板)皆已出貨(G1+G2),`FLEETY_ADDR` 預設對外亦已拍板出貨。建議依序:
+1. **決定 presence 信號來源**——純產品決策,擋住 presence 推論這條線(頻率 / 假陽性 / 隱私邊界三點),適合走 `/spectra-discuss`。
 2. **remote-config-panel 收尾**(server 區 provider/model 完整互動編輯、wss、敏感 key 分級)——設定體驗的最後打磨。
 3. **milestone 深度**擇一開展(browser snapshot-ref act 對 agent 自動化價值最高;wiki 三層對知識沉澱價值最高)。
 4. **fleety status 版本對照**小項可順手收尾。
