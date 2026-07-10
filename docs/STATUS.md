@@ -185,10 +185,49 @@ is on `main`; see commit history for the exact change.
 - [`docs/roadmap.md`](roadmap.md) — open gaps + implementation plans.
 - [`docs/acp.md`](acp.md) — using Fleety from an editor (ACP): setup, `fleety acp install`, updates, troubleshooting.
 
+## 2026-07 UX audit backlog — shipped
+
+A product-experience audit (72 confirmed findings) drove two waves of work. The
+high-frequency fixes landed on 2026-07-05; the structural gaps became 11 Spectra
+changes, all implemented + tested + archived on 2026-07-10 (see
+`openspec/changes/archive/2026-07-10-*` and `2026-07-05-turn-cancellation`):
+
+- **turn-cancellation** — per-tool-call cancellation checkpoint in agent-core +
+  `CancelTurn` frame; TUI Esc cancels an in-flight turn, ACP `session/cancel`
+  closes the prompt with `stopReason=cancelled`.
+- **restart-defer-until-idle** — in-flight turn accounting + a cross-process
+  restart-request marker + an idle watcher; manual and update-triggered
+  `fleety-server restart` defer until idle, `--force` stays immediate.
+- **schedule-run-notification** — each scheduled run records an outcome, a
+  failing schedule is isolated (others still fire), and unseen outcomes are
+  delivered to the owner proactively on their next connect.
+- **tui-depth** — markdown / fenced-code rendering, a waiting spinner, multi-line
+  input (Alt+Enter / Ctrl+J), `/attach`, capped-backoff auto-reconnect with
+  Resume/Replay, and unsent-input quit confirmation.
+- **config-value-validation** — `Setting` validators (enum / bool / uint / URL);
+  `config set` and the interactive editors reject out-of-domain values before
+  they reach `config.toml`.
+- **provider-editor-usability** — the `config provider edit` screen edits a
+  provider in place, removes groups / unsets roles, takes per-field input, and
+  confirms deletes.
+- **conversation-discovery** — `fleety conversations` lists recent resumable
+  conversations (id + relative time + preview), owner-scoped.
+- **voice-vad-barge-in** — energy-threshold VAD endpointing replaces fixed-second
+  blind recording; playback stops on barge-in.
+- **grant-access-revoke** — `revoke_access` / `list_access` tools so shared
+  access can be taken back.
+- **deploy-hardening** — Windows lifecycle verbs pre-flight an elevation check;
+  the insyra sidecar is provisioned symmetrically by server and daemon; the
+  container image runs as a non-root user (uid 10001) with state dirs it owns.
+- **cli-clipboard-acp-polish** — readable pairing errors, OAuth loopback-port
+  fail-fast, a correct install-dir writability probe, bounded + language-typed
+  clipboard attachments, and a spec-conformant ACP `session/load` response.
+
 ## Remaining gaps
 
-The M0–M11 milestones have shipped (see the status table above). What's left is
-within-milestone depth plus a few explicitly deferred items:
+The M0–M11 milestones have shipped (see the status table above). With the
+2026-07 UX-audit backlog closed, what's left is within-milestone depth plus a few
+explicitly deferred items:
 
 - **M9 browser — snapshot-ref acting** — `browser_open/close/navigate/eval/screenshot`
   ship, but the spec's accessibility-snapshot + ref-based `act`, `browser_tabs`, and

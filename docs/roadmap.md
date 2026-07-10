@@ -1,70 +1,48 @@
 # Fleety — 開發路線與實作計畫
 
-對照 [`STATUS.md`](STATUS.md)(已完成的能力清單)與 [`spec-v0.md`](spec-v0.md)(v0 規格)。本檔聚焦在「**還沒做、但該做**」的部分。舊版本檔內已出貨項目的完整實作計畫(eval harness、enrollment、audit CLI、多模態)保留在 git 歷史,不再佔用本檔。
+對照 [`STATUS.md`](STATUS.md)(已完成的能力清單)與 [`spec-v0.md`](spec-v0.md)(v0 規格)。本檔聚焦在「**還沒做、但該做**」的部分。已出貨項目的完整實作計畫保留在 git 歷史與 `openspec/changes/archive/`,不再佔用本檔。
 
 > 撰寫原則:不為了湊清單而塞 nice-to-have;每個 must-have 都附拒絕條件(在什麼情況下這個方案應該改做別的)。
 
 ---
 
-## 已出貨(自上次盤點)
+## 已出貨
 
-舊版 roadmap 的 §1-§5 全數或大半出貨,對應細節見 `STATUS.md`:
-
+### 舊版 roadmap §1-§5(自更早盤點)
 - **Eval / regression harness** — `fleety-eval` crate + goldens,CI 必過。
 - **Enrollment 端對端** — pairing code / token / `fleety pair`,整合測試齊。
 - **Audit + rollback CLI** — `fleety audit list|show`、`fleety rollback list|apply`。
 - **多模態輸入** — `Attachment` 進 `agent-core`,CLI `--image/--audio/--video/--file`,TUI Ctrl+V,OpenAI/Gemini provider 適配。
-- **Sidecar / 自動更新檢測(大半)** — fleetyd 每日輪詢 `FLEETY_UPDATE_MANIFEST`(`FLEETY_AUTO_UPDATE` notify/apply),sidecar 隨 `fleetyd update` 與 CI release 流程同步;`fleety status` 顯示 sidecar 健康。殘餘:status 尚未顯示「本機版本 vs 最新版」對照。
-- **語音對話** — `fleety voice`(cpal 錄音 + whisper.cpp 預設 / `FLEETY_STT_CMD` 模板 / server 端 STT),TTS 回覆。
+- **Sidecar / 自動更新檢測** — fleetyd 每日輪詢 `FLEETY_UPDATE_MANIFEST`;`fleety status` 顯示 sidecar 健康。
+- **語音對話** — `fleety voice`(cpal 錄音 + whisper.cpp / server 端 STT),TTS 回覆。
 
-## 必做(must-have)
+### 2026-07 產品體驗稽核 backlog(72 項 confirmed → 全數修復或出貨)
+高頻痛點於 2026-07-05 同日修復;結構性缺口拆成 11 個 Spectra 變更,於 2026-07-10 全部實作、測試、archive(見 `openspec/changes/archive/2026-07-10-*`):
+- **turn-cancellation** — server 端 per-tool-call 取消 checkpoint + `CancelTurn` frame;TUI Esc 取消、ACP `session/cancel` 以 `stopReason=cancelled` 收尾。
+- **restart-defer-until-idle**(舊 §1)— in-flight turn 計數 + marker 通道 + idle watcher;手動/update restart 走 defer,`--force` 即時。
+- **schedule-run-notification**(舊 §2)— run outcome 記錄 + per-schedule 失敗隔離 + 連線時 owner-scoped 主動投遞。
+- **tui-depth**(舊 §3)— markdown/程式碼區塊渲染、等待 spinner、多行輸入(Alt+Enter/Ctrl+J)、`/attach`、斷線指數退避重連、離開前確認。
+- **config-value-validation**(舊 §5)— Setting validator(enum/bool/uint/URL),set 與互動編輯共用,壞值寫入前擋下。
+- **provider-editor-usability** — 就地編輯 provider、group remove / role unset、逐欄輸入、刪除確認。
+- **conversation-discovery** — `fleety conversations` 列表(id + 相對時間 + preview),owner-scoped。
+- **voice-vad-barge-in** — 能量門檻 VAD 端點偵測取代固定秒數、TTS 播放中 barge-in。
+- **grant-access-revoke** — `revoke_access` / `list_access` 工具,授權可收回。
+- **deploy-hardening** — Windows 生命週期動詞 elevation 前置檢查、server/daemon sidecar 佈建對稱、Dockerfile 非 root(uid 10001)。
+- **cli-clipboard-acp-polish** — 可讀配對錯誤、OAuth port fail-fast、install.sh 權限判斷、clipboard 大小上限 + 語言別 mime、ACP `session/load` 合規回應。
 
-主要來自 2026-07-05 的產品體驗稽核(72 項 confirmed;高頻痛點已同日修復,以下是留下的結構性缺口)。
+## 剩餘(should-have)
 
-### 1. defer-until-idle 接上手動 restart 與 fleety-server
+- **fleety status 顯示 sidecar 版本 vs 最新版** — 目前只顯示 sidecar 健康(路徑),未做「本機版本 vs release 最新版」對照。小項。
 
-**現況** `fleety-tools/src/restart.rs` 的 PendingRestart/decide 只有 fleetyd 的自我更新路徑使用;手動 `restart` 動詞(兩個 binary)與 `fleety update` 觸發的 server 重啟都是即時 sc/systemctl,會打斷 in-flight turn(靠 journal recovery 續跑,不遺失,但體驗中斷)。文件已改為照實描述。
+真正未做的多屬 milestone 深度(見下)與待決策略,已無高頻體驗缺口。
 
-**設計** server 維護 in-flight turn 計數;`restart` 與更新觸發的重啟改走 PendingRestart,idle 才真正呼叫 manager restart;`--force` 保留即時路徑。daemon 的「收斂到 server 版本」改為請 server 自行 idle 重啟,而非外部硬砍。
+## Milestone 深度(既定 backlog,非稽核缺陷)
 
-**拒絕條件** 若使用情境幾乎都是單人互動(打斷自己剛好知道),成本效益可能不如把力氣花在 §2。
-
-### 2. 排程結果可見性
-
-**現況** 排程在 unattended 下執行,結果寫進 `schedule-<id>` 對話。`schedule_list` 已帶出 `conversation_id`(2026-07-05),但仍無主動通知:排程失敗只留在 log。
-
-**設計** 最小版:scheduler 把每次 run 的 outcome(成功/失敗+一句摘要)寫回排程檔,`schedule_list` 帶出;理想版:使用者下次連線時把新完成的排程結果當 proactive 訊息投遞。
-
-### 3. TUI 深度
-
-游標輸入編輯(含 CJK 寬度、橫向捲動)、底部錨定捲動、核可 y/n 流程已於 2026-07-05 出貨。剩餘:
-
-- markdown / 程式碼區塊渲染(目前純文字)
-- 斷線自動重連(目前斷線即退出)
-- 取消進行中的生成(需 server 端 turn cancellation,與 §4 共用)
-- 多行輸入(Shift+Enter 換行)
-- 等待中 spinner / tool 執行進度顯示
-
-### 4. Server 端 turn cancellation(供 TUI 取消與 ACP session/cancel)
-
-**現況** ACP 的 session/cancel 是 no-op;TUI 送出後只能等。server 沒有中止 in-flight turn 的機制。
-
-**設計** turn loop 每步檢查 cancellation token;收到 cancel 把已完成的工具結果落地、turn 標記 cancelled、回覆 stop_reason=cancelled。ACP 與 TUI(Esc 或 Ctrl+C 一次=取消、兩次=離開)共用。
-
-### 5. config 值驗證
-
-**現況** `config set` 只驗 key 不驗 value;寫壞的值在下次 boot 被 silent fallback 吃掉(providers.toml 壞檔已改為 error 級日誌)。
-
-**設計** registry 的 Setting 加 validator(enum 白名單 / 數字範圍 / URL scheme),set 與互動編輯共用;無法驗證的 key 保持放行。
-
-## 該做(should-have)
-
-- **provider 編輯器就地編輯** — 目前只能刪掉重建(被 group/role 引用時要連環解綁);TUI 缺 group remove / role unset;逗號分隔單行輸入改欄位式表單。
-- **conversation 列表** — `fleety resume` 已可從 ask/TUI 印出的 conversation id 接續(2026-07-05);補 `fleety conversations`(或 status 帶最近對話)讓列表可發現。
-- **voice 體驗** — 錄音提示已加(2026-07-05);剩 VAD(自動斷句取代固定秒數)與 TTS 播放中打斷(barge-in)。
-- **Windows 服務前置權限檢查** — install/up 在動手前先偵測是否系統管理員,而非 sc create 失敗才報。
-- **容器非 root** — Dockerfile 改 non-root user,避免 bind mount 的 workspace 檔案在宿主端變 root 所有。
-- **fleety status 顯示 sidecar 版本 vs 最新版**(§已出貨殘餘)。
+在 v0 已出貨的能力上仍可加深,已在 `STATUS.md` remaining gaps 追蹤:
+- **M9 browser** — snapshot-ref acting(`browser_tabs`、accessibility-snapshot + ref-based act);目前是 `browser_eval` 原始 JS。
+- **M10 computer-use** — presence gating(「人在用這台 → 警告/節流」),供無人看管控制。
+- **M11 wiki** — raw/distilled/meta 三層結構、frontmatter/wikilink 強制、dedup/lint/MOC、矛盾偵測(目前 convention-only)。
+- **M8 scheduling** — `schedule_show` / `schedule_update`(目前 edit = delete + recreate)。
 
 ## 明確延後或暫不做
 
@@ -73,7 +51,7 @@
 | Mobile client | post-v0 | spec 明確排除;桌機優先 |
 | Multi-user / RBAC | post-v0 | spec 明確排除;單使用者夠 |
 | Web UI / REST API | post-v0 | TUI/CLI 已能完成所有操作 |
-| Credential broker / OAuth broker | post-v0 | 使用者已表態先不做(Codex OAuth 登入已另行出貨) |
+| Credential broker | post-v0 | 使用者已表態先不做(Codex OAuth 登入已出貨) |
 | Encryption-at-rest / key rotation | post-v0 | 主機檔案系統權限已足夠 v0 |
 | LLM 成本追蹤 | post-v0 | 監測類功能,非核心能力 |
 | codebase-memory-mcp 整合 | 條件未滿足 | 需要 device→server file sync,v0 不做 |
@@ -83,18 +61,15 @@
 1. **Presence inference 信號來源**(colocation 上報與 site 記錄已出貨,推論未做)
    - 選項:(a) daemon 主動上報 LAN 鄰居 vs (b) server 主動掃 vs (c) 混合
    - 待決點:回報頻率、假陽性容忍、隱私邊界
-2. **`FLEETY_ADDR` 預設值** — 預設 `127.0.0.1` 讓「跨裝置」開箱即不可達(啟動時已加提示)。改 `0.0.0.0` 是安全取捨:配合 `FLEETY_REQUIRE_AUTH` 預設值一起決定。
-
-已拍板(從舊版待決清單移出):model routing/fallback → `providers.toml` 的 round_robin / failover pool 已出貨;voice 引擎 → whisper.cpp 預設 + `FLEETY_STT_CMD` 模板已出貨。
+2. **`FLEETY_ADDR` 預設值** — 預設 `127.0.0.1` 讓「跨裝置」開箱即不可達(啟動時已加提示、Docker 映像已預設 `0.0.0.0`)。是否改裸機預設為 `0.0.0.0` 是安全取捨,配合 `FLEETY_REQUIRE_AUTH` 預設值一起決定。適合走 `/spectra-discuss`。
 
 ## 建議下一動
 
-**第一順位** §4 turn cancellation。理由:同時解 TUI 取消與 ACP cancel 兩個對外承諾,是唯一需要動 agent loop 的基礎件,越晚做越貴。
-
-**第二順位** §2 排程可見性。理由:無人看管會動手改東西的功能,結果不可見是信任缺口;最小版一天內可交付。
-
-**第三順位** §1 defer-until-idle。理由:文件已照實,承諾債不再誤導;做完後把文件改回「不打斷」。
+高頻體驗缺口已清空。建議依序:
+1. **決定 §待決兩項**(`FLEETY_ADDR` 預設 + presence 信號來源)——純產品決策,擋住 presence 推論這條線。
+2. **milestone 深度**擇一開展(browser snapshot-ref act 對 agent 自動化價值最高;wiki 三層對知識沉澱價值最高)。
+3. **fleety status 版本對照**小項可順手收尾。
 
 ---
 
-_最後更新:2026-07-05,依產品體驗稽核(72 項 confirmed)重排;進度推進或現實對不上,直接改本檔。_
+_最後更新:2026-07-10,產品體驗稽核 backlog 11 個變更全數出貨後重排。進度推進或現實對不上,直接改本檔。_
