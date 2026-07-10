@@ -74,7 +74,13 @@ fn now_unix_secs() -> u64 {
 /// existing (earlier) stamp so repeated requests don't push the deadline out.
 /// Called by the requesting CLI process, not the server.
 pub(crate) fn request_restart(name: &str) -> Result<()> {
-    let path = service::restart_request_path(name);
+    request_restart_at(&service::restart_request_path(name))
+}
+
+/// The path-based core of [`request_restart`], split out so tests can operate on
+/// an explicit path instead of mutating the process-global HOME env (which would
+/// race other crates' tests under `cargo test --workspace`).
+fn request_restart_at(path: &Path) -> Result<()> {
     if path.exists() {
         // A restart is already pending; don't reset its deferral deadline.
         return Ok(());
@@ -83,7 +89,7 @@ pub(crate) fn request_restart(name: &str) -> Result<()> {
         std::fs::create_dir_all(parent)
             .map_err(|e| CoreError::Message(format!("cannot create {}: {e}", parent.display())))?;
     }
-    std::fs::write(&path, now_unix_secs().to_string()).map_err(|e| {
+    std::fs::write(path, now_unix_secs().to_string()).map_err(|e| {
         CoreError::Message(format!(
             "cannot write restart request {}: {e}",
             path.display()
@@ -104,8 +110,13 @@ fn read_request(path: &Path) -> Option<SystemTime> {
 /// restart that has *already* happened (this very start), so acting on it would
 /// loop the service. Best-effort — a failure to clear is logged, not fatal.
 pub(crate) fn clear_stale_request(name: &str) {
-    let path = service::restart_request_path(name);
-    match std::fs::remove_file(&path) {
+    clear_stale_request_at(&service::restart_request_path(name));
+}
+
+/// Path-based core of [`clear_stale_request`] (see [`request_restart_at`] for why
+/// tests take an explicit path).
+fn clear_stale_request_at(path: &Path) {
+    match std::fs::remove_file(path) {
         Ok(()) => tracing::info!("cleared stale restart-request marker at startup"),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => tracing::warn!(%e, "could not clear stale restart-request marker"),
@@ -229,28 +240,27 @@ mod tests {
 
     #[test]
     fn request_written_then_readable_then_cleared() {
-        let home = temp_home("marker");
-        std::env::set_var("HOME", &home);
-        std::env::set_var("USERPROFILE", &home);
-        let name = "fleety-server-test";
-        let path = service::restart_request_path(name);
+        // Operate on an explicit unique path — never mutate the process-global
+        // HOME env, which races other crates' tests under `cargo test --workspace`.
+        let dir = temp_home("marker");
+        let path = dir.join("fleety-server-test.restart-request");
 
         assert!(read_request(&path).is_none(), "no marker yet");
-        request_restart(name).expect("write request");
+        request_restart_at(&path).expect("write request");
         assert!(read_request(&path).is_some(), "marker readable after write");
 
         // A repeat request keeps the same (earlier) stamp: the file is untouched.
         let first = std::fs::read_to_string(&path).expect("read1");
-        request_restart(name).expect("second request");
+        request_restart_at(&path).expect("second request");
         let second = std::fs::read_to_string(&path).expect("read2");
         assert_eq!(first, second, "repeat request must not reset the stamp");
 
-        clear_stale_request(name);
+        clear_stale_request_at(&path);
         assert!(read_request(&path).is_none(), "marker gone after clear");
         // Clearing a missing marker is a no-op (no panic).
-        clear_stale_request(name);
+        clear_stale_request_at(&path);
 
-        let _ = std::fs::remove_dir_all(&home);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---- deferred-restart decision (reuses restart::decide) ----
