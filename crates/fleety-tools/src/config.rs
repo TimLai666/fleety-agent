@@ -484,6 +484,11 @@ pub fn load(path: &std::path::Path) -> ConfigMap {
 
 /// Persist config to `path` (TOML, sectioned by scope).
 pub fn save(path: &std::path::Path, map: &ConfigMap) -> Result<()> {
+    // Serialize all writes: config.toml is written rarely + small, so one lock
+    // across the tmp+rename keeps a concurrent apply from interleaving.
+    static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
     let mut root = toml::Table::new();
     for ((scope, key), value) in map {
         let section = root
@@ -499,8 +504,119 @@ pub fn save(path: &std::path::Path, map: &ConfigMap) -> Result<()> {
     }
     let text = toml::to_string_pretty(&root)
         .map_err(|e| CoreError::Message(format!("serialize config: {e}")))?;
-    std::fs::write(path, text).map_err(|e| CoreError::Message(format!("write config: {e}")))?;
+    // Atomic: write a temp file in the same dir, then rename over the target, so
+    // a crash / concurrent read never sees a half-written config.toml.
+    let tmp_name = format!(".config-{}.tmp", uuid::Uuid::new_v4());
+    let tmp = match path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        Some(d) => d.join(tmp_name),
+        None => std::path::PathBuf::from(tmp_name),
+    };
+    std::fs::write(&tmp, text).map_err(|e| CoreError::Message(format!("write config: {e}")))?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(CoreError::Message(format!("replace config: {e}")));
+    }
     Ok(())
+}
+
+/// Load config, erroring on a present-but-broken file rather than fail-softing
+/// to empty (which the boot-time [`load`] does). Used by the remote-config apply
+/// path so a corrupt `config.toml` is a clear error, not a silent revert to
+/// defaults (design §8, M3).
+pub fn load_strict(path: &std::path::Path) -> Result<ConfigMap> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ConfigMap::new()),
+        Err(e) => return Err(CoreError::Message(format!("cannot read config.toml: {e}"))),
+    };
+    let table = text.parse::<toml::Table>().map_err(|e| {
+        CoreError::Message(format!(
+            "config.toml is present but unparseable ({e}); fix it — the server will not \
+             silently apply defaults over a broken file"
+        ))
+    })?;
+    let mut out = ConfigMap::new();
+    for (section, value) in table {
+        let Some(scope) = Scope::from_str(&section) else {
+            continue;
+        };
+        if let Some(t) = value.as_table() {
+            for (k, v) in t {
+                if let Some(s) = v.as_str() {
+                    out.insert((scope, k.clone()), s.to_string());
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// A revision string for optimistic locking: a stable content hash of the config
+/// file's bytes (a missing/empty file hashes to a fixed marker). Deterministic
+/// across a program run, so a snapshot's revision compared to the current one
+/// detects any concurrent write. The server combines it with its boot id.
+pub fn revision(path: &std::path::Path) -> String {
+    use std::hash::{Hash, Hasher};
+    let bytes = std::fs::read(path).unwrap_or_default();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
+/// A structured snapshot of one setting for the remote-config panel. A secret's
+/// `value` is empty (only `is_set` is reported). The server maps this to the
+/// protocol `ConfigEntry` (keeping this crate protocol-free).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotEntry {
+    pub key: &'static str,
+    pub scope: Scope,
+    pub value: String,
+    pub default: &'static str,
+    pub description: &'static str,
+    pub secret: bool,
+    pub is_set: bool,
+    pub effect: Option<ConfigEffect>,
+    pub choices: Vec<&'static str>,
+}
+
+/// The enumerated valid choices for a setting (a display hint for the panel;
+/// the registry validator remains the source of truth for rejection). Empty for
+/// free-form keys.
+pub fn setting_choices(key: &str) -> Vec<&'static str> {
+    match key {
+        "FLEETY_POLICY" => vec!["full_access", "require_approval"],
+        "FLEETY_FS_SCOPE" => vec!["full", "workspace"],
+        "FLEETY_VOICE_AUDIO" => vec!["auto", "on", "off"],
+        "FLEETY_PRESENCE" => vec!["on", "off"],
+        "FLEETY_MODEL_EFFORT" | "FLEETY_CHEAP_MODEL_EFFORT" => vec!["low", "medium", "high"],
+        "FLEETY_REQUIRE_AUTH" | "FLEETY_AUTO_INSTALL_DEPS" | "FLEETY_FORCE_SSE"
+        | "FLEETY_DISABLE_SSE" => vec!["0", "1"],
+        _ => vec![],
+    }
+}
+
+/// Structured snapshot of the registry settings (optionally filtered to
+/// `scopes`), for the remote-config panel. A secret's value is omitted (only
+/// `is_set`); flat registry keys are env-seeded so their effect is `Restart`.
+pub fn snapshot_entries(map: &ConfigMap, scopes: Option<&[Scope]>) -> Vec<SnapshotEntry> {
+    registry()
+        .iter()
+        .filter(|s| scopes.map(|sc| sc.contains(&s.scope)).unwrap_or(true))
+        .filter_map(|s| {
+            let r = resolve(s.key, map)?;
+            Some(SnapshotEntry {
+                key: s.key,
+                scope: s.scope,
+                value: if s.secret { String::new() } else { r.value },
+                default: s.default,
+                description: s.description,
+                secret: s.secret,
+                is_set: r.source != Source::Default,
+                effect: Some(ConfigEffect::Restart),
+                choices: setting_choices(s.key),
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1425,6 +1541,44 @@ mod tests {
             Some("Asia/Taipei")
         );
         std::env::remove_var("FLEETY_CONFIG");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn snapshot_entries_revision_and_strict_load() {
+        let path = std::env::temp_dir().join(format!("fleety-cfg-{}.toml", uuid::Uuid::new_v4()));
+        std::env::remove_var("FLEETY_TOKEN");
+        std::env::remove_var("FLEETY_POLICY");
+
+        // Snapshot: a secret carries no value, only is_set; enums carry choices.
+        let entries = snapshot_entries(&ConfigMap::new(), None);
+        let tok = entries.iter().find(|e| e.key == "FLEETY_TOKEN").expect("token entry");
+        assert!(tok.secret && tok.value.is_empty() && !tok.is_set, "secret unset, no value");
+        let policy = entries.iter().find(|e| e.key == "FLEETY_POLICY").expect("policy entry");
+        assert_eq!(policy.choices, vec!["full_access", "require_approval"]);
+        assert_eq!(policy.effect, Some(ConfigEffect::Restart));
+
+        // Revision: stable for identical content, changes when content changes.
+        let mut m = ConfigMap::new();
+        save(&path, &m).unwrap();
+        let r1 = revision(&path);
+        assert_eq!(r1, revision(&path), "stable for same content");
+        m.insert((Scope::Server, "FLEETY_POLICY".into()), "require_approval".into());
+        save(&path, &m).unwrap();
+        assert_ne!(revision(&path), r1, "changes when content changes");
+
+        // load_strict round-trips; a broken file errors (not a fail-soft empty).
+        assert_eq!(
+            load_strict(&path)
+                .unwrap()
+                .get(&(Scope::Server, "FLEETY_POLICY".into()))
+                .map(String::as_str),
+            Some("require_approval")
+        );
+        std::fs::write(&path, "{ not toml ::").unwrap();
+        assert!(load_strict(&path).is_err(), "broken file errors under load_strict");
+        assert!(load(&path).is_empty(), "load() stays fail-soft");
         let _ = std::fs::remove_file(&path);
     }
 

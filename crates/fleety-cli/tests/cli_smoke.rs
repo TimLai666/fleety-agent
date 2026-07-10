@@ -70,6 +70,7 @@ fn welcome(token: Option<&str>) -> ServerMsg {
         protocol: PROTOCOL_VERSION,
         server_version: String::new(),
         audio_input: false,
+        config_protocol: 0,
         token: token.map(String::from),
     }
 }

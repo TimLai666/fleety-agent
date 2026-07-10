@@ -1069,7 +1069,8 @@ async fn ask(text: String, attachments: Vec<WireAttachment>) -> Result<()> {
             | Some(ServerMsg::RollbackResult { .. })
             | Some(ServerMsg::ConversationRolled { .. })
             | Some(ServerMsg::ServerStatusResult { .. })
-            | Some(ServerMsg::ConfigResult { .. }) => {}
+            | Some(ServerMsg::ConfigResult { .. })
+            | Some(ServerMsg::ConfigSnapshotResult { .. }) => {}
         }
     }
     // Close the connection gracefully so the server sees a clean disconnect.

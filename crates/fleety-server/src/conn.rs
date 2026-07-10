@@ -622,6 +622,7 @@ async fn serve(
             protocol: PROTOCOL_VERSION,
             server_version: agent_core::VERSION.to_string(),
             audio_input: provider.capabilities().audio,
+            config_protocol: fleety_protocol::CONFIG_PROTOCOL_VERSION,
             token: minted_token,
         },
     )?;
@@ -1456,6 +1457,85 @@ async fn serve(
                     emit(out, &reply)?;
                 }
             }
+            ClientMsg::ConfigSnapshot { target } => {
+                // Structured read of the server's settings for the interactive
+                // panel. Only the Server target is snapshotted here; Local is the
+                // CLI's own job and Device is a follow-up.
+                let reply = match target {
+                    fleety_protocol::ConfigTarget::Server => build_config_snapshot(),
+                    fleety_protocol::ConfigTarget::Local => config_err(
+                        "invalid",
+                        "the local device's settings are edited by the CLI, not snapshotted \
+                         from the server"
+                            .to_string(),
+                        None,
+                    ),
+                    fleety_protocol::ConfigTarget::Device(_) => config_err(
+                        "unsupported",
+                        "per-device config snapshot is not supported yet".to_string(),
+                        None,
+                    ),
+                };
+                emit(out, &reply)?;
+            }
+            ClientMsg::ConfigApply {
+                target,
+                base_revision,
+                changes,
+            } => {
+                let reply = match target {
+                    fleety_protocol::ConfigTarget::Server => {
+                        let (reply, applied, sensitive) =
+                            apply_structured_changes(&base_revision, &changes, auth.required());
+                        // Audit a successful mutation (with any sensitive keys),
+                        // like the ConfigExec path — the audit log is readable via
+                        // `fleety audit`, so record the keys, never their values.
+                        if applied > 0 {
+                            let event = agent_core::Event::ToolResult {
+                                id: "config_apply".to_string(),
+                                result: serde_json::json!({
+                                    "applied": applied,
+                                    "sensitive": sensitive,
+                                }),
+                            };
+                            let _ = storage.append_history(device_id, &event);
+                        }
+                        reply
+                    }
+                    fleety_protocol::ConfigTarget::Local => config_err(
+                        "invalid",
+                        "local settings are applied by the CLI, not over the connection"
+                            .to_string(),
+                        None,
+                    ),
+                    fleety_protocol::ConfigTarget::Device(_) => config_err(
+                        "unsupported",
+                        "per-device config apply is not supported yet".to_string(),
+                        None,
+                    ),
+                };
+                emit(out, &reply)?;
+            }
+            ClientMsg::Unknown => {
+                // A frame this build doesn't recognize (a newer client's additive
+                // frame). Reply with an unsupported error and KEEP the connection
+                // — dropping it would make every future additive frame fatal
+                // (design §8, M4).
+                emit(
+                    out,
+                    &ServerMsg::Error {
+                        error: fleety_protocol::WireError {
+                            kind: "unsupported".to_string(),
+                            message: "this server does not recognize that request frame \
+                                      (it may be from a newer client)"
+                                .to_string(),
+                            remediation: Some(
+                                "update the server, or use a matching client version".to_string(),
+                            ),
+                        },
+                    },
+                )?;
+            }
             ClientMsg::CancelTurn { .. } => {
                 // Reached only when no turn is in flight (the mid-turn select
                 // loop consumes CancelTurn while one runs): ignore silently — a
@@ -1522,6 +1602,200 @@ fn redact_config_args(args: &[String]) -> Vec<String> {
 /// an unauthenticated peer must not be able to reconfigure it. Pure.
 fn remote_mutation_denied(args: &[String], require_auth: bool) -> bool {
     fleety_tools::config::config_effect(args).is_some() && !require_auth
+}
+
+/// A process-unique boot id so a config revision is invalidated across a server
+/// restart (a stale snapshot from a previous boot never silently applies).
+fn boot_id() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| uuid::Uuid::new_v4().simple().to_string())
+}
+
+/// The current config revision (config.toml content hash + boot id) for the
+/// `ConfigApply` optimistic lock.
+fn config_revision() -> String {
+    format!(
+        "{}:{}",
+        fleety_tools::config::revision(&fleety_tools::config::config_path()),
+        boot_id()
+    )
+}
+
+fn wire_effect(e: fleety_tools::config::ConfigEffect) -> fleety_protocol::Effect {
+    match e {
+        fleety_tools::config::ConfigEffect::NextConnection => {
+            fleety_protocol::Effect::NextConnection
+        }
+        fleety_tools::config::ConfigEffect::Restart => fleety_protocol::Effect::Restart,
+    }
+}
+
+/// Keys whose overwrite could redirect data or credentials off-box — changing
+/// one warrants an audit entry (and a client-side confirm).
+fn is_sensitive_key(key: &str) -> bool {
+    matches!(
+        key,
+        "FLEETY_MODEL_KEY"
+            | "FLEETY_MODEL_BASE_URL"
+            | "FLEETY_BACKUP_REPO"
+            | "FLEETY_BACKUP_TOKEN"
+            | "FLEETY_CODEX_AUTHORIZE_URL"
+            | "FLEETY_CODEX_TOKEN_URL"
+            | "FLEETY_CODEX_BACKEND_URL"
+    )
+}
+
+/// Build the structured config snapshot for the `Server` target: registry
+/// settings as `ConfigEntry`s (secrets carry no value, only `is_set`) plus the
+/// structured provider/model config, tagged with the current revision.
+fn build_config_snapshot() -> ServerMsg {
+    let map = fleety_tools::config::load(&fleety_tools::config::config_path());
+    let entries = fleety_tools::config::snapshot_entries(&map, None)
+        .into_iter()
+        .map(|e| fleety_protocol::ConfigEntry {
+            key: e.key.to_string(),
+            scope: e.scope.as_str().to_string(),
+            value: e.value,
+            default: e.default.to_string(),
+            description: e.description.to_string(),
+            secret: e.secret,
+            is_set: e.is_set,
+            effect: e.effect.map(wire_effect),
+            choices: e.choices.iter().map(|c| c.to_string()).collect(),
+        })
+        .collect();
+    // Structured provider/model config (best-effort; "{}" when missing/broken).
+    let providers_json = fleety_tools::providers_config::load()
+        .and_then(|c| serde_json::to_string(&c).ok())
+        .unwrap_or_else(|| "{}".to_string());
+    ServerMsg::ConfigSnapshotResult {
+        revision: config_revision(),
+        entries,
+        providers_json,
+    }
+}
+
+/// A `ConfigResult` error frame with the given kind/message.
+fn config_err(kind: &str, message: String, remediation: Option<String>) -> ServerMsg {
+    ServerMsg::ConfigResult {
+        ok: false,
+        output: String::new(),
+        effect: None,
+        error: Some(fleety_protocol::WireError {
+            kind: kind.to_string(),
+            message,
+            remediation,
+        }),
+    }
+}
+
+/// Apply a structured `ConfigApply` to the server's config.toml: check the
+/// optimistic-lock revision, refuse mutation when auth is off, then apply the
+/// sparse tri-state changes (validate all before writing, one atomic save).
+/// Returns the result plus (applied count, sensitive keys touched) for auditing.
+fn apply_structured_changes(
+    base_revision: &str,
+    changes: &[fleety_protocol::ConfigChange],
+    require_auth: bool,
+) -> (ServerMsg, u32, Vec<String>) {
+    use fleety_protocol::ChangeOp;
+    if base_revision != config_revision() {
+        return (
+            config_err(
+                "conflict",
+                "the server config changed since you loaded it; reload and reapply".to_string(),
+                Some("re-open the panel to fetch the current settings".to_string()),
+            ),
+            0,
+            vec![],
+        );
+    }
+    let mutates = changes.iter().any(|c| !matches!(c.op, ChangeOp::Keep));
+    if mutates && !require_auth {
+        return (
+            config_err(
+                "unauthenticated",
+                "this server does not require authentication, so remote config changes are \
+                 refused — enable auth before changing settings remotely"
+                    .to_string(),
+                Some("set FLEETY_REQUIRE_AUTH=1 on the server and restart".to_string()),
+            ),
+            0,
+            vec![],
+        );
+    }
+    let path = fleety_tools::config::config_path();
+    let mut map = match fleety_tools::config::load_strict(&path) {
+        Ok(m) => m,
+        Err(e) => {
+            let r = e.report();
+            return (config_err(&r.kind, r.message, r.remediation), 0, vec![]);
+        }
+    };
+    let mut applied = 0u32;
+    let mut sensitive = Vec::new();
+    for ch in changes {
+        match ch.op {
+            ChangeOp::Keep => continue,
+            ChangeOp::Set => {
+                let Some(setting) = fleety_tools::config::find(&ch.key) else {
+                    return (
+                        config_err(
+                            "invalid",
+                            format!("unknown setting '{}'", ch.key),
+                            None,
+                        ),
+                        0,
+                        vec![],
+                    );
+                };
+                let v = ch.value.clone().unwrap_or_default();
+                if let Err(e) = fleety_tools::config::validate(setting, &v) {
+                    let r = e.report();
+                    return (config_err(&r.kind, r.message, r.remediation), 0, vec![]);
+                }
+                map.insert((setting.scope, ch.key.clone()), v);
+                if is_sensitive_key(&ch.key) {
+                    sensitive.push(ch.key.clone());
+                }
+                applied += 1;
+            }
+            ChangeOp::Clear => {
+                let Some(setting) = fleety_tools::config::find(&ch.key) else {
+                    return (
+                        config_err(
+                            "invalid",
+                            format!("unknown setting '{}'", ch.key),
+                            None,
+                        ),
+                        0,
+                        vec![],
+                    );
+                };
+                map.remove(&(setting.scope, ch.key.clone()));
+                if is_sensitive_key(&ch.key) {
+                    sensitive.push(ch.key.clone());
+                }
+                applied += 1;
+            }
+        }
+    }
+    if applied > 0 {
+        if let Err(e) = fleety_tools::config::save(&path, &map) {
+            let r = e.report();
+            return (config_err(&r.kind, r.message, r.remediation), 0, vec![]);
+        }
+    }
+    (
+        ServerMsg::ConfigResult {
+            ok: true,
+            output: format!("applied {applied} change(s)"),
+            effect: Some(fleety_protocol::Effect::Restart),
+            error: None,
+        },
+        applied,
+        sensitive,
+    )
 }
 
 /// Run a remote `config` request against this (the server's) own config files
@@ -2942,6 +3216,101 @@ mod tests {
 
         std::env::remove_var("FLEETY_CONFIG");
         std::env::remove_var("FLEETY_PROVIDERS");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn structured_snapshot_omits_secret_values_and_tags_revision() {
+        let dir = std::env::temp_dir().join(format!("fleety-snap-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::env::set_var("FLEETY_CONFIG", dir.join("config.toml"));
+        std::env::set_var("FLEETY_PROVIDERS", dir.join("providers.toml"));
+        std::env::remove_var("FLEETY_TOKEN");
+
+        match build_config_snapshot() {
+            ServerMsg::ConfigSnapshotResult {
+                revision,
+                entries,
+                providers_json,
+            } => {
+                assert!(revision.contains(':'), "revision carries the boot id: {revision}");
+                let tok = entries.iter().find(|e| e.key == "FLEETY_TOKEN").expect("token entry");
+                assert!(tok.secret && tok.value.is_empty(), "secret value omitted");
+                assert!(
+                    serde_json::from_str::<serde_json::Value>(&providers_json).is_ok(),
+                    "providers_json parses"
+                );
+            }
+            other => panic!("expected ConfigSnapshotResult, got {other:?}"),
+        }
+        std::env::remove_var("FLEETY_CONFIG");
+        std::env::remove_var("FLEETY_PROVIDERS");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn structured_apply_lock_tristate_auth_and_sensitive() {
+        use fleety_protocol::{ChangeOp, ConfigChange};
+        let dir = std::env::temp_dir().join(format!("fleety-apply-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("config.toml");
+        std::env::set_var("FLEETY_CONFIG", &path);
+        std::env::remove_var("FLEETY_POLICY");
+        let set = |key: &str, v: &str| ConfigChange {
+            key: key.into(),
+            op: ChangeOp::Set,
+            value: Some(v.into()),
+        };
+
+        // Stale base_revision → conflict, nothing applied.
+        let (r, applied, _) =
+            apply_structured_changes("stale:rev", &[set("FLEETY_POLICY", "require_approval")], true);
+        assert!(
+            matches!(&r, ServerMsg::ConfigResult { ok: false, error: Some(e), .. } if e.kind == "conflict")
+        );
+        assert_eq!(applied, 0);
+
+        // Correct revision + auth on → the Set applies (validated, atomic save).
+        let rev = config_revision();
+        let (r, applied, _) =
+            apply_structured_changes(&rev, &[set("FLEETY_POLICY", "require_approval")], true);
+        assert!(matches!(r, ServerMsg::ConfigResult { ok: true, .. }));
+        assert_eq!(applied, 1);
+        assert_eq!(
+            fleety_tools::config::load_strict(&path)
+                .unwrap()
+                .get(&(fleety_tools::config::Scope::Server, "FLEETY_POLICY".into()))
+                .map(String::as_str),
+            Some("require_approval")
+        );
+
+        // Auth off + a mutating change → refused (unauthenticated).
+        let (r, _, _) =
+            apply_structured_changes(&config_revision(), &[set("FLEETY_TZ", "Asia/Taipei")], false);
+        assert!(
+            matches!(&r, ServerMsg::ConfigResult { ok: false, error: Some(e), .. } if e.kind == "unauthenticated")
+        );
+        // Auth off + a Keep-only apply (no mutation) → allowed no-op.
+        let (r, applied, _) = apply_structured_changes(
+            &config_revision(),
+            &[ConfigChange {
+                key: "FLEETY_TZ".into(),
+                op: ChangeOp::Keep,
+                value: None,
+            }],
+            false,
+        );
+        assert!(matches!(r, ServerMsg::ConfigResult { ok: true, .. }));
+        assert_eq!(applied, 0);
+
+        // A sensitive key is reported for auditing.
+        let (_, _, sensitive) =
+            apply_structured_changes(&config_revision(), &[set("FLEETY_MODEL_KEY", "sk-x")], true);
+        assert_eq!(sensitive, vec!["FLEETY_MODEL_KEY".to_string()]);
+
+        std::env::remove_var("FLEETY_CONFIG");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

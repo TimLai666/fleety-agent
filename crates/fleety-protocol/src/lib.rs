@@ -9,7 +9,13 @@
 use serde::{Deserialize, Serialize};
 
 /// Bumped when the wire format changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 0;
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// The structured-config protocol version the server advertises in `Welcome`
+/// (`0` = only the legacy `ConfigExec`). A client compares this to decide
+/// whether to use `ConfigSnapshot`/`ConfigApply` or fall back. Additive — an
+/// older server omits it and the client sees `0`.
+pub const CONFIG_PROTOCOL_VERSION: u32 = 1;
 
 /// Wire form of an actionable error (mirrors `agent_core::ErrorReport`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -86,6 +92,45 @@ pub enum Effect {
     NextConnection,
     /// Needs a server restart (flat settings seeded into env at boot).
     Restart,
+}
+
+/// A single setting in a structured config snapshot (design §8): enough for a
+/// client to render and edit it without parsing rendered text. A secret's
+/// `value` is empty and only `is_set` is meaningful.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConfigEntry {
+    pub key: String,
+    pub scope: String,
+    #[serde(default)]
+    pub value: String,
+    pub default: String,
+    pub description: String,
+    pub secret: bool,
+    pub is_set: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect: Option<Effect>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub choices: Vec<String>,
+}
+
+/// How one config change applies (secret tri-state, design §8): `Keep` leaves a
+/// setting untouched (so a masked secret is never rewritten), `Set` writes the
+/// change's `value`, `Clear` reverts it to env/default.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeOp {
+    Keep,
+    Set,
+    Clear,
+}
+
+/// One change in a `ConfigApply` — sparse, only touched keys are sent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConfigChange {
+    pub key: String,
+    pub op: ChangeOp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
 }
 
 /// Frames sent client -> server over the WebSocket.
@@ -218,6 +263,24 @@ pub enum ClientMsg {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         peers: Vec<String>,
     },
+    /// Pull the target host's settings as a structured snapshot (reply:
+    /// `ConfigSnapshotResult`) — the structured counterpart to `ConfigExec list`.
+    ConfigSnapshot { target: ConfigTarget },
+    /// Apply a sparse set of config changes under optimistic locking:
+    /// `base_revision` is the revision of the snapshot the edit started from; the
+    /// server rejects the apply as a conflict if it no longer matches (no lost
+    /// update). Reply: `ConfigResult`.
+    ConfigApply {
+        target: ConfigTarget,
+        base_revision: String,
+        changes: Vec<ConfigChange>,
+    },
+    /// Any frame this build does not recognize. `#[serde(other)]` routes an
+    /// unknown `type` here instead of failing to parse — so a newer peer's
+    /// additive frame is answered with an `unsupported` error rather than
+    /// dropping the connection (design §8, M4).
+    #[serde(other)]
+    Unknown,
 }
 
 /// Frames sent server -> client over the WebSocket.
@@ -241,6 +304,11 @@ pub enum ServerMsg {
         /// Additive; `false` when an older server omits it (→ local STT).
         #[serde(default)]
         audio_input: bool,
+        /// The structured-config protocol the server supports (see
+        /// [`CONFIG_PROTOCOL_VERSION`]). Additive; `0` when an older server omits
+        /// it, so the client falls back to the legacy `ConfigExec`.
+        #[serde(default)]
+        config_protocol: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         token: Option<String>,
     },
@@ -350,6 +418,15 @@ pub enum ServerMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<WireError>,
     },
+    /// Reply to `ConfigSnapshot`: the target's settings as structured entries
+    /// plus the structured provider/model config, tagged with a `revision` for
+    /// optimistic-locked `ConfigApply`.
+    ConfigSnapshotResult {
+        revision: String,
+        entries: Vec<ConfigEntry>,
+        /// JSON-encoded structured provider/model config (providers.toml shape).
+        providers_json: String,
+    },
 }
 
 #[cfg(test)]
@@ -397,25 +474,89 @@ mod tests {
             protocol: PROTOCOL_VERSION,
             server_version: "0.3.0".into(),
             audio_input: true,
+            config_protocol: CONFIG_PROTOCOL_VERSION,
             token: None,
         };
         let json = serde_json::to_string(&w).expect("ser");
         assert!(json.contains("\"server_version\":\"0.3.0\""));
         assert!(json.contains("\"audio_input\":true"));
-        // An old server's frame (no server_version / audio_input) still parses
-        // → defaults ("" and false → local STT).
+        assert!(json.contains("\"config_protocol\":1"));
+        // An old server's frame (no server_version / audio_input / config_protocol)
+        // still parses → defaults ("" / false / 0 → legacy ConfigExec + local STT).
         let old = r#"{"type":"welcome","session_id":"s","conversation_id":"c","protocol":0}"#;
         match serde_json::from_str::<ServerMsg>(old).expect("de old") {
             ServerMsg::Welcome {
                 server_version,
                 audio_input,
+                config_protocol,
                 ..
             } => {
                 assert_eq!(server_version, "");
                 assert!(!audio_input);
+                assert_eq!(config_protocol, 0);
             }
             _ => panic!("not welcome"),
         }
+    }
+
+    #[test]
+    fn structured_config_frames_roundtrip_and_tolerate_unknown() {
+        // ConfigSnapshot / ConfigApply / ConfigSnapshotResult round-trip.
+        let snap = ClientMsg::ConfigSnapshot {
+            target: ConfigTarget::Server,
+        };
+        let back: ClientMsg =
+            serde_json::from_str(&serde_json::to_string(&snap).expect("ser")).expect("de");
+        assert_eq!(back, snap);
+
+        let apply = ClientMsg::ConfigApply {
+            target: ConfigTarget::Server,
+            base_revision: "rev-1".into(),
+            changes: vec![
+                ConfigChange {
+                    key: "FLEETY_POLICY".into(),
+                    op: ChangeOp::Set,
+                    value: Some("require_approval".into()),
+                },
+                ConfigChange {
+                    key: "FLEETY_TOKEN".into(),
+                    op: ChangeOp::Keep,
+                    value: None,
+                },
+            ],
+        };
+        assert_eq!(
+            serde_json::from_str::<ClientMsg>(&serde_json::to_string(&apply).expect("ser"))
+                .expect("de"),
+            apply
+        );
+
+        let result = ServerMsg::ConfigSnapshotResult {
+            revision: "rev-1".into(),
+            entries: vec![ConfigEntry {
+                key: "FLEETY_TOKEN".into(),
+                scope: "server".into(),
+                value: String::new(), // a secret carries no value
+                default: String::new(),
+                description: "bootstrap admin token".into(),
+                secret: true,
+                is_set: true,
+                effect: Some(Effect::Restart),
+                choices: vec![],
+            }],
+            providers_json: "{}".into(),
+        };
+        let rt: ServerMsg =
+            serde_json::from_str(&serde_json::to_string(&result).expect("ser")).expect("de");
+        assert_eq!(rt, result);
+
+        // An unknown client frame type deserializes to Unknown (does not error),
+        // so the server can reply "unsupported" instead of dropping the link.
+        let unknown = r#"{"type":"some_future_frame","field":1}"#;
+        assert_eq!(
+            serde_json::from_str::<ClientMsg>(unknown).expect("unknown parses"),
+            ClientMsg::Unknown
+        );
     }
 
     #[test]
@@ -629,7 +770,7 @@ mod tests {
         assert_eq!(reply, serde_json::from_str(&json).expect("de"));
 
         // Additive: the new variant doesn't disturb an existing frame's shape.
-        assert_eq!(PROTOCOL_VERSION, 0);
+        assert_eq!(PROTOCOL_VERSION, 1);
     }
 
     #[test]
@@ -667,7 +808,7 @@ mod tests {
         assert_eq!(msg, serde_json::from_str(&json).expect("deserialize"));
         // Additive: an older stream without this variant still parses other
         // ServerMsg variants, and the version is unchanged.
-        assert_eq!(PROTOCOL_VERSION, 0);
+        assert_eq!(PROTOCOL_VERSION, 1);
     }
 
     #[test]
@@ -702,7 +843,7 @@ mod tests {
             _ => panic!("expected UserMessage"),
         }
         // Protocol version unchanged (additive field).
-        assert_eq!(PROTOCOL_VERSION, 0);
+        assert_eq!(PROTOCOL_VERSION, 1);
     }
 
     #[test]
