@@ -134,3 +134,54 @@ code:
   - crates/fleety-daemon/src/service.rs
   - crates/fleety-daemon/src/provision.rs
 -->
+
+---
+### Requirement: Install provisions the insyra sidecar symmetrically
+
+fleety-server and fleetyd SHALL both provision the fleety-insyra data-analysis sidecar as part of their install/up lifecycle command, best-effort, so the install-time behavior is symmetric across the two binaries. When provisioning fails, each binary SHALL print a console note stating that on-host data analysis (insyra_exec) will be unavailable until a later `update` succeeds. A sidecar provisioning failure SHALL NOT fail the install/up command.
+
+#### Scenario: server up provisions the sidecar
+
+- **WHEN** the user runs `fleety-server up` (or `install`) on a supported platform with network access
+- **THEN** the fleety-insyra sidecar is provisioned next to the server executable as part of the command, matching fleetyd's install behavior
+
+#### Scenario: sidecar provisioning failure warns but install still succeeds
+
+- **WHEN** the sidecar cannot be provisioned during install/up (e.g. the device is offline)
+- **THEN** the command prints a console note that insyra_exec will be unavailable until a later update succeeds, and the install/up command still completes successfully
+
+<!-- @trace
+source: deploy-hardening
+updated: 2026-07-10
+code:
+  - crates/fleety-cli/src/main.rs
+  - docs/env.md
+  - crates/fleety-server/src/storage.rs
+  - crates/fleety-server/src/conn.rs
+  - crates/fleety-tools/src/service.rs
+  - crates/fleety-cli/src/provider_tui.rs
+  - crates/fleety-server/src/service.rs
+  - crates/fleety-cli/src/config.rs
+  - crates/fleety-server/src/restart_watch.rs
+  - crates/fleety-server/src/scheduler.rs
+  - crates/fleety-tools/src/config.rs
+  - Dockerfile
+  - scripts/install.sh
+  - README.md
+  - crates/fleety-cli/src/auth.rs
+  - crates/fleety-cli/src/voice.rs
+  - crates/fleety-server/src/privacy.rs
+  - crates/fleety-server/src/schedules.rs
+  - crates/fleety-server/src/main.rs
+  - crates/fleety-cli/src/clipboard.rs
+  - crates/fleety-daemon/src/service.rs
+  - crates/fleety-cli/src/tui.rs
+  - crates/fleety-protocol/src/lib.rs
+  - crates/fleety-cli/src/markdown.rs
+  - crates/fleety-daemon/src/main.rs
+  - crates/fleety-cli/src/acp.rs
+  - crates/fleety-server/src/identity.rs
+  - crates/fleety-cli/src/input.rs
+tests:
+  - crates/fleety-cli/tests/cli_smoke.rs
+-->

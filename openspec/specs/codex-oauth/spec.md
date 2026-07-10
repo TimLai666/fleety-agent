@@ -211,3 +211,54 @@ code:
   - crates/fleety-server/src/scheduler.rs
   - crates/fleety-tools/src/providers_config.rs
 -->
+
+---
+### Requirement: Login fails fast on an unavailable loopback port
+
+Because the Codex OAuth redirect URI is registered to a fixed loopback port, `fleety auth login` SHALL check that the port is available before opening the browser, and when it is already in use SHALL abort with an actionable message that states the fixed-port constraint and how to resolve it (free the port or close a stuck prior login, then retry), instead of sending the user through authorization only to fail at the redirect. The check SHALL NOT print token values and SHALL leave any existing stored tokens untouched.
+
+#### Scenario: busy port aborts before the browser opens
+
+- **WHEN** the fixed OAuth loopback port is already in use and the user runs login
+- **THEN** the CLI aborts before opening the browser with an actionable message that explains the fixed-port requirement and how to free the port
+
+#### Scenario: free port proceeds normally
+
+- **WHEN** the fixed OAuth loopback port is available
+- **THEN** login opens the browser and captures the authorization code as before
+
+<!-- @trace
+source: cli-clipboard-acp-polish
+updated: 2026-07-10
+code:
+  - crates/fleety-server/src/conn.rs
+  - crates/fleety-server/src/storage.rs
+  - crates/fleety-cli/src/input.rs
+  - crates/fleety-cli/src/acp.rs
+  - crates/fleety-server/src/service.rs
+  - crates/fleety-cli/src/markdown.rs
+  - crates/fleety-tools/src/config.rs
+  - crates/fleety-cli/src/config.rs
+  - docs/env.md
+  - crates/fleety-server/src/restart_watch.rs
+  - Dockerfile
+  - crates/fleety-server/src/schedules.rs
+  - crates/fleety-cli/src/voice.rs
+  - crates/fleety-protocol/src/lib.rs
+  - crates/fleety-cli/src/provider_tui.rs
+  - crates/fleety-daemon/src/service.rs
+  - crates/fleety-daemon/src/main.rs
+  - crates/fleety-server/src/main.rs
+  - crates/fleety-server/src/identity.rs
+  - crates/fleety-cli/src/tui.rs
+  - crates/fleety-server/src/scheduler.rs
+  - crates/fleety-tools/src/service.rs
+  - crates/fleety-server/src/privacy.rs
+  - scripts/install.sh
+  - crates/fleety-cli/src/main.rs
+  - README.md
+  - crates/fleety-cli/src/auth.rs
+  - crates/fleety-cli/src/clipboard.rs
+tests:
+  - crates/fleety-cli/tests/cli_smoke.rs
+-->

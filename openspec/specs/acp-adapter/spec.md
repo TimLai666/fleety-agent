@@ -197,3 +197,54 @@ code:
   - crates/fleety-cli/src/acp.rs
   - crates/fleety-cli/src/main.rs
 -->
+
+---
+### Requirement: session/load returns a conformant ACP response
+
+The adapter's `session/load` handler SHALL reply with a well-formed ACP `LoadSessionResponse` for the negotiated protocol version, sent after the mapped conversation's history is replayed as `session/update` notifications. The response SHALL be constructed from the ACP `LoadSessionResponse` shape the adapter targets rather than an arbitrary empty object, and SHALL be accepted by a conformant editor (verified end-to-end against Zed). A load failure SHALL return a JSON-RPC internal-error response and SHALL NOT crash the adapter.
+
+#### Scenario: load replies with a conformant response
+
+- **WHEN** the editor calls `session/load` for a known session and the history replay completes
+- **THEN** the adapter returns a well-formed ACP `LoadSessionResponse` that a conformant editor accepts, after the `session/update` replay notifications
+
+#### Scenario: load failure is a clean error
+
+- **WHEN** the mapped server conversation cannot be resumed
+- **THEN** the adapter returns a JSON-RPC internal-error response and keeps running, writing nothing non-protocol to stdout
+
+<!-- @trace
+source: cli-clipboard-acp-polish
+updated: 2026-07-10
+code:
+  - crates/fleety-server/src/conn.rs
+  - crates/fleety-server/src/storage.rs
+  - crates/fleety-cli/src/input.rs
+  - crates/fleety-cli/src/acp.rs
+  - crates/fleety-server/src/service.rs
+  - crates/fleety-cli/src/markdown.rs
+  - crates/fleety-tools/src/config.rs
+  - crates/fleety-cli/src/config.rs
+  - docs/env.md
+  - crates/fleety-server/src/restart_watch.rs
+  - Dockerfile
+  - crates/fleety-server/src/schedules.rs
+  - crates/fleety-cli/src/voice.rs
+  - crates/fleety-protocol/src/lib.rs
+  - crates/fleety-cli/src/provider_tui.rs
+  - crates/fleety-daemon/src/service.rs
+  - crates/fleety-daemon/src/main.rs
+  - crates/fleety-server/src/main.rs
+  - crates/fleety-server/src/identity.rs
+  - crates/fleety-cli/src/tui.rs
+  - crates/fleety-server/src/scheduler.rs
+  - crates/fleety-tools/src/service.rs
+  - crates/fleety-server/src/privacy.rs
+  - scripts/install.sh
+  - crates/fleety-cli/src/main.rs
+  - README.md
+  - crates/fleety-cli/src/auth.rs
+  - crates/fleety-cli/src/clipboard.rs
+tests:
+  - crates/fleety-cli/tests/cli_smoke.rs
+-->
