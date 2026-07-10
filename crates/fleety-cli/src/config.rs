@@ -76,7 +76,9 @@ pub fn run(args: &[String]) -> Result<()> {
     if matches!(config::parse(args), config::Command::Edit) && std::io::stdout().is_terminal() {
         run_tui_edit(&config::config_path())
     } else {
-        config::run(args)
+        // The CLI's config path is always the *local* target (main.rs routes
+        // remote via config_remote), so restrict it to this device's scopes.
+        config::run_scoped(args, Some(config::LOCAL_SCOPES))
     }
 }
 
@@ -100,8 +102,11 @@ fn source_label(s: Source) -> &'static str {
 }
 
 fn build_rows(map: &ConfigMap) -> Vec<Row> {
+    // The local edit screen shows only this device's own settings (Cli/Shared);
+    // server/daemon settings are edited on their own hosts.
     config::registry()
         .iter()
+        .filter(|s| config::LOCAL_SCOPES.contains(&s.scope))
         .filter_map(|s| {
             let r = config::resolve(s.key, map)?;
             Some(Row {
@@ -337,12 +342,12 @@ mod tests {
 
         // Drive the edit assertions on a key with no validator so the committed
         // value isn't rejected by write validation (that path has its own test
-        // below). `FLEETY_MODEL` is a free-form model name.
+        // below). `FLEETY_TZ` is a free-form (Shared-scope) timezone.
         app.sel = app
             .rows
             .iter()
-            .position(|r| r.key == "FLEETY_MODEL")
-            .expect("FLEETY_MODEL present");
+            .position(|r| r.key == "FLEETY_TZ")
+            .expect("FLEETY_TZ present");
         let key0 = app.rows[app.sel].key;
         let setting = config::find(key0).expect("known");
 
@@ -379,13 +384,14 @@ mod tests {
     #[test]
     fn config_tui_rejects_invalid_value() {
         let mut app = ConfigApp::new(ConfigMap::new());
-        // Select a validated key (FLEETY_REQUIRE_AUTH accepts only 0/1).
+        // Select a validated local-scope key (FLEETY_AUTO_INSTALL_DEPS is Shared
+        // and accepts only 0/1).
         app.sel = app
             .rows
             .iter()
-            .position(|r| r.key == "FLEETY_REQUIRE_AUTH")
-            .expect("FLEETY_REQUIRE_AUTH present");
-        let setting = config::find("FLEETY_REQUIRE_AUTH").expect("known");
+            .position(|r| r.key == "FLEETY_AUTO_INSTALL_DEPS")
+            .expect("FLEETY_AUTO_INSTALL_DEPS present");
+        let setting = config::find("FLEETY_AUTO_INSTALL_DEPS").expect("known");
 
         // Type an out-of-domain value and commit it.
         on_key(&mut app, KeyCode::Enter);
@@ -400,11 +406,11 @@ mod tests {
         assert!(
             !app
                 .map
-                .contains_key(&(setting.scope, "FLEETY_REQUIRE_AUTH".to_string())),
+                .contains_key(&(setting.scope, "FLEETY_AUTO_INSTALL_DEPS".to_string())),
             "the rejected value must not enter the map"
         );
         assert!(
-            app.status.contains("FLEETY_REQUIRE_AUTH"),
+            app.status.contains("FLEETY_AUTO_INSTALL_DEPS"),
             "status: {}",
             app.status
         );
@@ -412,6 +418,25 @@ mod tests {
             app.status.contains('0') && app.status.contains('1'),
             "status should list the accepted 0/1 values, got: {}",
             app.status
+        );
+    }
+
+    #[test]
+    fn build_rows_is_local_scope_only() {
+        let rows = build_rows(&ConfigMap::new());
+        assert!(!rows.is_empty());
+        for r in &rows {
+            assert!(
+                r.scope == "cli" || r.scope == "shared",
+                "local edit rows are Cli/Shared only, got {} [{}]",
+                r.key,
+                r.scope
+            );
+        }
+        assert!(rows.iter().any(|r| r.key == "FLEETY_TZ"), "a Shared key is present");
+        assert!(
+            !rows.iter().any(|r| r.key == "FLEETY_ADDR"),
+            "a Server key is excluded"
         );
     }
 

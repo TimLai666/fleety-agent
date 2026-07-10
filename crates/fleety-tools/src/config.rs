@@ -653,8 +653,19 @@ fn source_label(s: Source) -> &'static str {
 
 /// Display rows for `list`: (key, scope, shown value [secrets masked], source).
 pub fn rows(map: &ConfigMap) -> Vec<(String, String, String, String)> {
+    rows_in_scopes(map, &[Scope::Server, Scope::Daemon, Scope::Cli, Scope::Shared])
+}
+
+/// The scopes a local CLI edits — its own device behavior. Server/Daemon
+/// settings are edited on their own hosts (the server remotely, the daemon via
+/// `fleetyd config`), not through `fleety config --target local`.
+pub const LOCAL_SCOPES: &[Scope] = &[Scope::Cli, Scope::Shared];
+
+/// Display rows restricted to `scopes` (same shape as [`rows`]).
+pub fn rows_in_scopes(map: &ConfigMap, scopes: &[Scope]) -> Vec<(String, String, String, String)> {
     registry()
         .iter()
+        .filter(|s| scopes.contains(&s.scope))
         .filter_map(|s| {
             let r = resolve(s.key, map)?;
             Some((
@@ -667,9 +678,39 @@ pub fn rows(map: &ConfigMap) -> Vec<(String, String, String, String)> {
         .collect()
 }
 
-/// Run a `config` subcommand against the config file. `edit` is the line-based
-/// loop; the CLI overrides `edit` with a ratatui screen when stdout is a TTY.
+/// Reject editing `key` when it isn't in `scopes` — it belongs to another host.
+/// The error names where to edit it (the server, or the daemon) so a local
+/// `--target local` edit of a foreign key is redirected, not silently a no-op.
+/// An unknown key gets the usual unknown-setting error.
+pub fn ensure_scope(key: &str, scopes: &[Scope]) -> Result<()> {
+    match find(key) {
+        Some(s) if scopes.contains(&s.scope) => Ok(()),
+        Some(s) => {
+            let where_to = match s.scope {
+                Scope::Server => "on the server (the default `fleety config set` targets it)",
+                Scope::Daemon => "on the daemon with `fleetyd config set`",
+                Scope::Cli | Scope::Shared => "locally",
+            };
+            Err(CoreError::Message(format!(
+                "'{key}' is a {} setting — edit it {where_to}, not via `--target local`",
+                s.scope.as_str()
+            )))
+        }
+        None => Err(CoreError::Message(format!("unknown setting '{key}'"))),
+    }
+}
+
+/// Run a `config` subcommand against the config file (unfiltered — server/daemon
+/// on their own hosts). `edit` is the line-based loop; the CLI overrides `edit`
+/// with a ratatui screen when stdout is a TTY.
 pub fn run(args: &[String]) -> Result<()> {
+    run_scoped(args, None)
+}
+
+/// Like [`run`] but restricting the flat-key subcommands to `scopes` when
+/// `Some` — the CLI's local target passes [`LOCAL_SCOPES`] so it edits only this
+/// device's own settings. `None` is unfiltered (server/daemon on their host).
+pub fn run_scoped(args: &[String], scopes: Option<&[Scope]>) -> Result<()> {
     // Interactive flat-key edit stays local + line-based; everything else
     // renders to text (so the same code serves the remote handler).
     let is_providers = matches!(
@@ -679,7 +720,7 @@ pub fn run(args: &[String]) -> Result<()> {
     if !is_providers && matches!(parse(args), Command::Edit) {
         return edit_line_based(&config_path());
     }
-    let out = run_rendered(args)?;
+    let out = run_rendered_scoped(args, scopes)?;
     let out = out.trim_end_matches('\n');
     if !out.is_empty() {
         println!("{out}");
@@ -688,10 +729,16 @@ pub fn run(args: &[String]) -> Result<()> {
 }
 
 /// Run a `config` subcommand and return its rendered text instead of printing,
-/// so the remote handler can send it over the wire. `provider`/`group`/`role`
-/// manage the structured providers.toml; everything else is the flat-key
-/// registry. `edit` is interactive and has no rendered form (an error here).
+/// so the remote handler can send it over the wire (unfiltered — all scopes).
 pub fn run_rendered(args: &[String]) -> Result<String> {
+    run_rendered_scoped(args, None)
+}
+
+/// Like [`run_rendered`] but restricting the flat-key subcommands to `scopes`
+/// when `Some`: `list` shows only those scopes, and `get`/`set`/`unset` of a
+/// key outside them is refused (see [`ensure_scope`]). `provider`/`model`
+/// manage the structured providers.toml; `edit` is interactive (an error here).
+pub fn run_rendered_scoped(args: &[String], scopes: Option<&[Scope]>) -> Result<String> {
     if matches!(
         args.first().map(String::as_str),
         Some("provider" | "model")
@@ -702,8 +749,17 @@ pub fn run_rendered(args: &[String]) -> Result<String> {
     Ok(match parse(args) {
         Command::List => {
             let map = load(&path);
-            let mut out = String::from("Settings (env → config → default; secrets masked):\n\n");
-            for (key, scope, value, source) in rows(&map) {
+            let displayed = match scopes {
+                Some(sc) => rows_in_scopes(&map, sc),
+                None => rows(&map),
+            };
+            let header = if scopes.is_some() {
+                "This device's settings (env → config → default; secrets masked):\n\n"
+            } else {
+                "Settings (env → config → default; secrets masked):\n\n"
+            };
+            let mut out = String::from(header);
+            for (key, scope, value, source) in displayed {
                 out.push_str(&format!("  [{scope:6}] {key:<26} = {value}  ({source})\n"));
             }
             out.push_str(&format!(
@@ -713,6 +769,9 @@ pub fn run_rendered(args: &[String]) -> Result<String> {
             out
         }
         Command::Get(key) => {
+            if let Some(sc) = scopes {
+                ensure_scope(&key, sc)?;
+            }
             let setting =
                 find(&key).ok_or_else(|| CoreError::Message(format!("unknown setting '{key}'")))?;
             let map = load(&path);
@@ -726,6 +785,9 @@ pub fn run_rendered(args: &[String]) -> Result<String> {
             }
         }
         Command::Set(key, value) => {
+            if let Some(sc) = scopes {
+                ensure_scope(&key, sc)?;
+            }
             let setting = find(&key).ok_or_else(|| {
                 CoreError::Message(format!(
                     "unknown setting '{key}'. Run `config list` to see valid keys."
@@ -756,6 +818,9 @@ pub fn run_rendered(args: &[String]) -> Result<String> {
             out
         }
         Command::Unset(key) => {
+            if let Some(sc) = scopes {
+                ensure_scope(&key, sc)?;
+            }
             let setting =
                 find(&key).ok_or_else(|| CoreError::Message(format!("unknown setting '{key}'")))?;
             let mut map = load(&path);
@@ -1313,6 +1378,54 @@ mod tests {
     fn unknown_key_is_rejected() {
         assert!(find("FLEETY_NOPE").is_none());
         assert!(find("FLEETY_ADDR").is_some());
+    }
+
+    #[test]
+    fn rows_in_scopes_and_ensure_scope_restrict_to_local() {
+        // rows_in_scopes lists only the requested scopes.
+        let rows = rows_in_scopes(&ConfigMap::new(), LOCAL_SCOPES);
+        assert!(rows.iter().all(|(_, scope, _, _)| scope == "cli" || scope == "shared"));
+        assert!(rows.iter().any(|(k, _, _, _)| k == "FLEETY_VOICE_AUDIO")); // a Cli key
+        assert!(!rows.iter().any(|(k, _, _, _)| k == "FLEETY_ADDR")); // a Server key excluded
+        // ensure_scope: a Cli/Shared key passes; a Server/Daemon key is refused
+        // with direction; an unknown key is the usual unknown error.
+        assert!(ensure_scope("FLEETY_VOICE_AUDIO", LOCAL_SCOPES).is_ok());
+        assert!(ensure_scope("FLEETY_TZ", LOCAL_SCOPES).is_ok());
+        let err = ensure_scope("FLEETY_ADDR", LOCAL_SCOPES).unwrap_err().to_string();
+        assert!(err.contains("server"), "server key redirected: {err}");
+        let derr = ensure_scope("FLEETY_DEVICE_ID", LOCAL_SCOPES).unwrap_err().to_string();
+        assert!(derr.contains("daemon"), "daemon key redirected: {derr}");
+        assert!(ensure_scope("FLEETY_NOPE", LOCAL_SCOPES).is_err());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn run_rendered_scoped_local_hides_and_guards_server_keys() {
+        let path = std::env::temp_dir().join(format!("fleety-cfg-{}.toml", uuid::Uuid::new_v4()));
+        std::env::set_var("FLEETY_CONFIG", &path);
+        std::env::remove_var("FLEETY_ADDR");
+        let v = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // Local list omits Server keys, includes Cli/Shared.
+        let list = run_rendered_scoped(&v(&["list"]), Some(LOCAL_SCOPES)).unwrap();
+        assert!(!list.contains("FLEETY_ADDR"), "server key hidden: {list}");
+        assert!(list.contains("FLEETY_TZ"), "shared key shown: {list}");
+        // Unfiltered list (server/daemon) still shows everything.
+        assert!(run_rendered_scoped(&v(&["list"]), None).unwrap().contains("FLEETY_ADDR"));
+        // Local set of a Server key is refused and writes nothing.
+        assert!(
+            run_rendered_scoped(&v(&["set", "FLEETY_ADDR", "0.0.0.0:8787"]), Some(LOCAL_SCOPES))
+                .is_err()
+        );
+        assert!(!path.exists(), "a refused local set must not create the file");
+        // Local set of a Shared key works.
+        run_rendered_scoped(&v(&["set", "FLEETY_TZ", "Asia/Taipei"]), Some(LOCAL_SCOPES)).unwrap();
+        assert_eq!(
+            load(&path).get(&(Scope::Shared, "FLEETY_TZ".to_string())).map(String::as_str),
+            Some("Asia/Taipei")
+        );
+        std::env::remove_var("FLEETY_CONFIG");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
