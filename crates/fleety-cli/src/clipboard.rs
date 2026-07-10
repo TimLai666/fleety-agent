@@ -64,17 +64,18 @@ pub fn read() -> ClipboardPaste {
 
     // Drag-drop on most desktops translates to "the file path as text". If
     // that's the case, attach the file directly instead of pasting the path.
-    if let Some(att) = try_attach_as_file(&text) {
+    if let Some(att) = attach_path(&text) {
         return ClipboardPaste::File(att);
     }
 
     ClipboardPaste::Text(text)
 }
 
-/// If `text` is a single-line path to an existing file, read it and turn it
-/// into an attachment with a best-guess MIME.
-fn try_attach_as_file(text: &str) -> Option<WireAttachment> {
-    let trimmed = text.trim();
+/// If `input` is a single-line path to an existing file, read it and turn it
+/// into an attachment with a best-guess MIME. Shared by clipboard paste (a
+/// drag-drop delivers the path as text) and the TUI's `/attach <path>` command.
+pub fn attach_path(input: &str) -> Option<WireAttachment> {
+    let trimmed = input.trim();
     if trimmed.is_empty() || trimmed.lines().count() != 1 {
         return None;
     }
@@ -103,7 +104,7 @@ fn try_attach_as_file(text: &str) -> Option<WireAttachment> {
     })
 }
 
-fn guess_mime_from_path(path: &Path) -> String {
+pub fn guess_mime_from_path(path: &Path) -> String {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -182,20 +183,20 @@ mod tests {
     }
 
     #[test]
-    fn try_attach_as_file_returns_none_for_non_paths() {
-        assert!(try_attach_as_file("just some text").is_none());
-        assert!(try_attach_as_file("line one\nline two").is_none());
-        assert!(try_attach_as_file("").is_none());
+    fn attach_path_returns_none_for_non_paths() {
+        assert!(attach_path("just some text").is_none());
+        assert!(attach_path("line one\nline two").is_none());
+        assert!(attach_path("").is_none());
     }
 
     #[test]
-    fn try_attach_as_file_reads_a_real_file() {
+    fn attach_path_reads_a_real_file() {
         let dir = std::env::temp_dir().join(format!("fleety-clip-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("mk");
         let path = dir.join("hello.txt");
         std::fs::write(&path, b"hi clipboard").expect("write");
         let path_str = path.to_string_lossy().to_string();
-        let att = try_attach_as_file(&path_str).expect("found");
+        let att = attach_path(&path_str).expect("found");
         assert_eq!(att.mime, "text/plain");
         assert_eq!(att.name.as_deref(), Some("hello.txt"));
         assert!(att.bytes_b64.is_some());

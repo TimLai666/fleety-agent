@@ -11,6 +11,7 @@ mod auth;
 mod clipboard;
 mod config;
 mod input;
+mod markdown;
 mod provider_tui;
 mod tui;
 mod voice;
@@ -364,7 +365,8 @@ async fn run_tui() -> Result<()> {
     use ratatui::crossterm::event::{Event, KeyEventKind};
 
     let url = agent_url();
-    let (mut tx, mut rx) = transport::connect(&url, saved_token().as_deref())
+    let token = saved_token();
+    let (mut tx, mut rx) = transport::connect(&url, token.as_deref())
         .await?
         .split();
     send(&mut tx, &hello(None)).await?;
@@ -385,15 +387,26 @@ async fn run_tui() -> Result<()> {
 
     let mut terminal = ratatui::init();
     let mut app = tui::App::new(format!("connected to {url}"));
+    // Redraw only when something changed — a key/frame event, or a spinner tick
+    // while waiting. Idle ticks must not force periodic repaints (the spinner is
+    // static when no turn is in flight).
+    let mut dirty = true;
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(120));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let result = loop {
-        if let Err(e) = terminal.draw(|f| tui::render(f, &app)) {
-            break Err(CoreError::Message(format!("draw failed: {e}")));
+        if dirty {
+            if let Err(e) = terminal.draw(|f| tui::render(f, &app)) {
+                break Err(CoreError::Message(format!("draw failed: {e}")));
+            }
+            dirty = false;
         }
         if app.should_quit {
             break Ok(());
         }
         tokio::select! {
-            key = key_rx.recv() => match key {
+            key = key_rx.recv() => {
+                dirty = true;
+                match key {
                 Some(k) => match tui::on_key(&mut app, k) {
                     tui::Action::Send { text, attachments } => {
                         app.status = "sent; waiting…".to_string();
@@ -449,17 +462,29 @@ async fn run_tui() -> Result<()> {
                     tui::Action::None => {}
                 },
                 None => app.should_quit = true,
-            },
-            frame = rx.recv_text() => match frame {
+                }
+            }
+            frame = rx.recv_text() => {
+                dirty = true;
+                match frame {
                 Some(text) => match serde_json::from_str::<ServerMsg>(&text) {
-                    Ok(ServerMsg::AssistantDelta { chunk, .. }) => {
+                    Ok(ServerMsg::AssistantDelta { chunk, conversation_id }) => {
+                        // Track the id even mid-stream so a reconnect can Resume.
+                        app.last_conversation_id = Some(conversation_id);
                         app.push_delta(&chunk);
                         app.status = "streaming…".to_string();
                     }
-                    Ok(ServerMsg::Assistant { text, conversation_id, .. }) => {
+                    Ok(ServerMsg::Assistant { text, conversation_id, seq, .. }) => {
+                        app.note_seq(&conversation_id, seq);
                         app.finish_assistant(text);
                         // Surface the id — it's what `fleety resume` needs later.
                         app.status = format!("ready — conversation {conversation_id}");
+                    }
+                    Ok(ServerMsg::Replay { conversation_id, seq, role, content }) => {
+                        // Reconnect replay: apply only events we haven't shown.
+                        if app.apply_replay(&conversation_id, seq, &role, &content) {
+                            app.status = format!("restored — conversation {conversation_id}");
+                        }
                     }
                     Ok(ServerMsg::ApprovalRequested { approval_id, tool, risk, summary }) => {
                         app.request_approval(approval_id, &tool, &risk, &summary);
@@ -495,16 +520,110 @@ async fn run_tui() -> Result<()> {
                     _ => {}
                 },
                 None => {
-                    app.turn_in_flight = false;
-                    app.status = "disconnected".to_string();
-                    app.should_quit = true;
+                    // The link dropped: try to reconnect with capped backoff and
+                    // resume the conversation, instead of exiting outright. On a
+                    // give-up, reconnect() has already set the status + should_quit.
+                    if let Some((new_tx, new_rx)) =
+                        reconnect(&url, token.as_deref(), &mut app, &mut terminal, &mut key_rx)
+                            .await
+                    {
+                        tx = new_tx;
+                        rx = new_rx;
+                    }
                 }
-            },
+                }
+            }
+            _ = tick.tick() => {
+                // Only the waiting state animates; idle ticks cause no redraw.
+                if app.turn_in_flight {
+                    app.advance_spinner();
+                    dirty = true;
+                }
+            }
         }
     };
     ratatui::restore();
     let _ = tx.close().await;
     result
+}
+
+/// Reconnect after a dropped link, using capped exponential backoff. On success
+/// it re-sends `Hello`, `Resume`s the active conversation (so the server replays
+/// what we missed — de-duplicated by seq in the loop), and returns the fresh
+/// streams. The wait between attempts is abortable with Ctrl+C. Returns `None`
+/// (and sets `should_quit`) when Ctrl+C aborts or the attempts are exhausted.
+async fn reconnect(
+    url: &str,
+    token: Option<&str>,
+    app: &mut tui::App,
+    terminal: &mut ratatui::DefaultTerminal,
+    key_rx: &mut tokio::sync::mpsc::UnboundedReceiver<ratatui::crossterm::event::KeyEvent>,
+) -> Option<(Tx, Rx)> {
+    use ratatui::crossterm::event::{KeyCode, KeyModifiers};
+
+    // A dropped link ends any in-flight turn; the spinner marks the wait.
+    app.turn_in_flight = false;
+
+    const MAX_ATTEMPTS: u32 = 8;
+    const MAX_DELAY_MS: u64 = 30_000;
+    let mut delay_ms: u64 = 500;
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        app.advance_spinner();
+        app.status = format!(
+            "{} reconnecting… (attempt {attempt}/{MAX_ATTEMPTS}) — Ctrl+C to quit",
+            app.spinner_char()
+        );
+        let _ = terminal.draw(|f| tui::render(f, app));
+
+        if let Ok(conn) = transport::connect(url, token).await {
+            let (mut tx, rx) = conn.split();
+            if send(&mut tx, &hello(None)).await.is_ok() {
+                if let Some(cid) = app.last_conversation_id.clone() {
+                    let _ = send(
+                        &mut tx,
+                        &ClientMsg::Resume {
+                            conversation_id: cid,
+                            after_seq: app.last_seq,
+                        },
+                    )
+                    .await;
+                }
+                app.status = "reconnected".to_string();
+                return Some((tx, rx));
+            }
+        }
+
+        // Wait out the backoff, but let Ctrl+C abort the whole wait.
+        let sleep = tokio::time::sleep(std::time::Duration::from_millis(delay_ms));
+        tokio::pin!(sleep);
+        loop {
+            tokio::select! {
+                key = key_rx.recv() => match key {
+                    Some(k)
+                        if k.modifiers.contains(KeyModifiers::CONTROL)
+                            && matches!(k.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&'c')) =>
+                    {
+                        app.should_quit = true;
+                        return None;
+                    }
+                    // Other keys keep waiting; a closed channel means the input
+                    // thread died, so there's nothing left to drive the TUI.
+                    Some(_) => continue,
+                    None => {
+                        app.should_quit = true;
+                        return None;
+                    }
+                },
+                _ = &mut sleep => break,
+            }
+        }
+        delay_ms = delay_ms.saturating_mul(2).min(MAX_DELAY_MS);
+    }
+
+    app.status = "disconnected — reconnect attempts exhausted".to_string();
+    app.should_quit = true;
+    None
 }
 
 fn fleety_dir() -> Option<PathBuf> {
