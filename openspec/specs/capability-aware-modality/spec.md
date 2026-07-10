@@ -8,40 +8,50 @@ TBD - created by archiving change 'capability-aware-modality'. Update Purpose af
 
 ### Requirement: Providers report their modality capabilities
 
-A model provider SHALL report which input modalities it supports (text always; image, audio, and PDF optionally) via a capability query. The capability set SHALL come from configuration when set (`FLEETY_MODEL_MODALITIES` / `FLEETY_CHEAP_MODEL_MODALITIES`, comma-separated), and otherwise be derived from a model-family heuristic. Parsing the configured modality string SHALL be a pure function so it is unit-testable.
+Every provider SHALL report the input modalities it accepts (text, image, audio, video, pdf), derived from an explicit `modalities` setting or the model-family heuristic. A member pool SHALL report the **union** of its members' capabilities rather than any single member's, so the client's per-turn hints (e.g. whether to send audio) reflect what any routed member could accept. The native-vs-degrade decision for a given attachment SHALL happen inside the member that actually serves the call, using that member's own capabilities.
 
-#### Scenario: capabilities from configuration
+#### Scenario: a single provider reports its own capabilities
 
-- **WHEN** `FLEETY_MODEL_MODALITIES` is set to `text,image`
-- **THEN** the main provider reports support for text and image, and not for audio or PDF
+- **WHEN** a text-only provider is queried
+- **THEN** it reports image/audio/video as unsupported
 
-#### Scenario: capabilities from heuristic when unset
+##### Example: a text-only member's capabilities
 
-- **WHEN** no modality config is set and the model name matches a known multimodal family
-- **THEN** the provider reports multimodal support (image/audio/pdf) as the default
+- **GIVEN** a provider member with `modalities = "text"`
+- **WHEN** its capabilities are queried
+- **THEN** `image`, `audio`, and `video` are all reported unsupported, `text` supported
 
-##### Example: modality parsing
+#### Scenario: a pool reports the member union
 
-| Input string | image | audio | pdf |
-|---|---|---|---|
-| "text,image" | yes | no | no |
-| "text,image,audio,pdf" | yes | yes | yes |
-| "" (empty → heuristic) | (heuristic) | (heuristic) | (heuristic) |
-| "text,bogus" | no | no | no |
+- **WHEN** a pool mixing a text-only and an image-capable member is queried
+- **THEN** it reports image as supported (the union), and the routed member degrades the attachment if it cannot serve it
+
+##### Example: union of text-only + image-capable members
+
+- **GIVEN** member A with `modalities = "text"` and member B with `modalities = "text,image"`
+- **WHEN** the pool of `[A, B]` is queried
+- **THEN** it reports `image` supported (union), not unsupported (which taking A's `first()` would give)
 
 
 <!-- @trace
-source: capability-aware-modality
-updated: 2026-06-29
+source: provider-model-two-tier
+updated: 2026-07-10
 code:
-  - crates/agent-core/src/lib.rs
-  - docs/env.md
-  - crates/agent-core/src/gemini.rs
-  - crates/agent-core/src/model.rs
-  - crates/fleety-tools/src/config.rs
-  - crates/agent-core/src/retry.rs
+  - crates/fleety-tools/src/providers_config.rs
+  - crates/fleety-server/src/conn.rs
+  - crates/fleety-cli/src/provider_tui.rs
+  - crates/fleety-tools/src/connection.rs
+  - crates/fleety-tools/src/lib.rs
   - crates/fleety-server/src/providers.rs
-  - crates/agent-core/src/openai.rs
+  - crates/fleety-daemon/src/main.rs
+  - crates/fleety-cli/src/server.rs
+  - crates/fleety-server/src/pool.rs
+  - crates/fleety-server/src/main.rs
+  - crates/fleety-tools/src/config.rs
+  - crates/fleety-cli/src/main.rs
+tests:
+  - crates/fleety-cli/tests/cli_smoke.rs
+  - crates/fleety-daemon/tests/fleetyd_smoke.rs
 -->
 
 ---

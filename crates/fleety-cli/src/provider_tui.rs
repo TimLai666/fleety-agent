@@ -1,21 +1,22 @@
 //! Interactive `config provider edit` screen (CLI-only; needs a TTY).
 //!
-//! Lists the providers, groups, and roles from `providers.toml` and edits them
-//! in place: add/remove a provider, set a group's members + strategy, and bind a
-//! role. Saving runs the same validation + atomic write as the `config
-//! provider|group|role` subcommands (so the two paths can't diverge), and
+//! Lists the type-tagged providers and the `main`/`cheap` model roles from
+//! `providers.toml` and edits them in place via single-line inputs: add/remove a
+//! provider (by `type`), set a model role's members + strategy, and unset a
+//! role. Saving runs the same validation + atomic write as the non-interactive
+//! `config provider|model` subcommands (so the two paths can't diverge), and
 //! provider keys are masked on screen.
 //!
 //! The state mutations live on [`ProviderEditor`] as small, pure methods that
-//! are unit-tested; the ratatui render + key loop around them is thin and
-//! verified by hand.
+//! are unit-tested; the ratatui render + key loop around them is thin. (Design
+//! note: this is the minimal-viable two-tier editor — per-field forms and
+//! in-place provider editing from the old single-tier UI are dropped; use
+//! remove+add, or the non-interactive commands, for those.)
 
 use std::path::Path;
 
 use agent_core::{CoreError, Result};
-use fleety_tools::providers_config::{
-    self as pc, GroupSpec, ProviderSpec, ProvidersConfig, Strategy,
-};
+use fleety_tools::providers_config::{self as pc, Member, ModelPool, Provider, ProvidersConfig, Strategy};
 use ratatui::crossterm::event::KeyCode;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::text::Line;
@@ -24,9 +25,9 @@ use ratatui::Frame;
 
 use crate::input::LineEditor;
 
-/// The editable `providers.toml` model. Mutations validate references lazily
-/// (full validation runs on [`save`](Self::save)); the immediate guards here
-/// give friendly errors for the common mistakes.
+/// The editable two-tier `providers.toml` model. Full validation runs on
+/// [`save`](Self::save); the immediate guards here give friendly errors for the
+/// common mistakes (dup provider, removing a referenced provider).
 pub struct ProviderEditor {
     cfg: ProvidersConfig,
 }
@@ -36,127 +37,55 @@ impl ProviderEditor {
         Self { cfg }
     }
 
-    pub fn providers(&self) -> &[ProviderSpec] {
-        &self.cfg.providers
+    /// The provider names in display order (BTreeMap → sorted).
+    pub fn provider_names(&self) -> Vec<String> {
+        self.cfg.providers.keys().cloned().collect()
     }
 
-    /// Add a provider; a duplicate name is rejected.
+    /// Add a type-tagged provider; a duplicate name is rejected. Type field
+    /// rules (api needs base_url; oauth carries none) are enforced at [`save`].
     pub fn add_provider(
         &mut self,
         name: String,
-        base_url: String,
-        model: String,
+        kind: String,
+        base_url: Option<String>,
         key: Option<String>,
     ) -> Result<()> {
-        if self.cfg.provider(&name).is_some() {
+        if self.cfg.providers.contains_key(&name) {
             return Err(CoreError::Message(format!(
                 "provider '{name}' already exists"
             )));
         }
-        self.cfg.providers.push(ProviderSpec {
-            name,
-            base_url,
-            model,
-            key,
-            stream: false,
-            modalities: None,
-            effort: None,
-            auth: None,
-        });
-        Ok(())
-    }
-
-    /// Update an existing provider in place, reusing the `config provider set`
-    /// semantics: only the fields given as `Some` change, the rest are kept (a
-    /// `None` `key` preserves the current key). A missing provider is rejected
-    /// by name. Because the identity (`name`) is untouched, a provider a group
-    /// or role references can be edited without first unbinding it.
-    pub fn set_provider(
-        &mut self,
-        name: &str,
-        base_url: Option<String>,
-        model: Option<String>,
-        key: Option<String>,
-    ) -> Result<()> {
-        let p = self
-            .cfg
+        self.cfg
             .providers
-            .iter_mut()
-            .find(|p| p.name == name)
-            .ok_or_else(|| CoreError::Message(format!("no such provider '{name}'")))?;
-        if let Some(v) = base_url {
-            p.base_url = v;
-        }
-        if let Some(v) = model {
-            p.model = v;
-        }
-        if key.is_some() {
-            p.key = key;
-        }
+            .insert(name, Provider { kind, base_url, key });
         Ok(())
     }
 
-    /// Remove a provider; rejected if a group or role still references it.
+    /// Remove a provider; rejected if a model role member still references it
+    /// (the error names the role).
     pub fn remove_provider(&mut self, name: &str) -> Result<()> {
-        if self.cfg.provider(name).is_none() {
+        if !self.cfg.providers.contains_key(name) {
             return Err(CoreError::Message(format!("no such provider '{name}'")));
         }
-        if let Some(g) = self
-            .cfg
-            .groups
-            .iter()
-            .find(|g| g.members.iter().any(|m| m == name))
-        {
+        if let Some(role) = self.cfg.role_referencing(name) {
             return Err(CoreError::Message(format!(
-                "group '{}' references provider '{name}'",
-                g.name
+                "model role '{role}' references provider '{name}'"
             )));
         }
-        if let Some((r, _)) = self.cfg.roles.iter().find(|(_, t)| t.as_str() == name) {
-            return Err(CoreError::Message(format!(
-                "role '{r}' references provider '{name}'"
-            )));
-        }
-        self.cfg.providers.retain(|p| p.name != name);
+        self.cfg.providers.remove(name);
         Ok(())
     }
 
-    /// Create or replace a group.
-    pub fn set_group(&mut self, name: String, members: Vec<String>, strategy: Strategy) {
-        self.cfg.groups.retain(|g| g.name != name);
-        self.cfg.groups.push(GroupSpec {
-            name,
-            members,
-            strategy,
-        });
+    /// Create or replace a model role's member pool.
+    pub fn set_model(&mut self, role: String, members: Vec<Member>, strategy: Strategy) {
+        self.cfg.models.insert(role, ModelPool { strategy, members });
     }
 
-    /// Remove a group, matching `config group remove`: a group that a role still
-    /// targets is rejected (naming the referring role) and left in place; a
-    /// missing group is rejected by name.
-    pub fn remove_group(&mut self, name: &str) -> Result<()> {
-        if self.cfg.group(name).is_none() {
-            return Err(CoreError::Message(format!("no such group '{name}'")));
-        }
-        if let Some((r, _)) = self.cfg.roles.iter().find(|(_, t)| t.as_str() == name) {
-            return Err(CoreError::Message(format!(
-                "cannot remove group '{name}': role '{r}' references it"
-            )));
-        }
-        self.cfg.groups.retain(|g| g.name != name);
-        Ok(())
-    }
-
-    /// Bind a role to a provider/group name.
-    pub fn set_role(&mut self, role: String, target: String) {
-        self.cfg.roles.insert(role, target);
-    }
-
-    /// Unset a role binding, matching `config role unset`: an undefined role is
-    /// reported by name and the config is left unchanged.
-    pub fn unset_role(&mut self, role: &str) -> Result<()> {
-        if self.cfg.roles.remove(role).is_none() {
-            return Err(CoreError::Message(format!("no such role '{role}'")));
+    /// Unset a model role; an undefined role is reported by name.
+    pub fn unset_model(&mut self, role: &str) -> Result<()> {
+        if self.cfg.models.remove(role).is_none() {
+            return Err(CoreError::Message(format!("no such model role '{role}'")));
         }
         Ok(())
     }
@@ -170,12 +99,36 @@ impl ProviderEditor {
 /// Parse a strategy word (shared shape with the subcommands).
 fn strategy_word(s: &str) -> Result<Strategy> {
     match s.trim() {
+        "single" => Ok(Strategy::Single),
         "round_robin" => Ok(Strategy::RoundRobin),
         "failover" => Ok(Strategy::Failover),
         other => Err(CoreError::Message(format!(
-            "invalid strategy '{other}' (round_robin | failover)"
+            "invalid strategy '{other}' (single | round_robin | failover)"
         ))),
     }
+}
+
+/// Parse `p1/m1|p2/m2` into members.
+fn parse_members(s: &str) -> Result<Vec<Member>> {
+    let mut out = Vec::new();
+    for spec in s.split('|').map(str::trim).filter(|s| !s.is_empty()) {
+        let (provider, model) = spec
+            .split_once('/')
+            .ok_or_else(|| CoreError::Message(format!("member '{spec}' must be <provider>/<model>")))?;
+        out.push(Member {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            stream: false,
+            modalities: None,
+            effort: None,
+        });
+    }
+    if out.is_empty() {
+        return Err(CoreError::Message(
+            "need at least one member <provider>/<model>".to_string(),
+        ));
+    }
+    Ok(out)
 }
 
 fn masked_key(key: &Option<String>) -> &'static str {
@@ -187,144 +140,11 @@ fn masked_key(key: &Option<String>) -> &'static str {
 
 // ---- interactive screen ----
 
-/// Single-line actions that still take one comma-separated line (the provider
-/// add/edit flow moved to the per-field [`ProviderForm`]).
+/// A single-line action collecting one comma-separated input line.
 enum Action {
-    SetRole,
-    SetGroup,
-    RemoveGroup,
-    UnsetRole,
-}
-
-/// Which field the per-field provider entry is collecting.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Field {
-    Name,
-    BaseUrl,
-    Model,
-    Key,
-}
-
-impl Field {
-    /// The canonical field name shown in prompts and error messages.
-    fn label(self) -> &'static str {
-        match self {
-            Field::Name => "name",
-            Field::BaseUrl => "base_url",
-            Field::Model => "model",
-            Field::Key => "key",
-        }
-    }
-
-    /// name/base_url/model must be non-empty; the key is optional.
-    fn required(self) -> bool {
-        !matches!(self, Field::Key)
-    }
-}
-
-/// Result of committing the current field of a [`ProviderForm`].
-enum FieldOutcome {
-    /// Advanced to the next field (form stays open).
-    Continue,
-    /// A required field was left empty; the message names it (form stays open).
-    Invalid(String),
-    /// The last field was committed; the form is ready to apply.
-    Done,
-}
-
-/// Per-field entry for adding a new provider or editing an existing one. When
-/// `editing` is `Some(name)` the provider is updated in place (the name is fixed
-/// so the Name field is skipped and base_url/model are prefilled); `None` adds a
-/// new one. The key is never prefilled — leaving it blank on an edit keeps the
-/// current key (matching the `set_provider` "only given fields change" rule).
-struct ProviderForm {
-    editing: Option<String>,
-    field: Field,
-    name: String,
-    base_url: String,
-    model: String,
-    key: String,
-    buffer: LineEditor,
-}
-
-impl ProviderForm {
-    /// Start adding a brand-new provider (all fields empty, begins at Name).
-    fn add() -> Self {
-        Self {
-            editing: None,
-            field: Field::Name,
-            name: String::new(),
-            base_url: String::new(),
-            model: String::new(),
-            key: String::new(),
-            buffer: LineEditor::default(),
-        }
-    }
-
-    /// Start editing `p` in place: name fixed, base_url/model prefilled, key
-    /// blank. Begins at the base_url field.
-    fn edit(p: &ProviderSpec) -> Self {
-        let mut buffer = LineEditor::default();
-        buffer.set_text(p.base_url.clone());
-        Self {
-            editing: Some(p.name.clone()),
-            field: Field::BaseUrl,
-            name: p.name.clone(),
-            base_url: p.base_url.clone(),
-            model: p.model.clone(),
-            key: String::new(),
-            buffer,
-        }
-    }
-
-    /// The footer prompt for the field currently being collected.
-    fn prompt(&self) -> String {
-        let verb = match &self.editing {
-            Some(name) => format!("edit '{name}'"),
-            None => "add provider".to_string(),
-        };
-        let hint = match self.field {
-            Field::Key if self.editing.is_some() => "key (blank keeps current)".to_string(),
-            Field::Key => "key (optional)".to_string(),
-            f => f.label().to_string(),
-        };
-        format!("{verb} — {hint}")
-    }
-
-    /// Store the current buffer into its slot and advance. A required field left
-    /// empty is rejected by name and the form stays on it.
-    fn commit_field(&mut self) -> FieldOutcome {
-        let value = self.buffer.take().trim().to_string();
-        if self.field.required() && value.is_empty() {
-            return FieldOutcome::Invalid(format!("{} is required", self.field.label()));
-        }
-        match self.field {
-            Field::Name => self.name = value,
-            Field::BaseUrl => self.base_url = value,
-            Field::Model => self.model = value,
-            Field::Key => {
-                self.key = value;
-                return FieldOutcome::Done;
-            }
-        }
-        // Advance to the next field, prefilling its buffer from the slot (empty
-        // for a fresh add, the current value for an edit).
-        let next = match self.field {
-            Field::Name => Field::BaseUrl,
-            Field::BaseUrl => Field::Model,
-            // The Key arm returned Done above; mapping it to itself is a
-            // never-taken, never-panic fallback.
-            Field::Model | Field::Key => Field::Key,
-        };
-        self.field = next;
-        let prefill = match next {
-            Field::BaseUrl => self.base_url.clone(),
-            Field::Model => self.model.clone(),
-            Field::Name | Field::Key => self.key.clone(),
-        };
-        self.buffer.set_text(prefill);
-        FieldOutcome::Continue
-    }
+    AddProvider,
+    SetModel,
+    UnsetModel,
 }
 
 enum Mode {
@@ -333,12 +153,6 @@ enum Mode {
         action: Action,
         prompt: &'static str,
         buffer: LineEditor,
-    },
-    /// Per-field add/edit provider entry.
-    Form(ProviderForm),
-    /// Confirmation guard before deleting a provider.
-    ConfirmDelete {
-        name: String,
     },
 }
 
@@ -357,80 +171,46 @@ impl App {
             ed: ProviderEditor::new(cfg),
             sel: 0,
             mode: Mode::Browse,
-            status: "a add · e edit · d del · g group · G rm-group · r role · R unset-role · s save · q quit"
+            status: "a add-provider · d del-provider · m set-model · u unset-model · s save · q quit"
                 .to_string(),
             save_now: false,
             quit: false,
         }
     }
 
-    /// Apply a completed per-field provider form (add or edit-in-place).
-    fn apply_provider_form(&mut self, form: &ProviderForm) {
-        // A blank key means "none" on add and "keep current" on edit; both map
-        // to `None` so `set_provider`/`add_provider` do the right thing.
-        let key = if form.key.is_empty() {
-            None
-        } else {
-            Some(form.key.clone())
-        };
-        let res = match &form.editing {
-            Some(name) => self.ed.set_provider(
-                name,
-                Some(form.base_url.clone()),
-                Some(form.model.clone()),
-                key,
-            ),
-            None => self.ed.add_provider(
-                form.name.clone(),
-                form.base_url.clone(),
-                form.model.clone(),
-                key,
-            ),
-        };
-        self.status = match res {
-            Ok(()) => match &form.editing {
-                Some(name) => format!("updated '{name}'"),
-                None => format!("added '{}'", form.name),
-            },
-            Err(e) => format!("error: {e}"),
-        };
-    }
-
     /// Apply the submitted input buffer for the active single-line action.
     fn submit(&mut self, action: &Action, buf: &str) {
         let parts: Vec<String> = buf.split(',').map(|s| s.trim().to_string()).collect();
         let res = match action {
-            Action::SetRole => match parts.as_slice() {
-                [role, target] if !role.is_empty() && !target.is_empty() => {
-                    self.ed.set_role(role.clone(), target.clone());
-                    Ok(())
+            Action::AddProvider => match parts.as_slice() {
+                // name, type[, base_url[, key]]
+                [name, kind, rest @ ..] if !name.is_empty() && !kind.is_empty() => {
+                    let base_url = rest.first().filter(|s| !s.is_empty()).cloned();
+                    let key = rest.get(1).filter(|s| !s.is_empty()).cloned();
+                    self.ed.add_provider(name.clone(), kind.clone(), base_url, key)
                 }
-                _ => Err(CoreError::Message("expected: role, target".to_string())),
-            },
-            Action::SetGroup => match parts.as_slice() {
-                [name, members, strat] if !name.is_empty() => match strategy_word(strat) {
-                    Ok(strategy) => {
-                        let members = members
-                            .split('|')
-                            .map(|s| s.trim().to_string())
-                            .filter(|s| !s.is_empty())
-                            .collect();
-                        self.ed.set_group(name.clone(), members, strategy);
-                        Ok(())
-                    }
-                    Err(e) => Err(e),
-                },
                 _ => Err(CoreError::Message(
-                    "expected: name, member1|member2, strategy".to_string(),
+                    "expected: name, type [, base_url [, key]]".to_string(),
                 )),
             },
-            Action::RemoveGroup => match parts.as_slice() {
-                [name] if !name.is_empty() => self.ed.remove_group(name),
-                _ => Err(CoreError::Message("expected: group name".to_string())),
+            Action::SetModel => match parts.as_slice() {
+                // role, p1/m1|p2/m2, strategy
+                [role, members, strat] if !role.is_empty() => {
+                    match (parse_members(members), strategy_word(strat)) {
+                        (Ok(members), Ok(strategy)) => {
+                            self.ed.set_model(role.clone(), members, strategy);
+                            Ok(())
+                        }
+                        (Err(e), _) | (_, Err(e)) => Err(e),
+                    }
+                }
+                _ => Err(CoreError::Message(
+                    "expected: role, p1/m1|p2/m2, strategy".to_string(),
+                )),
             },
-            Action::UnsetRole => match parts.as_slice() {
-                [role] if !role.is_empty() => self.ed.unset_role(role),
-                _ => Err(CoreError::Message("expected: role name".to_string())),
+            Action::UnsetModel => match parts.as_slice() {
+                [role] if !role.is_empty() => self.ed.unset_model(role),
+                _ => Err(CoreError::Message("expected: model role".to_string())),
             },
         };
         self.status = match res {
@@ -464,92 +244,44 @@ fn on_key(app: &mut App, code: KeyCode) {
             }
             _ => {}
         },
-        Mode::Form(form) => match code {
-            KeyCode::Char(c) => form.buffer.insert(c),
-            KeyCode::Backspace => form.buffer.backspace(),
-            KeyCode::Delete => form.buffer.delete(),
-            KeyCode::Left => form.buffer.left(),
-            KeyCode::Right => form.buffer.right(),
-            KeyCode::Home => form.buffer.home(),
-            KeyCode::End => form.buffer.end(),
-            KeyCode::Esc => {
-                app.mode = Mode::Browse;
-                app.status = "cancelled".to_string();
-            }
-            KeyCode::Enter => match form.commit_field() {
-                FieldOutcome::Continue => {}
-                FieldOutcome::Invalid(msg) => app.status = format!("error: {msg}"),
-                FieldOutcome::Done => {
-                    // The last field is in; take the form out and apply it.
-                    if let Mode::Form(form) = std::mem::replace(&mut app.mode, Mode::Browse) {
-                        app.apply_provider_form(&form);
-                    }
-                }
-            },
-            _ => {}
-        },
-        Mode::ConfirmDelete { .. } => match code {
-            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                if let Mode::ConfirmDelete { name } =
-                    std::mem::replace(&mut app.mode, Mode::Browse)
-                {
-                    app.status = match app.ed.remove_provider(&name) {
-                        Ok(()) => format!("removed '{name}'"),
-                        Err(e) => format!("error: {e}"),
-                    };
-                }
-            }
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                app.mode = Mode::Browse;
-                app.status = "cancelled".to_string();
-            }
-            _ => {}
-        },
         Mode::Browse => match code {
             KeyCode::Char('q') => app.quit = true,
             KeyCode::Char('s') => app.save_now = true,
             KeyCode::Up => app.sel = app.sel.saturating_sub(1),
             KeyCode::Down => {
-                let max = app.ed.providers().len().saturating_sub(1);
+                let max = app.ed.provider_names().len().saturating_sub(1);
                 app.sel = (app.sel + 1).min(max);
             }
-            KeyCode::Char('a') => app.mode = Mode::Form(ProviderForm::add()),
-            KeyCode::Char('e') => match app.ed.providers().get(app.sel).cloned() {
-                Some(p) => app.mode = Mode::Form(ProviderForm::edit(&p)),
+            KeyCode::Char('a') => {
+                app.mode = Mode::Input {
+                    action: Action::AddProvider,
+                    prompt: "add provider — name, type(api|oauth:codex) [, base_url [, key]]",
+                    buffer: LineEditor::default(),
+                };
+            }
+            KeyCode::Char('d') => match app.ed.provider_names().get(app.sel).cloned() {
+                Some(name) => {
+                    app.status = match app.ed.remove_provider(&name) {
+                        Ok(()) => format!("removed '{name}'"),
+                        Err(e) => format!("error: {e}"),
+                    };
+                }
                 None => app.status = "nothing selected".to_string(),
             },
-            KeyCode::Char('g') => {
+            KeyCode::Char('m') => {
                 app.mode = Mode::Input {
-                    action: Action::SetGroup,
-                    prompt: "set group — name, member1|member2, strategy",
+                    action: Action::SetModel,
+                    prompt: "set model — role, p1/m1|p2/m2, strategy",
                     buffer: LineEditor::default(),
                 };
             }
-            KeyCode::Char('G') => {
+            KeyCode::Char('u') => {
                 app.mode = Mode::Input {
-                    action: Action::RemoveGroup,
-                    prompt: "remove group — name",
+                    action: Action::UnsetModel,
+                    prompt: "unset model — role",
                     buffer: LineEditor::default(),
                 };
             }
-            KeyCode::Char('r') => {
-                app.mode = Mode::Input {
-                    action: Action::SetRole,
-                    prompt: "set role — role, target",
-                    buffer: LineEditor::default(),
-                };
-            }
-            KeyCode::Char('R') => {
-                app.mode = Mode::Input {
-                    action: Action::UnsetRole,
-                    prompt: "unset role — role",
-                    buffer: LineEditor::default(),
-                };
-            }
-            KeyCode::Char('d') => match app.ed.providers().get(app.sel).map(|p| p.name.clone()) {
-                Some(name) => app.mode = Mode::ConfirmDelete { name },
-                None => app.status = "nothing selected".to_string(),
-            },
             _ => {}
         },
     }
@@ -563,33 +295,31 @@ fn render(f: &mut Frame, app: &App) {
 
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from("Providers:"));
-    for (i, p) in app.ed.cfg.providers.iter().enumerate() {
+    for (i, (name, p)) in app.ed.cfg.providers.iter().enumerate() {
         let marker = if i == app.sel { "▶" } else { " " };
+        let endpoint = p.base_url.as_deref().unwrap_or("(oauth login)");
         lines.push(Line::from(format!(
-            "{marker} {:<14} {} [{}] key={}",
-            p.name,
-            p.base_url,
-            p.model,
+            "{marker} {:<14} [{}] {} key={}",
+            name,
+            p.kind,
+            endpoint,
             masked_key(&p.key)
         )));
     }
     lines.push(Line::from(""));
-    lines.push(Line::from("Groups:"));
-    for g in &app.ed.cfg.groups {
+    lines.push(Line::from("Model roles:"));
+    for (role, pool) in &app.ed.cfg.models {
+        let members = pool
+            .members
+            .iter()
+            .map(|m| format!("{}/{}", m.provider, m.model))
+            .collect::<Vec<_>>()
+            .join(", ");
         lines.push(Line::from(format!(
-            "  {:<14} [{:?}] {}",
-            g.name,
-            g.strategy,
-            g.members.join(", ")
+            "  {:<8} [{:?}] {}",
+            role, pool.strategy, members
         )));
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from("Roles:"));
-    for (r, t) in &app.ed.cfg.roles {
-        lines.push(Line::from(format!("  {r} → {t}")));
-    }
-    // Keep the selected provider row visible when the list outgrows the pane
-    // (selection is line 1 + sel; line 0 is the "Providers:" header).
     let inner_h = chunks[0].height.saturating_sub(2);
     let sel_line = 1 + app.sel as u16;
     let offset = (sel_line + 1).saturating_sub(inner_h);
@@ -600,16 +330,12 @@ fn render(f: &mut Frame, app: &App) {
         chunks[0],
     );
 
-    // The footer's inner area is a single row, so the prompt goes in the block
-    // title and the row shows the buffer being typed (with the cursor on it).
     match &app.mode {
         Mode::Browse => f.render_widget(
             Paragraph::new(app.status.clone()).block(Block::bordered()),
             chunks[1],
         ),
         Mode::Input { prompt, buffer, .. } => {
-            // "> " takes two columns; the editor windows the rest so the
-            // cursor stays visible when the value outgrows the footer.
             let max_w = chunks[1].width.saturating_sub(2) as usize;
             let (view, x) = buffer.display_window(max_w.saturating_sub(2));
             f.render_widget(
@@ -622,32 +348,6 @@ fn render(f: &mut Frame, app: &App) {
                 chunks[1].y + 1,
             ));
         }
-        Mode::Form(form) => {
-            // Same windowed single-row input as `Mode::Input`, but the prompt
-            // and the Enter hint reflect the current per-field step.
-            let max_w = chunks[1].width.saturating_sub(2) as usize;
-            let (view, x) = form.buffer.display_window(max_w.saturating_sub(2));
-            let enter_hint = if form.field == Field::Key {
-                "Enter save"
-            } else {
-                "Enter next"
-            };
-            f.render_widget(
-                Paragraph::new(format!("> {view}")).block(
-                    Block::bordered().title(format!("{} · {enter_hint} · Esc cancel", form.prompt())),
-                ),
-                chunks[1],
-            );
-            f.set_cursor_position((
-                chunks[1].x + 1 + (2 + x as usize).min(max_w) as u16,
-                chunks[1].y + 1,
-            ));
-        }
-        Mode::ConfirmDelete { name } => f.render_widget(
-            Paragraph::new(format!("delete provider '{name}'? · y confirm · n/Esc cancel"))
-                .block(Block::bordered().title("confirm delete")),
-            chunks[1],
-        ),
     }
 }
 
@@ -690,56 +390,129 @@ pub fn run(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn api(base: &str) -> (String, Option<String>, Option<String>) {
+        ("api".to_string(), Some(base.to_string()), None)
+    }
+
     #[test]
     fn add_and_dup_provider() {
         let mut ed = ProviderEditor::new(ProvidersConfig::default());
-        ed.add_provider("p1".into(), "u".into(), "m".into(), Some("sk".into()))
-            .unwrap();
-        assert_eq!(ed.providers().len(), 1);
+        let (kind, base, key) = api("https://u/v1");
+        ed.add_provider("p1".into(), kind, base, key).unwrap();
+        assert_eq!(ed.provider_names(), vec!["p1".to_string()]);
         // Duplicate name is rejected.
         assert!(ed
-            .add_provider("p1".into(), "u".into(), "m".into(), None)
+            .add_provider("p1".into(), "api".into(), Some("https://x/v1".into()), None)
             .is_err());
     }
 
     #[test]
-    fn remove_guarded_by_group_reference() {
+    fn remove_guarded_by_model_reference() {
         let mut ed = ProviderEditor::new(ProvidersConfig::default());
-        ed.add_provider("p1".into(), "u".into(), "m".into(), None)
+        ed.add_provider("p1".into(), "api".into(), Some("https://u/v1".into()), None)
             .unwrap();
-        ed.set_group("g".into(), vec!["p1".into()], Strategy::Failover);
-        // Referenced by the group → cannot remove.
+        ed.set_model(
+            "main".into(),
+            vec![Member {
+                provider: "p1".into(),
+                model: "gpt-4o".into(),
+                stream: false,
+                modalities: None,
+                effort: None,
+            }],
+            Strategy::Single,
+        );
+        // Referenced by the main role → cannot remove (error names the role).
         assert!(ed
             .remove_provider("p1")
             .unwrap_err()
             .to_string()
-            .contains("g"));
+            .contains("main"));
         // Unreferenced provider removes fine.
-        ed.add_provider("p2".into(), "u".into(), "m".into(), None)
+        ed.add_provider("p2".into(), "api".into(), Some("https://u2/v1".into()), None)
             .unwrap();
         ed.remove_provider("p2").unwrap();
-        assert_eq!(ed.providers().len(), 1);
+        assert_eq!(ed.provider_names(), vec!["p1".to_string()]);
     }
 
     #[test]
-    fn set_role_set_group_then_save_roundtrips() {
+    fn set_model_then_save_roundtrips() {
         let mut ed = ProviderEditor::new(ProvidersConfig::default());
-        ed.add_provider("p1".into(), "u".into(), "m".into(), None)
+        ed.add_provider("p1".into(), "api".into(), Some("https://u/v1".into()), None)
             .unwrap();
-        ed.add_provider("p2".into(), "u".into(), "m".into(), None)
-            .unwrap();
-        ed.set_group(
-            "g".into(),
-            vec!["p1".into(), "p2".into()],
+        ed.set_model(
+            "main".into(),
+            parse_members("p1/gpt-4o|p1/gpt-4o-2").unwrap(),
             Strategy::RoundRobin,
         );
-        ed.set_role("main".into(), "g".into());
         let path = std::env::temp_dir().join(format!("fleety-tui-{}.toml", uuid::Uuid::new_v4()));
         ed.save(&path).expect("save");
         let back = pc::load_from(&path).expect("re-read");
-        assert_eq!(back.groups.len(), 1);
-        assert_eq!(back.roles.get("main").map(String::as_str), Some("g"));
+        assert_eq!(back.model("main").unwrap().members.len(), 2);
+        assert_eq!(back.model("main").unwrap().strategy, Strategy::RoundRobin);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_rejects_dangling_member() {
+        let mut ed = ProviderEditor::new(ProvidersConfig::default());
+        // A model member referencing an undefined provider fails validation on save.
+        ed.set_model(
+            "main".into(),
+            parse_members("ghost/m").unwrap(),
+            Strategy::Single,
+        );
+        let path = std::env::temp_dir().join(format!("fleety-tui-{}.toml", uuid::Uuid::new_v4()));
+        assert!(ed.save(&path).is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn unset_model_removes_and_rejects_unknown() {
+        let mut ed = ProviderEditor::new(ProvidersConfig::default());
+        ed.add_provider("p1".into(), "api".into(), Some("https://u/v1".into()), None)
+            .unwrap();
+        ed.set_model(
+            "main".into(),
+            parse_members("p1/gpt-4o").unwrap(),
+            Strategy::Single,
+        );
+        ed.unset_model("main").unwrap();
+        assert!(ed.cfg.model("main").is_none());
+        assert!(ed.unset_model("ghost").unwrap_err().to_string().contains("ghost"));
+    }
+
+    /// Feed each char of `s` to the app as a key press (input typing helper).
+    fn type_str(app: &mut App, s: &str) {
+        for c in s.chars() {
+            on_key(app, KeyCode::Char(c));
+        }
+    }
+
+    #[test]
+    fn add_provider_via_input_line() {
+        let mut app = App::new(ProvidersConfig::default());
+        on_key(&mut app, KeyCode::Char('a')); // enter add-provider input mode
+        type_str(&mut app, "openai1, api, https://u/v1, sk");
+        on_key(&mut app, KeyCode::Enter);
+        assert_eq!(app.ed.provider_names(), vec!["openai1".to_string()]);
+        let p = app.ed.cfg.provider("openai1").unwrap();
+        assert_eq!(p.kind, "api");
+        assert_eq!(p.base_url.as_deref(), Some("https://u/v1"));
+        assert_eq!(p.key.as_deref(), Some("sk"));
+    }
+
+    #[test]
+    fn set_model_via_input_line() {
+        let mut app = App::new(ProvidersConfig::default());
+        app.ed
+            .add_provider("p1".into(), "api".into(), Some("https://u/v1".into()), None)
+            .unwrap();
+        on_key(&mut app, KeyCode::Char('m'));
+        type_str(&mut app, "main, p1/gpt-4o|p1/gpt-4o-2, failover");
+        on_key(&mut app, KeyCode::Enter);
+        assert_eq!(app.ed.cfg.model("main").unwrap().members.len(), 2);
+        assert_eq!(app.ed.cfg.model("main").unwrap().strategy, Strategy::Failover);
     }
 
     #[test]
@@ -747,11 +520,10 @@ mod tests {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
         let mut app = App::new(ProvidersConfig::default());
-        on_key(&mut app, KeyCode::Char('a')); // enter add-provider input mode
+        on_key(&mut app, KeyCode::Char('a'));
         for c in "abc".chars() {
             on_key(&mut app, KeyCode::Char(c));
         }
-        // Cursor editing works mid-buffer (Left + insert, not append).
         on_key(&mut app, KeyCode::Left);
         on_key(&mut app, KeyCode::Char('X'));
         let mut terminal = Terminal::new(TestBackend::new(70, 10)).expect("term");
@@ -763,225 +535,7 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect();
-        // The buffer being typed must be visible (it used to be clipped by the
-        // 3-row footer whose inner area is a single row).
         assert!(content.contains("> abXc"), "typed buffer visible");
         assert!(content.contains("add provider"), "prompt visible in title");
-    }
-
-    #[test]
-    fn save_rejects_dangling_role() {
-        let mut ed = ProviderEditor::new(ProvidersConfig::default());
-        // A role pointing nowhere fails validation on save.
-        ed.set_role("main".into(), "ghost".into());
-        let path = std::env::temp_dir().join(format!("fleety-tui-{}.toml", uuid::Uuid::new_v4()));
-        assert!(ed.save(&path).is_err());
-        assert!(!path.exists());
-    }
-
-    #[test]
-    fn set_provider_edits_in_place_preserving_unchanged_and_bindings() {
-        let mut ed = ProviderEditor::new(ProvidersConfig::default());
-        ed.add_provider("p1".into(), "u".into(), "m".into(), Some("sk".into()))
-            .unwrap();
-        ed.set_group("g".into(), vec!["p1".into()], Strategy::Failover);
-        ed.set_role("main".into(), "g".into());
-        // Change only the model; base_url and key are None → preserved (same
-        // "only the given fields change" semantics as `config provider set`).
-        ed.set_provider("p1", None, Some("m2".into()), None).unwrap();
-        let p = ed.cfg.provider("p1").unwrap();
-        assert_eq!(p.model, "m2");
-        assert_eq!(p.base_url, "u"); // unchanged
-        assert_eq!(p.key.as_deref(), Some("sk")); // key None = preserve
-        // The group (and its member binding) is untouched by the edit.
-        assert_eq!(ed.cfg.group("g").unwrap().members, vec!["p1".to_string()]);
-        // Editing a missing provider is rejected by name.
-        assert!(ed
-            .set_provider("ghost", Some("x".into()), None, None)
-            .unwrap_err()
-            .to_string()
-            .contains("ghost"));
-    }
-
-    #[test]
-    fn set_provider_changes_only_key_when_others_untouched() {
-        let mut ed = ProviderEditor::new(ProvidersConfig::default());
-        ed.add_provider("p1".into(), "u".into(), "m".into(), Some("old".into()))
-            .unwrap();
-        // The edit UI prefills base_url and model, so it passes them back as
-        // their current values while swapping the key — result keeps them.
-        ed.set_provider("p1", Some("u".into()), Some("m".into()), Some("new".into()))
-            .unwrap();
-        let p = ed.cfg.provider("p1").unwrap();
-        assert_eq!(p.base_url, "u");
-        assert_eq!(p.model, "m");
-        assert_eq!(p.key.as_deref(), Some("new"));
-    }
-
-    #[test]
-    fn remove_group_guarded_by_role_reference() {
-        let mut ed = ProviderEditor::new(ProvidersConfig::default());
-        ed.add_provider("p1".into(), "u".into(), "m".into(), None)
-            .unwrap();
-        ed.set_group("g".into(), vec!["p1".into()], Strategy::Failover);
-        ed.set_role("main".into(), "g".into());
-        // A role still targets the group → removal is rejected, naming the role.
-        let err = ed.remove_group("g").unwrap_err().to_string();
-        assert!(err.contains("main"), "names the referring role: {err}");
-        assert!(ed.cfg.group("g").is_some(), "group left in place");
-        // Unbind the role, then removal succeeds.
-        ed.unset_role("main").unwrap();
-        ed.remove_group("g").unwrap();
-        assert!(ed.cfg.group("g").is_none());
-        // Removing a missing group is rejected by name.
-        assert!(ed
-            .remove_group("nope")
-            .unwrap_err()
-            .to_string()
-            .contains("nope"));
-    }
-
-    #[test]
-    fn unset_role_removes_binding_and_rejects_unknown() {
-        let mut ed = ProviderEditor::new(ProvidersConfig::default());
-        ed.add_provider("p1".into(), "u".into(), "m".into(), None)
-            .unwrap();
-        ed.set_role("main".into(), "p1".into());
-        ed.unset_role("main").unwrap();
-        assert!(!ed.cfg.roles.contains_key("main"));
-        // Unsetting an undefined role is reported (no such role) by name.
-        assert!(ed
-            .unset_role("ghost")
-            .unwrap_err()
-            .to_string()
-            .contains("ghost"));
-    }
-
-    /// Feed each char of `s` to the app as a key press (input typing helper).
-    fn type_str(app: &mut App, s: &str) {
-        for c in s.chars() {
-            on_key(app, KeyCode::Char(c));
-        }
-    }
-
-    #[test]
-    fn per_field_add_rejects_empty_model_then_completes() {
-        let mut app = App::new(ProvidersConfig::default());
-        on_key(&mut app, KeyCode::Char('a')); // add → Name field
-        type_str(&mut app, "p1");
-        on_key(&mut app, KeyCode::Enter); // → base_url
-        type_str(&mut app, "u");
-        on_key(&mut app, KeyCode::Enter); // → model
-        // Leave the (required) model empty: rejected by name, nothing added.
-        on_key(&mut app, KeyCode::Enter);
-        assert!(
-            app.status.contains("model"),
-            "empty model rejected by name: {}",
-            app.status
-        );
-        assert!(app.ed.providers().is_empty(), "no provider added yet");
-        // Supply the model and finish (blank key → None).
-        type_str(&mut app, "m");
-        on_key(&mut app, KeyCode::Enter); // → key
-        on_key(&mut app, KeyCode::Enter); // blank key → finalize add
-        assert_eq!(app.ed.providers().len(), 1);
-        let p = &app.ed.providers()[0];
-        assert_eq!(p.name, "p1");
-        assert_eq!(p.base_url, "u");
-        assert_eq!(p.model, "m");
-        assert_eq!(p.key, None);
-        assert!(matches!(app.mode, Mode::Browse), "returns to browse");
-    }
-
-    #[test]
-    fn edit_action_changes_only_the_edited_field() {
-        let mut app = App::new(ProvidersConfig::default());
-        app.ed
-            .add_provider("p1".into(), "u".into(), "m".into(), Some("sk".into()))
-            .unwrap();
-        // Reference it from a group to prove the edit needs no unbinding.
-        app.ed
-            .set_group("g".into(), vec!["p1".into()], Strategy::Failover);
-        on_key(&mut app, KeyCode::Char('e')); // edit selected (p1) → base_url prefilled
-        on_key(&mut app, KeyCode::Enter); // keep base_url
-        // model field is prefilled with "m"; replace it with "m2".
-        on_key(&mut app, KeyCode::Backspace);
-        type_str(&mut app, "m2");
-        on_key(&mut app, KeyCode::Enter); // → key
-        on_key(&mut app, KeyCode::Enter); // blank key → keep current, finalize
-        let p = &app.ed.providers()[0];
-        assert_eq!(p.model, "m2");
-        assert_eq!(p.base_url, "u", "unchanged field preserved");
-        assert_eq!(p.key.as_deref(), Some("sk"), "blank key keeps current");
-        assert_eq!(
-            app.ed.cfg.group("g").unwrap().members,
-            vec!["p1".to_string()],
-            "group binding intact"
-        );
-    }
-
-    #[test]
-    fn delete_requires_confirmation() {
-        let mut app = App::new(ProvidersConfig::default());
-        app.ed
-            .add_provider("p1".into(), "u".into(), "m".into(), None)
-            .unwrap();
-        // A single `d` does not remove — it opens a confirmation naming p1.
-        on_key(&mut app, KeyCode::Char('d'));
-        assert_eq!(app.ed.providers().len(), 1, "single d must not delete");
-        match &app.mode {
-            Mode::ConfirmDelete { name } => assert_eq!(name, "p1"),
-            _ => panic!("expected a confirmation prompt"),
-        }
-        // Cancelling keeps the provider.
-        on_key(&mut app, KeyCode::Char('n'));
-        assert_eq!(app.ed.providers().len(), 1);
-        assert!(matches!(app.mode, Mode::Browse));
-        // Confirming removes it.
-        on_key(&mut app, KeyCode::Char('d'));
-        on_key(&mut app, KeyCode::Char('y'));
-        assert!(app.ed.providers().is_empty(), "confirmed delete removes p1");
-    }
-
-    #[test]
-    fn group_remove_and_role_unset_keys() {
-        let mut app = App::new(ProvidersConfig::default());
-        app.ed
-            .add_provider("p1".into(), "u".into(), "m".into(), None)
-            .unwrap();
-        app.ed
-            .set_group("g".into(), vec!["p1".into()], Strategy::Failover);
-        app.ed.set_role("main".into(), "g".into());
-        // `G` removes a group, but a role still targets it → guard names the role.
-        on_key(&mut app, KeyCode::Char('G'));
-        type_str(&mut app, "g");
-        on_key(&mut app, KeyCode::Enter);
-        assert!(
-            app.status.contains("main"),
-            "guard names the referring role: {}",
-            app.status
-        );
-        assert!(app.ed.cfg.group("g").is_some(), "group left in place");
-        // `R` unsets the role, then `G` removes the now-unreferenced group.
-        on_key(&mut app, KeyCode::Char('R'));
-        type_str(&mut app, "main");
-        on_key(&mut app, KeyCode::Enter);
-        assert!(!app.ed.cfg.roles.contains_key("main"), "role unset");
-        on_key(&mut app, KeyCode::Char('G'));
-        type_str(&mut app, "g");
-        on_key(&mut app, KeyCode::Enter);
-        assert!(app.ed.cfg.group("g").is_none(), "group removed after unbind");
-    }
-
-    #[test]
-    fn help_line_lists_new_keys() {
-        let app = App::new(ProvidersConfig::default());
-        for token in ["e edit", "G rm-group", "R unset-role"] {
-            assert!(
-                app.status.contains(token),
-                "status line shows '{token}': {}",
-                app.status
-            );
-        }
     }
 }

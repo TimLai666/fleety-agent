@@ -390,6 +390,18 @@ async fn ensure_dependencies() {
 /// Run the server until a stop signal. `shutdown` is the optional external stop
 /// (Windows SCM); Ctrl+C and Unix SIGTERM are always honored (see [`wait_stop`]).
 async fn run_server(shutdown: Option<tokio::sync::watch::Receiver<bool>>) {
+    // Boot gate: migrate a legacy providers.toml to the two-tier shape and refuse
+    // to boot on a present-but-broken / referentially incomplete provider config,
+    // rather than silently degrading to the echo stub (design M5). A missing file
+    // is fine — the FLEETY_MODEL_* env bootstrap seed takes over.
+    if let Err(e) = providers::migrate_and_check() {
+        let report = e.report();
+        eprintln!("error: providers.toml is unusable: {}", report.message);
+        if let Some(hint) = report.remediation {
+            eprintln!("hint: {hint}");
+        }
+        std::process::exit(1);
+    }
     // Stamp the start time once so uptime reflects boot, not first status query.
     let _ = server_start();
     let addr = std::env::var("FLEETY_ADDR").unwrap_or_else(|_| "127.0.0.1:8787".to_string());

@@ -1,13 +1,24 @@
-//! `providers.toml` — the named model-provider pool.
+//! `providers.toml` — the two-tier provider / model-role configuration.
 //!
 //! A structured, separate file (`~/.fleety/providers.toml`, overridable with
-//! `FLEETY_PROVIDERS`) that defines any number of named providers, optional
-//! groups over them, and a role→name map. This module owns the data model plus
-//! a pure [`parse`] and a fail-soft [`load_from`]/[`load`]: a missing or broken
-//! file is treated as absent (the caller falls back to the env-built tiers) and
-//! never crashes. `fleety-server` turns this data into runtime providers and
-//! group pools; [`write_providers`] / [`validate`] back the `config
-//! provider|group|role` subcommands and the interactive editor.
+//! `FLEETY_PROVIDERS`) with two tiers (design §3.3):
+//!
+//! - **Providers** are endpoints/accounts, tagged by `type` (an extensible
+//!   registry — see [`provider_types`]). `type = "api"` carries a `base_url` and
+//!   optional `key`; `type = "oauth:codex"` sources a per-provider OAuth token
+//!   from `fleety auth login` and carries no `base_url`/`key`.
+//! - **Model roles** are fixed `main` and `cheap`; each is a pool with a
+//!   [`Strategy`] and a list of [`Member`]s, where a member is the full build
+//!   unit — it names a provider plus the `model` and the call-time traits
+//!   (`stream`/`modalities`/`effort`) that follow the model, not the account. One
+//!   provider can therefore serve different models to different roles.
+//!
+//! [`parse`] and the fail-soft [`load_from`]/[`load`] never crash (a missing or
+//! broken file is treated as absent, the caller falls back to the env tiers).
+//! [`write_providers`] / [`validate`] back the `config provider|model`
+//! subcommands and the interactive editor — the write path is **not** fail-soft
+//! (referential integrity is enforced before a file is written).
+//! [`migrate_providers`] one-time upgrades a legacy provider-binds-model file.
 //!
 //! Keys live here (not in `config.toml`) so secrets stay isolated.
 
@@ -17,60 +28,112 @@ use std::path::{Path, PathBuf};
 use agent_core::{CoreError, Result};
 use serde::{Deserialize, Serialize};
 
-/// How a group dispatches a call across its members.
+/// How a model role's member pool dispatches a call across its members.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Strategy {
+    /// Exactly one member (a plain single-provider role).
+    Single,
     /// Advance the starting member each call to spread load across members.
     RoundRobin,
     /// Always start at the first member; only advance on failure (primary + backups).
     Failover,
 }
 
-/// One named provider: an endpoint/account plus its model and optional traits.
-/// Mirrors the env-built provider fields (`{prefix}_BASE_URL` / model / key /
-/// stream / modalities / effort) so the runtime builds it the same way.
+/// A known provider `type`: its authentication/endpoint rules. The list in
+/// [`provider_types`] is the extensible registry — adding a new auth type is one
+/// entry here, never a new core `match` arm.
+pub struct ProviderType {
+    pub name: &'static str,
+    /// The `api` shape needs a `base_url`; oauth types must not carry one.
+    pub requires_base_url: bool,
+    /// The `api` shape may carry a static `key`; oauth types must not.
+    pub allows_key: bool,
+    /// Whether the bearer comes from an OAuth login rather than a static key.
+    pub is_oauth: bool,
+}
+
+/// The registry of known provider types. Extend by adding an entry.
+pub fn provider_types() -> &'static [ProviderType] {
+    &[
+        ProviderType {
+            name: "api",
+            requires_base_url: true,
+            allows_key: true,
+            is_oauth: false,
+        },
+        ProviderType {
+            name: "oauth:codex",
+            requires_base_url: false,
+            allows_key: false,
+            is_oauth: true,
+        },
+    ]
+}
+
+/// Look up a provider type in the registry.
+pub fn provider_type(kind: &str) -> Option<&'static ProviderType> {
+    provider_types().iter().find(|t| t.name == kind)
+}
+
+fn known_types_list() -> String {
+    provider_types()
+        .iter()
+        .map(|t| t.name)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// One provider: an endpoint/account tagged by `type`. The model is NOT a
+/// provider field (it lives on the [`Member`] that names this provider).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProviderSpec {
-    pub name: String,
-    pub base_url: String,
-    pub model: String,
+pub struct Provider {
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
+}
+
+impl Provider {
+    /// Whether this provider's bearer comes from an OAuth login (per its type).
+    pub fn is_oauth(&self) -> bool {
+        provider_type(&self.kind).map(|t| t.is_oauth).unwrap_or(false)
+    }
+}
+
+/// One member of a model-role pool: a provider plus the model and its call-time
+/// traits. This is the full build unit — `stream`/`modalities`/`effort` follow
+/// the model/call, so a mixed pool routes each member with its own traits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Member {
+    pub provider: String,
+    pub model: String,
     #[serde(default, skip_serializing_if = "is_false")]
     pub stream: bool,
-    /// Comma-separated input modalities (e.g. `"text,image"`); `None` derives
-    /// from the model-family heuristic, exactly like the env path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modalities: Option<String>,
-    /// Default reasoning effort (`low`/`medium`/`high`); `None` sends none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
-    /// Authentication mode: `None`/`"static"` uses `key`; `"oauth:codex"` sources
-    /// the bearer from the Codex OAuth token store (refreshing on expiry).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auth: Option<String>,
 }
 
-/// A named group over member providers, with a dispatch strategy.
+/// A model role (`main`/`cheap`): a dispatch strategy over member build units.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GroupSpec {
-    pub name: String,
-    pub members: Vec<String>,
+pub struct ModelPool {
     pub strategy: Strategy,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<Member>,
 }
 
-/// The whole `providers.toml`: providers, groups, and a role→name map. TOML uses
-/// the singular table-array keys `[[provider]]` / `[[group]]` and a `[roles]`
-/// table; serde renames bridge those to the plural fields here.
+/// The whole `providers.toml`: named providers and the `main`/`cheap` model
+/// roles. TOML uses `[providers.<name>]` and `[models.<role>]` tables.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProvidersConfig {
-    #[serde(default, rename = "provider", skip_serializing_if = "Vec::is_empty")]
-    pub providers: Vec<ProviderSpec>,
-    #[serde(default, rename = "group", skip_serializing_if = "Vec::is_empty")]
-    pub groups: Vec<GroupSpec>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub roles: BTreeMap<String, String>,
+    pub providers: BTreeMap<String, Provider>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub models: BTreeMap<String, ModelPool>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -78,21 +141,42 @@ fn is_false(b: &bool) -> bool {
 }
 
 impl ProvidersConfig {
-    /// Find a provider by name.
-    pub fn provider(&self, name: &str) -> Option<&ProviderSpec> {
-        self.providers.iter().find(|p| p.name == name)
+    /// The provider named `name`, if defined.
+    pub fn provider(&self, name: &str) -> Option<&Provider> {
+        self.providers.get(name)
     }
 
-    /// Find a group by name.
-    pub fn group(&self, name: &str) -> Option<&GroupSpec> {
-        self.groups.iter().find(|g| g.name == name)
+    /// The model role named `role`, if defined.
+    pub fn model(&self, role: &str) -> Option<&ModelPool> {
+        self.models.get(role)
+    }
+
+    /// The role that references provider `name` through a member, if any (used
+    /// to refuse removing a still-referenced provider).
+    pub fn role_referencing(&self, provider: &str) -> Option<&str> {
+        self.models
+            .iter()
+            .find(|(_, pool)| pool.members.iter().any(|m| m.provider == provider))
+            .map(|(role, _)| role.as_str())
     }
 }
 
-/// Parse `providers.toml` text. Pure; a TOML/shape error is returned, not logged
-/// or swallowed (callers decide whether to fail soft).
+/// Parse `providers.toml` text into the two-tier config. Pure; a TOML/shape
+/// error, or a provider naming an unknown `type`, is returned (not swallowed) so
+/// the editor path can fail loudly.
 pub fn parse(text: &str) -> Result<ProvidersConfig> {
-    toml::from_str(text).map_err(|e| CoreError::Message(format!("invalid providers.toml: {e}")))
+    let cfg: ProvidersConfig = toml::from_str(text)
+        .map_err(|e| CoreError::Message(format!("invalid providers.toml: {e}")))?;
+    for (name, p) in &cfg.providers {
+        if provider_type(&p.kind).is_none() {
+            return Err(CoreError::Message(format!(
+                "provider '{name}' has unknown type '{}' (known types: {})",
+                p.kind,
+                known_types_list()
+            )));
+        }
+    }
+    Ok(cfg)
 }
 
 /// The `providers.toml` path (`FLEETY_PROVIDERS` override, else
@@ -109,18 +193,16 @@ pub fn providers_path() -> PathBuf {
 
 /// Load and parse a `providers.toml` at `path`, failing soft: a missing file or
 /// any read/parse error yields `None` (a parse error is logged loudly), so a
-/// broken file never blocks startup — the caller falls back to env tiers.
+/// broken file never blocks a runtime read — the caller falls back to env tiers.
+/// The write path ([`write_providers`]) is deliberately NOT fail-soft.
 pub fn load_from(path: &Path) -> Option<ProvidersConfig> {
     let text = std::fs::read_to_string(path).ok()?;
     match parse(&text) {
         Ok(cfg) => Some(cfg),
         Err(e) => {
-            // Error-level on purpose: the user configured a provider pool and is
-            // silently NOT getting it — that must not drown in info-level noise.
             tracing::error!(path = %path.display(), error = %e,
-                "providers.toml is broken and was IGNORED — the provider pool is not \
-                 active; the runtime fell back to the FLEETY_MODEL_* env tiers. Fix the \
-                 file (e.g. `fleety config provider edit` or `config provider list`)");
+                "providers.toml is broken and was IGNORED at read time — fix it (e.g. \
+                 `fleety config provider list`)");
             None
         }
     }
@@ -132,9 +214,9 @@ pub fn load() -> Option<ProvidersConfig> {
     load_from(&providers_path())
 }
 
-/// Load for *editing*: a missing file yields an empty config, but a present
-/// file that fails to parse is an error (so editors never silently clobber a
-/// broken file). Distinct from [`load_from`], which fails soft for the runtime.
+/// Load for *editing*: a missing file yields an empty config, but a present file
+/// that fails to parse is an error (so editors never silently clobber a broken
+/// file). Distinct from [`load_from`], which fails soft for the runtime.
 pub fn load_or_default(path: &Path) -> Result<ProvidersConfig> {
     match std::fs::read_to_string(path) {
         Ok(text) => parse(&text),
@@ -142,45 +224,67 @@ pub fn load_or_default(path: &Path) -> Result<ProvidersConfig> {
     }
 }
 
-/// Validate cross-references in a config. Pure. Rejects a duplicate provider
-/// name, a group member that isn't a defined provider, and a role whose target
-/// is neither a defined provider nor a defined group. (A group's strategy is an
-/// enum, so an invalid strategy can't be represented — it's rejected when a
-/// command flag is parsed.) Each error names the offending item.
+/// Validate the two-tier config. Pure. Enforces provider `type` field rules (api
+/// needs a `base_url` and no oauth-only shape; oauth types carry no
+/// `base_url`/`key`), and role referential integrity (every member names a
+/// defined provider; a present role has ≥1 member; `single` has exactly one).
+/// Each error names the offending item.
 pub fn validate(cfg: &ProvidersConfig) -> Result<()> {
-    let mut seen = std::collections::HashSet::new();
-    for p in &cfg.providers {
-        if !seen.insert(p.name.as_str()) {
+    for (name, p) in &cfg.providers {
+        let Some(t) = provider_type(&p.kind) else {
             return Err(CoreError::Message(format!(
-                "duplicate provider name '{}'",
-                p.name
+                "provider '{name}' has unknown type '{}' (known types: {})",
+                p.kind,
+                known_types_list()
+            )));
+        };
+        let has_base = p.base_url.as_deref().map(|s| !s.is_empty()).unwrap_or(false);
+        if t.requires_base_url && !has_base {
+            return Err(CoreError::Message(format!(
+                "provider '{name}' (type {}) requires a base_url",
+                p.kind
+            )));
+        }
+        if !t.requires_base_url && p.base_url.is_some() {
+            return Err(CoreError::Message(format!(
+                "provider '{name}' (type {}) must not set base_url",
+                p.kind
+            )));
+        }
+        if !t.allows_key && p.key.is_some() {
+            return Err(CoreError::Message(format!(
+                "provider '{name}' (type {}) must not set key",
+                p.kind
             )));
         }
     }
-    for g in &cfg.groups {
-        for m in &g.members {
-            if cfg.provider(m).is_none() {
+    for (role, pool) in &cfg.models {
+        if pool.members.is_empty() {
+            return Err(CoreError::Message(format!(
+                "model role '{role}' has no members"
+            )));
+        }
+        if pool.strategy == Strategy::Single && pool.members.len() != 1 {
+            return Err(CoreError::Message(format!(
+                "model role '{role}' uses strategy=single but has {} members (need exactly one)",
+                pool.members.len()
+            )));
+        }
+        for m in &pool.members {
+            if !cfg.providers.contains_key(&m.provider) {
                 return Err(CoreError::Message(format!(
-                    "group '{}' references undefined provider '{m}'",
-                    g.name
+                    "model role '{role}' member references undefined provider '{}'",
+                    m.provider
                 )));
             }
-        }
-    }
-    for (role, target) in &cfg.roles {
-        if cfg.provider(target).is_none() && cfg.group(target).is_none() {
-            return Err(CoreError::Message(format!(
-                "role '{role}' targets undefined provider/group '{target}'"
-            )));
         }
     }
     Ok(())
 }
 
-/// Serialize `cfg` to TOML and write it to `path` atomically: write a temp file
-/// in the same directory, then rename it over `path` (so a crash or concurrent
-/// write never leaves a half-written file). The config is validated first; an
-/// invalid config is not written.
+/// Serialize `cfg` to TOML and write it to `path` atomically (temp file + rename
+/// in the same directory). The config is validated first; an invalid config is
+/// not written — the write path is not fail-soft.
 pub fn write_providers(path: &Path, cfg: &ProvidersConfig) -> Result<()> {
     validate(cfg)?;
     let text = toml::to_string_pretty(cfg)
@@ -204,160 +308,410 @@ pub fn write_providers(path: &Path, cfg: &ProvidersConfig) -> Result<()> {
     Ok(())
 }
 
+// ---- one-time migration: legacy provider-binds-model → two-tier ----
+
+/// Migrate legacy `providers.toml` text (the `[[provider]]` binds-a-model form
+/// with `[[group]]`/`[roles]`) into the two-tier shape. Returns `Ok(None)` when
+/// the text is already two-tier or has nothing to migrate (idempotent).
+/// Otherwise returns the new config plus any human-readable warnings for parts
+/// that could not be carried over (never silently dropped).
+///
+/// Providers that differ only by `model` (same `base_url`+`key`+`auth`) merge
+/// into one provider; each old model becomes a [`Member`] carrying that model
+/// and its `stream`/`modalities`/`effort`; old roles map to `models.<role>`.
+pub fn migrate_providers(text: &str) -> Result<Option<(ProvidersConfig, Vec<String>)>> {
+    let raw: toml::Value = text
+        .parse()
+        .map_err(|e| CoreError::Message(format!("invalid providers.toml: {e}")))?;
+    let has_new = raw.get("models").is_some()
+        || raw.get("providers").and_then(|v| v.as_table()).is_some();
+    let has_old = raw.get("provider").and_then(|v| v.as_array()).is_some()
+        || raw.get("group").is_some()
+        || raw.get("roles").is_some();
+    if has_new || !has_old {
+        return Ok(None);
+    }
+
+    #[derive(Deserialize)]
+    struct OldProvider {
+        name: String,
+        #[serde(default)]
+        base_url: String,
+        model: String,
+        #[serde(default)]
+        key: Option<String>,
+        #[serde(default)]
+        stream: bool,
+        #[serde(default)]
+        modalities: Option<String>,
+        #[serde(default)]
+        effort: Option<String>,
+        #[serde(default)]
+        auth: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct OldGroup {
+        name: String,
+        members: Vec<String>,
+        strategy: Strategy,
+    }
+    #[derive(Deserialize, Default)]
+    struct OldConfig {
+        #[serde(default, rename = "provider")]
+        providers: Vec<OldProvider>,
+        #[serde(default, rename = "group")]
+        groups: Vec<OldGroup>,
+        #[serde(default)]
+        roles: BTreeMap<String, String>,
+    }
+
+    let old: OldConfig = toml::from_str(text)
+        .map_err(|e| CoreError::Message(format!("invalid legacy providers.toml: {e}")))?;
+    let mut warnings = Vec::new();
+
+    // Dedup old providers by endpoint identity (base_url, key, auth) → one new
+    // provider; remember the old→new name mapping so members can point at it.
+    type EndpointId = (String, Option<String>, Option<String>);
+    let mut endpoints: Vec<(EndpointId, String)> = Vec::new();
+    let mut old_to_new: BTreeMap<String, String> = BTreeMap::new();
+    let mut providers: BTreeMap<String, Provider> = BTreeMap::new();
+    for op in &old.providers {
+        let ident = (op.base_url.clone(), op.key.clone(), op.auth.clone());
+        let newname = if let Some((_, n)) = endpoints.iter().find(|(e, _)| *e == ident) {
+            n.clone()
+        } else {
+            let kind = if op.auth.as_deref() == Some("oauth:codex") {
+                "oauth:codex".to_string()
+            } else {
+                "api".to_string()
+            };
+            let provider = if kind == "api" {
+                Provider {
+                    kind,
+                    base_url: Some(op.base_url.clone()),
+                    key: op.key.clone(),
+                }
+            } else {
+                Provider {
+                    kind,
+                    base_url: None,
+                    key: None,
+                }
+            };
+            providers.insert(op.name.clone(), provider);
+            endpoints.push((ident, op.name.clone()));
+            op.name.clone()
+        };
+        old_to_new.insert(op.name.clone(), newname);
+    }
+
+    let member_for = |op: &OldProvider| Member {
+        provider: old_to_new
+            .get(&op.name)
+            .cloned()
+            .unwrap_or_else(|| op.name.clone()),
+        model: op.model.clone(),
+        stream: op.stream,
+        modalities: op.modalities.clone(),
+        effort: op.effort.clone(),
+    };
+    let old_by_name: BTreeMap<&str, &OldProvider> =
+        old.providers.iter().map(|p| (p.name.as_str(), p)).collect();
+
+    let mut models: BTreeMap<String, ModelPool> = BTreeMap::new();
+    for (role, target) in &old.roles {
+        if let Some(op) = old_by_name.get(target.as_str()) {
+            models.insert(
+                role.clone(),
+                ModelPool {
+                    strategy: Strategy::Single,
+                    members: vec![member_for(op)],
+                },
+            );
+        } else if let Some(g) = old.groups.iter().find(|g| g.name == *target) {
+            let members: Vec<Member> = g
+                .members
+                .iter()
+                .filter_map(|mn| old_by_name.get(mn.as_str()).map(|op| member_for(op)))
+                .collect();
+            if members.is_empty() {
+                warnings.push(format!(
+                    "role '{role}' → group '{target}' had no resolvable members; skipped"
+                ));
+                continue;
+            }
+            models.insert(
+                role.clone(),
+                ModelPool {
+                    strategy: g.strategy,
+                    members,
+                },
+            );
+        } else {
+            warnings.push(format!(
+                "role '{role}' → '{target}' matched no provider or group; skipped"
+            ));
+        }
+    }
+
+    Ok(Some((ProvidersConfig { providers, models }, warnings)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    // ---- task 1.1: two-tier data model + parse ----
+
     #[test]
-    fn parse_providers_group_and_roles() {
+    fn parse_two_tier_round_trips() {
         let text = r#"
-            [[provider]]
-            name = "codex-1"
+            [providers.openai1]
+            type = "api"
             base_url = "https://api.openai.com/v1"
-            model = "gpt-5"
             key = "sk-a"
 
-            [[provider]]
-            name = "codex-2"
-            base_url = "https://api.openai.com/v1"
-            model = "gpt-5"
-            key = "sk-b"
-            stream = true
-            modalities = "text,image"
-            effort = "medium"
+            [providers.codex1]
+            type = "oauth:codex"
 
-            [[group]]
-            name = "codex"
-            members = ["codex-1", "codex-2"]
-            strategy = "round_robin"
+            [models.main]
+            strategy = "failover"
+            members = [
+              { provider = "openai1", model = "gpt-4o", stream = true, modalities = "text,image", effort = "medium" },
+              { provider = "codex1", model = "gpt-5" },
+            ]
 
-            [roles]
-            main = "codex"
-            cheap = "codex-1"
+            [models.cheap]
+            strategy = "single"
+            members = [ { provider = "openai1", model = "gpt-4o-mini" } ]
         "#;
         let cfg = parse(text).expect("parses");
         assert_eq!(cfg.providers.len(), 2);
-        assert_eq!(cfg.groups.len(), 1);
-        assert_eq!(cfg.groups[0].strategy, Strategy::RoundRobin);
-        assert_eq!(cfg.groups[0].members, vec!["codex-1", "codex-2"]);
-        assert_eq!(cfg.roles.get("main").map(String::as_str), Some("codex"));
-        assert!(cfg.provider("codex-2").unwrap().stream);
+        assert_eq!(cfg.provider("openai1").unwrap().kind, "api");
         assert_eq!(
-            cfg.provider("codex-2").unwrap().modalities.as_deref(),
-            Some("text,image")
+            cfg.provider("openai1").unwrap().base_url.as_deref(),
+            Some("https://api.openai.com/v1")
         );
+        assert!(cfg.provider("codex1").unwrap().is_oauth());
+        assert!(cfg.provider("codex1").unwrap().base_url.is_none());
+        let main = cfg.model("main").unwrap();
+        assert_eq!(main.strategy, Strategy::Failover);
+        assert_eq!(main.members.len(), 2);
+        assert_eq!(main.members[0].model, "gpt-4o");
+        assert!(main.members[0].stream);
+        assert_eq!(main.members[0].modalities.as_deref(), Some("text,image"));
+        // Round-trip through write shape.
+        let back = parse(&toml::to_string_pretty(&cfg).unwrap()).expect("re-parse");
+        assert_eq!(back, cfg);
     }
 
     #[test]
-    fn parse_rejects_bad_toml() {
-        assert!(parse("this is = = not toml").is_err());
-        // Unknown strategy is a shape error → Err (fails soft at the load layer).
-        let bad = "[[group]]\nname=\"g\"\nmembers=[]\nstrategy=\"random\"\n";
-        assert!(parse(bad).is_err());
+    fn parse_unknown_type_lists_known() {
+        let text = "[providers.x]\ntype = \"oauth:mystery\"\n";
+        let err = parse(text).unwrap_err().to_string();
+        assert!(err.contains("unknown type 'oauth:mystery'"), "got: {err}");
+        assert!(err.contains("api") && err.contains("oauth:codex"), "lists known: {err}");
     }
 
-    #[test]
-    fn empty_sections_default_to_empty() {
-        let cfg = parse("").expect("empty parses");
-        assert!(cfg.providers.is_empty());
-        assert!(cfg.groups.is_empty());
-        assert!(cfg.roles.is_empty());
+    // ---- task 1.2: validate (referential integrity, field rules) ----
+
+    fn api(base: &str) -> Provider {
+        Provider {
+            kind: "api".to_string(),
+            base_url: Some(base.to_string()),
+            key: None,
+        }
     }
 
-    #[test]
-    fn load_from_missing_file_is_none() {
-        let p = std::env::temp_dir().join(format!("fleety-no-such-{}.toml", uuid::Uuid::new_v4()));
-        assert!(load_from(&p).is_none());
+    fn member(provider: &str, model: &str) -> Member {
+        Member {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            stream: false,
+            modalities: None,
+            effort: None,
+        }
     }
 
-    #[test]
-    fn load_from_broken_file_is_none() {
-        let p = std::env::temp_dir().join(format!("fleety-bad-{}.toml", uuid::Uuid::new_v4()));
-        std::fs::write(&p, "= = broken").expect("write");
-        assert!(load_from(&p).is_none());
-        let _ = std::fs::remove_file(&p);
-    }
-
-    fn sample() -> ProvidersConfig {
-        let mut roles = BTreeMap::new();
-        roles.insert("main".to_string(), "codex".to_string());
-        roles.insert("cheap".to_string(), "codex-1".to_string());
+    fn cfg_with(providers: &[(&str, Provider)], models: &[(&str, ModelPool)]) -> ProvidersConfig {
         ProvidersConfig {
-            providers: vec![
-                ProviderSpec {
-                    name: "codex-1".to_string(),
-                    base_url: "https://api.openai.com/v1".to_string(),
-                    model: "gpt-5".to_string(),
-                    key: Some("sk-a".to_string()),
-                    stream: true,
-                    modalities: Some("text,image".to_string()),
-                    effort: Some("medium".to_string()),
-                    auth: None,
-                },
-                ProviderSpec {
-                    name: "codex-2".to_string(),
-                    base_url: "https://api.openai.com/v1".to_string(),
-                    model: "gpt-5".to_string(),
-                    key: None,
-                    stream: false,
-                    modalities: None,
-                    effort: None,
-                    auth: Some("oauth:codex".to_string()),
-                },
-            ],
-            groups: vec![GroupSpec {
-                name: "codex".to_string(),
-                members: vec!["codex-1".to_string(), "codex-2".to_string()],
-                strategy: Strategy::RoundRobin,
-            }],
-            roles,
+            providers: providers.iter().map(|(n, p)| (n.to_string(), p.clone())).collect(),
+            models: models.iter().map(|(n, m)| (n.to_string(), m.clone())).collect(),
         }
     }
 
     #[test]
-    fn write_then_parse_is_stable() {
-        let cfg = sample();
-        let p = std::env::temp_dir().join(format!("fleety-rt-{}.toml", uuid::Uuid::new_v4()));
-        write_providers(&p, &cfg).expect("write");
-        let back = load_from(&p).expect("re-read");
-        assert_eq!(back, cfg);
+    fn validate_rejects_undefined_member_provider() {
+        let cfg = cfg_with(
+            &[("openai1", api("https://x/v1"))],
+            &[(
+                "main",
+                ModelPool {
+                    strategy: Strategy::Single,
+                    members: vec![member("ghost", "gpt-4o")],
+                },
+            )],
+        );
+        let err = validate(&cfg).unwrap_err().to_string();
+        assert!(err.contains("undefined provider 'ghost'"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_single_requires_exactly_one_member() {
+        let cfg = cfg_with(
+            &[("openai1", api("https://x/v1"))],
+            &[(
+                "main",
+                ModelPool {
+                    strategy: Strategy::Single,
+                    members: vec![member("openai1", "a"), member("openai1", "b")],
+                },
+            )],
+        );
+        assert!(validate(&cfg).unwrap_err().to_string().contains("exactly one"));
+    }
+
+    #[test]
+    fn validate_rejects_api_without_base_url_and_oauth_with_fields() {
+        // api missing base_url.
+        let mut bad_api = api("");
+        bad_api.base_url = None;
+        let cfg = cfg_with(&[("p", bad_api)], &[]);
+        assert!(validate(&cfg).unwrap_err().to_string().contains("requires a base_url"));
+        // oauth carrying base_url/key.
+        let bad_oauth = Provider {
+            kind: "oauth:codex".to_string(),
+            base_url: Some("https://x".to_string()),
+            key: None,
+        };
+        let cfg = cfg_with(&[("c", bad_oauth)], &[]);
+        assert!(validate(&cfg).unwrap_err().to_string().contains("must not set base_url"));
+    }
+
+    #[test]
+    fn validate_passes_clean_and_reports_reference() {
+        let cfg = cfg_with(
+            &[("openai1", api("https://x/v1"))],
+            &[(
+                "main",
+                ModelPool {
+                    strategy: Strategy::Single,
+                    members: vec![member("openai1", "gpt-4o")],
+                },
+            )],
+        );
+        assert!(validate(&cfg).is_ok());
+        assert_eq!(cfg.role_referencing("openai1"), Some("main"));
+        assert_eq!(cfg.role_referencing("nope"), None);
+    }
+
+    #[test]
+    fn write_rejects_invalid_and_round_trips_valid() {
+        let good = cfg_with(
+            &[("openai1", api("https://x/v1"))],
+            &[(
+                "main",
+                ModelPool {
+                    strategy: Strategy::Failover,
+                    members: vec![member("openai1", "gpt-4o"), member("openai1", "gpt-4o-mini")],
+                },
+            )],
+        );
+        let p = std::env::temp_dir().join(format!("fleety-pv-{}.toml", uuid::Uuid::new_v4()));
+        write_providers(&p, &good).expect("write valid");
+        assert_eq!(load_from(&p).expect("re-read"), good);
+        // Invalid (undefined provider) is refused and leaves the good file intact.
+        let bad = cfg_with(&[], &[("main", good.models["main"].clone())]);
+        assert!(write_providers(&p, &bad).is_err());
+        assert_eq!(load_from(&p).expect("still good"), good);
         let _ = std::fs::remove_file(&p);
     }
 
+    // ---- task 1.3: migration ----
+
     #[test]
-    fn write_rejects_invalid_config() {
-        // A role targeting an undefined name fails validation → no file written.
-        let mut cfg = ProvidersConfig::default();
-        cfg.roles.insert("main".to_string(), "ghost".to_string());
-        let p = std::env::temp_dir().join(format!("fleety-inv-{}.toml", uuid::Uuid::new_v4()));
-        assert!(write_providers(&p, &cfg).is_err());
-        assert!(!p.exists(), "no file should be written on invalid config");
+    fn migrate_dedups_providers_and_sinks_traits_to_members() {
+        // Two legacy providers, same endpoint, different model, pooled by a group.
+        let legacy = r#"
+            [[provider]]
+            name = "openai-a"
+            base_url = "https://api.openai.com/v1"
+            key = "sk-x"
+            model = "gpt-4o"
+            stream = true
+            modalities = "text,image"
+
+            [[provider]]
+            name = "openai-b"
+            base_url = "https://api.openai.com/v1"
+            key = "sk-x"
+            model = "gpt-4o-mini"
+
+            [[group]]
+            name = "openai"
+            members = ["openai-a", "openai-b"]
+            strategy = "round_robin"
+
+            [roles]
+            main = "openai"
+            cheap = "openai-b"
+        "#;
+        let (cfg, warnings) = migrate_providers(legacy).expect("migrate").expect("is old");
+        // Same endpoint+key → deduped to ONE provider.
+        assert_eq!(cfg.providers.len(), 1, "deduped: {:?}", cfg.providers.keys().collect::<Vec<_>>());
+        let pname = cfg.providers.keys().next().unwrap().clone();
+        // main = round_robin pool of both models, both referencing the one provider.
+        let main = cfg.model("main").expect("main role");
+        assert_eq!(main.strategy, Strategy::RoundRobin);
+        assert_eq!(main.members.len(), 2);
+        assert!(main.members.iter().all(|m| m.provider == pname));
+        let models: Vec<&str> = main.members.iter().map(|m| m.model.as_str()).collect();
+        assert!(models.contains(&"gpt-4o") && models.contains(&"gpt-4o-mini"));
+        // Traits sank onto the matching member.
+        let a = main.members.iter().find(|m| m.model == "gpt-4o").unwrap();
+        assert!(a.stream);
+        assert_eq!(a.modalities.as_deref(), Some("text,image"));
+        // cheap = single, one member (gpt-4o-mini).
+        let cheap = cfg.model("cheap").expect("cheap role");
+        assert_eq!(cheap.strategy, Strategy::Single);
+        assert_eq!(cheap.members[0].model, "gpt-4o-mini");
+        assert!(warnings.is_empty(), "clean migration: {warnings:?}");
+        // The migrated config validates.
+        assert!(validate(&cfg).is_ok());
     }
 
     #[test]
-    fn validate_rejects_inconsistencies_and_passes_clean() {
-        // Duplicate provider name.
-        let mut dup = sample();
-        dup.providers[1].name = "codex-1".to_string();
-        assert!(validate(&dup).unwrap_err().to_string().contains("codex-1"));
+    fn migrate_is_idempotent_on_new_format() {
+        let new = r#"
+            [providers.openai1]
+            type = "api"
+            base_url = "https://x/v1"
 
-        // Group member that isn't a provider.
-        let mut bad_member = sample();
-        bad_member.groups[0].members.push("ghost".to_string());
-        assert!(validate(&bad_member)
-            .unwrap_err()
-            .to_string()
-            .contains("ghost"));
+            [models.main]
+            strategy = "single"
+            members = [ { provider = "openai1", model = "gpt-4o" } ]
+        "#;
+        assert!(migrate_providers(new).expect("no error").is_none());
+        // Empty text has nothing to migrate.
+        assert!(migrate_providers("").expect("no error").is_none());
+    }
 
-        // Role target that isn't a provider or group.
-        let mut bad_role = sample();
-        bad_role.roles.insert("x".to_string(), "nope".to_string());
-        assert!(validate(&bad_role)
-            .unwrap_err()
-            .to_string()
-            .contains("nope"));
+    #[test]
+    fn migrate_warns_on_unresolvable_role_target() {
+        let legacy = r#"
+            [[provider]]
+            name = "p1"
+            base_url = "https://x/v1"
+            model = "gpt-4o"
 
-        // A consistent config passes.
-        assert!(validate(&sample()).is_ok());
+            [roles]
+            main = "p1"
+            cheap = "ghost-group"
+        "#;
+        let (cfg, warnings) = migrate_providers(legacy).expect("migrate").expect("is old");
+        assert!(cfg.model("main").is_some());
+        assert!(cfg.model("cheap").is_none(), "unresolvable role skipped");
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("cheap") && warnings[0].contains("ghost-group"));
     }
 }

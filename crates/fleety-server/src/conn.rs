@@ -2870,7 +2870,7 @@ mod tests {
         // Provider add → ok + NextConnection effect.
         match config_apply(
             ConfigTarget::Server,
-            &s(&["provider", "add", "p", "--base-url", "u", "--model", "m"]),
+            &s(&["provider", "add", "p", "--type", "api", "--base-url", "u"]),
         ) {
             ServerMsg::ConfigResult { ok, effect, .. } => {
                 assert!(ok);

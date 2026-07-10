@@ -166,18 +166,60 @@ fn build_codex_responses(
     )
 }
 
-/// Build one provider from a `providers.toml` entry.
-fn build_from_spec(spec: &fleety_tools::providers_config::ProviderSpec) -> Arc<dyn ModelProvider> {
-    build_provider(ProviderBuild {
-        base_url: spec.base_url.clone(),
-        model: spec.model.clone(),
-        key: spec.key.clone(),
-        stream: spec.stream,
-        modalities: spec.modalities.clone(),
-        effort: spec.effort.clone(),
-        auth: spec.auth.clone(),
-        label: spec.name.clone(),
-    })
+/// Build one runtime provider from a model-role member: its named provider's
+/// endpoint/auth (from `providers.toml`) plus the member's model and call-time
+/// traits (`stream`/`modalities`/`effort`). Returns `None` when the member names
+/// a provider that isn't defined (the pool skips it with a warning).
+fn build_member(
+    cfg: &fleety_tools::providers_config::ProvidersConfig,
+    m: &fleety_tools::providers_config::Member,
+) -> Option<Arc<dyn ModelProvider>> {
+    let provider = cfg.providers.get(&m.provider)?;
+    let (base_url, key, auth) = if provider.is_oauth() {
+        // oauth types carry no base_url/key; the bearer comes from the token store.
+        (String::new(), None, Some(provider.kind.clone()))
+    } else {
+        (
+            provider.base_url.clone().unwrap_or_default(),
+            provider.key.clone(),
+            None,
+        )
+    };
+    Some(build_provider(ProviderBuild {
+        base_url,
+        model: m.model.clone(),
+        key,
+        stream: m.stream,
+        modalities: m.modalities.clone(),
+        effort: m.effort.clone(),
+        auth,
+        label: format!("{}/{}", m.provider, m.model),
+    }))
+}
+
+/// At server boot: migrate a legacy `providers.toml` (provider-binds-model form)
+/// in place, then refuse to boot on a present-but-broken or referentially
+/// incomplete two-tier config (design M5) — rather than silently degrading to the
+/// echo stub. A missing file is fine (the env `FLEETY_MODEL_*` bootstrap seed
+/// takes over). Called once from `main`; the caller exits on `Err`.
+pub fn migrate_and_check() -> agent_core::Result<()> {
+    use fleety_tools::providers_config as pc;
+    let path = pc::providers_path();
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Ok(()); // no structured config → env bootstrap seed
+    };
+    if let Some((cfg, warnings)) = pc::migrate_providers(&text)? {
+        for w in &warnings {
+            tracing::warn!(migration = %w, "providers.toml migration carried this over with a note");
+        }
+        pc::write_providers(&path, &cfg)?; // validates before writing
+        tracing::info!("migrated legacy providers.toml to the two-tier provider/model shape");
+        return Ok(());
+    }
+    // Already two-tier: parse + validate; a broken/incomplete config is fatal.
+    let cfg = pc::parse(&text)?;
+    pc::validate(&cfg)?;
+    Ok(())
 }
 
 /// Which reasoning-effort encoding (if any) a model family accepts. Conservative:
@@ -245,50 +287,45 @@ impl ProviderTiers {
         Self::new(build_main(), build("FLEETY_CHEAP_MODEL"))
     }
 
-    /// Build a registry from a parsed `providers.toml`. Returns `None` when no
-    /// providers are defined (so the caller falls back to the env tiers). Groups
-    /// become [`PoolProvider`]s over their members; a group with no resolvable
-    /// member is skipped with a warning.
+    /// Build a registry from a parsed two-tier `providers.toml`. Returns `None`
+    /// when no model roles are defined (so the caller falls back to the env
+    /// tiers). Each model role becomes an entry resolvable by its name: a
+    /// single-member role is that member's provider; a multi-member role is a
+    /// [`PoolProvider`] over the members built from provider + member traits.
     fn from_config(cfg: &fleety_tools::providers_config::ProvidersConfig) -> Option<Self> {
-        if cfg.providers.is_empty() {
+        if cfg.models.is_empty() {
             return None;
         }
         let mut providers: std::collections::HashMap<String, Arc<dyn ModelProvider>> =
             std::collections::HashMap::new();
-        for spec in &cfg.providers {
-            providers.insert(spec.name.clone(), build_from_spec(spec));
-        }
-        for g in &cfg.groups {
-            let members: Vec<Arc<dyn ModelProvider>> = g
+        for (role, pool) in &cfg.models {
+            let members: Vec<Arc<dyn ModelProvider>> = pool
                 .members
                 .iter()
-                .filter_map(|m| providers.get(m).cloned())
+                .filter_map(|m| build_member(cfg, m))
                 .collect();
             if members.is_empty() {
-                tracing::warn!(group = %g.name,
-                    "providers.toml group has no resolvable members; skipping");
+                tracing::warn!(role = %role,
+                    "providers.toml model role has no resolvable members; skipping");
                 continue;
             }
-            let pool = Arc::new(crate::pool::PoolProvider::new(members, g.strategy))
-                as Arc<dyn ModelProvider>;
-            providers.insert(g.name.clone(), pool);
+            let provider: Arc<dyn ModelProvider> = if members.len() == 1 {
+                Arc::clone(&members[0])
+            } else {
+                Arc::new(crate::pool::PoolProvider::new(members, pool.strategy))
+            };
+            providers.insert(role.clone(), provider);
         }
-        let roles: std::collections::HashMap<String, String> =
-            cfg.roles.clone().into_iter().collect();
-        // Resolve the fallback `main`: the `main` role's target, else a provider
-        // literally named "main", else the first defined provider.
-        let main = roles
+        // Fallback `main` for unknown selectors: the `main` role, else `cheap`,
+        // else any resolved role.
+        let main = providers
             .get("main")
-            .and_then(|n| providers.get(n).cloned())
-            .or_else(|| providers.get("main").cloned())
-            .or_else(|| {
-                cfg.providers
-                    .first()
-                    .and_then(|s| providers.get(&s.name).cloned())
-            })?;
+            .or_else(|| providers.get("cheap"))
+            .cloned()
+            .or_else(|| providers.values().next().cloned())?;
         Some(Self {
             providers,
-            roles,
+            roles: std::collections::HashMap::new(),
             main,
         })
     }
@@ -455,7 +492,66 @@ mod tests {
 
     #[test]
     #[serial]
-    fn providers_toml_builds_named_pool_and_roles() {
+    fn providers_toml_builds_role_pools_and_one_provider_two_roles() {
+        clear();
+        let path =
+            std::env::temp_dir().join(format!("fleety-providers-{}.toml", uuid::Uuid::new_v4()));
+        // One provider serves gpt-4o to `main` (a two-member failover pool) and
+        // gpt-4o-mini to `cheap` (single) — no duplicated provider.
+        std::fs::write(
+            &path,
+            r#"
+                [providers.openai1]
+                type = "api"
+                base_url = "https://api.openai.com/v1"
+                key = "sk-a"
+
+                [models.main]
+                strategy = "failover"
+                members = [
+                  { provider = "openai1", model = "gpt-4o" },
+                  { provider = "openai1", model = "gpt-4o-2" },
+                ]
+
+                [models.cheap]
+                strategy = "single"
+                members = [ { provider = "openai1", model = "gpt-4o-mini" } ]
+            "#,
+        )
+        .expect("write providers.toml");
+        std::env::set_var("FLEETY_PROVIDERS", &path);
+        let tiers = ProviderTiers::from_env();
+        // Both roles resolve; an unknown selector falls back to main.
+        assert!(Arc::ptr_eq(&tiers.resolve("zzz-unknown"), &tiers.resolve("main")));
+        // main (a pool) and cheap (a single) are distinct providers.
+        assert!(!Arc::ptr_eq(&tiers.resolve("main"), &tiers.resolve("cheap")));
+        let _ = std::fs::remove_file(&path);
+        clear();
+    }
+
+    #[test]
+    #[serial]
+    fn migrate_and_check_allows_missing_and_rejects_broken() {
+        clear();
+        let path =
+            std::env::temp_dir().join(format!("fleety-providers-{}.toml", uuid::Uuid::new_v4()));
+        std::env::set_var("FLEETY_PROVIDERS", &path);
+        // No providers.toml → the env bootstrap seed is allowed to take over.
+        assert!(migrate_and_check().is_ok());
+        // A two-tier config whose member references an undefined provider is fatal.
+        std::fs::write(
+            &path,
+            "[models.main]\nstrategy = \"single\"\nmembers = [ { provider = \"ghost\", model = \"m\" } ]\n",
+        )
+        .expect("write");
+        assert!(migrate_and_check().is_err(), "broken structured config must refuse to boot");
+        let _ = std::fs::remove_file(&path);
+        clear();
+    }
+
+    #[test]
+    #[serial]
+    fn migrate_and_check_upgrades_legacy_in_place() {
         clear();
         let path =
             std::env::temp_dir().join(format!("fleety-providers-{}.toml", uuid::Uuid::new_v4()));
@@ -467,35 +563,24 @@ mod tests {
                 base_url = "https://api.openai.com/v1"
                 model = "gpt-5"
 
-                [[provider]]
-                name = "codex-2"
-                base_url = "https://api.openai.com/v1"
-                model = "gpt-5"
-
                 [[group]]
                 name = "codex"
-                members = ["codex-1", "codex-2"]
-                strategy = "round_robin"
+                members = ["codex-1"]
+                strategy = "failover"
 
                 [roles]
                 main = "codex"
             "#,
         )
-        .expect("write providers.toml");
+        .expect("write legacy");
         std::env::set_var("FLEETY_PROVIDERS", &path);
-        let tiers = ProviderTiers::from_env();
-        // The `main` role maps to the `codex` group, so both resolve to the same
-        // pooled provider; an unknown tier falls back to `main`.
-        assert!(Arc::ptr_eq(&tiers.resolve("main"), &tiers.resolve("codex")));
-        assert!(Arc::ptr_eq(
-            &tiers.resolve("zzz-unknown"),
-            &tiers.resolve("main")
-        ));
-        // A bare provider name resolves to that single provider, distinct from the group.
-        assert!(!Arc::ptr_eq(
-            &tiers.resolve("codex-1"),
-            &tiers.resolve("codex")
-        ));
+        migrate_and_check().expect("migrate ok");
+        // The file is now two-tier and reloads cleanly.
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(text.contains("[providers."), "migrated shape: {text}");
+        assert!(text.contains("[models."), "migrated shape: {text}");
+        // The migrated config builds a runtime without panicking.
+        let _ = ProviderTiers::from_env().resolve("main");
         let _ = std::fs::remove_file(&path);
         clear();
     }

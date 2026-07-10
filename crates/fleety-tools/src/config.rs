@@ -598,7 +598,7 @@ pub enum ConfigEffect {
 /// until a restart. Pure.
 pub fn config_effect(args: &[String]) -> Option<ConfigEffect> {
     match args.first().map(String::as_str) {
-        Some("provider" | "group" | "role") => match args.get(1).map(String::as_str) {
+        Some("provider" | "model") => match args.get(1).map(String::as_str) {
             // A read sub-verb changes nothing.
             Some("list") | None => None,
             _ => Some(ConfigEffect::NextConnection),
@@ -674,7 +674,7 @@ pub fn run(args: &[String]) -> Result<()> {
     // renders to text (so the same code serves the remote handler).
     let is_providers = matches!(
         args.first().map(String::as_str),
-        Some("provider" | "group" | "role")
+        Some("provider" | "model")
     );
     if !is_providers && matches!(parse(args), Command::Edit) {
         return edit_line_based(&config_path());
@@ -694,7 +694,7 @@ pub fn run(args: &[String]) -> Result<()> {
 pub fn run_rendered(args: &[String]) -> Result<String> {
     if matches!(
         args.first().map(String::as_str),
-        Some("provider" | "group" | "role")
+        Some("provider" | "model")
     ) {
         return run_providers_at(&pc::providers_path(), args);
     }
@@ -776,45 +776,45 @@ pub fn run_rendered(args: &[String]) -> Result<String> {
 
 // ---- providers.toml subcommands (provider / group / role) ----
 
-use crate::providers_config::{self as pc, GroupSpec, ProviderSpec, Strategy};
+use crate::providers_config::{self as pc, Member, ModelPool, Provider, Strategy};
 
-/// A parsed `provider` / `group` / `role` subcommand over `providers.toml`.
+/// A parsed `provider` / `model` subcommand over `providers.toml` (the two-tier
+/// model: `type`-tagged providers and `main`/`cheap` member pools).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderCmd {
-    ProviderAdd(ProviderSpec),
-    /// Update named provider's fields (only `Some` fields change).
+    ProviderAdd {
+        name: String,
+        kind: String,
+        base_url: Option<String>,
+        key: Option<String>,
+    },
+    /// Update a named provider's fields (only `Some` fields change).
     ProviderSet {
         name: String,
+        kind: Option<String>,
         base_url: Option<String>,
-        model: Option<String>,
         key: Option<String>,
-        stream: Option<bool>,
-        modalities: Option<String>,
-        effort: Option<String>,
     },
     ProviderRemove(String),
     ProviderList,
-    GroupSet {
-        name: String,
-        members: Vec<String>,
+    /// Set a model role (`main`/`cheap`) to a member pool with a strategy.
+    ModelSet {
+        role: String,
+        members: Vec<Member>,
         strategy: Strategy,
     },
-    GroupRemove(String),
-    GroupList,
-    RoleSet {
-        role: String,
-        target: String,
-    },
-    RoleUnset(String),
-    RoleList,
+    ModelShow(Option<String>),
+    ModelUnset(String),
+    ModelList,
 }
 
 fn strategy_from(s: &str) -> Result<Strategy> {
     match s {
+        "single" => Ok(Strategy::Single),
         "round_robin" => Ok(Strategy::RoundRobin),
         "failover" => Ok(Strategy::Failover),
         _ => Err(CoreError::Message(format!(
-            "invalid strategy '{s}' (expected round_robin or failover)"
+            "invalid strategy '{s}' (expected single, round_robin, or failover)"
         ))),
     }
 }
@@ -857,9 +857,104 @@ fn no_unknown_flags(kv: &HashMap<String, String>) -> Result<()> {
     Ok(())
 }
 
-/// Parse a `provider` / `group` / `role` subcommand. Pure and unit-testable; an
-/// unknown verb, missing required field, bad strategy, or unknown flag is an
-/// error.
+/// Reject any bare (value-less) flags the caller didn't expect.
+fn reject_bare(bare: &std::collections::HashSet<String>) -> Result<()> {
+    if let Some(b) = bare.iter().next() {
+        return Err(CoreError::Message(format!("unexpected flag --{b}")));
+    }
+    Ok(())
+}
+
+/// Parse `model set <role> --member <provider>/<model> [--stream] [--modalities
+/// <list>] [--effort <level>] [--member …] --strategy <s>`. The trait flags
+/// attach to the most recent `--member`; `--strategy` is pool-level (defaulting
+/// to `single` for one member, else `failover`).
+fn parse_model_set(role: String, rest: &[String]) -> Result<ProviderCmd> {
+    let mut members: Vec<Member> = Vec::new();
+    let mut strategy: Option<Strategy> = None;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--member" => {
+                let spec = rest.get(i + 1).ok_or_else(|| {
+                    CoreError::Message("--member needs <provider>/<model>".to_string())
+                })?;
+                let (provider, model) = spec.split_once('/').ok_or_else(|| {
+                    CoreError::Message(format!("--member '{spec}' must be <provider>/<model>"))
+                })?;
+                members.push(Member {
+                    provider: provider.to_string(),
+                    model: model.to_string(),
+                    stream: false,
+                    modalities: None,
+                    effort: None,
+                });
+                i += 2;
+            }
+            "--stream" => {
+                members
+                    .last_mut()
+                    .ok_or_else(|| CoreError::Message("--stream must follow a --member".to_string()))?
+                    .stream = true;
+                i += 1;
+            }
+            "--modalities" => {
+                let v = rest
+                    .get(i + 1)
+                    .ok_or_else(|| CoreError::Message("--modalities needs a value".to_string()))?
+                    .clone();
+                members
+                    .last_mut()
+                    .ok_or_else(|| {
+                        CoreError::Message("--modalities must follow a --member".to_string())
+                    })?
+                    .modalities = Some(v);
+                i += 2;
+            }
+            "--effort" => {
+                let v = rest
+                    .get(i + 1)
+                    .ok_or_else(|| CoreError::Message("--effort needs a value".to_string()))?
+                    .clone();
+                members
+                    .last_mut()
+                    .ok_or_else(|| CoreError::Message("--effort must follow a --member".to_string()))?
+                    .effort = Some(v);
+                i += 2;
+            }
+            "--strategy" => {
+                let v = rest
+                    .get(i + 1)
+                    .ok_or_else(|| CoreError::Message("--strategy needs a value".to_string()))?;
+                strategy = Some(strategy_from(v)?);
+                i += 2;
+            }
+            other => {
+                return Err(CoreError::Message(format!(
+                    "unknown flag '{other}' for `model set`"
+                )))
+            }
+        }
+    }
+    if members.is_empty() {
+        return Err(CoreError::Message(
+            "model set needs at least one --member <provider>/<model>".to_string(),
+        ));
+    }
+    let strategy = strategy.unwrap_or(if members.len() == 1 {
+        Strategy::Single
+    } else {
+        Strategy::Failover
+    });
+    Ok(ProviderCmd::ModelSet {
+        role,
+        members,
+        strategy,
+    })
+}
+
+/// Parse a `provider` / `model` subcommand. Pure and unit-testable; an unknown
+/// verb, missing required field, bad strategy, or unknown flag is an error.
 pub fn parse_providers(args: &[String]) -> Result<ProviderCmd> {
     let kind = args.first().map(String::as_str);
     let verb = args.get(1).map(String::as_str);
@@ -876,89 +971,46 @@ pub fn parse_providers(args: &[String]) -> Result<ProviderCmd> {
         (Some("provider"), Some("add")) => {
             let name = need(rest.first(), "provider name")?;
             let (mut kv, bare) = split_flags(rest.get(1..).unwrap_or(&[]))?;
-            let base_url = kv
-                .remove("base-url")
-                .ok_or_else(|| CoreError::Message("missing --base-url".to_string()))?;
-            let model = kv
-                .remove("model")
-                .ok_or_else(|| CoreError::Message("missing --model".to_string()))?;
+            reject_bare(&bare)?;
+            let kind = kv
+                .remove("type")
+                .ok_or_else(|| CoreError::Message("missing --type (api|oauth:codex)".to_string()))?;
+            let base_url = kv.remove("base-url");
             let key = kv.remove("key");
-            let modalities = kv.remove("modalities");
-            let effort = kv.remove("effort");
-            let auth = kv.remove("auth");
             no_unknown_flags(&kv)?;
-            Ok(ProviderCmd::ProviderAdd(ProviderSpec {
+            Ok(ProviderCmd::ProviderAdd {
                 name,
+                kind,
                 base_url,
-                model,
                 key,
-                stream: bare.contains("stream"),
-                modalities,
-                effort,
-                auth,
-            }))
+            })
         }
         (Some("provider"), Some("set")) => {
             let name = need(rest.first(), "provider name")?;
             let (mut kv, bare) = split_flags(rest.get(1..).unwrap_or(&[]))?;
+            reject_bare(&bare)?;
+            let kind = kv.remove("type");
             let base_url = kv.remove("base-url");
-            let model = kv.remove("model");
             let key = kv.remove("key");
-            let modalities = kv.remove("modalities");
-            let effort = kv.remove("effort");
             no_unknown_flags(&kv)?;
-            let stream = if bare.contains("stream") {
-                Some(true)
-            } else {
-                None
-            };
             Ok(ProviderCmd::ProviderSet {
                 name,
+                kind,
                 base_url,
-                model,
                 key,
-                stream,
-                modalities,
-                effort,
             })
         }
-        (Some("group"), Some("list")) => Ok(ProviderCmd::GroupList),
-        (Some("group"), Some("remove")) => {
-            Ok(ProviderCmd::GroupRemove(need(rest.first(), "group name")?))
+        (Some("model"), Some("list")) => Ok(ProviderCmd::ModelList),
+        (Some("model"), Some("show")) => Ok(ProviderCmd::ModelShow(rest.first().cloned())),
+        (Some("model"), Some("unset")) => {
+            Ok(ProviderCmd::ModelUnset(need(rest.first(), "model role")?))
         }
-        (Some("group"), Some("set")) => {
-            let name = need(rest.first(), "group name")?;
-            let (mut kv, _bare) = split_flags(rest.get(1..).unwrap_or(&[]))?;
-            let members = kv
-                .remove("members")
-                .ok_or_else(|| CoreError::Message("missing --members".to_string()))?
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect::<Vec<_>>();
-            let strategy = strategy_from(
-                &kv.remove("strategy")
-                    .ok_or_else(|| CoreError::Message("missing --strategy".to_string()))?,
-            )?;
-            no_unknown_flags(&kv)?;
-            Ok(ProviderCmd::GroupSet {
-                name,
-                members,
-                strategy,
-            })
-        }
-        (Some("role"), Some("list")) => Ok(ProviderCmd::RoleList),
-        (Some("role"), Some("unset")) => {
-            Ok(ProviderCmd::RoleUnset(need(rest.first(), "role name")?))
-        }
-        (Some("role"), Some("set")) => {
-            let role = need(rest.first(), "role name")?;
-            let target = need(rest.get(1), "target provider/group name")?;
-            Ok(ProviderCmd::RoleSet { role, target })
+        (Some("model"), Some("set")) => {
+            let role = need(rest.first(), "model role (main|cheap)")?;
+            parse_model_set(role, rest.get(1..).unwrap_or(&[]))
         }
         _ => Err(CoreError::Message(
-            "usage: config provider <add|set|remove|list> | group <set|remove|list> | role <set|unset|list>"
-                .to_string(),
+            "usage: config provider <add|set|remove|list> | model <set|show|unset|list>".to_string(),
         )),
     }
 }
@@ -970,9 +1022,9 @@ fn mask_key(key: &Option<String>) -> &'static str {
     }
 }
 
-/// Execute a `provider` / `group` / `role` subcommand against `providers.toml`:
-/// load (empty when missing, error when present-but-broken), apply, validate,
-/// and write atomically.
+/// Execute a `provider` / `model` subcommand against `providers.toml`: load
+/// (empty when missing, error when present-but-broken), apply, validate, and
+/// write atomically.
 pub fn run_providers(args: &[String]) -> Result<()> {
     let out = run_providers_at(&pc::providers_path(), args)?;
     let out = out.trim_end_matches('\n');
@@ -980,6 +1032,22 @@ pub fn run_providers(args: &[String]) -> Result<()> {
         println!("{out}");
     }
     Ok(())
+}
+
+/// Render one model role's members for `model show` / list.
+fn render_model_role(role: &str, pool: &ModelPool) -> String {
+    let mut s = format!("model role '{role}' [{:?}]\n", pool.strategy);
+    for m in &pool.members {
+        s.push_str(&format!(
+            "  {}/{}  stream={}  modalities={}  effort={}\n",
+            m.provider,
+            m.model,
+            m.stream,
+            m.modalities.as_deref().unwrap_or("(auto)"),
+            m.effort.as_deref().unwrap_or("(none)")
+        ));
+    }
+    s
 }
 
 /// Like [`run_providers`] but against an explicit `providers.toml` path and
@@ -994,63 +1062,60 @@ pub fn run_providers_at(path: &std::path::Path, args: &[String]) -> Result<Strin
             if cfg.providers.is_empty() {
                 out.push_str(&format!("(no providers defined in {})\n", path.display()));
             }
-            for p in &cfg.providers {
-                out.push_str(&format!(
-                    "  {:<16} {} [{}] key={} stream={}\n",
-                    p.name,
-                    p.base_url,
-                    p.model,
-                    mask_key(&p.key),
-                    p.stream
-                ));
+            for (name, p) in &cfg.providers {
+                match p.base_url.as_deref() {
+                    Some(url) => out.push_str(&format!(
+                        "  {name:<16} [{}]  {url}  key={}\n",
+                        p.kind,
+                        mask_key(&p.key)
+                    )),
+                    None => out.push_str(&format!(
+                        "  {name:<16} [{}]  (token via `fleety auth login {name}`)\n",
+                        p.kind
+                    )),
+                }
             }
             Ok(out)
         }
-        ProviderCmd::ProviderAdd(spec) => {
+        ProviderCmd::ProviderAdd {
+            name,
+            kind,
+            base_url,
+            key,
+        } => {
             let mut cfg = pc::load_or_default(path)?;
-            if cfg.provider(&spec.name).is_some() {
+            if cfg.provider(&name).is_some() {
                 return Err(CoreError::Message(format!(
-                    "provider '{}' already exists (use `provider set` to change it)",
-                    spec.name
+                    "provider '{name}' already exists (use `provider set` to change it)"
                 )));
             }
-            let name = spec.name.clone();
-            cfg.providers.push(spec);
+            cfg.providers
+                .insert(name.clone(), Provider { kind, base_url, key });
+            // `write_providers` validates type field rules before persisting.
             pc::write_providers(path, &cfg)?;
             Ok(format!("added provider '{name}'"))
         }
         ProviderCmd::ProviderSet {
             name,
+            kind,
             base_url,
-            model,
             key,
-            stream,
-            modalities,
-            effort,
         } => {
             let mut cfg = pc::load_or_default(path)?;
-            let p = cfg
-                .providers
-                .iter_mut()
-                .find(|p| p.name == name)
-                .ok_or_else(|| CoreError::Message(format!("no such provider '{name}'")))?;
-            if let Some(v) = base_url {
-                p.base_url = v;
-            }
-            if let Some(v) = model {
-                p.model = v;
-            }
-            if key.is_some() {
-                p.key = key;
-            }
-            if let Some(v) = stream {
-                p.stream = v;
-            }
-            if modalities.is_some() {
-                p.modalities = modalities;
-            }
-            if effort.is_some() {
-                p.effort = effort;
+            {
+                let p = cfg
+                    .providers
+                    .get_mut(&name)
+                    .ok_or_else(|| CoreError::Message(format!("no such provider '{name}'")))?;
+                if let Some(v) = kind {
+                    p.kind = v;
+                }
+                if let Some(v) = base_url {
+                    p.base_url = Some(v);
+                }
+                if key.is_some() {
+                    p.key = key;
+                }
             }
             pc::write_providers(path, &cfg)?;
             Ok(format!("updated provider '{name}'"))
@@ -1060,90 +1125,71 @@ pub fn run_providers_at(path: &std::path::Path, args: &[String]) -> Result<Strin
             if cfg.provider(&name).is_none() {
                 return Err(CoreError::Message(format!("no such provider '{name}'")));
             }
-            if let Some(g) = cfg.groups.iter().find(|g| g.members.contains(&name)) {
+            if let Some(role) = cfg.role_referencing(&name) {
                 return Err(CoreError::Message(format!(
-                    "cannot remove provider '{name}': group '{}' references it",
-                    g.name
+                    "cannot remove provider '{name}': model role '{role}' references it (change that role first)"
                 )));
             }
-            if let Some((r, _)) = cfg.roles.iter().find(|(_, t)| **t == name) {
-                return Err(CoreError::Message(format!(
-                    "cannot remove provider '{name}': role '{r}' references it"
-                )));
-            }
-            cfg.providers.retain(|p| p.name != name);
+            cfg.providers.remove(&name);
             pc::write_providers(path, &cfg)?;
             Ok(format!("removed provider '{name}'"))
         }
-        ProviderCmd::GroupList => {
+        ProviderCmd::ModelList => {
             let cfg = pc::load_or_default(path)?;
             let mut out = String::new();
-            if cfg.groups.is_empty() {
-                out.push_str(&format!("(no groups defined in {})\n", path.display()));
+            if cfg.models.is_empty() {
+                out.push_str(&format!("(no model roles defined in {})\n", path.display()));
             }
-            for g in &cfg.groups {
-                out.push_str(&format!(
-                    "  {:<16} [{:?}] {}\n",
-                    g.name,
-                    g.strategy,
-                    g.members.join(", ")
-                ));
+            for (role, pool) in &cfg.models {
+                let members = pool
+                    .members
+                    .iter()
+                    .map(|m| format!("{}/{}", m.provider, m.model))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                out.push_str(&format!("  {role:<8} [{:?}]  {members}\n", pool.strategy));
             }
             Ok(out)
         }
-        ProviderCmd::GroupSet {
-            name,
+        ProviderCmd::ModelShow(role) => {
+            let cfg = pc::load_or_default(path)?;
+            match role {
+                Some(r) => {
+                    let pool = cfg
+                        .model(&r)
+                        .ok_or_else(|| CoreError::Message(format!("no such model role '{r}'")))?;
+                    Ok(render_model_role(&r, pool))
+                }
+                None => {
+                    let mut out = String::new();
+                    for (r, pool) in &cfg.models {
+                        out.push_str(&render_model_role(r, pool));
+                    }
+                    if out.is_empty() {
+                        out.push_str("(no model roles defined)\n");
+                    }
+                    Ok(out)
+                }
+            }
+        }
+        ProviderCmd::ModelSet {
+            role,
             members,
             strategy,
         } => {
             let mut cfg = pc::load_or_default(path)?;
-            cfg.groups.retain(|g| g.name != name);
-            cfg.groups.push(GroupSpec {
-                name: name.clone(),
-                members,
-                strategy,
-            });
+            cfg.models.insert(role.clone(), ModelPool { strategy, members });
+            // `write_providers` validates member references + single≠1 before persisting.
             pc::write_providers(path, &cfg)?;
-            Ok(format!("set group '{name}'"))
+            Ok(format!("set model role '{role}'"))
         }
-        ProviderCmd::GroupRemove(name) => {
+        ProviderCmd::ModelUnset(role) => {
             let mut cfg = pc::load_or_default(path)?;
-            if cfg.group(&name).is_none() {
-                return Err(CoreError::Message(format!("no such group '{name}'")));
-            }
-            if let Some((r, _)) = cfg.roles.iter().find(|(_, t)| **t == name) {
-                return Err(CoreError::Message(format!(
-                    "cannot remove group '{name}': role '{r}' references it"
-                )));
-            }
-            cfg.groups.retain(|g| g.name != name);
-            pc::write_providers(path, &cfg)?;
-            Ok(format!("removed group '{name}'"))
-        }
-        ProviderCmd::RoleSet { role, target } => {
-            let mut cfg = pc::load_or_default(path)?;
-            cfg.roles.insert(role.clone(), target.clone());
-            pc::write_providers(path, &cfg)?;
-            Ok(format!("bound role '{role}' → '{target}'"))
-        }
-        ProviderCmd::RoleUnset(role) => {
-            let mut cfg = pc::load_or_default(path)?;
-            if cfg.roles.remove(&role).is_none() {
-                return Err(CoreError::Message(format!("no such role '{role}'")));
+            if cfg.models.remove(&role).is_none() {
+                return Err(CoreError::Message(format!("no such model role '{role}'")));
             }
             pc::write_providers(path, &cfg)?;
-            Ok(format!("unset role '{role}'"))
-        }
-        ProviderCmd::RoleList => {
-            let cfg = pc::load_or_default(path)?;
-            let mut out = String::new();
-            if cfg.roles.is_empty() {
-                out.push_str(&format!("(no roles defined in {})\n", path.display()));
-            }
-            for (r, t) in &cfg.roles {
-                out.push_str(&format!("  {r:<16} → {t}\n"));
-            }
-            Ok(out)
+            Ok(format!("unset model role '{role}'"))
         }
     }
 }
@@ -1373,84 +1419,69 @@ mod tests {
 
     #[test]
     fn parse_providers_verbs_and_flags() {
-        // provider add → a fully-populated spec.
-        let cmd = parse_providers(&v(&[
-            "provider",
-            "add",
-            "codex-1",
-            "--base-url",
-            "https://x/v1",
-            "--model",
-            "gpt-5",
-            "--key",
-            "sk",
-            "--stream",
-            "--modalities",
-            "text,image",
-            "--effort",
-            "high",
+        // provider add (api) → a typed provider.
+        assert_eq!(
+            parse_providers(&v(&[
+                "provider", "add", "openai1", "--type", "api", "--base-url", "https://x/v1",
+                "--key", "sk",
+            ]))
+            .expect("add parses"),
+            ProviderCmd::ProviderAdd {
+                name: "openai1".into(),
+                kind: "api".into(),
+                base_url: Some("https://x/v1".into()),
+                key: Some("sk".into()),
+            }
+        );
+        // provider add (oauth) → no base_url/key.
+        assert_eq!(
+            parse_providers(&v(&["provider", "add", "codex1", "--type", "oauth:codex"])).unwrap(),
+            ProviderCmd::ProviderAdd {
+                name: "codex1".into(),
+                kind: "oauth:codex".into(),
+                base_url: None,
+                key: None,
+            }
+        );
+        // model set: per-member traits attach to the preceding --member; strategy pool-level.
+        match parse_providers(&v(&[
+            "model", "set", "main", "--member", "openai1/gpt-4o", "--stream", "--modalities",
+            "text,image", "--member", "codex1/gpt-5", "--strategy", "failover",
         ]))
-        .expect("add parses");
-        match cmd {
-            ProviderCmd::ProviderAdd(s) => {
-                assert_eq!(s.name, "codex-1");
-                assert_eq!(s.base_url, "https://x/v1");
-                assert!(s.stream);
-                assert_eq!(s.modalities.as_deref(), Some("text,image"));
+        .expect("model set parses")
+        {
+            ProviderCmd::ModelSet { role, members, strategy } => {
+                assert_eq!(role, "main");
+                assert_eq!(strategy, Strategy::Failover);
+                assert_eq!(members.len(), 2);
+                assert_eq!(members[0].provider, "openai1");
+                assert_eq!(members[0].model, "gpt-4o");
+                assert!(members[0].stream);
+                assert_eq!(members[0].modalities.as_deref(), Some("text,image"));
+                assert_eq!(members[1].provider, "codex1");
+                assert!(!members[1].stream);
             }
             other => panic!("wrong variant: {other:?}"),
         }
-        // group set with a strategy.
-        assert_eq!(
-            parse_providers(&v(&[
-                "group",
-                "set",
-                "codex",
-                "--members",
-                "codex-1,codex-2",
-                "--strategy",
-                "round_robin",
-            ]))
-            .unwrap(),
-            ProviderCmd::GroupSet {
-                name: "codex".into(),
-                members: vec!["codex-1".into(), "codex-2".into()],
-                strategy: Strategy::RoundRobin,
+        // one member with no --strategy defaults to single.
+        match parse_providers(&v(&["model", "set", "cheap", "--member", "openai1/gpt-4o-mini"]))
+            .unwrap()
+        {
+            ProviderCmd::ModelSet { strategy, members, .. } => {
+                assert_eq!(strategy, Strategy::Single);
+                assert_eq!(members.len(), 1);
             }
-        );
-        // role set is two positionals.
-        assert_eq!(
-            parse_providers(&v(&["role", "set", "main", "codex"])).unwrap(),
-            ProviderCmd::RoleSet {
-                role: "main".into(),
-                target: "codex".into()
-            }
-        );
-        // Errors: unknown verb, bad strategy, unknown flag, missing required.
+            other => panic!("wrong variant: {other:?}"),
+        }
+        // Errors: unknown verb, missing --type, bad strategy, bad --member, no members.
         assert!(parse_providers(&v(&["provider", "frobnicate"])).is_err());
+        assert!(parse_providers(&v(&["provider", "add", "p"])).is_err()); // missing --type
         assert!(parse_providers(&v(&[
-            "group",
-            "set",
-            "g",
-            "--members",
-            "a",
-            "--strategy",
-            "random"
+            "model", "set", "main", "--member", "p/m", "--strategy", "random"
         ]))
         .is_err());
-        assert!(parse_providers(&v(&[
-            "provider",
-            "add",
-            "p",
-            "--base-url",
-            "u",
-            "--model",
-            "m",
-            "--bogus",
-            "x"
-        ]))
-        .is_err());
-        assert!(parse_providers(&v(&["provider", "add", "p", "--model", "m"])).is_err());
+        assert!(parse_providers(&v(&["model", "set", "main", "--member", "no-slash"])).is_err());
+        assert!(parse_providers(&v(&["model", "set", "main", "--strategy", "single"])).is_err());
     }
 
     #[test]
@@ -1458,23 +1489,11 @@ mod tests {
         let eff = |p: &[&str]| config_effect(&v(p));
         // providers.toml mutations → next connection.
         assert_eq!(
-            eff(&["provider", "add", "p", "--base-url", "u", "--model", "m"]),
+            eff(&["provider", "add", "p", "--type", "api", "--base-url", "u"]),
             Some(ConfigEffect::NextConnection)
         );
         assert_eq!(
-            eff(&[
-                "group",
-                "set",
-                "g",
-                "--members",
-                "p",
-                "--strategy",
-                "failover"
-            ]),
-            Some(ConfigEffect::NextConnection)
-        );
-        assert_eq!(
-            eff(&["role", "set", "main", "g"]),
+            eff(&["model", "set", "main", "--member", "p/m", "--strategy", "single"]),
             Some(ConfigEffect::NextConnection)
         );
         // flat set/unset → restart.
@@ -1491,50 +1510,53 @@ mod tests {
         assert_eq!(eff(&["list"]), None);
         assert_eq!(eff(&["get", "FLEETY_MODEL"]), None);
         assert_eq!(eff(&["provider", "list"]), None);
+        assert_eq!(eff(&["model", "list"]), None);
     }
 
     #[test]
-    fn run_providers_add_list_and_guard_removal() {
+    fn run_providers_add_model_and_guard_removal() {
         let path = std::env::temp_dir().join(format!("fleety-cfg-{}.toml", uuid::Uuid::new_v4()));
-        // Add two providers, then a group over them.
+        // Add two api providers, then a model role pooling them.
         run_providers_at(
             &path,
-            &v(&["provider", "add", "p1", "--base-url", "u1", "--model", "m"]),
+            &v(&["provider", "add", "p1", "--type", "api", "--base-url", "https://u1/v1"]),
         )
         .unwrap();
         run_providers_at(
             &path,
-            &v(&["provider", "add", "p2", "--base-url", "u2", "--model", "m"]),
+            &v(&["provider", "add", "p2", "--type", "api", "--base-url", "https://u2/v1"]),
         )
         .unwrap();
         run_providers_at(
             &path,
             &v(&[
-                "group",
-                "set",
-                "g",
-                "--members",
-                "p1,p2",
-                "--strategy",
-                "failover",
+                "model", "set", "main", "--member", "p1/gpt-4o", "--member", "p2/gpt-4o",
+                "--strategy", "failover",
             ]),
         )
         .unwrap();
-        // Adding a duplicate name fails and leaves the file unchanged.
+        // Adding a duplicate name fails.
         assert!(run_providers_at(
             &path,
-            &v(&["provider", "add", "p1", "--base-url", "u", "--model", "m"])
+            &v(&["provider", "add", "p1", "--type", "api", "--base-url", "https://x/v1"])
         )
         .is_err());
-        // A referenced provider can't be removed (the group names it).
+        // A model member referencing an undefined provider is rejected on write.
+        assert!(run_providers_at(
+            &path,
+            &v(&["model", "set", "cheap", "--member", "ghost/x", "--strategy", "single"])
+        )
+        .is_err());
+        // A referenced provider can't be removed (the main role names it).
         let err = run_providers_at(&path, &v(&["provider", "remove", "p1"]))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("group 'g'"), "got: {err}");
-        // The file still parses with both providers + the group.
+        assert!(err.contains("model role 'main'"), "got: {err}");
+        // The file still parses with both providers + the role.
         let cfg = pc::load_from(&path).expect("re-read");
         assert_eq!(cfg.providers.len(), 2);
-        assert_eq!(cfg.groups.len(), 1);
+        assert_eq!(cfg.models.len(), 1);
+        assert_eq!(cfg.model("main").unwrap().members.len(), 2);
         let _ = std::fs::remove_file(&path);
     }
 

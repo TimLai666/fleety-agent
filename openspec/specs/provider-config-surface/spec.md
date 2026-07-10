@@ -74,39 +74,38 @@ code:
 ---
 ### Requirement: config subcommands manage providers, groups, and roles
 
-All three binaries (`fleety`, `fleety-server`, `fleetyd`) SHALL expose `config` subcommands to manage `providers.toml`: `provider add|set|remove|list`, `group set|remove|list`, and `role set|unset|list`. Each mutating subcommand SHALL load the current configuration, apply the change, validate, then write atomically. Listing a provider SHALL mask its key. Removing a provider that is still referenced by a group or role SHALL be rejected with a message naming the referrer. Subcommand parsing SHALL be a pure function; an unknown flag or verb SHALL return an error.
+The `config` command surface SHALL manage the two-tier model: `config provider add <name> --type api --base-url <url> [--key <secret>]` and `config provider add <name> --type oauth:codex`, plus `provider set`, `provider remove`, and `provider list` (listing SHALL show each provider by `type` with its type-appropriate fields and mask secrets). Model roles SHALL be managed with `config model set <main|cheap> --member <provider>/<model> [--stream] [--modalities <list>] [--effort <level>] [--member …] --strategy <single|round_robin|failover>`, plus `model show` and `model unset`. Removing a provider that a role member references SHALL be refused.
 
-#### Scenario: add then list a provider
+#### Scenario: add a provider then bind a model role to it
 
-- **WHEN** `config provider add foo` is run with a base URL, model, and key, then `config provider list` is run
-- **THEN** `foo` appears in the list with its key masked
+- **WHEN** `config provider add openai1 --type api --base-url https://api.openai.com/v1 --key sk-x` then `config model set main --member openai1/gpt-4o --strategy single` run
+- **THEN** `providers.toml` holds provider `openai1` (type api) and a `main` role with one member `openai1/gpt-4o`
 
-#### Scenario: removing a referenced provider is blocked
+#### Scenario: an oauth provider takes no base_url or key on the command line
 
-- **WHEN** `config provider remove foo` is run while a group or role still references `foo`
-- **THEN** the command fails with a message naming the referrer and the file is unchanged
-
-#### Scenario: adding a duplicate provider name fails
-
-- **WHEN** `config provider add foo` is run and `foo` already exists
-- **THEN** the command fails and the file is unchanged
+- **WHEN** `config provider add codex1 --type oauth:codex` runs
+- **THEN** it is accepted with no `base_url`/`key`, and the token is obtained separately via `fleety auth login codex1`
 
 
 <!-- @trace
-source: provider-config-surface
-updated: 2026-06-29
+source: provider-model-two-tier
+updated: 2026-07-10
 code:
-  - crates/fleety-cli/src/main.rs
   - crates/fleety-tools/src/providers_config.rs
-  - crates/fleety-tools/src/config.rs
-  - crates/fleety-tools/src/lib.rs
-  - crates/fleety-server/src/pool.rs
-  - crates/fleety-cli/src/config.rs
+  - crates/fleety-server/src/conn.rs
   - crates/fleety-cli/src/provider_tui.rs
-  - crates/fleety-server/src/main.rs
+  - crates/fleety-tools/src/connection.rs
+  - crates/fleety-tools/src/lib.rs
   - crates/fleety-server/src/providers.rs
-  - docs/env.md
-  - crates/fleety-tools/Cargo.toml
+  - crates/fleety-daemon/src/main.rs
+  - crates/fleety-cli/src/server.rs
+  - crates/fleety-server/src/pool.rs
+  - crates/fleety-server/src/main.rs
+  - crates/fleety-tools/src/config.rs
+  - crates/fleety-cli/src/main.rs
+tests:
+  - crates/fleety-cli/tests/cli_smoke.rs
+  - crates/fleety-daemon/tests/fleetyd_smoke.rs
 -->
 
 ---

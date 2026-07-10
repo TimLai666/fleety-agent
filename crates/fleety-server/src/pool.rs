@@ -53,7 +53,8 @@ impl PoolProvider {
     fn start(&self) -> usize {
         match self.strategy {
             Strategy::RoundRobin => self.next.fetch_add(1, Ordering::Relaxed),
-            Strategy::Failover => 0,
+            // Single (exactly one member) and failover both start at the first.
+            Strategy::Single | Strategy::Failover => 0,
         }
     }
 
@@ -112,11 +113,18 @@ impl ModelProvider for PoolProvider {
     }
 
     fn capabilities(&self) -> ModelCapabilities {
-        // Members are assumed homogeneous (same model across accounts/endpoints).
-        self.members
-            .first()
-            .map(|m| m.capabilities())
-            .unwrap_or(ModelCapabilities::ALL)
+        // Union across members (design M2): a modality is supported if ANY member
+        // supports it, so a mixed pool never blocks an attachment some member
+        // could handle — the routed member degrades what it cannot take. Never
+        // the first member's caps, nor the intersection.
+        self.members.iter().fold(ModelCapabilities::TEXT_ONLY, |acc, m| {
+            let c = m.capabilities();
+            ModelCapabilities {
+                image: acc.image || c.image,
+                audio: acc.audio || c.audio,
+                pdf: acc.pdf || c.pdf,
+            }
+        })
     }
 
     fn with_effort(&self, effort: Option<Effort>) -> Option<Arc<dyn ModelProvider>> {
@@ -225,13 +233,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn capabilities_come_from_first_member() {
-        let first = Arc::new(Stub {
+    async fn capabilities_are_union_across_members() {
+        // Spec example: a text-only member + an image-capable member → the pool
+        // reports image supported (union), not suppressed by the first being
+        // text-only.
+        let text_only = Arc::new(Stub {
             ok: true,
             tag: "a",
             caps: ModelCapabilities::TEXT_ONLY,
         });
-        let pool = PoolProvider::new(vec![first, Stub::ok("b")], Strategy::Failover);
-        assert_eq!(pool.capabilities(), ModelCapabilities::TEXT_ONLY);
+        let image_capable = Arc::new(Stub {
+            ok: true,
+            tag: "b",
+            caps: ModelCapabilities {
+                image: true,
+                audio: false,
+                pdf: false,
+            },
+        });
+        let pool = PoolProvider::new(vec![text_only, image_capable], Strategy::Failover);
+        let caps = pool.capabilities();
+        assert!(caps.image, "union: image supported because a member supports it");
+        assert!(!caps.audio, "union: audio unsupported (no member supports it)");
     }
 }

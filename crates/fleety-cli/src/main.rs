@@ -71,7 +71,7 @@ fn print_help() {
     println!("  voice                            voice conversation");
     println!("  status                           server health: version, uptime, devices");
     println!("  config <list|get|set|unset|edit> [--target server|local|<device-id>]");
-    println!("  config provider|group|role <...> manage the provider pool (providers.toml)");
+    println!("  config provider|model <...>      manage providers + model roles (providers.toml)");
     println!("  auth <login|status|logout>       ChatGPT/Codex OAuth sign-in");
     println!("  audit list [<limit>]             this device's audit-log entries");
     println!("  audit show <index>               one audit entry in full");

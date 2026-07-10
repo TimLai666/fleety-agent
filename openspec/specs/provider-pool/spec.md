@@ -108,22 +108,31 @@ code:
 ---
 ### Requirement: A pooled provider reports homogeneous capabilities
 
-A group's pooled provider SHALL assume its members are the same model across accounts/endpoints: it SHALL report the first member's input-modality capabilities, and applying a reasoning effort SHALL produce a pool whose members each carry that effort.
+A pooled provider (a model role's member pool) SHALL report its modality capabilities as the **union** across its members: a modality is advertised as supported when **any** member supports it. It SHALL NOT report only the first member's capabilities, nor the intersection. Because each member degrades unsupported attachments inside its own call, the union lets a capable member receive an attachment natively while a less-capable member degrades it — so a mixed pool never blocks an attachment that some member could handle.
 
-#### Scenario: capabilities come from the first member
+#### Scenario: a mixed pool advertises the union of member modalities
 
-- **WHEN** a group's pooled provider is asked for its capabilities
-- **THEN** it reports the first member's modality capabilities
+- **GIVEN** a pool whose first member is text-only and whose second member accepts images
+- **WHEN** the pool's capabilities are queried (e.g. for the client's audio/image hint)
+- **THEN** the image-capable modality is reported as supported, not suppressed by the first member being text-only
 
 <!-- @trace
-source: provider-pool
-updated: 2026-06-29
+source: provider-model-two-tier
+updated: 2026-07-10
 code:
-  - crates/fleety-tools/Cargo.toml
-  - crates/fleety-server/src/pool.rs
   - crates/fleety-tools/src/providers_config.rs
-  - docs/env.md
-  - crates/fleety-server/src/main.rs
-  - crates/fleety-server/src/providers.rs
+  - crates/fleety-server/src/conn.rs
+  - crates/fleety-cli/src/provider_tui.rs
+  - crates/fleety-tools/src/connection.rs
   - crates/fleety-tools/src/lib.rs
+  - crates/fleety-server/src/providers.rs
+  - crates/fleety-daemon/src/main.rs
+  - crates/fleety-cli/src/server.rs
+  - crates/fleety-server/src/pool.rs
+  - crates/fleety-server/src/main.rs
+  - crates/fleety-tools/src/config.rs
+  - crates/fleety-cli/src/main.rs
+tests:
+  - crates/fleety-cli/tests/cli_smoke.rs
+  - crates/fleety-daemon/tests/fleetyd_smoke.rs
 -->
