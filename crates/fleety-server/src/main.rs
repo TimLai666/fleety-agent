@@ -30,6 +30,7 @@ mod mdns;
 mod plugin_sources;
 mod presence;
 mod privacy;
+mod restart_watch;
 mod sidecar;
 mod sse;
 mod triage;
@@ -216,6 +217,13 @@ async fn async_main(cmd: Option<String>) -> std::process::ExitCode {
     // Service lifecycle subcommands (install/uninstall/start/stop/restart/
     // enable/disable/status/up/down) act on the manager and exit.
     if let Some(action) = cmd.as_deref().and_then(service::action_from_arg) {
+        // `restart` takes a `--force` flag: forced restarts immediately; otherwise
+        // a running server is asked to restart once idle (deferred). Other verbs
+        // ignore extra args.
+        if action == service::Action::Restart {
+            let force = std::env::args().skip(2).any(|a| a == "--force");
+            return log_action("restart", service::restart(force));
+        }
         return log_action(cmd.as_deref().unwrap_or("?"), service::run(action));
     }
 
@@ -371,6 +379,21 @@ async fn run_server(shutdown: Option<tokio::sync::watch::Receiver<bool>>) {
     let addr = std::env::var("FLEETY_ADDR").unwrap_or_else(|_| "127.0.0.1:8787".to_string());
     let home = agent_home();
     tracing::info!(version = agent_core::VERSION, %addr, home = %home.display(), "fleety-server starting");
+
+    // Deferred-restart channel: first clear any restart-request marker left from
+    // before this start (the restart it asked for is *this* start, so acting on
+    // it would loop), then watch for new non-forced `restart` requests and carry
+    // them out once idle / past the deadline. This watcher is the only path that
+    // turns a marker into a manager restart. See `restart_watch`.
+    match service::spec() {
+        Ok(spec) => {
+            restart_watch::clear_stale_request(&spec.name);
+            restart_watch::spawn_watcher(spec);
+        }
+        Err(e) => {
+            tracing::warn!(report = ?e.report(), "restart watcher not started (no service spec)")
+        }
+    }
 
     let storage = Arc::new(Storage::new(home));
     // One-time, idempotent, lossless migration of legacy per-device conversations

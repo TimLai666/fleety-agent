@@ -307,6 +307,13 @@ pub fn pidfile_path(name: &str) -> PathBuf {
     home_join(&format!(".fleety/{name}.pid"))
 }
 
+/// The restart-request marker path for a service, `~/.fleety/<name>.restart-request`
+/// (same runtime dir and convention as [`pidfile_path`]). A non-forced external
+/// `restart` drops this file so the running service can restart itself once idle.
+pub fn restart_request_path(name: &str) -> PathBuf {
+    home_join(&format!(".fleety/{name}.restart-request"))
+}
+
 /// Parse a pid from a pidfile's contents. `None` if missing or unparsable.
 pub fn read_pid(path: &Path) -> Option<u32> {
     std::fs::read_to_string(path)
@@ -502,6 +509,18 @@ mod tests {
     fn may_start_only_when_unowned() {
         assert!(may_start(None));
         assert!(!may_start(Some(1234)));
+    }
+
+    #[test]
+    fn restart_request_path_sits_beside_the_pidfile() {
+        let pid = pidfile_path("fleety-server");
+        let req = restart_request_path("fleety-server");
+        // Same runtime directory, distinct `.restart-request` suffix.
+        assert_eq!(pid.parent(), req.parent());
+        assert!(req
+            .to_string_lossy()
+            .replace('\\', "/")
+            .ends_with(".fleety/fleety-server.restart-request"));
     }
 
     #[test]

@@ -295,10 +295,12 @@ async fn update_all() -> Result<()> {
         if fleety_tools::update::manifest_is_templated() {
             match fleety_tools::update::update_named("fleety-server", &exe).await {
                 Ok(true) => {
+                    // Bare `restart` (no --force) → the running server defers the
+                    // restart until it is idle rather than interrupting a turn.
                     println!(
-                        "fleety-server updated — restarting its service now. An in-flight \
-                         turn may be interrupted; it is recovered from the journal and \
-                         continued, not lost."
+                        "fleety-server updated — requesting a restart. The running server \
+                         restarts once it is idle (no in-flight turn), or after the deferral \
+                         deadline; an interrupted turn is recovered from the journal, not lost."
                     );
                     let _ = std::process::Command::new(&exe).arg("restart").status();
                 }

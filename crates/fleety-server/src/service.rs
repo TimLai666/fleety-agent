@@ -84,6 +84,59 @@ pub fn run(action: Action) -> Result<()> {
     Ok(())
 }
 
+/// What a `restart` invocation should do. Pure decision; [`restart`] does the I/O.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartMode {
+    /// Restart immediately through the service manager (forced, or nothing running
+    /// to wait for).
+    Immediate,
+    /// Ask the running server to restart itself once idle (drop the marker).
+    RequestDeferred,
+}
+
+/// Decide how a `restart` should proceed given `--force` and whether a live server
+/// owns the pidfile. `--force` always restarts now; otherwise a live server is
+/// asked to defer until idle, and with no running server there is no in-flight
+/// work to wait for so we restart directly.
+pub fn restart_mode(force: bool, server_alive: bool) -> RestartMode {
+    if force || !server_alive {
+        RestartMode::Immediate
+    } else {
+        RestartMode::RequestDeferred
+    }
+}
+
+/// Carry out `fleety-server restart`. `--force` restarts immediately through the
+/// manager (the old behavior); otherwise, against a *live* server, drop a
+/// restart-request marker so that server restarts itself once idle instead of
+/// being hard-killed mid-turn. With no server running, restart directly. If the
+/// marker can't be written we fall back to an immediate manager restart (never
+/// silently skip the restart).
+pub fn restart(force: bool) -> Result<()> {
+    let spec = spec()?;
+    let pid = service::read_pid(&service::pidfile_path(&spec.name));
+    let server_alive = pid.map(service::pid_alive).unwrap_or(false);
+    match restart_mode(force, server_alive) {
+        RestartMode::Immediate => service::run_verb(&spec, Verb::Restart),
+        RestartMode::RequestDeferred => match crate::restart_watch::request_restart(&spec.name) {
+            Ok(()) => {
+                println!(
+                    "restart requested; the running server will restart once it is idle (no \
+                     in-flight turn), or after the deferral deadline. Pass --force to restart now."
+                );
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!(
+                    "could not record a deferred restart request ({}); restarting now instead.",
+                    e.report().message
+                );
+                service::run_verb(&spec, Verb::Restart)
+            }
+        },
+    }
+}
+
 /// Parse a CLI subcommand into an [`Action`]. Returns `None` for non-service
 /// commands (so the caller can fall through to running the server).
 pub fn action_from_arg(arg: &str) -> Option<Action> {
@@ -122,6 +175,17 @@ mod tests {
     #[test]
     fn down_is_just_stop() {
         assert_eq!(plan(Action::Down), vec![Verb::Stop]);
+    }
+
+    #[test]
+    fn restart_mode_defers_only_for_a_live_unforced_restart() {
+        // Forced → immediate, regardless of whether a server is up.
+        assert_eq!(restart_mode(true, true), RestartMode::Immediate);
+        assert_eq!(restart_mode(true, false), RestartMode::Immediate);
+        // Unforced against a live server → ask it to defer until idle.
+        assert_eq!(restart_mode(false, true), RestartMode::RequestDeferred);
+        // Unforced with nothing running → nothing to wait for, restart directly.
+        assert_eq!(restart_mode(false, false), RestartMode::Immediate);
     }
 
     #[test]

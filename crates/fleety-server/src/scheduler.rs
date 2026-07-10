@@ -47,6 +47,10 @@ pub async fn tick(
     if due.is_empty() && incomplete.is_empty() {
         return Ok(0);
     }
+    // This tick does turn work (recover interrupted schedule turns and/or fire
+    // due ones): count it as an in-flight turn so a deferred `restart` waits for
+    // schedule-fired turns too. Dropped when the tick returns (any path).
+    let _inflight = crate::restart_watch::turn_guard();
     let mut tools = crate::tools::build_registry(
         workspace,
         &storage.backups_dir(),

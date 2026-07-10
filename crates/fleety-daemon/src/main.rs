@@ -167,13 +167,17 @@ async fn converge_to_server_version(server_version: &str) {
         }
     };
     // Bring sibling binaries on this host to the same version. fleety-server is a
-    // service (restart it); the fleety CLI just needs its binary swapped.
+    // service: a bare `restart` (no --force) asks the running server to restart
+    // once it is idle (deferred until no in-flight turn), rather than hard-killing
+    // it mid-turn; the fleety CLI just needs its binary swapped.
     for bin in ["fleety", "fleety-server"] {
         let Some(exe) = fleety_tools::update::sibling_exe(bin) else {
             continue;
         };
         match fleety_tools::update::update_to_version(bin, &exe, server_version).await {
             Ok(true) if bin == "fleety-server" => {
+                // Deferred restart: never add --force here so an update never
+                // interrupts an in-flight turn before the deferral deadline.
                 let _ = std::process::Command::new(&exe).arg("restart").status();
             }
             Ok(_) => {}

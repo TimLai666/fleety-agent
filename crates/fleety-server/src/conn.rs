@@ -898,6 +898,12 @@ async fn serve(
                 let turn_provider: &dyn ModelProvider =
                     effort_provider.as_deref().unwrap_or(provider);
 
+                // Count this as an in-flight turn for the whole of recovery + the
+                // turn itself, so a deferred `restart` waits for it (idle == no
+                // in-flight turn). RAII: dropped at the end of this arm on every
+                // path (normal, `?`, or `continue`), never left stuck above zero.
+                let _inflight = crate::restart_watch::turn_guard();
+
                 // First finish any turn left interrupted by a crash/redeploy, so
                 // it isn't lost and doesn't interleave with this message. Best
                 // effort: on failure the journal stays for a later retry.
