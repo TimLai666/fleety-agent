@@ -1295,6 +1295,22 @@ async fn serve(
                 };
                 emit(out, &reply)?;
             }
+            ClientMsg::ConversationList { limit } => {
+                // Scope is the acting user resolved from this connection's device
+                // (owner, else the device's own unattributed conversations); the
+                // query never crosses into another user's data. Clamp the count to
+                // a sane window (default 20, 1..=50). Infallible query → an empty
+                // list is honest; only the JSON encode can fail, falling back to
+                // "[]" like the audit listing.
+                let limit = limit.unwrap_or(20).clamp(1, 50) as usize;
+                let conversations = storage.recent_conversations(device_id, limit);
+                let conversations_json =
+                    serde_json::to_string(&conversations).unwrap_or_else(|_| "[]".to_string());
+                emit(
+                    out,
+                    &ServerMsg::ConversationListResult { conversations_json },
+                )?;
+            }
             ClientMsg::AuditShow {
                 device_id: target,
                 index,
@@ -4141,6 +4157,96 @@ mod tests {
                 assert!(message.contains("missing"));
             }
             other => panic!("expected rollback result, got {other:?}"),
+        }
+        let _ = tx.close().await;
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// `ConversationList` returns a `ConversationListResult` scoped to the acting
+    /// user (the connecting device's owner): the owner's conversations appear,
+    /// another user's never do.
+    #[tokio::test]
+    async fn conversation_list_returns_owner_scoped_result() {
+        use crate::echo::EchoProvider;
+        use crate::identity::ActingUser;
+
+        let home = std::env::temp_dir().join(format!("fleety-convlist-{}", uuid::Uuid::new_v4()));
+        let workspace = home.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let storage = Arc::new(Storage::new(home.clone()));
+        // Device "dev" is owned by alice → the listing is scoped to alice.
+        storage
+            .set_device_ownership("dev", Some("alice"), &["alice".to_string()], false)
+            .expect("own");
+        // Alice's conversation (user-primary) and bob's (a different owner).
+        storage
+            .register_conversation_owner("c-alice", &ActingUser::User("alice".into()))
+            .expect("own alice conv");
+        storage
+            .append("dev", "c-alice", &Message::user("alice question"))
+            .expect("append alice");
+        storage
+            .register_conversation_owner("c-bob", &ActingUser::User("bob".into()))
+            .expect("own bob conv");
+        storage
+            .append("dev", "c-bob", &Message::user("bob question"))
+            .expect("append bob");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        {
+            let storage = Arc::clone(&storage);
+            let workspace = Arc::new(workspace.clone());
+            tokio::spawn(async move {
+                if let Ok((stream, _)) = listener.accept().await {
+                    let _ = handle_conn(
+                        stream,
+                        storage,
+                        Arc::new(EchoProvider),
+                        workspace,
+                        Policy::FullAccess,
+                        bridge::new_hub(),
+                        bridge::new_pending(),
+                        bridge::new_handles(),
+                        open_auth(),
+                        bridge::new_device_tools(),
+                    )
+                    .await;
+                }
+            });
+        }
+
+        let url = format!("ws://{addr}");
+        let (client, _) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("connect");
+        let (mut tx, mut rx) = client.split();
+        send_client(&mut tx, &hello("dev")).await;
+        assert!(matches!(
+            recv_server(&mut rx).await,
+            Some(ServerMsg::Welcome { .. })
+        ));
+
+        send_client(&mut tx, &ClientMsg::ConversationList { limit: Some(10) }).await;
+        match recv_server(&mut rx).await {
+            Some(ServerMsg::ConversationListResult { conversations_json }) => {
+                let rows: Vec<serde_json::Value> =
+                    serde_json::from_str(&conversations_json).expect("parse rows");
+                let ids: Vec<&str> = rows
+                    .iter()
+                    .filter_map(|r| r["conversation_id"].as_str())
+                    .collect();
+                assert!(ids.contains(&"c-alice"), "owner's conversation is listed");
+                assert!(!ids.contains(&"c-bob"), "another user's is not listed");
+                let alice = rows
+                    .iter()
+                    .find(|r| r["conversation_id"] == serde_json::json!("c-alice"))
+                    .expect("alice row");
+                assert_eq!(alice["preview"], serde_json::json!("alice question"));
+            }
+            other => panic!("expected conversation list, got {other:?}"),
         }
         let _ = tx.close().await;
         let _ = std::fs::remove_dir_all(&home);

@@ -365,6 +365,29 @@ fn resume_audit_and_rollback_render_server_results() {
             backup_id
         }) if device_id == "cli-smoke" && backup_id == "b1"
     ));
+
+    // `conversations` renders the listing (ids + previews) and sends a
+    // ConversationList request carrying the parsed limit.
+    let convs = serde_json::json!([
+        {"conversation_id": "c-new", "last_ts_secs": 20, "events": 4, "preview": "newest topic"},
+        {"conversation_id": "c-old", "last_ts_secs": 10, "events": 2, "preview": "older topic"}
+    ]);
+    let (url, rx) = start_ws_server(vec![
+        vec![welcome(None)],
+        vec![ServerMsg::ConversationListResult {
+            conversations_json: convs.to_string(),
+        }],
+    ]);
+    let (output, received) = run_against_server(&["conversations", "5"], &url, &home, rx);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("c-new"));
+    assert!(stdout.contains("newest topic"));
+    assert!(stdout.contains("c-old"));
+    assert!(matches!(
+        received.get(1),
+        Some(ClientMsg::ConversationList { limit: Some(5) })
+    ));
 }
 
 #[test]

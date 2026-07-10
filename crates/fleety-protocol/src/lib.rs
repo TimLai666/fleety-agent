@@ -174,6 +174,15 @@ pub enum ClientMsg {
     },
     /// Fetch one audit entry by its monotonic line number (0-indexed).
     AuditShow { device_id: String, index: u64 },
+    /// List the connecting device's recent conversations so a user can find the
+    /// id `Resume` needs. Scoped by the server to the acting user resolved for
+    /// the device (its owner, else the device's own unattributed conversations);
+    /// `limit` caps how many are returned (server-clamped). Reply:
+    /// `ConversationListResult`. Additive + optional: an older server ignores it.
+    ConversationList {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+    },
     /// List backups available to roll back, by device.
     RollbackList { device_id: String },
     /// Restore a file from a backup (records its own audit + a fresh backup of
@@ -300,6 +309,12 @@ pub enum ServerMsg {
         index: u64,
         event_json: String,
     },
+    /// Reply to `ConversationList`: a JSON-encoded array of conversation
+    /// summaries. Each carries `conversation_id`, `last_ts_secs` (unix seconds
+    /// of last activity), `events` (event count), and `preview` (a one-line clip
+    /// of the first user message). Most-recent-first; empty array when the acting
+    /// user has none.
+    ConversationListResult { conversations_json: String },
     /// Reply to `RollbackList`: JSON-encoded array of backup descriptors
     /// (`id`, `original_path`, `ts_secs`, `source_tool`).
     RollbackListResult {
@@ -584,6 +599,37 @@ mod tests {
         };
         let json = serde_json::to_string(&rb).expect("ser");
         assert_eq!(rb, serde_json::from_str(&json).expect("de"));
+    }
+
+    #[test]
+    fn conversation_list_frames_roundtrip() {
+        // Request with an explicit limit → round-trips and carries the field.
+        let with_limit = ClientMsg::ConversationList { limit: Some(10) };
+        let json = serde_json::to_string(&with_limit).expect("ser");
+        assert!(json.contains("\"limit\":10"));
+        assert_eq!(with_limit, serde_json::from_str(&json).expect("de"));
+
+        // Request with no limit → the field is omitted on the wire (matching an
+        // older client's shape) and parses back to None.
+        let no_limit = ClientMsg::ConversationList { limit: None };
+        let json = serde_json::to_string(&no_limit).expect("ser");
+        assert!(!json.contains("limit"), "limit omitted when None");
+        assert_eq!(no_limit, serde_json::from_str(&json).expect("de"));
+
+        // An old frame that lacks the limit field entirely still parses → None.
+        let bare: ClientMsg =
+            serde_json::from_str(r#"{"type":"conversation_list"}"#).expect("de bare");
+        assert_eq!(bare, ClientMsg::ConversationList { limit: None });
+
+        // The reply round-trips.
+        let reply = ServerMsg::ConversationListResult {
+            conversations_json: r#"[{"conversation_id":"c1","last_ts_secs":5,"events":3,"preview":"hi"}]"#.into(),
+        };
+        let json = serde_json::to_string(&reply).expect("ser");
+        assert_eq!(reply, serde_json::from_str(&json).expect("de"));
+
+        // Additive: the new variant doesn't disturb an existing frame's shape.
+        assert_eq!(PROTOCOL_VERSION, 0);
     }
 
     #[test]

@@ -70,7 +70,7 @@ ready-to-use systemd unit for autostart.
 | [`crates/fleety-tools`](crates/fleety-tools) | Shared, root-relative workspace tools (read/list/search-ripgrep/write/edit/run/git + unified diff). Used by the server **and** the daemon, so every device gets the full toolset. |
 | [`crates/fleety-server`](crates/fleety-server) | Fleety Agent server (`fleety-server`): runs the agent loop, the tool surface, cross-device routing, and the scheduler. |
 | [`crates/fleety-daemon`](crates/fleety-daemon) | Device background service (`fleetyd`): connects, runs on-device tools, `install`/`update` (also provisions the `fleety-insyra` sidecar so `insyra_exec` works on the device). |
-| [`crates/fleety-cli`](crates/fleety-cli) | CLI + interactive TUI (`fleety`): `init` / `ask` / `resume` / `tui` / `voice` / `status` / `config` / `audit` / `rollback` / `daemon` / `update` / `acp` / `pair` (see [Command reference](#command-reference)). |
+| [`crates/fleety-cli`](crates/fleety-cli) | CLI + interactive TUI (`fleety`): `init` / `ask` / `resume` / `conversations` / `tui` / `voice` / `status` / `config` / `audit` / `rollback` / `daemon` / `update` / `acp` / `pair` (see [Command reference](#command-reference)). |
 
 Dependency rule: everything may depend on `agent-core`; `agent-core` depends on
 nothing Fleety-specific, so it can later be extracted to its own repo and mounted
@@ -245,6 +245,7 @@ launchd / Windows SCM).
 | `fleety init <ws-url>` | Save the agent URL (e.g. `ws://host:8787`) for later commands. |
 | `fleety ask "<text>"` | One-shot prompt; prints the reply. Accepts file paths as attachments. |
 | `fleety resume <conversation_id>` | Continue an existing conversation. |
+| `fleety conversations [<limit>]` | List your recent conversations (most-recent-first) with a relative last-activity time and a first-message preview, so you can find the id `resume` needs. |
 | `fleety tui` | Interactive terminal UI (streaming chat). While a reply is generating, **Esc cancels** the turn (completed work is kept); when idle, Esc quits. Ctrl+C always quits. PgUp/PgDn scroll the history. |
 | `fleety voice` | Voice conversation (speech-to-text in, spoken reply out). |
 | `fleety status` | Server health: version, uptime, connected devices. |

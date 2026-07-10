@@ -61,6 +61,7 @@ fn print_help() {
     println!("                                   one-shot prompt (with attachments)");
     println!("  resume <conversation_id> [after_seq]");
     println!("                                   continue an existing conversation");
+    println!("  conversations [<limit>]          list recent conversations to resume");
     println!("  tui                              interactive terminal UI");
     println!("  voice                            voice conversation");
     println!("  status                           server health: version, uptime, devices");
@@ -162,6 +163,12 @@ async fn main() -> std::process::ExitCode {
             done(resume(conversation_id, after_seq).await)
         }
         Some("tui") => done(run_tui().await),
+        Some("conversations") => {
+            // `fleety conversations [<limit>]` — list recent conversations so the
+            // user can find the id `fleety resume` needs.
+            let limit = args.get(2).and_then(|s| s.parse::<u32>().ok());
+            done(conversations(limit).await)
+        }
         Some("audit") => {
             let sub = args.get(2).cloned().unwrap_or_default();
             match sub.as_str() {
@@ -844,6 +851,7 @@ async fn ask(text: String, attachments: Vec<WireAttachment>) -> Result<()> {
             | Some(ServerMsg::AssistantDelta { .. })
             | Some(ServerMsg::AuditListResult { .. })
             | Some(ServerMsg::AuditShowResult { .. })
+            | Some(ServerMsg::ConversationListResult { .. })
             | Some(ServerMsg::RollbackListResult { .. })
             | Some(ServerMsg::RollbackResult { .. })
             | Some(ServerMsg::ConversationRolled { .. })
@@ -1140,6 +1148,61 @@ fn format_relative(now: u64, ts: u64) -> String {
     }
 }
 
+/// Clamp a conversation preview to `max` characters for single-line display,
+/// appending an ellipsis when it was cut. Truncation is on char boundaries, not
+/// byte indices, so multibyte (e.g. CJK) previews never panic or split a
+/// codepoint. The server already sends a short one-line preview; this is a
+/// display-side safety net so a non-conforming/large preview can't blow up the
+/// row.
+fn truncate_preview(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push('…');
+    out
+}
+
+async fn conversations(limit: Option<u32>) -> Result<()> {
+    let (mut tx, mut rx) = connect_hello().await?;
+    send(&mut tx, &ClientMsg::ConversationList { limit }).await?;
+    match recv(&mut rx).await? {
+        Some(ServerMsg::ConversationListResult { conversations_json }) => {
+            let items: Vec<serde_json::Value> =
+                serde_json::from_str(&conversations_json).unwrap_or_default();
+            if items.is_empty() {
+                println!("(no conversations)");
+            } else {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                for item in &items {
+                    let id = item
+                        .get("conversation_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?");
+                    let ts = item.get("last_ts_secs").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let preview = item.get("preview").and_then(|v| v.as_str()).unwrap_or("");
+                    let when = format_relative(now, ts);
+                    let preview = truncate_preview(preview, 80);
+                    if preview.is_empty() {
+                        println!("{id}  {when:>8}");
+                    } else {
+                        println!("{id}  {when:>8}  {preview}");
+                    }
+                }
+            }
+        }
+        Some(ServerMsg::Error { error }) => {
+            eprintln!("agent error: {}", error.message);
+        }
+        other => return Err(CoreError::Provider(format!("unexpected reply: {other:?}"))),
+    }
+    let _ = tx.close().await;
+    Ok(())
+}
+
 async fn audit_list(limit: Option<u32>) -> Result<()> {
     let (mut tx, mut rx) = connect_hello().await?;
     send(
@@ -1358,7 +1421,23 @@ async fn recv(rx: &mut Rx) -> Result<Option<ServerMsg>> {
 
 #[cfg(test)]
 mod coverage_tests {
-    use super::{format_relative, format_uptime};
+    use super::{format_relative, format_uptime, truncate_preview};
+
+    #[test]
+    fn preview_truncation_is_char_safe_and_ellipsizes() {
+        // Short strings pass through unchanged (no ellipsis).
+        assert_eq!(truncate_preview("hello", 80), "hello");
+        assert_eq!(truncate_preview("", 80), "");
+        // Exactly at the bound → unchanged.
+        assert_eq!(truncate_preview("abcde", 5), "abcde");
+        // Over the bound → cut to `max` chars plus an ellipsis.
+        assert_eq!(truncate_preview("abcdef", 5), "abcde…");
+        // Multibyte (CJK) is cut on char boundaries, never mid-codepoint, so it
+        // never panics and the kept part is exactly `max` characters.
+        let cut = truncate_preview("這是一段很長的中文預覽內容", 5);
+        assert_eq!(cut, "這是一段很…");
+        assert_eq!(cut.chars().count(), 6); // 5 kept + ellipsis
+    }
 
     #[test]
     fn uptime_picks_the_right_band() {

@@ -123,6 +123,60 @@ fn read_events(path: &Path) -> Result<Vec<StoredEvent>> {
     Ok(events)
 }
 
+/// Upper bound (in characters, not bytes) for a conversation preview clip. The
+/// preview is a one-line teaser of the first user message, so the listing stays
+/// scannable; the CLI may clamp further for its column width.
+const PREVIEW_MAX_CHARS: usize = 80;
+
+/// Collapse a message body into a single-line preview clipped to
+/// [`PREVIEW_MAX_CHARS`] characters. Whitespace (including newlines) is folded to
+/// single spaces so a multi-line message renders on one row, and truncation is
+/// on char boundaries — never a byte index — so multibyte (e.g. CJK) text can't
+/// panic or split a codepoint.
+fn preview_line(content: &str) -> String {
+    let one_line = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    one_line.chars().take(PREVIEW_MAX_CHARS).collect()
+}
+
+/// Cheap single-pass metadata for a conversation file: `(events, last_ts_secs,
+/// preview)`. Reads each line as a JSON value to pull `ts_secs` and, for the
+/// first `role == "user"` line, a one-line `preview` of its content — without
+/// deserializing the full typed `Message`. A missing/unreadable file → zeros and
+/// an empty preview (the caller treats that as an empty conversation).
+fn conversation_meta(path: &Path) -> (u64, u64, String) {
+    let Ok(text) = fs::read_to_string(path) else {
+        return (0, 0, String::new());
+    };
+    let mut events = 0u64;
+    let mut last_ts = 0u64;
+    let mut preview = String::new();
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        events += 1;
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if let Some(ts) = value.get("ts_secs").and_then(Value::as_u64) {
+            last_ts = last_ts.max(ts);
+        }
+        if preview.is_empty() {
+            let message = value.get("message");
+            let is_user =
+                message.and_then(|m| m.get("role")).and_then(Value::as_str) == Some("user");
+            if is_user {
+                if let Some(content) =
+                    message.and_then(|m| m.get("content")).and_then(Value::as_str)
+                {
+                    preview = preview_line(content);
+                }
+            }
+        }
+    }
+    (events, last_ts, preview)
+}
+
 /// Reject id components that could escape the store via path traversal.
 fn validate_id(kind: &str, id: &str) -> Result<()> {
     if id.is_empty()
@@ -487,6 +541,64 @@ impl Storage {
             }
         }
         (count, last)
+    }
+
+    /// Recent conversations for a connecting device, most-recent-first, capped
+    /// at `limit`. Scope is the acting user resolved from the device's ownership
+    /// (see [`Self::acting_for_device`]): a real user → their user-primary
+    /// conversations; a guest / owner-less device → the device's own
+    /// (unattributed) conversations. This never crosses into another user's
+    /// data. Each row is `{conversation_id, last_ts_secs, events, preview}` with
+    /// `preview` a one-line clip of the first user message. Infallible: any read
+    /// error (missing dir, unreadable file) is treated as "no conversations".
+    pub fn recent_conversations(&self, device_id: &str, limit: usize) -> Vec<Value> {
+        let acting = self.acting_for_device(device_id);
+        let dir = match acting.user_id() {
+            Some(user) => self
+                .home
+                .join("fleet")
+                .join("users")
+                .join(user)
+                .join("conversations"),
+            None => self
+                .home
+                .join("fleet")
+                .join("devices")
+                .join(device_id)
+                .join("conversations"),
+        };
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => return Vec::new(),
+        };
+        // (last_ts_secs, row) so we can sort by recency without re-reading.
+        let mut rows: Vec<(u64, Value)> = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            // In-flight turn journals sit beside conversations under the device
+            // path and also end in `.jsonl` — never list them as conversations.
+            if name.ends_with(".journal.jsonl") {
+                continue;
+            }
+            let Some(conversation_id) = name.strip_suffix(".jsonl") else {
+                continue;
+            };
+            let (events, last_ts, preview) = conversation_meta(&entry.path());
+            rows.push((
+                last_ts,
+                serde_json::json!({
+                    "conversation_id": conversation_id,
+                    "last_ts_secs": last_ts,
+                    "events": events,
+                    "preview": preview,
+                }),
+            ));
+        }
+        // Newest first; stable so equal timestamps keep their read order.
+        rows.sort_by_key(|(last_ts, _)| std::cmp::Reverse(*last_ts));
+        rows.truncate(limit);
+        rows.into_iter().map(|(_, row)| row).collect()
     }
 
     /// A user conversation's events with `seq` strictly greater than `after`.
@@ -1980,6 +2092,115 @@ mod tests {
             .join("conversations")
             .join("k1.jsonl")
             .exists());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Write a conversation `.jsonl` at an explicit path with controlled
+    /// `ts_secs`, so recency ordering is deterministic (real appends can share a
+    /// wall-clock second in a fast test). Each `(role, content)` becomes one line.
+    fn write_conv(path: &std::path::Path, lines: &[(u64, &str, &str)]) {
+        std::fs::create_dir_all(path.parent().expect("conv parent")).expect("mk conv dir");
+        let mut body = String::new();
+        for (i, (ts, role, content)) in lines.iter().enumerate() {
+            let record = serde_json::json!({
+                "seq": (i as u64) + 1,
+                "ts_secs": ts,
+                "device_id": "dev",
+                "message": { "role": role, "content": content },
+            });
+            body.push_str(&record.to_string());
+            body.push('\n');
+        }
+        std::fs::write(path, body).expect("write conv");
+    }
+
+    #[test]
+    fn recent_conversations_scopes_to_user_newest_first_with_preview() {
+        let home = temp_home();
+        let storage = Storage::new(home.clone());
+        // A device owned by alice → the listing is scoped to alice.
+        storage
+            .set_device_ownership("laptop", Some("alice"), &["alice".to_string()], false)
+            .expect("own");
+        let users = home.join("fleet").join("users");
+        // Two of alice's conversations, c-old older than c-new.
+        write_conv(
+            &users.join("alice").join("conversations").join("c-old.jsonl"),
+            &[(100, "user", "older question"), (110, "assistant", "a")],
+        );
+        write_conv(
+            &users.join("alice").join("conversations").join("c-new.jsonl"),
+            &[(200, "user", "newer question"), (205, "assistant", "b")],
+        );
+        // Bob's conversation MUST NOT leak into alice's listing.
+        write_conv(
+            &users.join("bob").join("conversations").join("c-bob.jsonl"),
+            &[(300, "user", "bob's secret")],
+        );
+
+        let rows = storage.recent_conversations("laptop", 20);
+        let ids: Vec<&str> = rows
+            .iter()
+            .map(|r| r["conversation_id"].as_str().unwrap_or(""))
+            .collect();
+        // Scoped to alice (no bob), newest-first.
+        assert_eq!(ids, vec!["c-new", "c-old"]);
+        // Preview is the first user message; event count and last_ts are right.
+        assert_eq!(rows[0]["preview"], serde_json::json!("newer question"));
+        assert_eq!(rows[0]["events"], serde_json::json!(2u64));
+        assert_eq!(rows[0]["last_ts_secs"], serde_json::json!(205u64));
+        assert_eq!(rows[1]["preview"], serde_json::json!("older question"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn recent_conversations_guest_falls_back_to_device_and_limits() {
+        let home = temp_home();
+        let storage = Storage::new(home.clone());
+        // "kiosk" has no owner → Guest → its own device-dir conversations.
+        let convs = home
+            .join("fleet")
+            .join("devices")
+            .join("kiosk")
+            .join("conversations");
+        write_conv(&convs.join("k1.jsonl"), &[(100, "user", "one")]);
+        write_conv(&convs.join("k2.jsonl"), &[(200, "user", "two")]);
+        write_conv(&convs.join("k3.jsonl"), &[(300, "user", "three")]);
+        // A concurrent turn journal lives beside them and also ends in `.jsonl`;
+        // it must never be listed as a conversation.
+        std::fs::write(convs.join("k3.journal.jsonl"), "{\"kind\":\"start\"}\n").expect("journal");
+
+        // limit truncates to the newest N.
+        let rows = storage.recent_conversations("kiosk", 2);
+        let ids: Vec<&str> = rows
+            .iter()
+            .map(|r| r["conversation_id"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(ids, vec!["k3", "k2"]);
+
+        // A long first message is clipped to a single line ≤ 80 chars.
+        let long = "word ".repeat(40); // 200 chars, spaces fold to single
+        write_conv(&convs.join("k4.jsonl"), &[(400, "user", &long)]);
+        let rows = storage.recent_conversations("kiosk", 20);
+        let newest = &rows[0];
+        assert_eq!(newest["conversation_id"], serde_json::json!("k4"));
+        let preview = newest["preview"].as_str().expect("preview");
+        assert!(preview.chars().count() <= 80, "preview clipped to ≤ 80 chars");
+        assert!(!preview.contains('\n'), "preview is a single line");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn recent_conversations_empty_when_none() {
+        let home = temp_home();
+        let storage = Storage::new(home.clone());
+        // Owner with no conversations dir → honest empty, not an error.
+        storage
+            .set_device_ownership("laptop", Some("alice"), &["alice".to_string()], false)
+            .expect("own");
+        assert!(storage.recent_conversations("laptop", 20).is_empty());
+        // Unknown device (guest, no dir) → empty too.
+        assert!(storage.recent_conversations("ghost", 20).is_empty());
         let _ = std::fs::remove_dir_all(&home);
     }
 
