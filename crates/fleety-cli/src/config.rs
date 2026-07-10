@@ -167,6 +167,16 @@ fn on_key(app: &mut ConfigApp, key: KeyCode) -> bool {
                     app.map.remove(&(setting.scope, setting.key.to_string()));
                     app.status = format!("unset {} (reverts to env/default)", setting.key);
                 } else {
+                    // Reject out-of-domain values before they reach the map/file;
+                    // reopen the editor with the rejected text so the user can
+                    // fix it, surface the reason, and skip the save.
+                    if let Err(e) = config::validate(setting, &buf) {
+                        app.status = e.to_string();
+                        let mut ed = LineEditor::default();
+                        ed.set_text(buf);
+                        app.edit = Some(ed);
+                        return false;
+                    }
                     app.map
                         .insert((setting.scope, setting.key.to_string()), buf);
                     app.status = format!("set {}", setting.key);
@@ -318,14 +328,23 @@ mod tests {
     fn config_tui_key_handling() {
         let mut app = ConfigApp::new(ConfigMap::new());
         assert!(app.rows.len() >= 2);
-        let key0 = app.rows[0].key;
-        let setting = config::find(key0).expect("known");
 
         // Navigation.
         on_key(&mut app, KeyCode::Down);
         assert_eq!(app.sel, 1);
         on_key(&mut app, KeyCode::Up);
         assert_eq!(app.sel, 0);
+
+        // Drive the edit assertions on a key with no validator so the committed
+        // value isn't rejected by write validation (that path has its own test
+        // below). `FLEETY_MODEL` is a free-form model name.
+        app.sel = app
+            .rows
+            .iter()
+            .position(|r| r.key == "FLEETY_MODEL")
+            .expect("FLEETY_MODEL present");
+        let key0 = app.rows[app.sel].key;
+        let setting = config::find(key0).expect("known");
 
         // Edit then cancel → no change, no save.
         on_key(&mut app, KeyCode::Enter);
@@ -355,6 +374,45 @@ mod tests {
         // Quit.
         on_key(&mut app, KeyCode::Char('q'));
         assert!(app.quit);
+    }
+
+    #[test]
+    fn config_tui_rejects_invalid_value() {
+        let mut app = ConfigApp::new(ConfigMap::new());
+        // Select a validated key (FLEETY_REQUIRE_AUTH accepts only 0/1).
+        app.sel = app
+            .rows
+            .iter()
+            .position(|r| r.key == "FLEETY_REQUIRE_AUTH")
+            .expect("FLEETY_REQUIRE_AUTH present");
+        let setting = config::find("FLEETY_REQUIRE_AUTH").expect("known");
+
+        // Type an out-of-domain value and commit it.
+        on_key(&mut app, KeyCode::Enter);
+        app.edit = Some(LineEditor::default()); // clear any prefill
+        for c in "abc".chars() {
+            on_key(&mut app, KeyCode::Char(c));
+        }
+        let saved = on_key(&mut app, KeyCode::Enter);
+
+        // Not saved, not stored, and the error names the key + accepted values.
+        assert!(!saved, "an invalid commit must not request a save");
+        assert!(
+            !app
+                .map
+                .contains_key(&(setting.scope, "FLEETY_REQUIRE_AUTH".to_string())),
+            "the rejected value must not enter the map"
+        );
+        assert!(
+            app.status.contains("FLEETY_REQUIRE_AUTH"),
+            "status: {}",
+            app.status
+        );
+        assert!(
+            app.status.contains('0') && app.status.contains('1'),
+            "status should list the accepted 0/1 values, got: {}",
+            app.status
+        );
     }
 
     #[test]

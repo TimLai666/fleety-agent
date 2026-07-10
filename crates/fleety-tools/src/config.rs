@@ -5,6 +5,12 @@
 //! → default**: an explicit environment variable always wins, so existing
 //! env-based deployments are unaffected; config.toml only fills what env leaves
 //! unset. The CLI edits this; the server/daemon seed their env from it at boot.
+//!
+//! A registry entry may carry a `validator`; `config set` and the interactive
+//! editors check the value against it before writing, rejecting out-of-domain
+//! values (bad enums, non-boolean `0|1`, non-numeric, non-`http(s)` URLs) so a
+//! typo never lands silently in `config.toml`. Keys with no validator accept
+//! any value (pass-through).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -40,9 +46,14 @@ impl Scope {
     }
 }
 
+/// A value validator: rejects an out-of-domain write, returning a short
+/// description of the accepted values (no key name — [`validate`] prepends it).
+/// A bare `fn` pointer (not a closure) so [`Setting`] stays `Copy`.
+pub type Validator = fn(&str) -> std::result::Result<(), String>;
+
 /// A known setting: its canonical key (== its `FLEETY_*` env name), scope,
-/// default, one-line description, and whether it holds a secret (masked in
-/// display).
+/// default, one-line description, whether it holds a secret (masked in
+/// display), and an optional value validator run before a write.
 #[derive(Debug, Clone, Copy)]
 pub struct Setting {
     pub key: &'static str,
@@ -50,6 +61,9 @@ pub struct Setting {
     pub default: &'static str,
     pub description: &'static str,
     pub secret: bool,
+    /// Reject out-of-domain values before they reach `config.toml`; `None` means
+    /// any value is accepted (pass-through).
+    pub validator: Option<Validator>,
 }
 
 /// The single source of truth for known settings. Adding one = one entry here.
@@ -62,6 +76,7 @@ pub fn registry() -> &'static [Setting] {
             default: "127.0.0.1:8787",
             description: "WebSocket listen address.",
             secret: false,
+            validator: None,
         },
         Setting {
             key: "FLEETY_WORKSPACE",
@@ -69,6 +84,7 @@ pub fn registry() -> &'static [Setting] {
             default: "(cwd)",
             description: "Fallback workspace root for tools.",
             secret: false,
+            validator: None,
         },
         Setting {
             key: "FLEETY_POLICY",
@@ -76,6 +92,7 @@ pub fn registry() -> &'static [Setting] {
             default: "full_access",
             description: "full_access or require_approval.",
             secret: false,
+            validator: Some(v_policy),
         },
         Setting {
             key: "FLEETY_REQUIRE_AUTH",
@@ -83,6 +100,7 @@ pub fn registry() -> &'static [Setting] {
             default: "0",
             description: "Require a token to connect (1/0).",
             secret: false,
+            validator: Some(v_bool),
         },
         Setting {
             key: "FLEETY_TOKEN",
@@ -90,6 +108,7 @@ pub fn registry() -> &'static [Setting] {
             default: "",
             description: "Bootstrap admin token for first pairing.",
             secret: true,
+            validator: None,
         },
         Setting {
             key: "FLEETY_MODEL_BASE_URL",
@@ -97,6 +116,7 @@ pub fn registry() -> &'static [Setting] {
             default: "",
             description: "OpenAI-compatible model base URL.",
             secret: false,
+            validator: Some(v_url),
         },
         Setting {
             key: "FLEETY_MODEL",
@@ -104,6 +124,7 @@ pub fn registry() -> &'static [Setting] {
             default: "",
             description: "Main model name.",
             secret: false,
+            validator: None,
         },
         Setting {
             key: "FLEETY_MODEL_KEY",
@@ -111,6 +132,7 @@ pub fn registry() -> &'static [Setting] {
             default: "",
             description: "Main model API key.",
             secret: true,
+            validator: None,
         },
         Setting {
             key: "FLEETY_MODEL_RETRIES",
@@ -118,6 +140,7 @@ pub fn registry() -> &'static [Setting] {
             default: "3",
             description: "Model-call retry attempts on transient failure (0 = no retry).",
             secret: false,
+            validator: Some(v_uint),
         },
         Setting {
             key: "FLEETY_MODEL_RETRY_BASE_MS",
@@ -125,6 +148,7 @@ pub fn registry() -> &'static [Setting] {
             default: "500",
             description: "Base backoff (ms) for model-call retries.",
             secret: false,
+            validator: Some(v_uint),
         },
         Setting {
             key: "FLEETY_MODEL_RETRY_CAP_MS",
@@ -132,6 +156,7 @@ pub fn registry() -> &'static [Setting] {
             default: "30000",
             description: "Max backoff (ms) for model-call retries.",
             secret: false,
+            validator: Some(v_uint),
         },
         Setting {
             key: "FLEETY_MODEL_MODALITIES",
@@ -139,6 +164,7 @@ pub fn registry() -> &'static [Setting] {
             default: "(heuristic)",
             description: "Main model input modalities, e.g. text,image,audio,pdf (overrides the name heuristic).",
             secret: false,
+            validator: None,
         },
         Setting {
             key: "FLEETY_CHEAP_MODEL_MODALITIES",
@@ -146,6 +172,7 @@ pub fn registry() -> &'static [Setting] {
             default: "(heuristic)",
             description: "Economy model input modalities (same form as FLEETY_MODEL_MODALITIES).",
             secret: false,
+            validator: None,
         },
         Setting {
             key: "FLEETY_MODEL_EFFORT",
@@ -153,6 +180,7 @@ pub fn registry() -> &'static [Setting] {
             default: "(none)",
             description: "Default reasoning effort for the main model: low/medium/high (only models that support effort).",
             secret: false,
+            validator: Some(v_effort),
         },
         Setting {
             key: "FLEETY_CHEAP_MODEL_EFFORT",
@@ -160,6 +188,7 @@ pub fn registry() -> &'static [Setting] {
             default: "(none)",
             description: "Default reasoning effort for the economy model (low/medium/high).",
             secret: false,
+            validator: Some(v_effort),
         },
         Setting {
             key: "FLEETY_VOICE_AUDIO",
@@ -167,6 +196,7 @@ pub fn registry() -> &'static [Setting] {
             default: "auto",
             description: "Voice transport: auto (send audio iff model accepts it) / on / off (local STT).",
             secret: false,
+            validator: Some(v_voice_audio),
         },
         Setting {
             key: "FLEETY_VOICE_AUDIO_MAX_KB",
@@ -174,6 +204,7 @@ pub fn registry() -> &'static [Setting] {
             default: "2048",
             description: "Max voice-audio payload (KB) before falling back to local STT.",
             secret: false,
+            validator: Some(v_uint),
         },
         Setting {
             key: "FLEETY_CHEAP_MODEL",
@@ -181,6 +212,7 @@ pub fn registry() -> &'static [Setting] {
             default: "",
             description: "Economy/cheap model name (subagents, housekeeping).",
             secret: false,
+            validator: None,
         },
         Setting {
             key: "FLEETY_TZ",
@@ -188,6 +220,7 @@ pub fn registry() -> &'static [Setting] {
             default: "UTC",
             description: "Fallback timezone for display (IANA).",
             secret: false,
+            validator: None,
         },
         Setting {
             key: "FLEETY_FS_SCOPE",
@@ -195,6 +228,7 @@ pub fn registry() -> &'static [Setting] {
             default: "full",
             description: "full or workspace (path confinement).",
             secret: false,
+            validator: Some(v_fs_scope),
         },
         Setting {
             key: "FLEETY_CMD_TIMEOUT_SECS",
@@ -202,6 +236,7 @@ pub fn registry() -> &'static [Setting] {
             default: "120",
             description: "Default wall-clock limit for run_command / ssh_exec (0 = no limit); a per-call timeout_secs overrides it.",
             secret: false,
+            validator: Some(v_uint),
         },
         Setting {
             key: "FLEETY_AUTO_INSTALL_DEPS",
@@ -209,6 +244,7 @@ pub fn registry() -> &'static [Setting] {
             default: "1",
             description: "Auto-install missing dependencies at boot (1/0).",
             secret: false,
+            validator: Some(v_bool),
         },
         Setting {
             key: "FLEETY_AGENT_URL",
@@ -216,6 +252,7 @@ pub fn registry() -> &'static [Setting] {
             default: "(mDNS → ws://127.0.0.1:8787)",
             description: "Server WebSocket URL the daemon/CLI connects to.",
             secret: false,
+            validator: None,
         },
         Setting {
             key: "FLEETY_DEVICE_ID",
@@ -223,6 +260,7 @@ pub fn registry() -> &'static [Setting] {
             default: "(hostname)",
             description: "This device's id.",
             secret: false,
+            validator: None,
         },
         Setting {
             key: "FLEETY_FORCE_SSE",
@@ -230,6 +268,7 @@ pub fn registry() -> &'static [Setting] {
             default: "0",
             description: "Always use the SSE+POST transport, skipping WebSocket (1/0).",
             secret: false,
+            validator: Some(v_bool),
         },
         Setting {
             key: "FLEETY_DISABLE_SSE",
@@ -237,6 +276,7 @@ pub fn registry() -> &'static [Setting] {
             default: "0",
             description: "Disable the SSE+POST fallback; WebSocket only (1/0).",
             secret: false,
+            validator: Some(v_bool),
         },
         Setting {
             key: "FLEETY_SSE_TIMEOUT_SECS",
@@ -244,6 +284,7 @@ pub fn registry() -> &'static [Setting] {
             default: "45",
             description: "SSE half-open timeout: reconnect if no event/keep-alive arrives.",
             secret: false,
+            validator: Some(v_uint),
         },
         Setting {
             key: "FLEETY_BACKUP_REPO",
@@ -251,6 +292,7 @@ pub fn registry() -> &'static [Setting] {
             default: "",
             description: "Private GitHub repo for auto-backup (owner/repo or URL); unset disables.",
             secret: false,
+            validator: None,
         },
         Setting {
             key: "FLEETY_BACKUP_TOKEN",
@@ -258,6 +300,7 @@ pub fn registry() -> &'static [Setting] {
             default: "",
             description: "PAT for the backup repo (push + private-visibility check).",
             secret: true,
+            validator: None,
         },
         Setting {
             key: "FLEETY_BACKUP_INTERVAL_SECS",
@@ -265,6 +308,7 @@ pub fn registry() -> &'static [Setting] {
             default: "3600",
             description: "Seconds between scheduled backups.",
             secret: false,
+            validator: Some(v_uint),
         },
         Setting {
             key: "FLEETY_PRESENCE",
@@ -272,6 +316,7 @@ pub fn registry() -> &'static [Setting] {
             default: "off",
             description: "Presence tracking: report this device's co-location (on/off).",
             secret: false,
+            validator: Some(v_presence),
         },
         Setting {
             key: "FLEETY_PRESENCE_INTERVAL_SECS",
@@ -279,6 +324,7 @@ pub fn registry() -> &'static [Setting] {
             default: "300",
             description: "Seconds between co-location reports (floored at 60).",
             secret: false,
+            validator: Some(v_uint),
         },
         Setting {
             key: "FLEETY_CODEX_CLIENT_ID",
@@ -289,6 +335,7 @@ pub fn registry() -> &'static [Setting] {
             default: "app_EMoamEEZ73f0CkXaXp7hrann",
             description: "Codex ChatGPT OAuth public client id.",
             secret: false,
+            validator: None,
         },
         Setting {
             key: "FLEETY_CODEX_AUTHORIZE_URL",
@@ -296,6 +343,7 @@ pub fn registry() -> &'static [Setting] {
             default: "https://auth.openai.com/oauth/authorize",
             description: "Codex OAuth authorization endpoint.",
             secret: false,
+            validator: Some(v_url),
         },
         Setting {
             key: "FLEETY_CODEX_TOKEN_URL",
@@ -303,6 +351,7 @@ pub fn registry() -> &'static [Setting] {
             default: "https://auth.openai.com/oauth/token",
             description: "Codex OAuth token endpoint.",
             secret: false,
+            validator: Some(v_url),
         },
         Setting {
             key: "FLEETY_CODEX_BACKEND_URL",
@@ -310,8 +359,85 @@ pub fn registry() -> &'static [Setting] {
             default: "https://chatgpt.com/backend-api/codex",
             description: "Codex OAuth backend base URL for model calls.",
             secret: false,
+            validator: Some(v_url),
         },
     ]
+}
+
+// ---- registry value validators ----
+//
+// Each validator inspects a to-be-written value and, on rejection, returns a
+// short description of the accepted values (no key name — [`validate`] prepends
+// it). Kept as bare `fn` pointers so `Setting` stays `Copy`. `validate` treats
+// an empty value as unset and never calls a validator with it.
+
+/// Accept only one of a fixed set of members; the error lists them.
+fn check_enum(value: &str, allowed: &[&str]) -> std::result::Result<(), String> {
+    if allowed.contains(&value) {
+        Ok(())
+    } else {
+        Err(format!("accepted values: {}", allowed.join(", ")))
+    }
+}
+
+fn v_policy(value: &str) -> std::result::Result<(), String> {
+    check_enum(value, &["full_access", "require_approval"])
+}
+
+fn v_fs_scope(value: &str) -> std::result::Result<(), String> {
+    check_enum(value, &["full", "workspace"])
+}
+
+fn v_voice_audio(value: &str) -> std::result::Result<(), String> {
+    check_enum(value, &["auto", "on", "off"])
+}
+
+fn v_presence(value: &str) -> std::result::Result<(), String> {
+    check_enum(value, &["on", "off"])
+}
+
+fn v_effort(value: &str) -> std::result::Result<(), String> {
+    check_enum(value, &["low", "medium", "high"])
+}
+
+/// Accept only the boolean forms `0` or `1`.
+fn v_bool(value: &str) -> std::result::Result<(), String> {
+    match value {
+        "0" | "1" => Ok(()),
+        _ => Err("accepted values: 0 or 1".to_string()),
+    }
+}
+
+/// Accept a non-negative integer (parses as `u64`, so no sign, decimal, or text).
+fn v_uint(value: &str) -> std::result::Result<(), String> {
+    value
+        .parse::<u64>()
+        .map(|_| ())
+        .map_err(|_| "expected a non-negative integer".to_string())
+}
+
+/// Accept only an `http://` or `https://` URL (scheme check, not full parse).
+fn v_url(value: &str) -> std::result::Result<(), String> {
+    if value.starts_with("http://") || value.starts_with("https://") {
+        Ok(())
+    } else {
+        Err("expected an http:// or https:// URL".to_string())
+    }
+}
+
+/// Validate a to-be-written `value` for `setting`. A setting with no validator
+/// accepts anything (pass-through); an empty value means unset and is never
+/// validated. Otherwise the registry validator decides, and a rejection is
+/// wrapped as `CoreError::Message` naming the key and the accepted values so the
+/// user can correct it without reading source. Pure (no I/O).
+pub fn validate(setting: &Setting, value: &str) -> Result<()> {
+    if value.is_empty() {
+        return Ok(());
+    }
+    let Some(check) = setting.validator else {
+        return Ok(());
+    };
+    check(value).map_err(|why| CoreError::Message(format!("invalid value for {}: {why}", setting.key)))
 }
 
 /// Find a setting by key (unknown keys are rejected by callers).
@@ -607,6 +733,10 @@ pub fn run_rendered(args: &[String]) -> Result<String> {
                     "unknown setting '{key}'. Run `config list` to see valid keys."
                 ))
             })?;
+            // Reject out-of-domain values before touching the file, so a typo
+            // never lands silently (server/daemon and remote `--target` all
+            // funnel through here).
+            validate(setting, &value)?;
             let mut map = load(&path);
             map.insert((setting.scope, key.clone()), value);
             save(&path, &map)?;
@@ -1057,6 +1187,12 @@ pub fn edit_line_based(path: &std::path::Path) -> Result<()> {
         if val.is_empty() {
             continue;
         }
+        // Reject invalid values without saving; keep looping so the user can
+        // retry (same rules as `config set`).
+        if let Err(e) = validate(setting, &val) {
+            println!("{e}");
+            continue;
+        }
         map.insert((setting.scope, setting.key.to_string()), val);
         save(path, &map)?;
         println!("saved {}", setting.key);
@@ -1379,6 +1515,97 @@ mod tests {
         let cfg = pc::load_from(&path).expect("re-read");
         assert_eq!(cfg.providers.len(), 2);
         assert_eq!(cfg.groups.len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn registry_validators_accept_and_reject() {
+        // Every key that carries a validator accepts a representative good value
+        // and rejects a bad one, and the rejection names the key.
+        let cases: &[(&str, &str, &str)] = &[
+            ("FLEETY_POLICY", "require_approval", "nope"),
+            ("FLEETY_FS_SCOPE", "workspace", "ful"),
+            ("FLEETY_VOICE_AUDIO", "on", "loud"),
+            ("FLEETY_PRESENCE", "on", "maybe"),
+            ("FLEETY_MODEL_EFFORT", "high", "extreme"),
+            ("FLEETY_CHEAP_MODEL_EFFORT", "low", "extreme"),
+            ("FLEETY_REQUIRE_AUTH", "1", "abc"),
+            ("FLEETY_AUTO_INSTALL_DEPS", "0", "true"),
+            ("FLEETY_FORCE_SSE", "1", "yes"),
+            ("FLEETY_DISABLE_SSE", "0", "no"),
+            ("FLEETY_MODEL_RETRIES", "3", "-1"),
+            ("FLEETY_MODEL_RETRY_BASE_MS", "500", "fast"),
+            ("FLEETY_MODEL_RETRY_CAP_MS", "30000", "1.5"),
+            ("FLEETY_CMD_TIMEOUT_SECS", "120", "notanumber"),
+            ("FLEETY_SSE_TIMEOUT_SECS", "45", "-5"),
+            ("FLEETY_BACKUP_INTERVAL_SECS", "3600", "hourly"),
+            ("FLEETY_PRESENCE_INTERVAL_SECS", "300", "5m"),
+            ("FLEETY_VOICE_AUDIO_MAX_KB", "2048", "big"),
+            ("FLEETY_MODEL_BASE_URL", "https://api.x/v1", "notaurl"),
+            ("FLEETY_CODEX_AUTHORIZE_URL", "https://auth/x", "ftp://x"),
+            ("FLEETY_CODEX_TOKEN_URL", "http://auth/x", "auth/x"),
+            ("FLEETY_CODEX_BACKEND_URL", "https://b/x", "b"),
+        ];
+        for &(key, good, bad) in cases {
+            let s = find(key).unwrap_or_else(|| panic!("{key} registered"));
+            assert!(s.validator.is_some(), "{key} should carry a validator");
+            assert!(validate(s, good).is_ok(), "{key}: '{good}' should pass");
+            let err = validate(s, bad).unwrap_err().to_string();
+            assert!(err.contains(key), "{key}: error should name the key, got: {err}");
+        }
+        // A key with no validator accepts anything (pass-through).
+        let tz = find("FLEETY_TZ").unwrap();
+        assert!(tz.validator.is_none());
+        assert!(validate(tz, "Anything/Here").is_ok());
+    }
+
+    #[test]
+    fn validate_error_names_accepted_values() {
+        // Enum rejection lists the members …
+        let voice = find("FLEETY_VOICE_AUDIO").unwrap();
+        let err = validate(voice, "loud").unwrap_err().to_string();
+        assert!(err.contains("FLEETY_VOICE_AUDIO"), "got: {err}");
+        assert!(
+            err.contains("auto") && err.contains("on") && err.contains("off"),
+            "got: {err}"
+        );
+        // … and URL rejection states the required scheme.
+        let url = find("FLEETY_MODEL_BASE_URL").unwrap();
+        let err = validate(url, "notaurl").unwrap_err().to_string();
+        assert!(err.contains("FLEETY_MODEL_BASE_URL"), "got: {err}");
+        assert!(err.contains("http"), "got: {err}");
+        // Pass-through (no validator) and unset (empty) both accept silently.
+        let model = find("FLEETY_MODEL").unwrap();
+        assert!(validate(model, "anything").is_ok());
+        assert!(validate(voice, "").is_ok());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn run_rendered_set_validates_before_writing() {
+        let path = std::env::temp_dir().join(format!("fleety-cfg-{}.toml", uuid::Uuid::new_v4()));
+        std::env::set_var("FLEETY_CONFIG", &path);
+        // Don't let a real env var shadow the keys we read back.
+        std::env::remove_var("FLEETY_REQUIRE_AUTH");
+        std::env::remove_var("FLEETY_POLICY");
+
+        // Invalid value → error, and the file is never created.
+        let err = run_rendered(&v(&["set", "FLEETY_REQUIRE_AUTH", "abc"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("FLEETY_REQUIRE_AUTH"), "got: {err}");
+        assert!(!path.exists(), "an invalid set must not create the config file");
+
+        // Valid value → written under the setting's scope and readable back.
+        run_rendered(&v(&["set", "FLEETY_POLICY", "require_approval"])).unwrap();
+        let map = load(&path);
+        assert_eq!(
+            map.get(&(Scope::Server, "FLEETY_POLICY".to_string()))
+                .map(String::as_str),
+            Some("require_approval")
+        );
+
+        std::env::remove_var("FLEETY_CONFIG");
         let _ = std::fs::remove_file(&path);
     }
 }
