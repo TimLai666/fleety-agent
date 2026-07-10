@@ -1086,9 +1086,13 @@ async fn voice_chat() -> Result<()> {
                 }) => {
                     println!("{text}");
                     // Read the spoken channel aloud; falls back to silence if no
-                    // engine or no spoken version was produced.
+                    // engine or no spoken version was produced. Honor barge-in:
+                    // if the user talks over the reply, stop this turn early and
+                    // return to the outer loop to capture their utterance.
                     if let Some(spoken) = speech {
-                        voice::speak(&spoken);
+                        if voice::speak_interruptible(&spoken) == voice::SpeakOutcome::Interrupted {
+                            break;
+                        }
                     }
                     // Device-deixis: point the user at the named device/target.
                     if let Some(a) = attention {
