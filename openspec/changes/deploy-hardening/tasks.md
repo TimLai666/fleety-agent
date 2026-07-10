@@ -1,6 +1,6 @@
 ## 1. Windows lifecycle verbs pre-flight an elevation check
 
-- [ ] 1.1 在 crates/fleety-tools/src/service.rs 新增無 `unsafe`、無新依賴的 `is_elevated() -> bool`（Windows 以 `net session` 之類指令 exit code 探測；非 Windows 恆真），以及純函式 `elevation_required_message(verb)`，並加單元測試：`elevation_required_message` 對 Install/Start 等變更型動詞含 "administrator"、對 Status 為空字串（比照既有 `admin_hint_only_for_windows_install_uninstall` 測試風格）
+- [x] 1.1 在 crates/fleety-tools/src/service.rs 新增無 `unsafe`、無新依賴的 `is_elevated() -> bool`（Windows 以 `net session` 之類指令 exit code 探測；非 Windows 恆真），以及純函式 `elevation_required_message(verb)`，並加單元測試：`elevation_required_message` 對 Install/Start 等變更型動詞含 "administrator"、對 Status 為空字串（比照既有 `admin_hint_only_for_windows_install_uninstall` 測試風格）
 - [ ] 1.2 讓 crates/fleety-server/src/service.rs 的 `run(action)` 在 status 以外的動作執行前，對變更型動詞呼叫上述守衛；未 elevated 時回傳 `CoreError::Message`（不呼叫任何 `sc`），由 main.rs 的 `log_action` 印到 stderr 並非零退出。以 `cargo test -p fleety-server service::` 驗證 plan/映射不回歸（實作 requirement: Windows lifecycle verbs pre-flight an elevation check）
 - [ ] 1.3 讓 crates/fleety-daemon/src/service.rs 的 install/uninstall/start/stop/restart/enable/disable 在呼叫 `run_verb` 前套用同一守衛，確保 daemon 與 server 行為一致；以 `cargo test -p fleety-daemon` 驗證 spec 建構不回歸
 - [ ] 1.4 手動驗證（Windows，非管理員終端）：`fleety-server up` 與 `fleetyd install` 在動手前中止並印出「請以系統管理員身分重新執行」訊息，且 `sc query fleety-server` 顯示服務未被建立（無半套狀態）；`status` 在非管理員下仍正常回報

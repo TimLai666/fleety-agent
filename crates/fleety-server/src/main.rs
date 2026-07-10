@@ -224,7 +224,23 @@ async fn async_main(cmd: Option<String>) -> std::process::ExitCode {
             let force = std::env::args().skip(2).any(|a| a == "--force");
             return log_action("restart", service::restart(force));
         }
-        return log_action(cmd.as_deref().unwrap_or("?"), service::run(action));
+        let name = cmd.as_deref().unwrap_or("?");
+        let result = service::run(action);
+        // Symmetry with fleetyd's install branch: on a successful install/up,
+        // provision the data-analysis sidecar (best-effort) so the user hears now
+        // — not at a later insyra_exec failure — if it couldn't be fetched. A
+        // provisioning failure never fails install/up.
+        if result.is_ok() && matches!(action, service::Action::Install | service::Action::Up) {
+            if let Err(e) = fleety_tools::deps::insyra::ensure_insyra(false).await {
+                eprintln!(
+                    "note: could not provision the fleety-insyra sidecar ({}); on-host data \
+                     analysis (insyra_exec) will be unavailable until it is provisioned — the \
+                     server retries this automatically on each start (or after a later update)",
+                    e.report().message
+                );
+            }
+        }
+        return log_action(name, result);
     }
 
     // `backup now` / `backup restore` run once against the user-configured repo

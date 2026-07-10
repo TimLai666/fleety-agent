@@ -253,6 +253,53 @@ pub fn status_text(spec: &ServiceSpec) -> String {
     }
 }
 
+/// Whether the current process is running elevated (administrator). On Windows,
+/// probe with `net session`, which enumerates active sessions and is refused
+/// without administrator rights: a zero exit means elevated. Any failure to run
+/// the probe, or a non-zero exit, is treated as *not* elevated so we fail toward
+/// asking the user to elevate rather than proceeding into a half-done SCM change.
+/// Non-Windows managers (systemd `--user`, launchd LaunchAgent) run per-user and
+/// never need elevation, so this is always `true` there. No `unsafe`, no new dep.
+pub fn is_elevated() -> bool {
+    if cfg!(target_os = "windows") {
+        Command::new("net")
+            .arg("session")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    } else {
+        true
+    }
+}
+
+/// Actionable message for a verb that was blocked by the elevation pre-flight.
+/// Pure: state-changing verbs get an "administrator" instruction; the query verb
+/// (status) needs no elevation and so carries no message (empty string).
+pub fn elevation_required_message(verb: Verb) -> String {
+    if verb == Verb::Status {
+        String::new()
+    } else {
+        "changing a Windows service needs administrator rights; re-run this command from an \
+         elevated (Administrator) terminal"
+            .to_string()
+    }
+}
+
+/// Pre-flight elevation guard for a lifecycle verb. On Windows, a state-changing
+/// verb run without elevation returns an error *before* any `sc` is issued, so no
+/// partial service state is left behind. Query verbs (status) and non-Windows
+/// hosts always pass. Callers (fleety-server, fleetyd) invoke this before handing
+/// the verb to the Service Control Manager.
+pub fn ensure_elevated_for(verb: Verb) -> Result<()> {
+    if verb == Verb::Status || is_elevated() {
+        Ok(())
+    } else {
+        Err(CoreError::Message(elevation_required_message(verb)))
+    }
+}
+
 /// Windows service install/uninstall needs admin; surface that in errors.
 fn admin_hint(os: Os, verb: Verb) -> String {
     if os == Os::Windows && matches!(verb, Verb::Install | Verb::Uninstall) {
@@ -503,6 +550,41 @@ mod tests {
         assert!(admin_hint(Os::Windows, Verb::Start).is_empty());
         assert!(admin_hint(Os::Linux, Verb::Install).is_empty());
         assert!(admin_hint(Os::Macos, Verb::Uninstall).is_empty());
+    }
+
+    #[test]
+    fn elevation_required_message_only_for_state_changing_verbs() {
+        // Every state-changing verb yields an actionable "administrator" message.
+        for verb in [
+            Verb::Install,
+            Verb::Uninstall,
+            Verb::Start,
+            Verb::Stop,
+            Verb::Restart,
+            Verb::Enable,
+            Verb::Disable,
+        ] {
+            assert!(
+                elevation_required_message(verb).contains("administrator"),
+                "{verb:?} should mention administrator"
+            );
+        }
+        // A query verb needs no elevation, so it carries no message.
+        assert!(elevation_required_message(Verb::Status).is_empty());
+    }
+
+    #[test]
+    fn status_never_requires_elevation() {
+        // Regardless of platform/elevation, a query verb passes the guard.
+        assert!(ensure_elevated_for(Verb::Status).is_ok());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn non_windows_never_requires_elevation() {
+        // On systemd/launchd hosts the manager runs per-user; the guard is a no-op.
+        assert!(ensure_elevated_for(Verb::Install).is_ok());
+        assert!(is_elevated());
     }
 
     #[test]

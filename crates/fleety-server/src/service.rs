@@ -68,7 +68,14 @@ pub fn run(action: Action) -> Result<()> {
         println!("{}", service::status_text(&spec));
         return Ok(());
     }
-    for verb in plan(action) {
+    let verbs = plan(action);
+    // Pre-flight the elevation check once before touching the SCM. Every
+    // non-status action is state-changing, so if we're not elevated on Windows we
+    // abort here — before any `sc` runs — leaving no half-created service behind.
+    if let Some(&first) = verbs.first() {
+        service::ensure_elevated_for(first)?;
+    }
+    for verb in verbs {
         service::run_verb(&spec, verb)?;
     }
     match action {
@@ -117,7 +124,13 @@ pub fn restart(force: bool) -> Result<()> {
     let pid = service::read_pid(&service::pidfile_path(&spec.name));
     let server_alive = pid.map(service::pid_alive).unwrap_or(false);
     match restart_mode(force, server_alive) {
-        RestartMode::Immediate => service::run_verb(&spec, Verb::Restart),
+        RestartMode::Immediate => {
+            // A forced/immediate restart drives the SCM directly (sc stop + start),
+            // so pre-flight the same elevation guard the other state-changing verbs
+            // use — abort before touching the SCM when not elevated on Windows.
+            service::ensure_elevated_for(Verb::Restart)?;
+            service::run_verb(&spec, Verb::Restart)
+        }
         RestartMode::RequestDeferred => match crate::restart_watch::request_restart(&spec.name) {
             Ok(()) => {
                 println!(

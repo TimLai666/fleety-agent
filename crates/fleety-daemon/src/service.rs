@@ -26,6 +26,7 @@ pub fn spec() -> Result<ServiceSpec> {
 }
 
 pub fn install() -> Result<()> {
+    service::ensure_elevated_for(Verb::Install)?;
     service::run_verb(&spec()?, Verb::Install)?;
     // Installed but not yet autostart-enabled; mirror the manager's own model.
     println!("fleetyd service installed. Use `fleetyd enable` for boot autostart and `fleetyd start` to run now.");
@@ -33,28 +34,34 @@ pub fn install() -> Result<()> {
 }
 
 pub fn uninstall() -> Result<()> {
+    service::ensure_elevated_for(Verb::Uninstall)?;
     service::run_verb(&spec()?, Verb::Uninstall)?;
     println!("fleetyd service removed.");
     Ok(())
 }
 
 pub fn start() -> Result<()> {
+    service::ensure_elevated_for(Verb::Start)?;
     service::run_verb(&spec()?, Verb::Start)
 }
 
 pub fn stop() -> Result<()> {
+    service::ensure_elevated_for(Verb::Stop)?;
     service::run_verb(&spec()?, Verb::Stop)
 }
 
 pub fn restart() -> Result<()> {
+    service::ensure_elevated_for(Verb::Restart)?;
     service::run_verb(&spec()?, Verb::Restart)
 }
 
 pub fn enable() -> Result<()> {
+    service::ensure_elevated_for(Verb::Enable)?;
     service::run_verb(&spec()?, Verb::Enable)
 }
 
 pub fn disable() -> Result<()> {
+    service::ensure_elevated_for(Verb::Disable)?;
     service::run_verb(&spec()?, Verb::Disable)
 }
 
