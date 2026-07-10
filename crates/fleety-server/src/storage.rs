@@ -215,6 +215,27 @@ impl Storage {
         grants.save(&path)
     }
 
+    /// Revoke grants `owner` made to `grantee`, returning how many were removed
+    /// (`scope` = `None` removes all of them, `Some` is an exact match). Uses the
+    /// same load-modify-save under the index lock as [`Self::add_grant`], so a
+    /// concurrent grant and revoke can't clobber each other. Revoking nothing is
+    /// not an error (returns 0) and leaves the store untouched.
+    pub fn remove_grant(&self, owner: &str, grantee: &str, scope: Option<&str>) -> Result<usize> {
+        validate_id("user_id", owner)?;
+        validate_id("user_id", grantee)?;
+        let _guard = self
+            .append_lock
+            .lock()
+            .map_err(|_| CoreError::Message("storage index lock poisoned".to_string()))?;
+        let path = self.grants_path();
+        let mut grants = crate::privacy::Grants::load(&path);
+        let removed = grants.revoke(owner, grantee, scope);
+        if removed > 0 {
+            grants.save(&path)?;
+        }
+        Ok(removed)
+    }
+
     fn conversation_workspace_path(&self) -> PathBuf {
         self.home.join("fleet").join("conversation-workspace.json")
     }
@@ -2423,6 +2444,91 @@ mod tests {
         assert!(storage.ensure_device("../x", "client_session").is_err());
         // A normal id still works.
         assert!(storage.append("dev", "conv", &Message::user("ok")).is_ok());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn remove_grant_revokes_and_reloads() {
+        use crate::identity::ActingUser;
+        use crate::privacy::{can_access, Decision};
+        let home = temp_home();
+        let storage = Storage::new(home.clone());
+        let bob = ActingUser::User("bob".to_string());
+
+        storage.add_grant("alice", "bob", "trip").expect("grant");
+        assert_eq!(
+            can_access(&bob, "alice", "trip", &storage.grants()),
+            Decision::Allow
+        );
+
+        // Revoking with no scope removes the grant; it reports one removed and,
+        // on a fresh reload, the data-layer guard now denies bob.
+        assert_eq!(
+            storage.remove_grant("alice", "bob", None).expect("revoke"),
+            1
+        );
+        assert_eq!(
+            can_access(&bob, "alice", "trip", &storage.grants()),
+            Decision::Deny
+        );
+
+        // Revoking again removes nothing and still succeeds (reveals nothing).
+        assert_eq!(
+            storage.remove_grant("alice", "bob", None).expect("revoke-again"),
+            0
+        );
+        // Path-traversal ids are rejected, same as add_grant.
+        assert!(storage.remove_grant("../evil", "bob", None).is_err());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn add_and_remove_grant_do_not_clobber() {
+        use crate::identity::ActingUser;
+        use crate::privacy::{can_access, Decision};
+        use std::sync::{Arc, Barrier};
+        let home = temp_home();
+        let storage = Arc::new(Storage::new(home.clone()));
+
+        // Seed two grants; one thread adds a third while another revokes one of
+        // the seeds. Under the shared lock neither write clobbers the other.
+        storage.add_grant("alice", "bob", "trip").expect("seed bob");
+        storage.add_grant("alice", "carol", "notes").expect("seed carol");
+
+        let barrier = Arc::new(Barrier::new(2));
+        let adder = {
+            let storage = Arc::clone(&storage);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                storage.add_grant("alice", "dave", "photos").expect("add dave");
+            })
+        };
+        let remover = {
+            let storage = Arc::clone(&storage);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                storage.remove_grant("alice", "bob", None).expect("revoke bob");
+            })
+        };
+        adder.join().expect("adder");
+        remover.join().expect("remover");
+
+        // Both writes survived: dave was added, carol kept, bob removed.
+        let grants = storage.grants();
+        assert_eq!(
+            can_access(&ActingUser::User("dave".to_string()), "alice", "photos", &grants),
+            Decision::Allow
+        );
+        assert_eq!(
+            can_access(&ActingUser::User("carol".to_string()), "alice", "notes", &grants),
+            Decision::Allow
+        );
+        assert_eq!(
+            can_access(&ActingUser::User("bob".to_string()), "alice", "trip", &grants),
+            Decision::Deny
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 }
