@@ -228,8 +228,26 @@ pub(crate) fn due_schedules(dir: &Path, now: u64) -> Result<Vec<DueSchedule>> {
     Ok(due)
 }
 
-/// Record that a schedule fired at `now` (sets `last_run`).
-pub(crate) fn mark_fired(dir: &Path, id: &str, now: u64) -> Result<()> {
+/// Upper bound (in chars) for an outcome summary persisted on a schedule.
+const SUMMARY_MAX_CHARS: usize = 500;
+
+/// Truncate `s` to at most [`SUMMARY_MAX_CHARS`] characters on a UTF-8 char
+/// boundary (never splits a codepoint, never panics). Returns the leading
+/// portion verbatim — nothing is appended.
+pub(crate) fn truncate_summary(s: &str) -> String {
+    s.chars().take(SUMMARY_MAX_CHARS).collect()
+}
+
+/// Read-modify-write a schedule's JSON record by `id`, applying `edit` to its
+/// top-level object and persisting the result pretty-printed. Rejects ids with
+/// path separators (same guard as the CRUD tools). The scheduler's book-keeping
+/// fields (`last_run`, `last_outcome`, `last_notified`) are all written through
+/// here so they share one id check and one write path.
+fn update_schedule(
+    dir: &Path,
+    id: &str,
+    edit: impl FnOnce(&mut serde_json::Map<String, Value>),
+) -> Result<()> {
     if id.contains('/') || id.contains('\\') || id.contains("..") {
         return Err(CoreError::Message(format!("invalid schedule id '{id}'")));
     }
@@ -239,13 +257,112 @@ pub(crate) fn mark_fired(dir: &Path, id: &str, now: u64) -> Result<()> {
     let mut value: Value = serde_json::from_str(&text)
         .map_err(|e| CoreError::Message(format!("corrupt schedule '{id}': {e}")))?;
     if let Some(obj) = value.as_object_mut() {
-        obj.insert("last_run".to_string(), json!(now));
+        edit(obj);
     }
     let pretty = serde_json::to_string_pretty(&value)
         .map_err(|e| CoreError::Message(format!("serialize schedule: {e}")))?;
     std::fs::write(&path, pretty)
         .map_err(|e| CoreError::Message(format!("write schedule: {e}")))?;
     Ok(())
+}
+
+/// Record that a schedule fired at `now` (sets `last_run`).
+pub(crate) fn mark_fired(dir: &Path, id: &str, now: u64) -> Result<()> {
+    update_schedule(dir, id, |obj| {
+        obj.insert("last_run".to_string(), json!(now));
+    })
+}
+
+/// Additively record a run's outcome onto a schedule: sets `last_outcome`
+/// (`{status, summary, ts}`) without disturbing `last_run` or any other field.
+/// `status` is `"ok"` or `"error"`; `summary` should already be truncated
+/// (see [`truncate_summary`]).
+pub(crate) fn record_outcome(
+    dir: &Path,
+    id: &str,
+    status: &str,
+    summary: &str,
+    ts: u64,
+) -> Result<()> {
+    update_schedule(dir, id, |obj| {
+        obj.insert(
+            "last_outcome".to_string(),
+            json!({ "status": status, "summary": summary, "ts": ts }),
+        );
+    })
+}
+
+/// Advance a schedule's notification watermark to `ts` (sets `last_notified`),
+/// so an already-delivered outcome is not delivered again.
+pub(crate) fn mark_notified(dir: &Path, id: &str, ts: u64) -> Result<()> {
+    update_schedule(dir, id, |obj| {
+        obj.insert("last_notified".to_string(), json!(ts));
+    })
+}
+
+/// A schedule outcome that has completed since the owner was last notified,
+/// ready to deliver.
+pub(crate) struct PendingNotification {
+    pub id: String,
+    pub status: String,
+    pub summary: String,
+    pub ts: u64,
+}
+
+/// Schedules whose latest `last_outcome.ts` is newer than their `last_notified`
+/// watermark (i.e. finished since the owner was last notified), oldest first.
+/// Best-effort: a missing dir, unreadable/corrupt files, schedules with no
+/// outcome, and records with a blank id are all skipped rather than erroring.
+pub(crate) fn pending_notifications(dir: &Path) -> Vec<PendingNotification> {
+    let mut pending = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return pending;
+    };
+    for entry in entries.flatten() {
+        if entry.path().extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        let Some(outcome) = value.get("last_outcome").and_then(Value::as_object) else {
+            continue;
+        };
+        let ts = outcome.get("ts").and_then(Value::as_u64).unwrap_or(0);
+        let last_notified = value.get("last_notified").and_then(Value::as_u64).unwrap_or(0);
+        if ts <= last_notified {
+            continue;
+        }
+        let id = value
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if id.is_empty() {
+            continue;
+        }
+        let status = outcome
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let summary = outcome
+            .get("summary")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        pending.push(PendingNotification {
+            id,
+            status,
+            summary,
+            ts,
+        });
+    }
+    pending.sort_by_key(|p| p.ts);
+    pending
 }
 
 struct ScheduleCreate {
@@ -594,6 +711,121 @@ mod tests {
         assert!(trigger_due(trigger, "UTC", None, now));
         // Just fired this minute — shouldn't re-fire 30 s later.
         assert!(!trigger_due(trigger, "UTC", Some(now), now + 30));
+    }
+
+    #[test]
+    fn truncate_summary_is_char_boundary_safe() {
+        // ASCII under the cap is returned verbatim.
+        assert_eq!(truncate_summary("hello"), "hello");
+        // Over the cap: exactly SUMMARY_MAX_CHARS chars, no panic.
+        let long = "a".repeat(SUMMARY_MAX_CHARS + 100);
+        assert_eq!(truncate_summary(&long).chars().count(), SUMMARY_MAX_CHARS);
+        // Multi-byte chars are never split mid-codepoint.
+        let wide = "你".repeat(SUMMARY_MAX_CHARS + 50);
+        let cut = truncate_summary(&wide);
+        assert_eq!(cut.chars().count(), SUMMARY_MAX_CHARS);
+        assert!(cut.chars().all(|c| c == '你')); // valid UTF-8, whole chars
+    }
+
+    #[test]
+    fn mark_fired_records_last_outcome() {
+        let dir = temp_dir();
+        std::fs::write(
+            dir.join("s1.json"),
+            r#"{"id":"s1","trigger":"at:1","prompt":"go","enabled":true}"#,
+        )
+        .expect("write schedule");
+
+        mark_fired(&dir, "s1", 2000).expect("mark fired");
+        record_outcome(&dir, "s1", "ok", "did the thing", 2000).expect("record outcome");
+
+        let text = std::fs::read_to_string(dir.join("s1.json")).expect("read back");
+        let value: Value = serde_json::from_str(&text).expect("parse");
+        // last_run set by mark_fired is preserved alongside the additive outcome.
+        assert_eq!(value.get("last_run").and_then(Value::as_u64), Some(2000));
+        let outcome = value.get("last_outcome").expect("last_outcome present");
+        assert_eq!(outcome.get("status").and_then(Value::as_str), Some("ok"));
+        assert_eq!(
+            outcome.get("summary").and_then(Value::as_str),
+            Some("did the thing")
+        );
+        assert_eq!(outcome.get("ts").and_then(Value::as_u64), Some(2000));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn schedule_list_surfaces_last_outcome() {
+        let dir = temp_dir();
+        let mut registry = ToolRegistry::new();
+        register(&mut registry, &dir);
+        let created = registry
+            .call(
+                "schedule_create",
+                json!({ "trigger": "at:1", "prompt": "check" }),
+            )
+            .await
+            .expect("create");
+        let id = created["id"].as_str().expect("id").to_string();
+
+        mark_fired(&dir, &id, 2000).expect("mark fired");
+        record_outcome(&dir, &id, "error", "boom", 2000).expect("record outcome");
+
+        let listed = registry
+            .call("schedule_list", json!({}))
+            .await
+            .expect("list");
+        let entry = listed["schedules"]
+            .as_array()
+            .and_then(|a| a.first())
+            .expect("one schedule");
+        assert_eq!(entry.get("last_run").and_then(Value::as_u64), Some(2000));
+        assert_eq!(
+            entry
+                .get("last_outcome")
+                .and_then(|o| o.get("status"))
+                .and_then(Value::as_str),
+            Some("error")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pending_and_mark_notified_roundtrip() {
+        let dir = temp_dir();
+        // Two schedules with outcomes, one already notified.
+        std::fs::write(dir.join("a.json"), r#"{"id":"a"}"#).expect("write a");
+        std::fs::write(dir.join("b.json"), r#"{"id":"b"}"#).expect("write b");
+        record_outcome(&dir, "a", "ok", "a ran", 100).expect("outcome a");
+        record_outcome(&dir, "b", "error", "b failed", 200).expect("outcome b");
+        // b already notified at its outcome ts -> not pending; a is pending.
+        mark_notified(&dir, "b", 200).expect("mark b notified");
+
+        let pending = pending_notifications(&dir);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, "a");
+        assert_eq!(pending[0].status, "ok");
+        assert_eq!(pending[0].ts, 100);
+
+        // After notifying a, nothing is pending.
+        mark_notified(&dir, "a", 100).expect("mark a notified");
+        assert!(pending_notifications(&dir).is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pending_notifications_orders_oldest_first() {
+        let dir = temp_dir();
+        std::fs::write(dir.join("x.json"), r#"{"id":"x"}"#).expect("write x");
+        std::fs::write(dir.join("y.json"), r#"{"id":"y"}"#).expect("write y");
+        record_outcome(&dir, "x", "ok", "later", 300).expect("outcome x");
+        record_outcome(&dir, "y", "ok", "earlier", 100).expect("outcome y");
+        let pending = pending_notifications(&dir);
+        let ids: Vec<&str> = pending.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, vec!["y", "x"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

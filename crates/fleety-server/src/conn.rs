@@ -626,6 +626,10 @@ async fn serve(
         },
     )?;
 
+    // Proactively surface schedule outcomes finished since this owner last
+    // connected (owner-scoped, best-effort; see scheduler::tick / schedules).
+    deliver_pending_schedule_notifications(storage, out, device_id);
+
     // Build the tool stack rooted at the server's default workspace. A
     // conversation may rebind it to the originating CLI's cwd on its first
     // message (see the UserMessage arm), making Fleety a coding agent in that
@@ -2148,6 +2152,58 @@ fn emit(out: &Out, msg: &ServerMsg) -> Result<()> {
         .map_err(|_| CoreError::Provider("connection writer closed".to_string()))
 }
 
+/// On connect, proactively deliver each schedule outcome that has completed
+/// since the owner was last notified — one `ServerMsg::Assistant` per outcome,
+/// addressed to its `schedule-<id>` conversation, with failures prominently
+/// marked and pointing at `fleety resume`.
+///
+/// Owner-scoped: only a connection whose acting user is the scheduler owner's
+/// (and non-Guest) receives them; a Guest or a device owned by someone else gets
+/// nothing (v0 single-owner model — schedules belong to the scheduler device's
+/// owner). Best-effort throughout — a read, emit, or watermark-write failure for
+/// one schedule is logged and skipped, never blocking the connection.
+fn deliver_pending_schedule_notifications(storage: &Arc<Storage>, out: &Out, device_id: &str) {
+    let acting = storage.acting_for_device(device_id);
+    // Guest connections never receive schedule notifications.
+    if acting == crate::identity::ActingUser::Guest {
+        return;
+    }
+    // Only the scheduler owner's own devices (same acting user) are notified.
+    if acting != storage.acting_for_device(crate::scheduler::SCHED_DEVICE) {
+        return;
+    }
+    let dir = storage.schedules_dir();
+    for pending in crate::schedules::pending_notifications(&dir) {
+        let conversation = format!("schedule-{}", pending.id);
+        let text = if pending.status == "error" {
+            format!(
+                "⚠ Schedule {} FAILED: {}\nResume with: fleety resume {}",
+                pending.id, pending.summary, conversation
+            )
+        } else {
+            format!("Schedule {} ran OK: {}", pending.id, pending.summary)
+        };
+        if let Err(e) = emit(
+            out,
+            &ServerMsg::Assistant {
+                conversation_id: conversation,
+                text,
+                seq: 0,
+                speech: None,
+                attention: None,
+            },
+        ) {
+            tracing::warn!(schedule = %pending.id, report = ?e.report(), "could not deliver schedule notification");
+            continue;
+        }
+        // Advance the watermark only after a successful emit, so an undelivered
+        // outcome is retried on the next connect rather than lost.
+        if let Err(e) = crate::schedules::mark_notified(&dir, &pending.id, pending.ts) {
+            tracing::warn!(schedule = %pending.id, report = ?e.report(), "could not advance schedule notification watermark");
+        }
+    }
+}
+
 /// A client going away (close frame, reset, or a disconnect-shaped IO error) is
 /// a normal end of connection, not an error.
 #[cfg(test)]
@@ -2858,6 +2914,98 @@ mod tests {
             Some(ClientMsg::Deny { approval_id }) if approval_id == "a2"
         ));
         assert!(inbound.next_client().await.unwrap().is_none());
+    }
+
+    // ---- proactive schedule-notification delivery ----------------------------
+
+    #[tokio::test]
+    async fn connect_delivers_unnotified_schedule_outcomes() {
+        let home = std::env::temp_dir().join(format!("fleety-notify-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&home).expect("mk home");
+        let storage = Arc::new(Storage::new(home.clone()));
+        // The scheduler device and the connecting device share owner "alice".
+        storage
+            .set_device_ownership(crate::scheduler::SCHED_DEVICE, Some("alice"), &[], false)
+            .expect("own sched");
+        storage
+            .set_device_ownership("phone", Some("alice"), &[], false)
+            .expect("own phone");
+        // A schedule with a failed outcome, not yet notified.
+        let sdir = storage.schedules_dir();
+        std::fs::create_dir_all(&sdir).expect("mk sdir");
+        std::fs::write(
+            sdir.join("s1.json"),
+            r#"{"id":"s1","trigger":"at:1","prompt":"p","enabled":true}"#,
+        )
+        .expect("write schedule");
+        crate::schedules::record_outcome(&sdir, "s1", "error", "it broke", 100).expect("outcome");
+
+        let (out, mut rx) = mpsc::unbounded_channel::<WsMessage>();
+        deliver_pending_schedule_notifications(&storage, &out, "phone");
+        let assistant: Vec<(String, String)> = drain(&mut rx)
+            .into_iter()
+            .filter_map(|m| match m {
+                ServerMsg::Assistant {
+                    conversation_id,
+                    text,
+                    ..
+                } => Some((conversation_id, text)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(assistant.len(), 1);
+        assert_eq!(assistant[0].0, "schedule-s1");
+        // Failure is prominently marked and points the user at the conversation.
+        assert!(assistant[0].1.contains("FAILED"));
+        assert!(assistant[0].1.contains("it broke"));
+        assert!(assistant[0].1.contains("fleety resume schedule-s1"));
+
+        // A second connect from the same device does not redeliver the outcome.
+        deliver_pending_schedule_notifications(&storage, &out, "phone");
+        assert!(drain(&mut rx).is_empty());
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn guest_connection_gets_no_schedule_notifications() {
+        let home =
+            std::env::temp_dir().join(format!("fleety-notify-guest-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&home).expect("mk home");
+        let storage = Arc::new(Storage::new(home.clone()));
+        storage
+            .set_device_ownership(crate::scheduler::SCHED_DEVICE, Some("alice"), &[], false)
+            .expect("own sched");
+        // "bobphone" is owned by a different user; "kiosk" has no owner (Guest).
+        storage
+            .set_device_ownership("bobphone", Some("bob"), &[], false)
+            .expect("own bob");
+        let sdir = storage.schedules_dir();
+        std::fs::create_dir_all(&sdir).expect("mk sdir");
+        std::fs::write(
+            sdir.join("s1.json"),
+            r#"{"id":"s1","trigger":"at:1","prompt":"p","enabled":true}"#,
+        )
+        .expect("write schedule");
+        crate::schedules::record_outcome(&sdir, "s1", "ok", "done", 100).expect("outcome");
+
+        let (out, mut rx) = mpsc::unbounded_channel::<WsMessage>();
+        // Guest device (no owner record): nothing delivered.
+        deliver_pending_schedule_notifications(&storage, &out, "kiosk");
+        assert!(
+            drain(&mut rx).is_empty(),
+            "guest must not receive schedule notifications"
+        );
+        // Foreign-owner device: acting user differs from the scheduler owner.
+        deliver_pending_schedule_notifications(&storage, &out, "bobphone");
+        assert!(
+            drain(&mut rx).is_empty(),
+            "foreign-owner device must not receive schedule notifications"
+        );
+        // The outcome is still pending for the real owner (watermark untouched).
+        assert_eq!(crate::schedules::pending_notifications(&sdir).len(), 1);
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     // ---- drive-to-goal loop tests --------------------------------------------

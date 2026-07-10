@@ -154,4 +154,21 @@ mod tests {
         assert_eq!(ActingUser::User("x".into()).user_id(), Some("x"));
         assert_eq!(ActingUser::Guest.user_id(), None);
     }
+
+    #[test]
+    fn acting_user_equality_scopes_owner() {
+        // The owner-scoped schedule delivery compares two resolved acting users:
+        // the same owner resolved twice must be equal, and a Guest must never
+        // equal a named user (so Guest connections are excluded).
+        assert_eq!(
+            ActingUser::User("alice".to_string()),
+            ActingUser::User("alice".to_string())
+        );
+        assert_ne!(
+            ActingUser::User("alice".to_string()),
+            ActingUser::User("bob".to_string())
+        );
+        assert_ne!(ActingUser::Guest, ActingUser::User("alice".to_string()));
+        assert_eq!(ActingUser::Guest, ActingUser::Guest);
+    }
 }
