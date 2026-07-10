@@ -10,6 +10,7 @@ mod acp;
 mod auth;
 mod clipboard;
 mod config;
+mod config_panel;
 mod input;
 mod markdown;
 mod provider_tui;
@@ -235,8 +236,13 @@ async fn main() -> std::process::ExitCode {
             // this host's own files. `--target <device-id>` is sent to the server
             // (which reports it as a follow-up for now).
             let (target, rest) = config::split_target(&args[2..]);
-            let res = if config::is_interactive_edit(&rest) || matches!(target, ConfigTarget::Local)
+            // Bare `fleety config` on a TTY → the three-region interactive panel
+            // (connection / this device / server); no `--target` needed.
+            let res = if rest.is_empty()
+                && std::io::IsTerminal::is_terminal(&std::io::stdout())
             {
+                config_panel::run().await
+            } else if config::is_interactive_edit(&rest) || matches!(target, ConfigTarget::Local) {
                 config::run(&rest)
             } else {
                 config_remote(target, &rest).await
@@ -1611,13 +1617,35 @@ async fn rollback_apply(backup_id: String) -> Result<()> {
     Ok(())
 }
 
-async fn send(tx: &mut Tx, msg: &ClientMsg) -> Result<()> {
+/// Connect to the current server, complete the Hello handshake, and return the
+/// split streams plus the server's config-protocol version (from `Welcome`).
+/// Used by the interactive config panel to decide the Server region path.
+pub(crate) async fn open_panel() -> Result<((Tx, Rx), u32)> {
+    let target = resolve_target()?;
+    let (mut tx, mut rx) = transport::connect(&target.url, target.token.as_deref())
+        .await?
+        .split();
+    send(&mut tx, &hello(target.token.clone(), None)).await?;
+    let config_protocol = match recv(&mut rx).await? {
+        Some(ServerMsg::Welcome {
+            config_protocol, ..
+        }) => config_protocol,
+        other => {
+            return Err(CoreError::Provider(format!(
+                "expected welcome, got {other:?}"
+            )))
+        }
+    };
+    Ok(((tx, rx), config_protocol))
+}
+
+pub(crate) async fn send(tx: &mut Tx, msg: &ClientMsg) -> Result<()> {
     let json = serde_json::to_string(msg)
         .map_err(|e| CoreError::Message(format!("serialize client frame: {e}")))?;
     tx.send_text(json).await
 }
 
-async fn recv(rx: &mut Rx) -> Result<Option<ServerMsg>> {
+pub(crate) async fn recv(rx: &mut Rx) -> Result<Option<ServerMsg>> {
     match rx.recv_text().await {
         Some(text) => {
             let msg = serde_json::from_str(&text)

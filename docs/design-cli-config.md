@@ -1,6 +1,6 @@
 # Fleety CLI 設定架構重新設計(定稿)
 
-_狀態:設計定稿,待落成 Spectra proposal 分階段實作。2026-07-10。_
+_狀態:設計定稿並已實作。Phase 1(connection-profiles / provider-model-two-tier / auth-default-on / local-config-scope)+ Phase 2(remote-config-panel:結構化 `ConfigSnapshot`/`ConfigApply` wire + 三區互動全包面板 minimal-viable)全數出貨並 archive(見 `openspec/changes/archive/2026-07-10-*`)。Phase 2 已知缺口(server 區 provider/model 完整互動、wss、敏感 key 分級)見 `docs/roadmap.md`。2026-07-10。_
 
 本檔是 CLI 設定架構的重新設計。經一輪多方案設計 + 一輪六角度紅隊(7 blocker /
 20 high)+ 與擁有者逐項拍板收斂而成。實作分兩階段(見 §10)。
@@ -306,7 +306,7 @@ ClientMsg::ConfigApply { target, base_revision, changes: [ ConfigChange { key, o
 
 ---
 
-## 10. 分兩階段(降風險,先出價值)
+## 10. 分兩階段(降風險,先出價值)— 兩階段皆已出貨(2026-07-10)
 
 **Phase 1(不動 wire,全 additive、可降級):**
 - `fleety-tools` 共用連線模組 + `connections.toml` + `fleety server …` 命令

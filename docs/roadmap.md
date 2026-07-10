@@ -38,11 +38,11 @@
 - **auth-default-on** — `FLEETY_REQUIRE_AUTH` 預設開(顯式 `0` 才關)+ 首啟配對引導 + 遠端寫入⇒認證必開(auth 關閉時拒 mutating config frame)。
 - **local-config-scope** — `fleety config --target local` 只顯示/編輯 Cli/Shared;server/daemon key 導向正確主機。
 
-**Phase 2(remote-config-panel,未做)** — 動 wire:`ConfigSnapshot`/`ConfigApply` frame + revision 樂觀鎖 + 真原子存檔 + 能力協商 + secret tri-state + 互動式全包三區面板(連線 / 本機 / server)+ 遠端互動 edit + 敏感 key 授權/告警/稽核 + 傳輸 wss 要求。交付 G2(一個面板設定任何東西)。
+**Phase 2(remote-config-panel,2026-07-10 出貨)** — 動 wire、交付 G2(一個面板設定任何東西):`ConfigSnapshot`/`ConfigApply` frame + revision 樂觀鎖 + 真原子存檔(config.toml tmp+rename+mutex)+ 能力協商(`Welcome.config_protocol`)+ 未知 frame 容忍(`ClientMsg::Unknown` → unsupported、不斷線)+ secret tri-state(keep/set/clear)+ 遠端寫入認證閘 + 敏感 key 稽核;`PROTOCOL_VERSION` 0→1。裸 `fleety config`(TTY)開三區互動面板(連線 / 本機 / server),server 區經結構化通道遠端 edit、舊 server 退回 ConfigExec。**已知缺口**(minimal-viable,列後續):server 區為單值 edit,provider/model 的完整互動編輯待補;傳輸 wss 硬要求未做;敏感 key 面板告警為二次確認,更完整的分級稽核待強化。
 
 ## 剩餘(should-have)
 
-- **CLI config 重設計 Phase 2(remote-config-panel)** — 見上;Phase 2 交付互動全包面板 + 遠端互動 edit(動 wire、`PROTOCOL_VERSION` +1)。
+- **remote-config-panel 收尾** — server 區 provider/model 完整互動編輯、傳輸 wss 要求、敏感 key 分級告警/稽核;§4「額外防線」(配對強化、snapshot 敏感欄位讀取分級)可一併做。
 - **fleety status 顯示 sidecar 版本 vs 最新版** — 目前只顯示 sidecar 健康(路徑),未做「本機版本 vs release 最新版」對照。小項。
 
 真正未做的多屬 milestone 深度(見下)與待決策略,已無高頻體驗缺口。
@@ -76,12 +76,12 @@
 
 ## 建議下一動
 
-高頻體驗缺口已清空,CLI 設定架構重設計 Phase 1 亦已出貨。建議依序:
-1. **CLI config 重設計 Phase 2(remote-config-panel)**——動 wire 的互動全包面板 + 遠端互動 edit,交付 G2;是設定體驗的最後一塊,建議獨立聚焦開展。
-2. **決定 §待決兩項**(`FLEETY_ADDR` 預設 + presence 信號來源)——純產品決策,擋住 presence 推論這條線。
+高頻體驗缺口已清空,CLI 設定架構重設計 Phase 1 + Phase 2(含互動全包面板)皆已出貨(G1+G2)。建議依序:
+1. **決定 §待決兩項**(`FLEETY_ADDR` 預設 + presence 信號來源)——純產品決策,擋住 presence 推論這條線。
+2. **remote-config-panel 收尾**(server 區 provider/model 完整互動編輯、wss、敏感 key 分級)——設定體驗的最後打磨。
 3. **milestone 深度**擇一開展(browser snapshot-ref act 對 agent 自動化價值最高;wiki 三層對知識沉澱價值最高)。
 4. **fleety status 版本對照**小項可順手收尾。
 
 ---
 
-_最後更新:2026-07-10,CLI 設定架構重設計 Phase 1(4 個變更)出貨後重排(Phase 2 remote-config-panel 待做)。進度推進或現實對不上,直接改本檔。_
+_最後更新:2026-07-10,CLI 設定架構重設計 Phase 1(4 變更)+ Phase 2(remote-config-panel,結構化 wire + 互動全包面板 minimal-viable)全數出貨後重排。進度推進或現實對不上,直接改本檔。_
