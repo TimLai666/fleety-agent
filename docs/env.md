@@ -676,7 +676,9 @@ are ignored), and nothing deeper inside it is split out — so both a flat repo
 (`<skill>/SKILL.md`) and a plugin-marketplace repo
 (`plugins/<plugin>/skills/<skill>/SKILL.md`) work, and a nested sub-skill ships
 inside its parent. Duplicate skill names keep the first in path order (warning
-logged). The synced tier has the
+logged). An empty synced tier is always re-synced even when the recorded SHA
+still matches the remote — so a tier emptied by a fault heals itself on the
+next sync instead of waiting for a new upstream commit. The synced tier has the
 **lowest precedence** (installed > authored > builtin > synced), so a same-named
 installed/authored/builtin skill always wins. Any failure keeps the last good
 copy and logs a warning; it never crashes. Server-side only.

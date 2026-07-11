@@ -3,7 +3,9 @@
 //!
 //! A background task (spawned at boot, then every `FLEETY_SKILLS_SYNC_INTERVAL_SECS`)
 //! first checks the repo's latest commit SHA; only when it differs from the
-//! locally recorded one does it download the branch zip, rebuild the synced tier
+//! locally recorded one — or when the local tier holds no skills at all (fault
+//! residue self-heals even under an unchanged SHA) — does it download the
+//! branch zip, rebuild the synced tier
 //! in a staging dir from the repo's skill directories, and atomically swap it in
 //! — so additions/removals are mirrored and a partially-synced state is never
 //! served. Skills are discovered by a pruned walk (the outermost directory with
@@ -65,12 +67,26 @@ fn walk_skill_roots(dir: &Path, rel: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Whether to download + apply: yes when there's no local SHA or it differs.
-pub fn should_sync(remote_sha: &str, local_sha: Option<&str>) -> bool {
+/// Whether to download + apply: yes when there's no local SHA, when it
+/// differs, or when the local tier holds no skills (the SHA short-circuit only
+/// counts while the tier is non-empty, so an emptied tier self-heals).
+pub fn should_sync(remote_sha: &str, local_sha: Option<&str>, local_has_skills: bool) -> bool {
+    if !local_has_skills {
+        return true; // empty tier: fault residue — always rebuild
+    }
     match local_sha {
         Some(local) => local != remote_sha,
         None => true,
     }
+}
+
+/// Whether the synced tier currently holds at least one skill directory. A
+/// missing dir, or one containing no subdirectories (e.g. only the SHA record
+/// left behind by a fault), counts as empty.
+pub fn synced_tier_has_skills(synced_dir: &Path) -> bool {
+    std::fs::read_dir(synced_dir)
+        .map(|entries| entries.flatten().any(|e| e.path().is_dir()))
+        .unwrap_or(false)
 }
 
 /// Validate an `owner/repo` slug (defends the constructed URLs).
@@ -239,7 +255,11 @@ async fn sync_once(synced_dir: &Path, repo: &str) -> Result<bool> {
         .ok()
         .map(|s| s.trim().to_string());
     let remote_sha = fetch_latest_sha(repo).await?;
-    if !should_sync(&remote_sha, local_sha.as_deref()) {
+    if !should_sync(
+        &remote_sha,
+        local_sha.as_deref(),
+        synced_tier_has_skills(synced_dir),
+    ) {
         return Ok(false);
     }
     let bytes = download_zip(repo).await?;
@@ -391,11 +411,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// The delta spec's "sync decision" example table, row by row.
     #[test]
     fn should_sync_table() {
-        assert!(should_sync("abc123", None)); // none → sync
-        assert!(!should_sync("abc123", Some("abc123"))); // same → skip
-        assert!(should_sync("def456", Some("abc123"))); // differ → sync
+        assert!(should_sync("abc123", None, true)); // no local SHA → sync
+        assert!(!should_sync("abc123", Some("abc123"), true)); // same + has skills → skip
+        assert!(should_sync("def456", Some("abc123"), true)); // differ → sync
+        // Same SHA but the tier is empty (fault residue) → sync (self-heal).
+        assert!(should_sync("abc123", Some("abc123"), false));
+    }
+
+    /// Empty-tier detection: missing dir and a dir holding only the SHA record
+    /// are empty; any subdirectory (a skill) makes it non-empty.
+    #[test]
+    fn synced_tier_emptiness_check() {
+        let home = temp();
+        let synced = home.join("synced");
+        assert!(!synced_tier_has_skills(&synced), "missing dir is empty");
+        std::fs::create_dir_all(&synced).expect("mk synced");
+        std::fs::write(synced.join(SHA_FILE), "abc123").expect("sha file");
+        assert!(
+            !synced_tier_has_skills(&synced),
+            "only the SHA record left behind is still empty"
+        );
+        write_skill(&synced, "a", "# A");
+        assert!(synced_tier_has_skills(&synced), "a skill dir makes it non-empty");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     /// Flat-layout regression: top-level skill dirs are found exactly as
