@@ -67,6 +67,18 @@ fn sse_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 
+/// WebSocket read deadline (ws-liveness), armed only once the server has
+/// pinged: no frame of any kind within this window means the link is dead.
+/// Keep it at least twice the server's `FLEETY_WS_PING_SECS`.
+fn ws_timeout() -> Duration {
+    let secs = std::env::var("FLEETY_WS_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(60);
+    Duration::from_secs(secs)
+}
+
 /// Extract the payloads of `data:` lines in one SSE event block. Keep-alive
 /// comment lines (starting `:`) and other fields are ignored.
 fn data_frames(block: &str) -> Vec<String> {
@@ -97,8 +109,21 @@ pub enum Sender {
 
 /// Inbound half.
 pub enum Receiver {
-    Ws(futures::stream::SplitStream<Ws>),
+    Ws(WsReceiver),
     Sse(mpsc::UnboundedReceiver<String>),
+}
+
+/// The WebSocket inbound half with its ping-adaptive read deadline
+/// (ws-liveness): the deadline arms only after the first Ping frame from the
+/// server, so a connection to an older server that never pings behaves exactly
+/// as before. Once armed, any frame resets the window; a window with no frames
+/// at all reports the link as dead (`recv_text` → `None`), which sends fleetyd
+/// through its normal backoff reconnect and the CLI through its link-closed
+/// handling.
+pub struct WsReceiver {
+    rx: futures::stream::SplitStream<Ws>,
+    deadline: Duration,
+    armed: bool,
 }
 
 impl Connection {
@@ -164,15 +189,39 @@ impl Sender {
 }
 
 impl Receiver {
-    /// The next inbound frame text, or `None` when the link is closed/dead.
+    /// The next inbound frame text, or `None` when the link is closed/dead
+    /// (including a WebSocket whose armed read deadline elapsed with no frames).
     pub async fn recv_text(&mut self) -> Option<String> {
         match self {
-            Receiver::Ws(rx) => loop {
-                match rx.next().await {
+            Receiver::Ws(ws) => loop {
+                // Armed: every wait is bounded; any frame (the server's pings
+                // included) starts a fresh window. Unarmed: wait indefinitely,
+                // exactly the pre-liveness behavior.
+                let next = if ws.armed {
+                    match tokio::time::timeout(ws.deadline, ws.rx.next()).await {
+                        Ok(next) => next,
+                        Err(_) => {
+                            tracing::warn!(
+                                deadline_secs = ws.deadline.as_secs(),
+                                "websocket read deadline elapsed with no frames; treating link as dead"
+                            );
+                            return None;
+                        }
+                    }
+                } else {
+                    ws.rx.next().await
+                };
+                match next {
                     Some(Ok(WsMessage::Text(t))) => return Some(t.to_string()),
                     Some(Ok(WsMessage::Close(_))) | None => return None,
                     Some(Err(_)) => return None,
-                    Some(Ok(_)) => continue, // ping/pong/binary
+                    Some(Ok(WsMessage::Ping(_))) => {
+                        // The server pings: it supports liveness, so arm the
+                        // read deadline (tungstenite answers the ping itself).
+                        ws.armed = true;
+                        continue;
+                    }
+                    Some(Ok(_)) => continue, // pong/binary
                 }
             },
             Receiver::Sse(rx) => rx.recv().await,
@@ -210,7 +259,11 @@ async fn connect_ws(agent_url: &str) -> Result<Connection> {
     let (tx, rx) = ws.split();
     Ok(Connection {
         sender: Sender::Ws(tx),
-        receiver: Receiver::Ws(rx),
+        receiver: Receiver::Ws(WsReceiver {
+            rx,
+            deadline: ws_timeout(),
+            armed: false,
+        }),
     })
 }
 
@@ -280,6 +333,68 @@ async fn read_sse(mut resp: reqwest::Response, tx: mpsc::UnboundedSender<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fake WebSocket server for the read-deadline tests: accepts one client,
+    /// optionally sends a single Ping, then holds the socket open in silence.
+    async fn silent_ws_server(ping_first: bool) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                if let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await {
+                    if ping_first {
+                        let _ = ws.send(WsMessage::Ping(Vec::new())).await;
+                    }
+                    // Stay silent, holding the socket open well past any
+                    // deadline the test uses (the task dies with the test).
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    drop(ws);
+                }
+            }
+        });
+        addr
+    }
+
+    /// Wrap a connected client socket in a `Receiver` with a short deadline
+    /// (bypassing env so parallel tests don't race on process globals).
+    async fn ws_receiver(addr: std::net::SocketAddr, deadline: Duration) -> Receiver {
+        let (ws, _) = connect_async(format!("ws://{addr}")).await.expect("connect");
+        let (_tx, rx) = ws.split();
+        Receiver::Ws(WsReceiver {
+            rx,
+            deadline,
+            armed: false,
+        })
+    }
+
+    /// ws-liveness (spec: armed deadline detects a dead link): after the
+    /// server's first Ping, a window with no frames at all makes `recv_text`
+    /// report the link as ended (`None`) instead of waiting forever.
+    #[tokio::test]
+    async fn ws_read_deadline_arms_after_first_ping() {
+        let addr = silent_ws_server(true).await;
+        let mut receiver = ws_receiver(addr, Duration::from_millis(200)).await;
+        let got = tokio::time::timeout(Duration::from_secs(3), receiver.recv_text())
+            .await
+            .expect("armed deadline must fire well within 3s");
+        assert_eq!(got, None, "silence after a ping is a dead link");
+    }
+
+    /// ws-liveness (spec: never-pinged connection is unaffected): against a
+    /// server that never pings (an older release), no deadline arms — recv
+    /// keeps waiting far past the deadline window with no false positive.
+    #[tokio::test]
+    async fn ws_read_deadline_stays_unarmed_without_ping() {
+        let addr = silent_ws_server(false).await;
+        let mut receiver = ws_receiver(addr, Duration::from_millis(200)).await;
+        let waited = tokio::time::timeout(Duration::from_millis(800), receiver.recv_text()).await;
+        assert!(
+            waited.is_err(),
+            "no ping was ever seen, so recv must still be waiting (got {waited:?})"
+        );
+    }
 
     #[test]
     fn http_base_derives_from_ws_scheme() {

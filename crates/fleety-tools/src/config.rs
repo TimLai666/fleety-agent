@@ -285,6 +285,22 @@ pub fn registry() -> &'static [Setting] {
             validator: Some(v_uint),
         },
         Setting {
+            key: "FLEETY_WS_PING_SECS",
+            scope: Server,
+            default: "20",
+            description: "Seconds between server keepalive Pings on each WebSocket connection.",
+            secret: false,
+            validator: Some(v_pos_uint),
+        },
+        Setting {
+            key: "FLEETY_WS_TIMEOUT_SECS",
+            scope: Shared,
+            default: "60",
+            description: "WebSocket liveness deadline: a connection with no inbound frame for this many seconds is considered dead (use at least twice FLEETY_WS_PING_SECS).",
+            secret: false,
+            validator: Some(v_pos_uint),
+        },
+        Setting {
             key: "FLEETY_BACKUP_REPO",
             scope: Server,
             default: "",
@@ -412,6 +428,15 @@ fn v_uint(value: &str) -> std::result::Result<(), String> {
         .parse::<u64>()
         .map(|_| ())
         .map_err(|_| "expected a non-negative integer".to_string())
+}
+
+/// Accept a positive integer (like [`v_uint`] but also rejecting `0` — for
+/// periods/deadlines where zero is meaningless rather than "disabled").
+fn v_pos_uint(value: &str) -> std::result::Result<(), String> {
+    match value.parse::<u64>() {
+        Ok(n) if n > 0 => Ok(()),
+        _ => Err("expected a positive integer".to_string()),
+    }
 }
 
 /// Accept only an `http://` or `https://` URL (scheme check, not full parse).
@@ -1491,6 +1516,28 @@ mod tests {
     }
 
     #[test]
+    fn ws_liveness_settings_registered_and_validated() {
+        // WS keepalive timing: the server's ping period, and the shared
+        // liveness deadline (server reclaim + client read deadline).
+        let ping = find("FLEETY_WS_PING_SECS").expect("FLEETY_WS_PING_SECS registered");
+        assert_eq!(ping.scope, Scope::Server);
+        assert_eq!(ping.default, "20");
+        let timeout = find("FLEETY_WS_TIMEOUT_SECS").expect("FLEETY_WS_TIMEOUT_SECS registered");
+        assert_eq!(timeout.scope, Scope::Shared);
+        assert_eq!(timeout.default, "60");
+        // Both take a positive integer: zero, negative, and non-numeric values
+        // are rejected at write time (a zero ping period / deadline is
+        // meaningless — runtime parsing falls back to the defaults instead).
+        for s in [ping, timeout] {
+            assert!(validate(s, "45").is_ok(), "{}: '45' should pass", s.key);
+            for bad in ["0", "-5", "abc"] {
+                let err = validate(s, bad).unwrap_err().to_string();
+                assert!(err.contains(s.key), "{}: '{bad}' rejection should name the key, got: {err}", s.key);
+            }
+        }
+    }
+
+    #[test]
     fn unknown_key_is_rejected() {
         assert!(find("FLEETY_NOPE").is_none());
         assert!(find("FLEETY_ADDR").is_some());
@@ -1872,6 +1919,8 @@ mod tests {
             ("FLEETY_MODEL_RETRY_CAP_MS", "30000", "1.5"),
             ("FLEETY_CMD_TIMEOUT_SECS", "120", "notanumber"),
             ("FLEETY_SSE_TIMEOUT_SECS", "45", "-5"),
+            ("FLEETY_WS_PING_SECS", "20", "0"),
+            ("FLEETY_WS_TIMEOUT_SECS", "60", "-5"),
             ("FLEETY_BACKUP_INTERVAL_SECS", "3600", "hourly"),
             ("FLEETY_PRESENCE_INTERVAL_SECS", "300", "5m"),
             ("FLEETY_VOICE_AUDIO_MAX_KB", "2048", "big"),

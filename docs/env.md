@@ -328,6 +328,19 @@ uses WebSocket.
 | `FLEETY_FORCE_SSE` | `0` | Always use SSE+POST, skipping the WebSocket attempt (1/0). |
 | `FLEETY_DISABLE_SSE` | `0` | Disable the fallback entirely; WebSocket only (1/0). |
 | `FLEETY_SSE_TIMEOUT_SECS` | `45` | SSE half-open timeout: if no event or keep-alive arrives within this window, the client treats the stream as dead and reconnects. |
+| `FLEETY_WS_PING_SECS` | `20` | Server side: seconds between the keepalive Ping frames the server sends on every WebSocket connection. A non-numeric or non-positive value falls back to the default. |
+| `FLEETY_WS_TIMEOUT_SECS` | `60` | WebSocket liveness deadline (seconds), shared by both ends. Server: a connection that produces no inbound frame of any kind within this window is closed and cleaned up, so routing to that device fails fast instead of waiting out the per-call timeout. Client (CLI and fleetyd): armed as a read deadline only after the server's first Ping is seen on the connection — a server that never pings (an older release) arms nothing and behavior is unchanged. Keep it at least twice `FLEETY_WS_PING_SECS`. A non-numeric or non-positive value falls back to the default. |
+
+A middlebox that swallows WebSocket control frames (a non-compliant proxy —
+conformant ones must forward them) keeps the server from seeing the client's
+Pong replies, so otherwise-idle connections get reclaimed every deadline
+window: raise `FLEETY_WS_TIMEOUT_SECS`, or set `FLEETY_FORCE_SSE=1` to switch
+to the SSE transport, which has its own keepalive. One known interaction:
+fleetyd executes a device tool inline and does not read its socket meanwhile,
+so a tool that blocks past the deadline gets its connection reclaimed — the
+call itself has already failed `device_exec`'s 30 s per-call timeout, the
+tool's side effects still complete on the device, and the daemon reconnects as
+soon as the tool finishes.
 
 ## Device identity
 

@@ -644,6 +644,14 @@ async fn serve(
                 let args: serde_json::Value =
                     serde_json::from_str(&args_json).unwrap_or_else(|_| serde_json::json!({}));
                 tracing::info!(%tool, "running on-device tool");
+                // The tool runs inline: this loop stops reading the socket, so
+                // the WebSocket layer stops answering the server's keepalive
+                // pings (ws-liveness). A tool that blocks past the liveness
+                // deadline gets this connection reclaimed by the server — by
+                // then the call has already failed device_exec's per-call
+                // timeout; the tool still completes here (side effects intact),
+                // the reply send below fails, and we reconnect via the normal
+                // backoff path.
                 let reply = match registry.call(&tool, args).await {
                     Ok(value) => ClientMsg::ToolResult {
                         call_id,

@@ -20,8 +20,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use fleety_protocol::ClientMsg;
-use futures::stream::{self, SplitSink, SplitStream};
-use futures::{SinkExt, StreamExt};
+use futures::stream;
+use futures::StreamExt;
 use tokio::sync::{mpsc, Mutex};
 
 use crate::auth::AuthStore;
@@ -48,6 +48,38 @@ pub fn new_sse_sessions() -> SseSessions {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
+/// WebSocket liveness timings (ws-liveness): how often the server pings each
+/// connection, and how long a connection may stay silent before it is treated
+/// as half-open and reclaimed. Read from env once at startup and carried in
+/// [`AppState`], so tests can shorten the timings without racing on
+/// process-global env.
+#[derive(Clone, Copy)]
+pub struct WsLiveness {
+    pub ping_interval: std::time::Duration,
+    pub deadline: std::time::Duration,
+}
+
+impl WsLiveness {
+    /// `FLEETY_WS_PING_SECS` / `FLEETY_WS_TIMEOUT_SECS`; a non-numeric or
+    /// non-positive value falls back to the default (20s / 60s). Keep the
+    /// deadline at least twice the ping interval.
+    pub fn from_env() -> Self {
+        Self {
+            ping_interval: std::time::Duration::from_secs(env_secs("FLEETY_WS_PING_SECS", 20)),
+            deadline: std::time::Duration::from_secs(env_secs("FLEETY_WS_TIMEOUT_SECS", 60)),
+        }
+    }
+}
+
+/// Parse `var` as a positive number of seconds, falling back to `default`.
+fn env_secs(var: &str, default: u64) -> u64 {
+    std::env::var(var)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(default)
+}
+
 /// Shared dependencies handed to every connection. Cheap to clone (Arcs + Copy).
 #[derive(Clone)]
 pub struct AppState {
@@ -61,6 +93,7 @@ pub struct AppState {
     pub auth: Arc<AuthStore>,
     pub device_tools: DeviceTools,
     pub sse_sessions: SseSessions,
+    pub ws_liveness: WsLiveness,
 }
 
 /// Build the router. WebSocket upgrades at `GET /` (clients connect to
@@ -80,9 +113,13 @@ async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Resp
 }
 
 async fn serve_ws(socket: WebSocket, state: AppState) {
-    let (sink, stream) = socket.split();
-    let inbound: Box<dyn ClientInbound> = Box::new(AxumWsInbound { stream });
-    let writer: Box<dyn FrameWriter> = Box::new(AxumWsFrameWriter { sink });
+    // The socket-owner task is the only holder of the WebSocket; the connection
+    // logic talks to it through channels — the same shape as the SSE adapters.
+    let (out_tx, out_rx) = mpsc::unbounded_channel::<String>();
+    let (in_tx, in_rx) = mpsc::unbounded_channel::<String>();
+    let owner = tokio::spawn(own_socket(socket, out_rx, in_tx, state.ws_liveness));
+    let inbound: Box<dyn ClientInbound> = Box::new(WsChannelInbound { rx: in_rx });
+    let writer: Box<dyn FrameWriter> = Box::new(WsChannelWriter { tx: out_tx });
     if let Err(e) = run_connection(
         inbound,
         writer,
@@ -100,46 +137,122 @@ async fn serve_ws(socket: WebSocket, state: AppState) {
     {
         tracing::warn!(report = ?e.report(), "websocket connection error");
     }
+    // run_connection has dropped its writer: the owner flushes whatever is still
+    // queued (bounded by the write timeout) and exits, closing the socket.
+    let _ = owner.await;
 }
 
-/// Inbound adapter over an axum WebSocket stream.
-struct AxumWsInbound {
-    stream: SplitStream<WebSocket>,
-}
+/// How long a single outbound write may stall before the peer is declared dead.
+/// Keeps a vanished-but-unclosed client from parking the socket owner forever.
+const WS_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-#[async_trait::async_trait]
-impl ClientInbound for AxumWsInbound {
-    async fn next_client(&mut self) -> Result<Option<ClientMsg>> {
-        while let Some(frame) = self.stream.next().await {
-            match frame {
-                Ok(Message::Text(text)) => {
-                    let msg = serde_json::from_str(text.as_str()).map_err(|e| {
-                        CoreError::Provider(format!(
-                            "malformed client frame: {e}; expected a ClientMsg JSON object"
-                        ))
-                    })?;
-                    return Ok(Some(msg));
+/// Own the WebSocket: forward outbound frames from the connection logic,
+/// forward inbound text frames to it, and keep the connection honest
+/// (ws-liveness). A Ping goes out every `liveness.ping_interval`; any inbound
+/// frame — text, pong, whatever — counts as proof of life; a connection silent
+/// past `liveness.deadline` is closed, so `run_connection` unwinds through its
+/// normal cleanup (hub and device_tools removal) and routing to the device
+/// fails fast. Also exits when the socket ends (close/error), when a write
+/// fails or stalls, or when the connection logic is done and its outbound
+/// queue is drained.
+///
+/// A daemon blocked in a long-running tool does not read its socket, so it
+/// stops answering pings and gets reclaimed here too. That is deliberate: the
+/// call has already failed `device_exec`'s per-call timeout, the tool's side
+/// effects still complete on the device, and the daemon reconnects as soon as
+/// it returns to its loop.
+async fn own_socket(
+    mut socket: WebSocket,
+    mut out_rx: mpsc::UnboundedReceiver<String>,
+    in_tx: mpsc::UnboundedSender<String>,
+    liveness: WsLiveness,
+) {
+    let mut ping = tokio::time::interval(liveness.ping_interval);
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_seen = std::time::Instant::now();
+    // The wire device id from the Hello frame, for the liveness log only (the
+    // resolved identity lives in run_connection, above this task).
+    let mut hello_device: Option<String> = None;
+    loop {
+        tokio::select! {
+            out = out_rx.recv() => match out {
+                Some(text) => {
+                    let sent =
+                        tokio::time::timeout(WS_WRITE_TIMEOUT, socket.send(Message::Text(text.into()))).await;
+                    if !matches!(sent, Ok(Ok(()))) {
+                        break; // write failed or stalled: the peer is gone
+                    }
                 }
-                Ok(Message::Close(_)) => return Ok(None),
-                // A read error (reset/abort/EOF) is a normal end of connection.
-                Err(_) => return Ok(None),
-                // Ignore ping/pong/binary frames.
-                Ok(_) => continue,
-            }
+                None => break, // connection logic finished and its queue is drained
+            },
+            frame = socket.next() => {
+                last_seen = std::time::Instant::now();
+                match frame {
+                    Some(Ok(Message::Text(text))) => {
+                        if hello_device.is_none() {
+                            if let Ok(ClientMsg::Hello { device_id, .. }) =
+                                serde_json::from_str::<ClientMsg>(text.as_str())
+                            {
+                                hello_device = Some(device_id);
+                            }
+                        }
+                        // A dropped receiver means run_connection ended; keep
+                        // looping so the outbound queue still drains.
+                        let _ = in_tx.send(text.to_string());
+                    }
+                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                    // Ping/pong/binary carry no message — they only feed liveness.
+                    Some(Ok(_)) => {}
+                }
+            },
+            _ = ping.tick() => {
+                if last_seen.elapsed() >= liveness.deadline {
+                    tracing::warn!(
+                        device = hello_device.as_deref().unwrap_or("(pre-hello)"),
+                        silent_secs = last_seen.elapsed().as_secs(),
+                        "websocket liveness timeout; reclaiming half-open connection"
+                    );
+                    break;
+                }
+                let sent =
+                    tokio::time::timeout(WS_WRITE_TIMEOUT, socket.send(Message::Ping(Vec::new().into()))).await;
+                if !matches!(sent, Ok(Ok(()))) {
+                    break; // cannot even ping: the connection is dead
+                }
+            },
         }
-        Ok(None)
     }
 }
 
-/// Outbound adapter over an axum WebSocket sink.
-struct AxumWsFrameWriter {
-    sink: SplitSink<WebSocket, Message>,
+/// Inbound adapter over the socket owner's channel: parses each text frame into
+/// a `ClientMsg` (a malformed frame is a connection error, as before).
+struct WsChannelInbound {
+    rx: mpsc::UnboundedReceiver<String>,
 }
 
 #[async_trait::async_trait]
-impl FrameWriter for AxumWsFrameWriter {
+impl ClientInbound for WsChannelInbound {
+    async fn next_client(&mut self) -> Result<Option<ClientMsg>> {
+        match self.rx.recv().await {
+            Some(text) => serde_json::from_str(&text).map(Some).map_err(|e| {
+                CoreError::Provider(format!(
+                    "malformed client frame: {e}; expected a ClientMsg JSON object"
+                ))
+            }),
+            None => Ok(None),
+        }
+    }
+}
+
+/// Outbound adapter: hands serialized frames to the socket-owner task.
+struct WsChannelWriter {
+    tx: mpsc::UnboundedSender<String>,
+}
+
+#[async_trait::async_trait]
+impl FrameWriter for WsChannelWriter {
     async fn send_text(&mut self, text: String) -> bool {
-        self.sink.send(Message::Text(text.into())).await.is_ok()
+        self.tx.send(text).is_ok()
     }
 }
 
@@ -320,6 +433,7 @@ mod tests {
     use crate::echo::EchoProvider;
     use crate::storage::Storage;
     use fleety_protocol::{ClientMsg, ServerMsg, PROTOCOL_VERSION};
+    use futures::SinkExt;
     use std::time::Duration;
     use tokio::time::timeout;
 
@@ -335,6 +449,7 @@ mod tests {
             auth,
             device_tools: bridge::new_device_tools(),
             sse_sessions: new_sse_sessions(),
+            ws_liveness: WsLiveness::from_env(),
         }
     }
 
@@ -386,6 +501,180 @@ mod tests {
                 None => panic!("sse stream ended before the expected frame"),
             }
         }
+    }
+
+    type WsClient =
+        tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+    /// Connect a raw tokio-tungstenite client — the same WebSocket layer an
+    /// old (pre-liveness) fleetyd uses — say Hello, and read until Welcome.
+    /// Returns the socket and the Welcome's conversation id.
+    async fn ws_hello(base: &str, device: &str) -> (WsClient, String) {
+        let url = base.replace("http://", "ws://");
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.expect("ws connect");
+        let hello = serde_json::to_string(&ClientMsg::Hello {
+            device_id: device.into(),
+            protocol: PROTOCOL_VERSION,
+            token: None,
+            pairing_code: None,
+            local_tools_json: None,
+            hostname: None,
+        })
+        .expect("hello json");
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(hello))
+            .await
+            .expect("send hello");
+        // Read until Welcome so the connection is fully registered in the hub.
+        let conversation = timeout(Duration::from_secs(5), async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t))) => {
+                        if let Ok(ServerMsg::Welcome {
+                            conversation_id, ..
+                        }) = serde_json::from_str::<ServerMsg>(t.as_ref())
+                        {
+                            break conversation_id;
+                        }
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("connection ended before Welcome: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("welcome");
+        (ws, conversation)
+    }
+
+    /// ws-liveness (spec: server reclaims half-open connections): a WebSocket
+    /// client that completes Hello and then stops reading and writing — the
+    /// shape of a silent drop, or of a daemon blocked in a long tool — is
+    /// removed from the hub within the liveness deadline plus a ping interval,
+    /// and a subsequent device_exec fails fast with not-connected instead of
+    /// burning the 30s per-call timeout.
+    #[tokio::test]
+    async fn ws_liveness_reclaims_half_open_connection() {
+        let home = std::env::temp_dir().join(format!("fleety-wslive-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&home).expect("mk home");
+        let mut state = test_state(&home);
+        state.ws_liveness = WsLiveness {
+            ping_interval: Duration::from_millis(100),
+            deadline: Duration::from_millis(300),
+        };
+        let hub = Arc::clone(&state.hub);
+        let pending = Arc::clone(&state.pending);
+        let handles = Arc::clone(&state.handles);
+        let device_tools = Arc::clone(&state.device_tools);
+        let base = serve(state).await;
+
+        let (ws, _conversation) = ws_hello(&base, "half-open-dev").await;
+        assert!(
+            hub.lock().await.contains_key("half-open-dev"),
+            "registered after Welcome"
+        );
+
+        // Go silent WITHOUT closing: hold the socket open but never poll it
+        // again, so the client's WebSocket layer cannot flush pong replies.
+        let reclaimed = async {
+            while hub.lock().await.contains_key("half-open-dev") {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        };
+        timeout(Duration::from_secs(3), reclaimed)
+            .await
+            .expect("half-open connection should be reclaimed within deadline + ping interval");
+        drop(ws);
+
+        // Routing to the reclaimed device fails fast, not via the call timeout.
+        let mut registry = agent_core::ToolRegistry::new();
+        crate::bridge::register(&mut registry, hub, pending, handles, device_tools);
+        let err = timeout(
+            Duration::from_secs(2),
+            registry.call(
+                "device_exec",
+                serde_json::json!({ "device": "half-open-dev", "tool": "read_file", "args": {} }),
+            ),
+        )
+        .await
+        .expect("not-connected must fail fast")
+        .expect_err("device is gone");
+        assert!(
+            err.report().message.contains("not connected"),
+            "unexpected error: {}",
+            err.report().message
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// ws-liveness (spec: idle healthy connection survives indefinitely; old
+    /// daemon is protected without an upgrade): a bare tokio-tungstenite
+    /// client — exactly the WebSocket layer a pre-liveness fleetyd uses —
+    /// keeps polling its socket, so tungstenite answers the server's pings
+    /// automatically. Across several deadline windows of message silence it
+    /// stays registered and can still run a full message round-trip, with no
+    /// client-side or protocol change.
+    #[tokio::test]
+    async fn ws_liveness_keeps_healthy_idle_connection() {
+        let home = std::env::temp_dir().join(format!("fleety-wsidle-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&home).expect("mk home");
+        let mut state = test_state(&home);
+        state.ws_liveness = WsLiveness {
+            ping_interval: Duration::from_millis(100),
+            deadline: Duration::from_millis(300),
+        };
+        let hub = Arc::clone(&state.hub);
+        let base = serve(state).await;
+
+        let (mut ws, conversation) = ws_hello(&base, "idle-dev").await;
+
+        // Idle (no messages) for ~3x the deadline while polling the socket —
+        // the frames read here are the server's pings, and reading them is
+        // what lets the WebSocket layer flush its automatic pong replies.
+        let idle_until = tokio::time::Instant::now() + Duration::from_millis(1000);
+        while tokio::time::Instant::now() < idle_until {
+            match timeout(Duration::from_millis(50), ws.next()).await {
+                Ok(Some(Ok(_))) => {}
+                Ok(other) => panic!("connection ended while idle: {other:?}"),
+                Err(_) => {} // no frame this tick
+            }
+        }
+        assert!(
+            hub.lock().await.contains_key("idle-dev"),
+            "healthy idle client must stay registered"
+        );
+
+        // Still fully routable after idling: a message round-trip completes.
+        let msg = serde_json::to_string(&ClientMsg::UserMessage {
+            conversation_id: Some(conversation),
+            text: "still there?".into(),
+            origin: Default::default(),
+            attachments: Vec::new(),
+            voice: false,
+            acting_user: None,
+        })
+        .expect("msg json");
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(msg))
+            .await
+            .expect("send after idle");
+        let reply = timeout(Duration::from_secs(5), async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t))) => {
+                        if let Ok(ServerMsg::Assistant { text, .. }) =
+                            serde_json::from_str::<ServerMsg>(t.as_ref())
+                        {
+                            break text;
+                        }
+                    }
+                    Some(Ok(_)) => {}
+                    other => panic!("connection ended before the assistant reply: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("assistant reply after idle");
+        assert!(reply.contains("echo: still there?"), "unexpected reply: {reply}");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     /// Dropping a session's stream guard reclaims it from the registry (so a
