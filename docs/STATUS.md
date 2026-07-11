@@ -157,6 +157,16 @@ is on `main`; see commit history for the exact change.
 - **fleetyd self-update polling** — daily check against
   `FLEETY_UPDATE_MANIFEST`; notify-only by default,
   `FLEETY_AUTO_UPDATE=apply` runs the full update.
+- **Update-manifest pipeline** — each release attaches per-target raw binaries
+  plus one multi-target `<bin>-manifest.json` per binary (`version` +
+  `targets{triple: {url, sha256}}` + `versioned_manifest` template), so
+  `FLEETY_UPDATE_MANIFEST=…/releases/latest/download/{bin}-manifest.json`
+  enables every update path with zero self-hosting. Latest resolution
+  substitutes `{version}` → `latest`; fleet convergence pins the server's exact
+  version via env `{version}` template or the manifest's `versioned_manifest`,
+  rejecting any manifest that declares a different version; sibling updates
+  require a `{bin}` template (skip + warn instead of installing the wrong
+  binary).
 - **Model capability hint** — warns at boot if `FLEETY_MODEL` doesn't match a
   known multimodal family.
 - **Device tool advertisement** — `Hello.local_tools_json` carries fleetyd's

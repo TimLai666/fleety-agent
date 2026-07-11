@@ -50,6 +50,28 @@ pub fn python_dependency() -> Dependency {
 
 pub use insyra::insyra_dependency;
 
+/// The release asset target triple for this build, or None if unsupported.
+/// Shared by the insyra sidecar URL logic and the binary updater's multi-target
+/// manifest resolution — one table, so the two can't drift.
+///
+/// ARM/RISC-V Linux entries have no Rust release target yet — fleetyd is built
+/// from source there — but the release still ships a cross-built sidecar for
+/// them (the `sidecar-cross` job in release.yml; keep both lists in sync). The
+/// static pure-Go binary runs on glibc and musl systems alike, so one asset per
+/// arch/os is enough. No 32-bit ARM: Insyra's thrift dependency doesn't build
+/// where Go's `int` is 32-bit.
+pub fn target_triple() -> Option<&'static str> {
+    match (std::env::consts::ARCH, std::env::consts::OS) {
+        ("x86_64", "linux") => Some("x86_64-unknown-linux-gnu"),
+        ("aarch64", "linux") => Some("aarch64-unknown-linux-gnu"),
+        ("riscv64", "linux") => Some("riscv64gc-unknown-linux-gnu"),
+        ("aarch64", "macos") => Some("aarch64-apple-darwin"),
+        ("x86_64", "macos") => Some("x86_64-apple-darwin"),
+        ("x86_64", "windows") => Some("x86_64-pc-windows-msvc"),
+        _ => None,
+    }
+}
+
 /// How a missing dependency gets installed. Informational (the actual work is in
 /// the dependency's `install` closure) but documents intent and shapes messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

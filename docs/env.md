@@ -580,13 +580,47 @@ and `fleetyd` — the latter also refreshing the `fleety-insyra` sidecar), resta
 the services it touches. Run it on each host. `fleetyd update` (binary + sidecar)
 and the daemon's background poll below are the same mechanism, scoped to the daemon.
 
-Each binary's artifact is described by a JSON manifest (`version`, `url`, `sha256`).
-`FLEETY_UPDATE_MANIFEST` gives the manifest URL; when it contains the literal
-`{bin}`, that placeholder is substituted with the binary name so one base URL serves
-all of them (e.g. `https://host/dl/{bin}/latest.json`). A plain URL (no `{bin}`) is
-treated as the *current* binary's manifest — `fleety update` then only self-updates
-the CLI (it can't safely resolve the others) and says so. Binaries ship in lockstep
-(one workspace version), so the running process's version is the baseline.
+Each binary's update is described by a JSON manifest in one of two forms: the flat
+form (`version`, `url`, `sha256` — one artifact, for single-platform self-hosting)
+or the multi-target form the release pipeline publishes:
+
+```json
+{
+  "version": "0.2.0",
+  "versioned_manifest": "https://…/releases/download/v{version}/fleetyd-manifest.json",
+  "targets": {
+    "x86_64-unknown-linux-gnu": { "url": "https://…/fleetyd-x86_64-unknown-linux-gnu", "sha256": "…" }
+  }
+}
+```
+
+The updater selects its own target triple's entry, verifies the artifact's
+SHA-256, and swaps the raw executable in place — no archive extraction, so `url`
+must point at a raw binary (the release attaches these per target alongside the
+install archives). A manifest with no entry for the local platform still answers
+version probes (notify polling keeps working); installing reports a clear "no
+artifact for this platform" error — ARM/RISC-V hosts running a source-built
+fleetyd keep updating from source. Unknown manifest fields are ignored.
+
+**Recommended setup (GitHub releases, zero self-hosting).** Every release attaches
+one `<bin>-manifest.json` per binary, so a single line enables every update path
+(`fleety update`, `fleetyd update`, both polling modes, and fleet convergence):
+
+```
+FLEETY_UPDATE_MANIFEST=https://github.com/TimLai666/fleety-agent/releases/latest/download/{bin}-manifest.json
+```
+
+`{bin}` is substituted with each binary's name. A self-hosted URL may also contain
+`{version}`: pinned resolution substitutes the exact version, and latest
+resolution substitutes the literal `latest` — a layout like
+`https://host/dl/{bin}/{version}/manifest.json` is polled as
+`https://host/dl/fleetyd/latest/manifest.json`, so serve a `latest` alias
+directory (or symlink) next to the versioned ones. A plain URL (no `{bin}`) is
+treated as the *current* binary's manifest — `fleety update` then only
+self-updates the CLI and says so, and the daemon skips sibling binaries with a
+warning naming the missing `{bin}` placeholder (a bin-less template would resolve
+to the running binary's manifest and install the wrong binary). Binaries ship in
+lockstep (one workspace version), so the running process's version is the baseline.
 
 **Fleet convergence (server-driven).** `Welcome` carries the server's version, so
 when a device's daemon (re)connects and finds the server **newer**, it pulls this
@@ -595,9 +629,14 @@ host's binaries (fleetyd + any sibling `fleety`/`fleety-server`) to the server's
 update` catches up on reconnect, and the whole fleet tracks the server rather than a
 floating "latest". It is **forward-only**: a device never auto-downgrades; if a
 device is newer than the server, it only warns (upgrade the server to converge).
-Pinning to an exact version needs a `{version}` placeholder in the manifest URL
-(e.g. `https://host/dl/{bin}/{version}/manifest.json`); without it, the daemon logs
-that it can't pin. With no `FLEETY_UPDATE_MANIFEST` set, convergence is skipped.
+The exact version resolves through a chain: a `{version}` template in
+`FLEETY_UPDATE_MANIFEST` pins directly; otherwise the binary's latest manifest is
+used as-is when it already declares the server's version, else followed through
+its `versioned_manifest` template. Any manifest fetched to pin a version must
+declare exactly that version, or it is rejected. When no path can pin, the daemon
+logs a warning naming both remedies (publish manifests with `versioned_manifest`,
+or switch to a `{version}` template) and leaves the binary unchanged. With no
+`FLEETY_UPDATE_MANIFEST` set, convergence is skipped.
 
 ### Background polling (`fleetyd` loop)
 
@@ -608,7 +647,7 @@ to run it; `fleetyd update` (one-shot) restarts the installed service the same w
 
 | Var | Default | Meaning |
 |---|---|---|
-| `FLEETY_UPDATE_MANIFEST` | (unset → no poll) | URL of the JSON manifest (`version`, `url`, `sha256`). May contain `{bin}` (serve all binaries from one base) and `{version}` (required for server-version convergence). |
+| `FLEETY_UPDATE_MANIFEST` | (unset → no poll) | URL of the JSON update manifest (flat or multi-target form). `{bin}` substitutes the binary name; `{version}` substitutes the exact version when pinning and the literal `latest` otherwise. |
 | `FLEETY_UPDATE_POLL_SECS` | `86400` (24 h) | How often to check. Floor 60 s. |
 | `FLEETY_AUTO_UPDATE` | `notify` | Set to `apply` to run the full update on each tick (`fleetyd update` equivalent). |
 

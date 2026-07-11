@@ -107,6 +107,25 @@ jobs:
           raw="$GITHUB_WORKSPACE/fleety-insyra-${{ matrix.target }}"
           [ "${{ matrix.archive }}" = "zip" ] && raw="$raw.exe"
           (cd sidecars/fleety-insyra && go build -trimpath -ldflags "-s -w" -o "$raw" .)
+      # Raw per-binary executables ship alongside the archives so the updater
+      # (fleetyd update / fleety update / server-version convergence) can
+      # download + swap without extraction — same posture as the fleety-insyra
+      # sidecar. Staged into raw/ and also uploaded as workflow artifacts for
+      # the manifests fan-in job, which hashes every target's exact bytes.
+      - name: Stage raw binaries
+        shell: bash
+        run: |
+          ext=""
+          [ "${{ matrix.archive }}" = "zip" ] && ext=".exe"
+          mkdir -p raw
+          for b in fleety fleety-server fleetyd; do
+            cp "target/${{ matrix.target }}/release/$b$ext" "raw/$b-${{ matrix.target }}$ext"
+          done
+      - name: Upload raw binaries for the manifests job
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw-${{ matrix.target }}
+          path: raw/
       - name: Package (tar.gz)
         if: matrix.archive == 'tar.gz'
         run: |
@@ -133,6 +152,93 @@ jobs:
             fleetyd-${{ matrix.target }}.${{ matrix.archive }}
             fleety-insyra-${{ matrix.target }}
             fleety-insyra-${{ matrix.target }}.exe
+            raw/fleety-${{ matrix.target }}
+            raw/fleety-${{ matrix.target }}.exe
+            raw/fleety-server-${{ matrix.target }}
+            raw/fleety-server-${{ matrix.target }}.exe
+            raw/fleetyd-${{ matrix.target }}
+            raw/fleetyd-${{ matrix.target }}.exe
+
+  # Fan-in: one update manifest per binary, covering every target's raw asset
+  # (multi-target schema: version + targets{triple: {url, sha256}} + a
+  # versioned_manifest URL template). Updaters resolve these via
+  #   FLEETY_UPDATE_MANIFEST=https://github.com/<repo>/releases/latest/download/{bin}-manifest.json
+  # Manifest urls pin the tag (releases/download/<tag>/…): those assets are
+  # immutable, so a manifest's sha256 stays valid after newer releases ship.
+  manifests:
+    name: build update manifests
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: raw-*
+          path: raw
+          merge-multiple: true
+      - name: Generate and validate manifests
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The manifest version MUST equal the binaries' compiled-in workspace
+          # version (agent_core::VERSION): needs_update() is a plain
+          # version-difference test, so a mismatched manifest would make every
+          # freshly-updated binary look outdated again — an install loop.
+          # Section-aware scan: only the version line inside [workspace.package]
+          # (a bare grep could match a version line in some other section).
+          ws=$(awk -F'"' '/^\[workspace\.package\]/{s=1;next} /^\[/{s=0} s && /^version = /{print $2; exit}' Cargo.toml)
+          [ -n "$ws" ] || { echo "cannot read [workspace.package] version from Cargo.toml" >&2; exit 1; }
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            tag="$GITHUB_REF_NAME"
+            if [ "${tag#v}" != "$ws" ]; then
+              echo "tag $tag does not match workspace version $ws — fix the tag or Cargo.toml and re-run" >&2
+              exit 1
+            fi
+          else
+            tag="v$ws"  # workflow_dispatch dry-run: stand-in tag, nothing attaches
+          fi
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download"
+          targets="x86_64-unknown-linux-gnu aarch64-apple-darwin x86_64-apple-darwin x86_64-pc-windows-msvc"
+          expected=$(wc -w <<<"$targets")
+          mkdir -p manifests
+          for bin in fleety fleety-server fleetyd; do
+            json='{}'
+            for t in $targets; do
+              f="raw/$bin-$t"
+              [ -f "$f" ] || f="raw/$bin-$t.exe"
+              [ -f "$f" ] || { echo "missing raw binary for $bin ($t)" >&2; exit 1; }
+              sha=$(sha256sum "$f" | cut -d' ' -f1)
+              json=$(jq --arg t "$t" --arg url "$base/$tag/$(basename "$f")" --arg sha "$sha" \
+                '.targets[$t] = {url: $url, sha256: $sha}' <<<"$json")
+            done
+            jq --arg v "${tag#v}" --arg vm "$base/v{version}/$bin-manifest.json" \
+              '{version: $v, versioned_manifest: $vm} + .' <<<"$json" > "manifests/$bin-manifest.json"
+            # Field-completeness gate: version, versioned_manifest, and a full
+            # url+sha256 (lowercase hex) entry for every target.
+            jq -e --arg v "${tag#v}" --argjson n "$expected" '
+              .version == $v
+              and (.versioned_manifest | type == "string")
+              and ((.targets | length) == $n)
+              and ([.targets[] | (.url | type == "string") and (.sha256 | test("^[0-9a-f]{64}$"))] | all)
+            ' "manifests/$bin-manifest.json" >/dev/null \
+              || { echo "generated $bin-manifest.json failed validation" >&2; exit 1; }
+          done
+          ls -l manifests
+      # Always uploaded as a workflow artifact so a workflow_dispatch dry-run
+      # can be inspected without attaching anything to a release.
+      - name: Upload manifests as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: update-manifests
+          path: manifests/
+      # Re-runs are safe: action-gh-release's overwrite_files defaults to true,
+      # so a fixed re-run of this job REPLACES same-named assets (verified
+      # against the action's docs) — no delete-then-upload dance needed.
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: manifests/*.json
 
   # The Go sidecar also ships for ARM/RISC-V Linux SBCs (Pi, LicheeRV, NAS…)
   # that have no Rust release target yet: a source-built fleetyd there still

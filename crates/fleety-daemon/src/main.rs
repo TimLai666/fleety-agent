@@ -136,21 +136,19 @@ async fn converge_to_server_version(server_version: &str) {
     if !fleety_tools::update::is_newer(server_version, me) {
         return; // already matched
     }
-    if !fleety_tools::update::manifest_supports_version() {
-        tracing::warn!(
-            server = server_version,
-            "server is newer but FLEETY_UPDATE_MANIFEST has no {{version}} template; cannot pin to \
-             the server's version — set it (e.g. https://host/dl/{{bin}}/{{version}}/manifest.json)"
-        );
-        return;
-    }
     tracing::info!(
         device = me,
         server = server_version,
         "server is newer; converging this host"
     );
 
-    let self_updated = match fleety_tools::update::self_update_to_version(server_version).await {
+    // The resolution chain lives in fleety_tools::update::converge_to_version:
+    // an env {version} template pins directly; otherwise the binary's latest
+    // manifest either already matches or names the pinned manifest via its
+    // versioned_manifest template. When neither applies, the error names both
+    // remedies (publish versioned_manifest, or switch to a {version} template)
+    // and this host just stays put — forward-only, never a wrong install.
+    let self_updated = match fleety_tools::update::converge_self_to_version(server_version).await {
         Ok(updated) => updated,
         Err(e) => {
             tracing::warn!(report = ?e.report(), "could not self-update fleetyd to the server version");
@@ -165,7 +163,7 @@ async fn converge_to_server_version(server_version: &str) {
         let Some(exe) = fleety_tools::update::sibling_exe(bin) else {
             continue;
         };
-        match fleety_tools::update::update_to_version(bin, &exe, server_version).await {
+        match fleety_tools::update::converge_to_version(bin, &exe, server_version).await {
             Ok(true) if bin == "fleety-server" => {
                 // Deferred restart: never add --force here so an update never
                 // interrupts an in-flight turn before the deferral deadline.
