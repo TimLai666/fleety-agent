@@ -54,13 +54,12 @@ pub use insyra::insyra_dependency;
 /// Shared by the insyra sidecar URL logic and the binary updater's multi-target
 /// manifest resolution — one table, so the two can't drift.
 ///
-/// ARM/RISC-V Linux and Intel macOS entries have no Rust release target —
-/// fleety binaries are built from source there (Intel macOS because the
-/// ort/ONNX dependency ships no prebuilt) — but the release still ships a
-/// cross-built sidecar for them (the `sidecar-cross` job in release.yml; keep
-/// both lists in sync). The static pure-Go binary runs on glibc and musl
-/// systems alike, so one asset per arch/os is enough. No 32-bit ARM: Insyra's
-/// thrift dependency doesn't build where Go's `int` is 32-bit.
+/// ARM/RISC-V Linux entries have no Rust release target yet — fleetyd is built
+/// from source there — but the release still ships a cross-built sidecar for
+/// them (the `sidecar-cross` job in release.yml; keep both lists in sync). The
+/// static pure-Go binary runs on glibc and musl systems alike, so one asset per
+/// arch/os is enough. No 32-bit ARM: Insyra's thrift dependency doesn't build
+/// where Go's `int` is 32-bit.
 pub fn target_triple() -> Option<&'static str> {
     match (std::env::consts::ARCH, std::env::consts::OS) {
         ("x86_64", "linux") => Some("x86_64-unknown-linux-gnu"),

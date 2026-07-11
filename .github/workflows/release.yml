@@ -27,10 +27,13 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             archive: tar.gz
-          # No x86_64-apple-darwin: the ort/ONNX dependency ships no prebuilt
-          # for Intel macOS (and macos-13, the last Intel image, is retired).
-          # Intel Macs build fleety from source; their pure-Go sidecar still
-          # ships from the sidecar-cross job below.
+          # Cross-compiled on the arm64 runner: macos-13, the last Intel
+          # image, is retired. Semantic embedding is compiled out on this
+          # target (ort/ONNX ships no Intel-macOS prebuilt — see
+          # fleety-server/src/embed.rs); everything else is identical.
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            archive: tar.gz
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             archive: zip
@@ -217,7 +220,7 @@ jobs:
             tag="v$ws"  # workflow_dispatch dry-run: stand-in tag, nothing attaches
           fi
           base="https://github.com/${GITHUB_REPOSITORY}/releases/download"
-          targets="x86_64-unknown-linux-gnu aarch64-apple-darwin x86_64-pc-windows-msvc"
+          targets="x86_64-unknown-linux-gnu aarch64-apple-darwin x86_64-apple-darwin x86_64-pc-windows-msvc"
           expected=$(wc -w <<<"$targets")
           mkdir -p manifests
           for bin in fleety fleety-server fleetyd; do
@@ -259,16 +262,15 @@ jobs:
         with:
           files: manifests/*.json
 
-  # The Go sidecar also ships for platforms that have no Rust release target:
-  # ARM/RISC-V Linux SBCs (Pi, LicheeRV, NAS…) and Intel macOS (ort ships no
-  # prebuilt there). A source-built fleety/fleetyd on those hosts still
+  # The Go sidecar also ships for ARM/RISC-V Linux SBCs (Pi, LicheeRV, NAS…)
+  # that have no Rust release target yet: a source-built fleetyd there still
   # downloads its sidecar from the release page (the shared target table in
   # fleety-tools deps maps arch/os to these triples — keep both lists in
   # sync). Pure-Go cross builds; CGO is pinned off so a future cgo dependency
   # fails loudly here instead of silently changing linkage. No 32-bit ARM:
   # Insyra's thrift dependency doesn't build where Go's `int` is 32-bit.
   sidecar-cross:
-    name: build sidecar (linux arm64/riscv64, darwin x64)
+    name: build sidecar (linux arm64/riscv64)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -292,7 +294,6 @@ jobs:
           cd sidecars/fleety-insyra
           GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o "$GITHUB_WORKSPACE/fleety-insyra-aarch64-unknown-linux-gnu" .
           GOOS=linux GOARCH=riscv64 go build -trimpath -ldflags "-s -w" -o "$GITHUB_WORKSPACE/fleety-insyra-riscv64gc-unknown-linux-gnu" .
-          GOOS=darwin GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o "$GITHUB_WORKSPACE/fleety-insyra-x86_64-apple-darwin" .
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
@@ -300,4 +301,3 @@ jobs:
           files: |
             fleety-insyra-aarch64-unknown-linux-gnu
             fleety-insyra-riscv64gc-unknown-linux-gnu
-            fleety-insyra-x86_64-apple-darwin

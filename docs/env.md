@@ -599,9 +599,8 @@ SHA-256, and swaps the raw executable in place — no archive extraction, so `ur
 must point at a raw binary (the release attaches these per target alongside the
 install archives). A manifest with no entry for the local platform still answers
 version probes (notify polling keeps working); installing reports a clear "no
-artifact for this platform" error — ARM/RISC-V Linux and Intel macOS hosts
-running source-built binaries keep updating from source. Unknown manifest
-fields are ignored.
+artifact for this platform" error — ARM/RISC-V hosts running a source-built
+fleetyd keep updating from source. Unknown manifest fields are ignored.
 
 **Recommended setup (GitHub releases, zero self-hosting).** Every release attaches
 one `<bin>-manifest.json` per binary, so a single line enables every update path
@@ -697,7 +696,7 @@ current automatically (re-embeds notes whose content hash changed).
 
 | Var | Default | Meaning |
 |---|---|---|
-| `FLEETY_WIKI_EMBED` | (unset → on) | Set to `0` to disable semantic search (no model download; `wiki_semantic_search` returns an error pointing at `wiki_search`). |
+| `FLEETY_WIKI_EMBED` | (unset → on) | Set to `0` to disable semantic search (no model download; `wiki_semantic_search` returns an error pointing at `wiki_search`). On Intel macOS the switch is forced off at compile time — the ONNX runtime ships no prebuilt x86_64-apple-darwin library, so wiki and conversation search always use the keyword fallback there. |
 | `FLEETY_MODELS_DIR` | `{FLEETY_AGENT_HOME}/models` | Cache dir for downloaded model weights. |
 
 ## Command execution
