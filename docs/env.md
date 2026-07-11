@@ -668,9 +668,15 @@ The server keeps a fourth skill tier, `~/.fleety/agent/skills/synced`, in step w
 an external skills repo at runtime — so those skills update **without** a Fleety
 release. A background task syncs once at boot and then on an interval: it first
 checks the repo's latest commit SHA and only downloads (the branch zip) when it
-changed, then rebuilds the synced tier from the repo's top-level skill
-directories (each a dir with a `SKILL.md`; loose files are ignored) and swaps it
-in atomically — so added/removed skills are mirrored. The synced tier has the
+changed, then rebuilds the synced tier from the repo's skill directories and
+swaps it in atomically — so added/removed skills are mirrored. Skills are found
+by a pruned walk: the first directory along any path with a `SKILL.md` is a
+skill (dot-directories and the repo root itself are never skills; loose files
+are ignored), and nothing deeper inside it is split out — so both a flat repo
+(`<skill>/SKILL.md`) and a plugin-marketplace repo
+(`plugins/<plugin>/skills/<skill>/SKILL.md`) work, and a nested sub-skill ships
+inside its parent. Duplicate skill names keep the first in path order (warning
+logged). The synced tier has the
 **lowest precedence** (installed > authored > builtin > synced), so a same-named
 installed/authored/builtin skill always wins. Any failure keeps the last good
 copy and logs a warning; it never crashes. Server-side only.

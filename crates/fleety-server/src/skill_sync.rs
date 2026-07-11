@@ -4,10 +4,13 @@
 //! A background task (spawned at boot, then every `FLEETY_SKILLS_SYNC_INTERVAL_SECS`)
 //! first checks the repo's latest commit SHA; only when it differs from the
 //! locally recorded one does it download the branch zip, rebuild the synced tier
-//! in a staging dir from the repo's top-level skill directories (each a dir with
-//! a `SKILL.md`), and atomically swap it in — so additions/removals are mirrored
-//! and a partially-synced state is never served. Any failure keeps the previous
-//! copy and logs a warning; it never crashes.
+//! in a staging dir from the repo's skill directories, and atomically swap it in
+//! — so additions/removals are mirrored and a partially-synced state is never
+//! served. Skills are discovered by a pruned walk (the outermost directory with
+//! a `SKILL.md` on each path; see [`skill_roots_from_extracted`]), which covers
+//! flat repos and plugin-marketplace repos alike and keeps nested sub-skills
+//! inside their parent. Any failure keeps the previous copy and logs a warning;
+//! it never crashes.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -20,23 +23,46 @@ const SHA_FILE: &str = ".synced-sha";
 
 // ---- pure helpers (unit-tested) ----
 
-/// Top-level subdirectories of `root` that contain a `SKILL.md` — the skills in
-/// an extracted skill repo. Loose files at the root are ignored. Sorted.
-pub fn skill_dirs_from_extracted(root: &Path) -> Vec<String> {
+/// Relative paths of the skill roots in an extracted skill repo, found by a
+/// pruned top-down walk: dot-directories are skipped, and the first directory
+/// along any path that contains a `SKILL.md` is a skill root — the walk does
+/// not descend into it, so a `SKILL.md` nested deeper (a sub-skill shipped
+/// inside a skill) stays part of that skill instead of becoming its own. The
+/// repo root itself is never a skill; loose files at non-skill levels are
+/// ignored. This covers the flat layout (top-level skill dirs) and plugin
+/// marketplace layouts (plugins/<plugin>/skills/<skill>/) alike. Sorted by
+/// relative path (which also decides who wins a duplicate-name collision).
+pub fn skill_roots_from_extracted(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return out;
+    walk_skill_roots(root, Path::new(""), &mut out);
+    out.sort();
+    out
+}
+
+/// The recursive half of [`skill_roots_from_extracted`]: visit `dir` (at
+/// repo-relative `rel`), record pruned skill roots into `out`.
+fn walk_skill_roots(dir: &Path, rel: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_dir() && path.join("SKILL.md").is_file() {
-            if let Some(name) = entry.file_name().to_str() {
-                out.push(name.to_string());
-            }
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if name.starts_with('.') {
+            continue; // dot-directories (.claude-plugin, .git, …) are never skills
+        }
+        let child_rel = rel.join(&name);
+        if path.join("SKILL.md").is_file() {
+            out.push(child_rel); // skill root — prune: don't descend into it
+        } else {
+            walk_skill_roots(&path, &child_rel, out);
         }
     }
-    out.sort();
-    out
 }
 
 /// Whether to download + apply: yes when there's no local SHA or it differs.
@@ -82,13 +108,27 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
 }
 
 /// Build the full new synced tier in `staging` from `repo_root`: copy each
-/// top-level skill dir, then record the SHA. Removals are inherent — only the
-/// repo's current skills end up in staging.
+/// discovered skill root (flattened by its directory name), then record the
+/// SHA. Removals are inherent — only the repo's current skills end up in
+/// staging. On a duplicate skill name the root earliest in path order wins;
+/// the rest are skipped with a warning (the sync itself never fails on this).
 fn rebuild_into(staging: &Path, repo_root: &Path, sha: &str) -> Result<()> {
     let _ = std::fs::remove_dir_all(staging);
     std::fs::create_dir_all(staging).map_err(msg("create staging"))?;
-    for name in skill_dirs_from_extracted(repo_root) {
-        copy_dir_all(&repo_root.join(&name), &staging.join(&name)).map_err(msg("copy skill"))?;
+    for rel in skill_roots_from_extracted(repo_root) {
+        let Some(name) = rel.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let dst = staging.join(name);
+        if dst.exists() {
+            tracing::warn!(
+                skill = name,
+                path = %rel.display(),
+                "duplicate skill name in repo; keeping the first in path order"
+            );
+            continue;
+        }
+        copy_dir_all(&repo_root.join(&rel), &dst).map_err(msg("copy skill"))?;
     }
     std::fs::write(staging.join(SHA_FILE), sha).map_err(msg("write sha"))?;
     Ok(())
@@ -277,6 +317,80 @@ mod tests {
         std::fs::write(d.join("SKILL.md"), body).expect("write SKILL.md");
     }
 
+    /// Write `body` at `rel` (creating parents) — for laying out nested repos.
+    fn write_file(root: &Path, rel: &str, body: &str) {
+        let path = root.join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("mk parents");
+        }
+        std::fs::write(path, body).expect("write file");
+    }
+
+    /// The delta spec's "discovery across layouts" example table, row by row:
+    /// flat skill found, plugin-layout skill found, nested SKILL.md pruned into
+    /// its parent, dot-directory ignored, repo-root SKILL.md ignored.
+    #[test]
+    fn skill_roots_pruned_recursive_discovery() {
+        let root = temp();
+        write_skill(&root, "a", "# A");
+        write_file(&root, "plugins/p1/skills/b/SKILL.md", "# B");
+        write_file(&root, "plugins/p1/skills/b/sub/SKILL.md", "# sub of B");
+        write_file(&root, ".claude-plugin/x/SKILL.md", "# hidden");
+        write_file(&root, "SKILL.md", "# root is never a skill");
+        std::fs::create_dir_all(root.join("plugins").join("p2")).expect("empty plugin");
+        assert_eq!(
+            skill_roots_from_extracted(&root),
+            vec![
+                PathBuf::from("a"),
+                PathBuf::from("plugins").join("p1").join("skills").join("b"),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Plugin-layout skills flatten into the tier by directory name, and a
+    /// nested sub-skill travels inside its parent at its original relative
+    /// path instead of being split out as its own skill.
+    #[test]
+    fn rebuild_flattens_plugin_layout_and_keeps_nested_subskill() {
+        let home = temp();
+        let repo = home.join("repo");
+        write_skill(&repo, "a", "# A");
+        write_file(&repo, "plugins/p1/skills/b/SKILL.md", "# B");
+        write_file(&repo, "plugins/p1/skills/b/sub/SKILL.md", "# sub of B");
+        let staging = home.join("stage");
+        rebuild_into(&staging, &repo, "sha1").expect("rebuild");
+        assert!(staging.join("a").join("SKILL.md").is_file());
+        assert!(staging.join("b").join("SKILL.md").is_file());
+        assert!(
+            staging.join("b").join("sub").join("SKILL.md").is_file(),
+            "nested sub-skill must ship inside its parent"
+        );
+        assert!(
+            !staging.join("sub").exists(),
+            "nested sub-skill must not be split into its own skill"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Two skill roots with the same directory name: the one earliest in
+    /// relative-path sort order wins, the sync does not fail.
+    #[test]
+    fn duplicate_skill_names_first_in_path_order_wins() {
+        let home = temp();
+        let repo = home.join("repo");
+        write_file(&repo, "plugins/p1/skills/dup/SKILL.md", "# from p1");
+        write_file(&repo, "plugins/p2/skills/dup/SKILL.md", "# from p2");
+        let staging = home.join("stage");
+        rebuild_into(&staging, &repo, "sha1").expect("rebuild");
+        assert_eq!(
+            std::fs::read_to_string(staging.join("dup").join("SKILL.md")).unwrap_or_default(),
+            "# from p1",
+            "earliest path order (p1 < p2) must win"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     #[test]
     fn should_sync_table() {
         assert!(should_sync("abc123", None)); // none → sync
@@ -284,8 +398,10 @@ mod tests {
         assert!(should_sync("def456", Some("abc123"))); // differ → sync
     }
 
+    /// Flat-layout regression: top-level skill dirs are found exactly as
+    /// before, and loose files at the root are not skills.
     #[test]
-    fn skill_dirs_only_top_level_with_skill_md() {
+    fn flat_layout_discovery_unchanged() {
         let root = temp();
         write_skill(&root, "a", "# A");
         write_skill(&root, "b", "# B");
@@ -293,8 +409,8 @@ mod tests {
         std::fs::write(root.join("loose.md"), "x").expect("loose file");
         std::fs::write(root.join("script.py"), "y").expect("loose file");
         assert_eq!(
-            skill_dirs_from_extracted(&root),
-            vec!["a".to_string(), "b".to_string()]
+            skill_roots_from_extracted(&root),
+            vec![PathBuf::from("a"), PathBuf::from("b")]
         );
         let _ = std::fs::remove_dir_all(&root);
     }
