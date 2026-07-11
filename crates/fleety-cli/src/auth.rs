@@ -140,10 +140,14 @@ fn bind_loopback(port: u16) -> Result<TcpListener> {
 /// Best-effort: open `url` in the platform browser. Failure is non-fatal — the
 /// URL was already printed for the user to open manually.
 fn open_browser(url: &str) {
+    // Windows: NOT `cmd /C start` — start runs through cmd's parser, and an
+    // unquoted URL (no spaces, so Command adds no quotes) is split at every `&`,
+    // executing the query parameters as commands and truncating the URL. The
+    // url.dll handler takes the URL as a plain argument, no shell involved.
     #[cfg(target_os = "windows")]
     let mut cmd = {
-        let mut c = std::process::Command::new("cmd");
-        c.args(["/C", "start", "", url]);
+        let mut c = std::process::Command::new("rundll32");
+        c.args(["url.dll,FileProtocolHandler", url]);
         c
     };
     #[cfg(target_os = "macos")]
