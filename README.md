@@ -58,8 +58,8 @@ Listens on `:8787`, persists state in the `fleety-data` volume, and operates on
 curl -fsSL https://raw.githubusercontent.com/TimLai666/fleety-agent/main/scripts/install-server.sh | sh
 ```
 
-It installs `fleety-server` onto your PATH and prints how to run it plus a
-ready-to-use systemd unit for autostart.
+It installs `fleety-server` onto your PATH and prints how to run it; register
+it as a boot service with `fleety-server up` (systemd --user / launchd / SCM).
 
 ## Workspace
 

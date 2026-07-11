@@ -122,25 +122,15 @@ install_ddgs() {
 install_ddgs || true
 
 echo
-echo "Run it (listens on FLEETY_ADDR, default 127.0.0.1:8787 — set 0.0.0.0:8787 to expose):"
-echo "  FLEETY_ADDR=0.0.0.0:8787 $BIN"
+echo "Run it in the foreground (listens on 0.0.0.0:8787 by default; auth is on and a"
+echo "fresh server prints a short-lived pairing code at startup):"
+echo "  $BIN"
 echo
-# Note: the unit lines are printed flush-left on purpose — indented content
-# would end up inside the .service file, and an indented EOF never terminates
-# the heredoc, so a copy-paste of an indented block would hang the shell.
-echo "Autostart with systemd (Linux), as the current user:"
-echo "  mkdir -p ~/.config/systemd/user"
-echo "  cat > ~/.config/systemd/user/fleety-server.service <<'EOF'"
-echo "[Unit]"
-echo "Description=Fleety Agent server"
-echo "[Service]"
-echo "ExecStart=$dir/$BIN"
-echo "Environment=FLEETY_ADDR=0.0.0.0:8787"
-echo "Restart=on-failure"
-echo "[Install]"
-echo "WantedBy=default.target"
-echo "EOF"
-echo "  systemctl --user daemon-reload && systemctl --user enable --now fleety-server"
+echo "Or register it as a boot service and start it now (systemd --user on Linux,"
+echo "launchd on macOS; one step = install + enable + start):"
+echo "  $BIN up"
+echo
+echo "Prefer loopback-only? Persist it first:  $BIN config set FLEETY_ADDR 127.0.0.1:8787"
 case ":$PATH:" in
   *":$dir:"*) ;;
   *) echo; echo "$BIN: add $dir to your PATH" ;;
