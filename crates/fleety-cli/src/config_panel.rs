@@ -8,8 +8,10 @@
 //!
 //! This is the minimal-viable panel (design Risks note): each region does a
 //! single-value edit; the Connection region also switches the current server.
-//! Full interactive provider/model editing in the Server region is a follow-up —
-//! use `fleety config provider|model …` for that meanwhile.
+//! Provider/model editing embedded in the Server region is a follow-up — use
+//! `fleety config provider edit` for the full interactive editor (it acts on
+//! the connected server's providers), or `fleety config provider|model …` for
+//! the subcommands.
 
 use std::collections::BTreeMap;
 
@@ -565,6 +567,7 @@ async fn apply_changes(
             target: ConfigTarget::Server,
             base_revision: base_revision.to_string(),
             changes,
+            providers_json: None,
         },
     )
     .await?;

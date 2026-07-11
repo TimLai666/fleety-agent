@@ -170,7 +170,13 @@ config model show [main|cheap]  |  config model unset main  |  config model list
 On a TTY, bare `fleety config` opens the interactive **three-region panel**
 (Connection / This device / Server) — the Server region edits providers/models
 and settings over the connection. `fleety config provider edit` (CLI only) opens
-the provider-only editor. Without a TTY, the subcommands above are used.
+the provider-only editor, and like the subcommands it acts on the **connected
+server's** providers by default (snapshot → edit → apply under an optimistic
+lock; a concurrent edit reloads instead of overwriting). Use
+`fleety config --target local provider edit` to edit this host's own file. A
+server older than config protocol 2 is refused up front (it would silently
+ignore the write-back) — update it first. Without a TTY, the subcommands above
+are used.
 
 #### Remote vs local (`--target`)
 

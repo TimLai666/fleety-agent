@@ -1489,20 +1489,28 @@ async fn serve(
                 target,
                 base_revision,
                 changes,
+                providers_json,
             } => {
                 let reply = match target {
                     fleety_protocol::ConfigTarget::Server => {
-                        let (reply, applied, sensitive) =
-                            apply_structured_changes(&base_revision, &changes, auth.required());
+                        let (reply, applied, sensitive, providers_changed) =
+                            apply_structured_changes(
+                                &base_revision,
+                                &changes,
+                                providers_json.as_deref(),
+                                auth.required(),
+                            );
                         // Audit a successful mutation (with any sensitive keys),
                         // like the ConfigExec path — the audit log is readable via
-                        // `fleety audit`, so record the keys, never their values.
-                        if applied > 0 {
+                        // `fleety audit`, so record the keys (plus whether the
+                        // provider config changed), never their values.
+                        if applied > 0 || providers_changed {
                             let event = agent_core::Event::ToolResult {
                                 id: "config_apply".to_string(),
                                 result: serde_json::json!({
                                     "applied": applied,
                                     "sensitive": sensitive,
+                                    "providers": providers_changed,
                                 }),
                             };
                             let _ = storage.append_history(device_id, &event);
@@ -1805,9 +1813,12 @@ fn boot_id() -> &'static str {
 /// The current config revision (config.toml content hash + boot id) for the
 /// `ConfigApply` optimistic lock.
 fn config_revision() -> String {
+    // Fingerprints BOTH remote-config surfaces: providers edits invalidate
+    // stale key snapshots and vice versa (one revision, no lost updates).
     format!(
-        "{}:{}",
+        "{}:{}:{}",
         fleety_tools::config::revision(&fleety_tools::config::config_path()),
+        fleety_tools::config::revision(&fleety_tools::providers_config::providers_path()),
         boot_id()
     )
 }
@@ -1887,8 +1898,9 @@ fn config_err(kind: &str, message: String, remediation: Option<String>) -> Serve
 fn apply_structured_changes(
     base_revision: &str,
     changes: &[fleety_protocol::ConfigChange],
+    providers_json: Option<&str>,
     require_auth: bool,
-) -> (ServerMsg, u32, Vec<String>) {
+) -> (ServerMsg, u32, Vec<String>, bool) {
     use fleety_protocol::ChangeOp;
     if base_revision != config_revision() {
         return (
@@ -1899,9 +1911,11 @@ fn apply_structured_changes(
             ),
             0,
             vec![],
+            false,
         );
     }
-    let mutates = changes.iter().any(|c| !matches!(c.op, ChangeOp::Keep));
+    let mutates =
+        providers_json.is_some() || changes.iter().any(|c| !matches!(c.op, ChangeOp::Keep));
     if mutates && !require_auth {
         return (
             config_err(
@@ -1913,6 +1927,7 @@ fn apply_structured_changes(
             ),
             0,
             vec![],
+            false,
         );
     }
     let path = fleety_tools::config::config_path();
@@ -1920,7 +1935,12 @@ fn apply_structured_changes(
         Ok(m) => m,
         Err(e) => {
             let r = e.report();
-            return (config_err(&r.kind, r.message, r.remediation), 0, vec![]);
+            return (
+                config_err(&r.kind, r.message, r.remediation),
+                0,
+                vec![],
+                false,
+            );
         }
     };
     let mut applied = 0u32;
@@ -1934,12 +1954,18 @@ fn apply_structured_changes(
                         config_err("invalid", format!("unknown setting '{}'", ch.key), None),
                         0,
                         vec![],
+                        false,
                     );
                 };
                 let v = ch.value.clone().unwrap_or_default();
                 if let Err(e) = fleety_tools::config::validate(setting, &v) {
                     let r = e.report();
-                    return (config_err(&r.kind, r.message, r.remediation), 0, vec![]);
+                    return (
+                        config_err(&r.kind, r.message, r.remediation),
+                        0,
+                        vec![],
+                        false,
+                    );
                 }
                 map.insert((setting.scope, ch.key.clone()), v);
                 if is_sensitive_key(&ch.key) {
@@ -1953,6 +1979,7 @@ fn apply_structured_changes(
                         config_err("invalid", format!("unknown setting '{}'", ch.key), None),
                         0,
                         vec![],
+                        false,
                     );
                 };
                 map.remove(&(setting.scope, ch.key.clone()));
@@ -1966,8 +1993,48 @@ fn apply_structured_changes(
     if applied > 0 {
         if let Err(e) = fleety_tools::config::save(&path, &map) {
             let r = e.report();
-            return (config_err(&r.kind, r.message, r.remediation), 0, vec![]);
+            return (
+                config_err(&r.kind, r.message, r.remediation),
+                0,
+                vec![],
+                false,
+            );
         }
+    }
+    // Full provider write-back (config protocol 2): parse, then validate +
+    // atomic write via the same path the local editor uses. Nothing lands on a
+    // parse or validation failure.
+    let mut providers_changed = false;
+    if let Some(json) = providers_json {
+        let cfg: fleety_tools::providers_config::ProvidersConfig = match serde_json::from_str(json)
+        {
+            Ok(c) => c,
+            Err(e) => {
+                return (
+                    config_err(
+                        "invalid",
+                        format!("malformed providers payload: {e}"),
+                        Some("re-open the provider editor and save again".to_string()),
+                    ),
+                    applied,
+                    sensitive,
+                    false,
+                )
+            }
+        };
+        if let Err(e) = fleety_tools::providers_config::write_providers(
+            &fleety_tools::providers_config::providers_path(),
+            &cfg,
+        ) {
+            let r = e.report();
+            return (
+                config_err(&r.kind, r.message, r.remediation),
+                applied,
+                sensitive,
+                false,
+            );
+        }
+        providers_changed = true;
     }
     (
         ServerMsg::ConfigResult {
@@ -1978,6 +2045,7 @@ fn apply_structured_changes(
         },
         applied,
         sensitive,
+        providers_changed,
     )
 }
 
@@ -3162,6 +3230,88 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn config_revision_covers_providers_and_apply_writes_them_back() {
+        // Redirect both config files to a temp home (process-global env: serial).
+        let dir = std::env::temp_dir().join(format!("fleety-provrev-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("mk");
+        let config_path = dir.join("config.toml");
+        let providers_path = dir.join("providers.toml");
+        std::env::set_var("FLEETY_CONFIG", &config_path);
+        std::env::set_var("FLEETY_PROVIDERS", &providers_path);
+
+        // A provider change alone bumps the revision (stale snapshots of either
+        // file are invalidated by edits to the other).
+        let r0 = config_revision();
+        std::fs::write(&providers_path, "x").expect("write");
+        let r1 = config_revision();
+        assert_ne!(r0, r1, "providers.toml content is part of the revision");
+        std::fs::remove_file(&providers_path).expect("rm");
+
+        // A full provider write-back through apply: valid config lands on disk.
+        let providers = r#"{
+            "providers": { "p1": { "type": "api", "base_url": "https://x/v1" } },
+            "models": {}
+        }"#;
+        let rev = config_revision();
+        let (reply, _applied, _sensitive, providers_changed) =
+            apply_structured_changes(&rev, &[], Some(providers), true);
+        match reply {
+            ServerMsg::ConfigResult { ok, error, .. } => {
+                assert!(ok, "valid providers write-back succeeds: {error:?}")
+            }
+            other => panic!("unexpected reply {other:?}"),
+        }
+        assert!(providers_changed);
+        assert!(providers_path.exists(), "providers.toml written");
+
+        // Malformed JSON is rejected without touching the file.
+        let before = std::fs::read_to_string(&providers_path).expect("read");
+        let rev = config_revision();
+        let (reply, _, _, changed) = apply_structured_changes(&rev, &[], Some("{not json"), true);
+        match reply {
+            ServerMsg::ConfigResult { ok, .. } => assert!(!ok),
+            other => panic!("unexpected reply {other:?}"),
+        }
+        assert!(!changed);
+        assert_eq!(
+            std::fs::read_to_string(&providers_path).expect("read"),
+            before,
+            "rejected payload leaves the file untouched"
+        );
+
+        // A stale revision (taken before a provider edit) conflicts and writes
+        // nothing.
+        let stale = config_revision();
+        std::fs::write(&providers_path, "# hand edit").expect("write");
+        let (reply, _, _, changed) = apply_structured_changes(&stale, &[], Some(providers), true);
+        match reply {
+            ServerMsg::ConfigResult { ok, error, .. } => {
+                assert!(!ok);
+                assert_eq!(error.expect("conflict").kind, "conflict");
+            }
+            other => panic!("unexpected reply {other:?}"),
+        }
+        assert!(!changed);
+
+        // Auth-off server refuses a providers write-back (it mutates).
+        let rev = config_revision();
+        let (reply, _, _, changed) = apply_structured_changes(&rev, &[], Some(providers), false);
+        match reply {
+            ServerMsg::ConfigResult { ok, error, .. } => {
+                assert!(!ok);
+                assert_eq!(error.expect("gate").kind, "unauthenticated");
+            }
+            other => panic!("unexpected reply {other:?}"),
+        }
+        assert!(!changed);
+
+        std::env::remove_var("FLEETY_CONFIG");
+        std::env::remove_var("FLEETY_PROVIDERS");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn credential_put_status_delete_lifecycle() {
         let dir = std::env::temp_dir().join(format!("fleety-cred-{}", uuid::Uuid::new_v4()));
         let path = dir.join("codex-oauth.json");
@@ -3560,9 +3710,10 @@ mod tests {
         };
 
         // Stale base_revision → conflict, nothing applied.
-        let (r, applied, _) = apply_structured_changes(
+        let (r, applied, _, _) = apply_structured_changes(
             "stale:rev",
             &[set("FLEETY_POLICY", "require_approval")],
+            None,
             true,
         );
         assert!(
@@ -3572,8 +3723,12 @@ mod tests {
 
         // Correct revision + auth on → the Set applies (validated, atomic save).
         let rev = config_revision();
-        let (r, applied, _) =
-            apply_structured_changes(&rev, &[set("FLEETY_POLICY", "require_approval")], true);
+        let (r, applied, _, _) = apply_structured_changes(
+            &rev,
+            &[set("FLEETY_POLICY", "require_approval")],
+            None,
+            true,
+        );
         assert!(matches!(r, ServerMsg::ConfigResult { ok: true, .. }));
         assert_eq!(applied, 1);
         assert_eq!(
@@ -3585,30 +3740,36 @@ mod tests {
         );
 
         // Auth off + a mutating change → refused (unauthenticated).
-        let (r, _, _) = apply_structured_changes(
+        let (r, _, _, _) = apply_structured_changes(
             &config_revision(),
             &[set("FLEETY_TZ", "Asia/Taipei")],
+            None,
             false,
         );
         assert!(
             matches!(&r, ServerMsg::ConfigResult { ok: false, error: Some(e), .. } if e.kind == "unauthenticated")
         );
         // Auth off + a Keep-only apply (no mutation) → allowed no-op.
-        let (r, applied, _) = apply_structured_changes(
+        let (r, applied, _, _) = apply_structured_changes(
             &config_revision(),
             &[ConfigChange {
                 key: "FLEETY_TZ".into(),
                 op: ChangeOp::Keep,
                 value: None,
             }],
+            None,
             false,
         );
         assert!(matches!(r, ServerMsg::ConfigResult { ok: true, .. }));
         assert_eq!(applied, 0);
 
         // A sensitive key is reported for auditing.
-        let (_, _, sensitive) =
-            apply_structured_changes(&config_revision(), &[set("FLEETY_MODEL_KEY", "sk-x")], true);
+        let (_, _, sensitive, _) = apply_structured_changes(
+            &config_revision(),
+            &[set("FLEETY_MODEL_KEY", "sk-x")],
+            None,
+            true,
+        );
         assert_eq!(sensitive, vec!["FLEETY_MODEL_KEY".to_string()]);
 
         std::env::remove_var("FLEETY_CONFIG");

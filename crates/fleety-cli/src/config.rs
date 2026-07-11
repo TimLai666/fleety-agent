@@ -11,7 +11,7 @@ use std::io::IsTerminal;
 use std::path::Path;
 
 use agent_core::{CoreError, Result};
-use fleety_protocol::ConfigTarget;
+use fleety_protocol::{ClientMsg, ConfigTarget, ServerMsg};
 use fleety_tools::config::{self, ConfigMap, Source};
 
 /// Split a leading-or-embedded `--target <server|local|<device-id>>` out of the
@@ -39,17 +39,160 @@ pub fn split_target(args: &[String]) -> (ConfigTarget, Vec<String>) {
     (target, rest)
 }
 
-/// Whether `args` is an interactive edit (`edit` / `provider edit`), which is
-/// always local + TTY (remote interactive editing is a follow-up).
+/// Whether `args` is an interactive edit (`edit` / `provider edit`). The plain
+/// settings editor is always local; `provider edit` is local only under an
+/// explicit `--target local` (the default target edits the connected server —
+/// see [`is_remote_provider_edit`]).
 pub fn is_interactive_edit(args: &[String]) -> bool {
-    matches!(args.first().map(String::as_str), Some("edit"))
-        || matches!(
-            (
-                args.first().map(String::as_str),
-                args.get(1).map(String::as_str)
-            ),
-            (Some("provider"), Some("edit"))
+    matches!(args.first().map(String::as_str), Some("edit")) || is_provider_edit(args)
+}
+
+/// Whether `args` is exactly the interactive provider editor invocation.
+fn is_provider_edit(args: &[String]) -> bool {
+    matches!(
+        (
+            args.first().map(String::as_str),
+            args.get(1).map(String::as_str)
+        ),
+        (Some("provider"), Some("edit"))
+    )
+}
+
+/// Pure routing: `provider edit` with the default (server) target belongs to
+/// the remote flow — the providers file it edits lives on the server. An
+/// explicit `--target local` keeps the local-file editor.
+pub fn is_remote_provider_edit(args: &[String], target: &ConfigTarget) -> bool {
+    is_provider_edit(args) && matches!(target, ConfigTarget::Server)
+}
+
+/// The version gate for remote provider editing: the full-config write-back
+/// rides `ConfigApply.providers_json`, which servers before config protocol 2
+/// silently ignore — refuse up front rather than losing the edit.
+fn provider_edit_support_err(config_protocol: u32) -> Option<CoreError> {
+    (config_protocol < 2).then(|| {
+        CoreError::Message(
+            "the connected server is too old for remote provider editing — update it first \
+             (run `fleety update` on the server host), or edit this host's own file with \
+             `fleety config --target local provider edit`"
+                .to_string(),
         )
+    })
+}
+
+/// Interactive provider editing against the connected server: snapshot the
+/// server's providers, edit them in memory, and apply the result under the
+/// snapshot's optimistic-lock revision. A concurrent-edit conflict closes the
+/// editor and reloads from a fresh snapshot instead of overwriting.
+pub async fn provider_edit_remote() -> Result<()> {
+    loop {
+        let (mut tx, mut rx, config_protocol, _target) =
+            crate::connect_hello_for_auth().await.map_err(|e| {
+                CoreError::Message(format!(
+                    "could not reach the server whose providers this would edit: {} — pair this \
+                     device first (`fleety pair <code>`), set the server URL with `fleety init \
+                     <ws-url>`, or edit this host's own file with `fleety config --target local \
+                     provider edit`",
+                    e.report().message
+                ))
+            })?;
+        if let Some(err) = provider_edit_support_err(config_protocol) {
+            return Err(err);
+        }
+        crate::send(
+            &mut tx,
+            &ClientMsg::ConfigSnapshot {
+                target: ConfigTarget::Server,
+            },
+        )
+        .await?;
+        let (mut revision, providers_json) = match crate::recv(&mut rx).await? {
+            Some(ServerMsg::ConfigSnapshotResult {
+                revision,
+                providers_json,
+                ..
+            }) => (revision, providers_json),
+            Some(ServerMsg::ConfigResult { error: Some(e), .. }) => {
+                return Err(CoreError::Message(match e.remediation {
+                    Some(r) => format!("{} — {r}", e.message),
+                    None => e.message,
+                }))
+            }
+            other => {
+                return Err(CoreError::Provider(format!(
+                    "expected a config snapshot, got {other:?}"
+                )))
+            }
+        };
+        let cfg: fleety_tools::providers_config::ProvidersConfig =
+            serde_json::from_str(&providers_json).map_err(|e| {
+                CoreError::Message(format!(
+                    "the server returned an unreadable provider snapshot: {e}"
+                ))
+            })?;
+
+        // The editor loop is synchronous (crossterm events); each save runs the
+        // async apply on the runtime from inside it.
+        let handle = tokio::runtime::Handle::current();
+        let conflict = tokio::task::block_in_place(|| {
+            crate::provider_tui::run_with_saver(cfg, |edited| {
+                let json = serde_json::to_string(edited)
+                    .map_err(|e| CoreError::Message(format!("serialize providers: {e}")))?;
+                handle.block_on(async {
+                    crate::send(
+                        &mut tx,
+                        &ClientMsg::ConfigApply {
+                            target: ConfigTarget::Server,
+                            base_revision: revision.clone(),
+                            changes: vec![],
+                            providers_json: Some(json),
+                        },
+                    )
+                    .await?;
+                    match crate::recv(&mut rx).await? {
+                        Some(ServerMsg::ConfigResult { ok: true, .. }) => {
+                            // Our own write moved the server's revision; refresh
+                            // it so the next save in this session doesn't
+                            // conflict with our own edit.
+                            crate::send(
+                                &mut tx,
+                                &ClientMsg::ConfigSnapshot {
+                                    target: ConfigTarget::Server,
+                                },
+                            )
+                            .await?;
+                            if let Some(ServerMsg::ConfigSnapshotResult { revision: r, .. }) =
+                                crate::recv(&mut rx).await?
+                            {
+                                revision = r;
+                            }
+                            Ok(crate::provider_tui::SaveOutcome::Saved)
+                        }
+                        Some(ServerMsg::ConfigResult { error: Some(e), .. })
+                            if e.kind == "conflict" =>
+                        {
+                            Ok(crate::provider_tui::SaveOutcome::Conflict(e.message))
+                        }
+                        Some(ServerMsg::ConfigResult { error: Some(e), .. }) => {
+                            Err(CoreError::Message(match e.remediation {
+                                Some(r) => format!("{} — {r}", e.message),
+                                None => e.message,
+                            }))
+                        }
+                        other => Err(CoreError::Provider(format!(
+                            "expected a config result, got {other:?}"
+                        ))),
+                    }
+                })
+            })
+        })?;
+        match conflict {
+            None => return Ok(()),
+            Some(msg) => {
+                println!("{msg} — reloading the current server configuration…");
+                continue;
+            }
+        }
+    }
 }
 use ratatui::crossterm::event::KeyCode;
 use ratatui::layout::{Constraint, Direction, Layout};
@@ -327,6 +470,42 @@ mod tests {
         assert!(is_interactive_edit(&s(&["edit"])));
         assert!(is_interactive_edit(&s(&["provider", "edit"])));
         assert!(!is_interactive_edit(&s(&["list"])));
+    }
+
+    #[test]
+    fn provider_edit_routes_by_target_and_gates_by_version() {
+        let s = |a: &[&str]| a.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // Default (server) target → the remote flow; explicit local keeps the
+        // local file editor; other subcommands never route here.
+        assert!(is_remote_provider_edit(
+            &s(&["provider", "edit"]),
+            &ConfigTarget::Server
+        ));
+        assert!(!is_remote_provider_edit(
+            &s(&["provider", "edit"]),
+            &ConfigTarget::Local
+        ));
+        assert!(!is_remote_provider_edit(
+            &s(&["provider", "list"]),
+            &ConfigTarget::Server
+        ));
+
+        // Version gate: pre-credential-era servers silently drop the write-back
+        // field, so the editor must not open against them.
+        let msg = provider_edit_support_err(1)
+            .expect("old server refused")
+            .to_string();
+        assert!(msg.contains("update"), "gate names the remedy: {msg}");
+        assert!(
+            msg.contains("--target local"),
+            "gate offers the local escape hatch: {msg}"
+        );
+        assert!(provider_edit_support_err(0).is_some());
+        assert!(provider_edit_support_err(2).is_none());
+        assert!(
+            provider_edit_support_err(3).is_none(),
+            "future versions pass"
+        );
     }
 
     #[test]

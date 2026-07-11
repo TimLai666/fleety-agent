@@ -99,10 +99,19 @@ impl ProviderEditor {
         Ok(())
     }
 
-    /// Validate and write atomically (delegates to the shared writer).
-    pub fn save(&self, path: &Path) -> Result<()> {
-        pc::write_providers(path, &self.cfg)
+    /// The current edited configuration (for savers that ship it elsewhere,
+    /// e.g. the remote apply).
+    pub fn config(&self) -> &ProvidersConfig {
+        &self.cfg
     }
+}
+
+/// What a save attempt did. The remote saver reports a concurrent-edit
+/// conflict as data (not an error) so the editor can exit and the caller
+/// reload from a fresh snapshot instead of overwriting.
+pub enum SaveOutcome {
+    Saved,
+    Conflict(String),
 }
 
 /// Parse a strategy word (shared shape with the subcommands).
@@ -362,11 +371,27 @@ fn render(f: &mut Frame, app: &App) {
     }
 }
 
-/// Open the interactive providers editor over `path`.
+/// Open the interactive providers editor over `path` (this host's own file).
 pub fn run(path: &Path) -> Result<()> {
-    use ratatui::crossterm::event::{self, Event, KeyEventKind};
     let cfg = pc::load_or_default(path)?;
+    run_with_saver(cfg, |edited| {
+        pc::write_providers(path, edited).map(|()| SaveOutcome::Saved)
+    })
+    .map(|_| ())
+}
+
+/// Open the interactive providers editor over an in-memory configuration; every
+/// save goes through `save` (local file write or remote apply — the editor does
+/// not care). Returns the conflict message when the editor exited because a
+/// save hit a concurrent-edit conflict (the caller reloads and reopens), `None`
+/// on a normal quit.
+pub fn run_with_saver(
+    cfg: ProvidersConfig,
+    mut save: impl FnMut(&ProvidersConfig) -> Result<SaveOutcome>,
+) -> Result<Option<String>> {
+    use ratatui::crossterm::event::{self, Event, KeyEventKind};
     let mut app = App::new(cfg);
+    let mut conflict: Option<String> = None;
     let mut terminal = ratatui::init();
     let result = (|| -> Result<()> {
         loop {
@@ -383,10 +408,16 @@ pub fn run(path: &Path) -> Result<()> {
                     on_key(&mut app, k.code);
                     if app.save_now {
                         app.save_now = false;
-                        app.status = match app.ed.save(path) {
-                            Ok(()) => "saved".to_string(),
-                            Err(e) => format!("save failed: {e}"),
-                        };
+                        match save(app.ed.config()) {
+                            Ok(SaveOutcome::Saved) => app.status = "saved".to_string(),
+                            Ok(SaveOutcome::Conflict(msg)) => {
+                                // Someone else changed the target while editing:
+                                // never overwrite — leave, let the caller reload.
+                                conflict = Some(msg);
+                                app.quit = true;
+                            }
+                            Err(e) => app.status = format!("save failed: {e}"),
+                        }
                     }
                 }
             }
@@ -394,7 +425,7 @@ pub fn run(path: &Path) -> Result<()> {
         Ok(())
     })();
     ratatui::restore();
-    result
+    result.map(|()| conflict)
 }
 
 #[cfg(test)]
@@ -462,7 +493,7 @@ mod tests {
             Strategy::RoundRobin,
         );
         let path = std::env::temp_dir().join(format!("fleety-tui-{}.toml", uuid::Uuid::new_v4()));
-        ed.save(&path).expect("save");
+        pc::write_providers(&path, ed.config()).expect("save");
         let back = pc::load_from(&path).expect("re-read");
         assert_eq!(back.model("main").unwrap().members.len(), 2);
         assert_eq!(back.model("main").unwrap().strategy, Strategy::RoundRobin);
@@ -479,7 +510,7 @@ mod tests {
             Strategy::Single,
         );
         let path = std::env::temp_dir().join(format!("fleety-tui-{}.toml", uuid::Uuid::new_v4()));
-        assert!(ed.save(&path).is_err());
+        assert!(pc::write_providers(&path, ed.config()).is_err());
         assert!(!path.exists());
     }
 

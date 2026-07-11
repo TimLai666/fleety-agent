@@ -270,11 +270,17 @@ pub enum ClientMsg {
     /// Apply a sparse set of config changes under optimistic locking:
     /// `base_revision` is the revision of the snapshot the edit started from; the
     /// server rejects the apply as a conflict if it no longer matches (no lost
-    /// update). Reply: `ConfigResult`.
+    /// update). `providers_json`, when present, additionally writes back the full
+    /// structured provider config (the same shape `ConfigSnapshotResult` returns)
+    /// under the same revision lock — part of the config protocol 2 capability
+    /// set; older servers ignore unknown fields, so clients must gate on the
+    /// advertised version before sending it. Reply: `ConfigResult`.
     ConfigApply {
         target: ConfigTarget,
         base_revision: String,
         changes: Vec<ConfigChange>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        providers_json: Option<String>,
     },
     /// Store a credential in the connected server's credential store. `kind`
     /// discriminates the credential (first kind: `codex-oauth`, whose
@@ -555,11 +561,40 @@ mod tests {
                     value: None,
                 },
             ],
+            providers_json: None,
         };
         assert_eq!(
             serde_json::from_str::<ClientMsg>(&serde_json::to_string(&apply).expect("ser"))
                 .expect("de"),
             apply
+        );
+        // Key-only applies omit providers_json entirely on the wire, and an old
+        // client's frame (predating the field) parses to None.
+        match &apply {
+            ClientMsg::ConfigApply { providers_json, .. } => assert!(providers_json.is_none()),
+            _ => unreachable!(),
+        }
+        let apply_json = serde_json::to_string(&apply).expect("ser");
+        assert!(!apply_json.contains("providers_json"));
+        let old = r#"{"type":"config_apply","target":"server","base_revision":"r","changes":[]}"#;
+        match serde_json::from_str::<ClientMsg>(old).expect("de old") {
+            ClientMsg::ConfigApply { providers_json, .. } => assert!(providers_json.is_none()),
+            _ => panic!("not a config apply"),
+        }
+
+        // A full provider write-back rides the same frame (config protocol 2).
+        let apply_providers = ClientMsg::ConfigApply {
+            target: ConfigTarget::Server,
+            base_revision: "rev-1".into(),
+            changes: vec![],
+            providers_json: Some(r#"{"providers":{}}"#.into()),
+        };
+        assert_eq!(
+            serde_json::from_str::<ClientMsg>(
+                &serde_json::to_string(&apply_providers).expect("ser")
+            )
+            .expect("de"),
+            apply_providers
         );
 
         let result = ServerMsg::ConfigSnapshotResult {

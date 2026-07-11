@@ -238,8 +238,14 @@ async fn main() -> std::process::ExitCode {
             let (target, rest) = config::split_target(&args[2..]);
             // Bare `fleety config` on a TTY → the three-region interactive panel
             // (connection / this device / server); no `--target` needed.
-            let res = if rest.is_empty() && std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+            let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
+            let res = if rest.is_empty() && is_tty {
                 config_panel::run().await
+            } else if config::is_remote_provider_edit(&rest, &target) && is_tty {
+                // Default-target provider editing acts on the CONNECTED SERVER's
+                // providers (snapshot → edit → apply); `--target local` below
+                // keeps this host's own file.
+                config::provider_edit_remote().await
             } else if config::is_interactive_edit(&rest) || matches!(target, ConfigTarget::Local) {
                 config::run(&rest)
             } else {
