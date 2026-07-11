@@ -36,7 +36,7 @@ server keeps the fallback root and records the originating device on the binding
 
 | `FLEETY_FS_SCOPE` | (unset → `full`) | `full` (default): the structured file tools may read/write anywhere on the device (absolute paths allowed; still audited + rollback-backed; a sensitive-path guard refuses SSH keys/`/etc/shadow`/`/dev`/Windows system dirs/etc.). `workspace`: re-confine every path to the workspace/device root (`..`/absolute/symlink-tight sandbox). Set on `fleetyd` too for its `FLEETY_DEVICE_ROOT`. |
 | `FLEETY_POLICY` | `full_access` | `require_approval` gates every non-read tool through the approval flow. Limitation: under `require_approval` the server does not read frames mid-turn (the approval gate owns the inbound stream), so a `CancelTurn` sent during a gated turn has no effect — cancel works under the default full-access policy. |
-| `FLEETY_REQUIRE_AUTH` | `0` | Set to `1` to require a valid token / pairing code on every `Hello`. |
+| `FLEETY_REQUIRE_AUTH` | `1` | Require a valid token / pairing code on every `Hello`. **On by default** — set `0` to disable. A fresh auth-required server (no `FLEETY_TOKEN`, no paired device) prints a short-lived first-run pairing code at startup. |
 | `FLEETY_TOKEN` | (unset) | Bootstrap admin token. Use it once to pair the first device. |
 | `FLEETY_SCHED_TICK` | `60` | Seconds between scheduler fire-loop ticks. |
 | `FLEETY_SYSTEM_PROMPT` | (unset → full) | `minimal` drops the embedded behavioural docs (protocol/rules/memory/policy) from the system message, leaving only core memory (ME/USER/TODO) — for token-lean / debugging runs. |
@@ -102,75 +102,75 @@ alongside) the env vars above.
 |---|---|---|
 | `FLEETY_PROVIDERS` | `~/.fleety/providers.toml` | Path to the named-provider file. |
 
-**Fallback:** when the file is absent, empty, or unparseable, the server falls
-back to the env vars above (building providers named `main` and `cheap`), so the
-zero-config behavior is unchanged. A broken file is ignored with a warning, not
-a crash.
+**Bootstrap seed + hard error:** with no structured providers/models defined,
+the flat `FLEETY_MODEL_*` / `FLEETY_CHEAP_MODEL_*` env above auto-forms the `main`
+(and `cheap`) role — so a three-line-env deployment still runs. A `providers.toml`
+that is **present but broken or referentially incomplete** makes the server
+**refuse to boot** with a clear error (rather than silently degrading to the echo
+stub); the echo stub survives only as the placeholder when nothing at all is
+configured.
 
-Each `[[provider]]` has the same fields as the env path. A `[[group]]` pools
-several providers under one name with a dispatch `strategy`:
+Two tiers:
 
-- `round_robin` — advance the starting member each call, spreading quota across
-  accounts.
-- `failover` — always start at the first member, advancing only on failure
-  (primary + backups).
-
-On **any** member error (after that member's own retries — see
-`FLEETY_MODEL_RETRIES`), the pool tries the next member, returning an error only
-once all members fail. The `[roles]` table maps a role or subagent tier name
-(`main`, `cheap`, or any custom name) to a provider **or** group name; an unknown
-selector falls back to `main`.
+- **Providers** are endpoints/accounts, tagged by `type` (an extensible registry):
+  `type = "api"` carries a `base_url` and optional `key`; `type = "oauth:codex"`
+  sources a per-provider OAuth token from `fleety auth login` and carries no
+  `base_url`/`key`.
+- **Model roles** are `main` and `cheap`; each is a pool with a `strategy`
+  (`single` / `round_robin` / `failover`) and a list of `members`, where a member
+  names a provider plus the `model` and its call-time traits (`stream` /
+  `modalities` / `effort`). One provider can serve different models to different
+  roles. `round_robin` spreads load across members; `failover` starts at the
+  first and advances only on error (after each member's own retries — see
+  `FLEETY_MODEL_RETRIES`); an unknown selector falls back to `main`. A mixed pool
+  reports the **union** of its members' modality capabilities, and each member
+  degrades an unsupported attachment in its own call.
 
 ```toml
-[[provider]]
-name = "codex-1"
+[providers.openai1]
+type = "api"
 base_url = "https://api.openai.com/v1"
-model = "gpt-5"
 key = "sk-aaa"
-stream = true            # optional (default false)
-modalities = "text,image" # optional (default: model-name heuristic)
-effort = "medium"         # optional (default: none)
 
-[[provider]]
-name = "codex-2"
-base_url = "https://api.openai.com/v1"
-model = "gpt-5"
-key = "sk-bbb"
+[providers.codex1]
+type = "oauth:codex"        # token from `fleety auth login codex1`; no base_url/key
 
-[[group]]
-name = "codex"
-members = ["codex-1", "codex-2"]
-strategy = "round_robin"   # or "failover"
+[models.main]
+strategy = "failover"
+members = [
+  { provider = "openai1", model = "gpt-4o", stream = true, modalities = "text,image", effort = "medium" },
+  { provider = "codex1", model = "gpt-5" },
+]
 
-[roles]
-main = "codex"            # the main turn uses the pooled group
-cheap = "codex-1"         # subagents' cheap tier uses one account
+[models.cheap]
+strategy = "single"
+members = [ { provider = "openai1", model = "gpt-4o-mini" } ]   # one provider, a different model
 ```
 
 #### Managing it with `config` (no hand-editing required)
 
 `providers.toml` can be edited with `config` subcommands instead of by hand —
 available on all three binaries (`fleety`, `fleety-server`, `fleetyd`). Each
-change is validated (unique names, group members and role targets must exist)
-and written atomically; an invalid change is rejected with a message and nothing
-is written. Provider keys are masked in `list`.
+change is validated (every member's provider must be defined; `single` needs
+exactly one member; a provider a role member references can't be removed) and
+written atomically; an invalid change is rejected with a message and nothing is
+written. Provider keys are masked in `list`.
 
 ```
-config provider add codex-1 --base-url https://api.openai.com/v1 --model gpt-5 --key sk-aaa [--stream] [--modalities text,image] [--effort medium]
-config provider set codex-1 --model gpt-5.1        # change only the given fields
-config provider remove codex-1                     # blocked if a group/role still references it
-config provider list                               # keys masked
-config group set codex --members codex-1,codex-2 --strategy round_robin   # or failover
-config group remove codex
-config group list
-config role set main codex                         # bind main → the codex group
-config role unset main
-config role list
+config provider add openai1 --type api --base-url https://api.openai.com/v1 --key sk-aaa
+config provider add codex1 --type oauth:codex          # then: fleety auth login codex1
+config provider set openai1 --base-url https://…       # change only the given fields
+config provider remove openai1                         # blocked if a model role references it
+config provider list                                   # by type; keys masked
+config model set main --member openai1/gpt-4o --member codex1/gpt-5 --strategy failover
+config model set cheap --member openai1/gpt-4o-mini    # one member → strategy defaults to single
+config model show [main|cheap]  |  config model unset main  |  config model list
 ```
 
-On a TTY, `config provider edit` (CLI only) opens an interactive screen to list
-and edit providers, groups, and roles; it saves through the same validation and
-atomic write. Without a TTY it falls back to the subcommands above.
+On a TTY, bare `fleety config` opens the interactive **three-region panel**
+(Connection / This device / Server) — the Server region edits providers/models
+and settings over the connection. `fleety config provider edit` (CLI only) opens
+the provider-only editor. Without a TTY, the subcommands above are used.
 
 #### Remote vs local (`--target`)
 
@@ -179,11 +179,13 @@ authenticated connection — no shell access to the server host needed). Pick th
 host with `--target`:
 
 - `--target server` (default) — the connected server. The result reports when the
-  change takes effect: a provider-pool change (`provider`/`group`/`role`) on the
-  next connection; a flat `set`/`unset` after a server restart (flat settings are
-  env-seeded at boot, and the environment takes precedence).
-- `--target local` — this CLI host's own `~/.fleety` files (no connection; the
-  pre-existing behavior).
+  change takes effect: a provider/model change on the next connection; a flat
+  `set`/`unset` after a server restart (flat settings are env-seeded at boot, and
+  the environment takes precedence). A mutating change is **refused when the
+  server runs with auth disabled** (enable auth first).
+- `--target local` — this CLI host's own `~/.fleety` files (no connection), scoped
+  to **this device's own settings** (Cli/Shared). A Server-scoped key is redirected
+  to the server (edit it via the default `fleety config`).
 - `--target <device-id>` — a follow-up; the server reports it as not-yet-supported.
   Configure a device on its own host with `fleetyd config` for now.
 
@@ -211,9 +213,9 @@ The defaults work out of the box; override only for a non-default install.
 | `FLEETY_CODEX_ORIGINATOR` | `codex_cli_rs` | Originator sent on the Responses call (`fleety` is used on the authorize request). |
 | `FLEETY_CODEX_TOKENS` | `~/.fleety/codex-oauth.json` | Override the token-store path (tests / non-default installs). |
 | `FLEETY_CODEX_AUDIT` | `~/.fleety/` (auth audit file) | Override the auth-audit log path (login/logout events, never token values). |
-| `FLEETY_MODEL_AUTH` / `FLEETY_CHEAP_MODEL_AUTH` | unset | Env twin of the `providers.toml` `auth` field: set `oauth:codex` to route the main / economy tier through the Codex Responses backend without a providers.toml. |
+| `FLEETY_MODEL_AUTH` / `FLEETY_CHEAP_MODEL_AUTH` | unset | Bootstrap-seed twin of a provider's `type`: set `oauth:codex` to route the env-seeded main / economy tier through the Codex Responses backend without a providers.toml. |
 
-Setting a provider to `auth = "oauth:codex"` builds a **Codex Responses provider**:
+Setting a provider's `type = "oauth:codex"` builds a **Codex Responses provider**:
 it calls `<FLEETY_CODEX_BACKEND_URL>/responses` (the OpenAI Responses API, not
 `/chat/completions`) with the account's OAuth bearer, the `chatgpt-account-id`
 header (decoded from the login `id_token`), and the Codex beta/originator/session
@@ -304,11 +306,34 @@ last fallback when no URL is configured.
 
 | Var | Default | Meaning |
 |---|---|---|
-| `FLEETY_AGENT_URL` | mDNS → `ws://127.0.0.1:8787` | Server WebSocket URL. Tries mDNS (2 s) before falling back to localhost. |
+| `FLEETY_AGENT_URL` | (see Connection profiles) | **Transient** override of the server URL (never written to a file). The persistent connection target lives in `~/.fleety/connections.toml`, managed by `fleety server …` — see **Connection profiles** below. |
 | `FLEETY_DEVICE_ID` | OS machine id → hostname | Override for this device's id (path-safe; no slashes / `:`). See **Device identity** below. |
 | `FLEETY_DEVICE_ROOT` | cwd | Filesystem root the on-device tools operate within. |
-| `FLEETY_TOKEN` | (unset, then `~/.fleety/fleetyd.token`) | Auth token. fleetyd persists a freshly-paired one to `~/.fleety/fleetyd.token`; this env var overrides. |
+| `FLEETY_TOKEN` | (unset → current profile's token) | Auth-token override. A freshly-paired token is persisted to the **current profile** in `~/.fleety/connections.toml` (migrated from the old `fleetyd.token`); this env var overrides it. |
 | `FLEETY_PAIRING_CODE` | (unset) | Pass once to enroll a new device; server mints a token in `Welcome`, fleetyd writes it to disk. |
+
+## Connection profiles (`connections.toml`)
+
+Which server this device connects to (and its token) lives in
+`~/.fleety/connections.toml` — shared by `fleety` and `fleetyd` on the same host,
+so the CLI (the window) and the daemon (the hand) target the same server. Manage
+it with `fleety server`:
+
+```
+fleety server add home ws://192.168.1.10:8787 --use   # add a profile + switch to it
+fleety server use home           # switch the current server (CLI + this host's daemon)
+fleety server list | show | current | rename | remove | set-url
+fleety init <ws-url>             # sugar for `server add … --use` + enroll
+fleety pair <code>               # enroll; the minted token is written to the current profile
+fleety -s <name> <cmd> | --url <ws> <cmd>   # one-shot override; doesn't change current
+```
+
+Resolution precedence: a one-shot `-s`/`--url` → the `FLEETY_AGENT_URL` env
+(transient) → the current profile's URL + token → mDNS (only until enrolled;
+sticky + fingerprint-guarded afterward) → `ws://127.0.0.1:8787`. `FLEETY_AGENT_URL`
+is **no longer a `config` key** — the connection target is managed here, not in
+`config.toml`. A legacy `config.json` / `fleetyd.token` is migrated once into
+`connections.toml` on first run (device_id preserved). The file is `0600`.
 
 ## Transport (WebSocket + SSE fallback)
 
