@@ -99,7 +99,9 @@ pub struct Provider {
 impl Provider {
     /// Whether this provider's bearer comes from an OAuth login (per its type).
     pub fn is_oauth(&self) -> bool {
-        provider_type(&self.kind).map(|t| t.is_oauth).unwrap_or(false)
+        provider_type(&self.kind)
+            .map(|t| t.is_oauth)
+            .unwrap_or(false)
     }
 }
 
@@ -238,7 +240,11 @@ pub fn validate(cfg: &ProvidersConfig) -> Result<()> {
                 known_types_list()
             )));
         };
-        let has_base = p.base_url.as_deref().map(|s| !s.is_empty()).unwrap_or(false);
+        let has_base = p
+            .base_url
+            .as_deref()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false);
         if t.requires_base_url && !has_base {
             return Err(CoreError::Message(format!(
                 "provider '{name}' (type {}) requires a base_url",
@@ -323,8 +329,8 @@ pub fn migrate_providers(text: &str) -> Result<Option<(ProvidersConfig, Vec<Stri
     let raw: toml::Value = text
         .parse()
         .map_err(|e| CoreError::Message(format!("invalid providers.toml: {e}")))?;
-    let has_new = raw.get("models").is_some()
-        || raw.get("providers").and_then(|v| v.as_table()).is_some();
+    let has_new =
+        raw.get("models").is_some() || raw.get("providers").and_then(|v| v.as_table()).is_some();
     let has_old = raw.get("provider").and_then(|v| v.as_array()).is_some()
         || raw.get("group").is_some()
         || raw.get("roles").is_some();
@@ -510,7 +516,10 @@ mod tests {
         let text = "[providers.x]\ntype = \"oauth:mystery\"\n";
         let err = parse(text).unwrap_err().to_string();
         assert!(err.contains("unknown type 'oauth:mystery'"), "got: {err}");
-        assert!(err.contains("api") && err.contains("oauth:codex"), "lists known: {err}");
+        assert!(
+            err.contains("api") && err.contains("oauth:codex"),
+            "lists known: {err}"
+        );
     }
 
     // ---- task 1.2: validate (referential integrity, field rules) ----
@@ -535,8 +544,14 @@ mod tests {
 
     fn cfg_with(providers: &[(&str, Provider)], models: &[(&str, ModelPool)]) -> ProvidersConfig {
         ProvidersConfig {
-            providers: providers.iter().map(|(n, p)| (n.to_string(), p.clone())).collect(),
-            models: models.iter().map(|(n, m)| (n.to_string(), m.clone())).collect(),
+            providers: providers
+                .iter()
+                .map(|(n, p)| (n.to_string(), p.clone()))
+                .collect(),
+            models: models
+                .iter()
+                .map(|(n, m)| (n.to_string(), m.clone()))
+                .collect(),
         }
     }
 
@@ -568,7 +583,10 @@ mod tests {
                 },
             )],
         );
-        assert!(validate(&cfg).unwrap_err().to_string().contains("exactly one"));
+        assert!(validate(&cfg)
+            .unwrap_err()
+            .to_string()
+            .contains("exactly one"));
     }
 
     #[test]
@@ -577,7 +595,10 @@ mod tests {
         let mut bad_api = api("");
         bad_api.base_url = None;
         let cfg = cfg_with(&[("p", bad_api)], &[]);
-        assert!(validate(&cfg).unwrap_err().to_string().contains("requires a base_url"));
+        assert!(validate(&cfg)
+            .unwrap_err()
+            .to_string()
+            .contains("requires a base_url"));
         // oauth carrying base_url/key.
         let bad_oauth = Provider {
             kind: "oauth:codex".to_string(),
@@ -585,7 +606,10 @@ mod tests {
             key: None,
         };
         let cfg = cfg_with(&[("c", bad_oauth)], &[]);
-        assert!(validate(&cfg).unwrap_err().to_string().contains("must not set base_url"));
+        assert!(validate(&cfg)
+            .unwrap_err()
+            .to_string()
+            .contains("must not set base_url"));
     }
 
     #[test]
@@ -613,7 +637,10 @@ mod tests {
                 "main",
                 ModelPool {
                     strategy: Strategy::Failover,
-                    members: vec![member("openai1", "gpt-4o"), member("openai1", "gpt-4o-mini")],
+                    members: vec![
+                        member("openai1", "gpt-4o"),
+                        member("openai1", "gpt-4o-mini"),
+                    ],
                 },
             )],
         );
@@ -658,7 +685,12 @@ mod tests {
         "#;
         let (cfg, warnings) = migrate_providers(legacy).expect("migrate").expect("is old");
         // Same endpoint+key → deduped to ONE provider.
-        assert_eq!(cfg.providers.len(), 1, "deduped: {:?}", cfg.providers.keys().collect::<Vec<_>>());
+        assert_eq!(
+            cfg.providers.len(),
+            1,
+            "deduped: {:?}",
+            cfg.providers.keys().collect::<Vec<_>>()
+        );
         let pname = cfg.providers.keys().next().unwrap().clone();
         // main = round_robin pool of both models, both referencing the one provider.
         let main = cfg.model("main").expect("main role");

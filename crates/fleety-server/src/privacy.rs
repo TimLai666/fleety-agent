@@ -432,7 +432,8 @@ mod tests {
 
     #[tokio::test]
     async fn revoke_access_tool_removes_and_guards_guest() {
-        let home = std::env::temp_dir().join(format!("fleety-revoke-tool-{}", uuid::Uuid::new_v4()));
+        let home =
+            std::env::temp_dir().join(format!("fleety-revoke-tool-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&home).unwrap();
         let storage = Arc::new(Storage::new(home.clone()));
         // Alice has granted bob two scopes.
@@ -538,7 +539,10 @@ mod tests {
         g.grant("alice", "bob", "finances");
         // Exact-scope revoke removes only that grant; access is denied at once.
         assert_eq!(g.revoke("alice", "bob", Some("trip")), 1);
-        assert_eq!(can_access(&user("bob"), "alice", "trip", &g), Decision::Deny);
+        assert_eq!(
+            can_access(&user("bob"), "alice", "trip", &g),
+            Decision::Deny
+        );
         // The other scope survives.
         assert_eq!(
             can_access(&user("bob"), "alice", "finances", &g),
@@ -557,7 +561,10 @@ mod tests {
         g.grant("alice", "carol", "trip");
         // No scope → every grant to bob goes; carol is untouched.
         assert_eq!(g.revoke("alice", "bob", None), 2);
-        assert_eq!(can_access(&user("bob"), "alice", "trip", &g), Decision::Deny);
+        assert_eq!(
+            can_access(&user("bob"), "alice", "trip", &g),
+            Decision::Deny
+        );
         assert_eq!(
             can_access(&user("bob"), "alice", "finances", &g),
             Decision::Deny

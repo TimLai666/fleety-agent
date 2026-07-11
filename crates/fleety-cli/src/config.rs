@@ -404,8 +404,7 @@ mod tests {
         // Not saved, not stored, and the error names the key + accepted values.
         assert!(!saved, "an invalid commit must not request a save");
         assert!(
-            !app
-                .map
+            !app.map
                 .contains_key(&(setting.scope, "FLEETY_AUTO_INSTALL_DEPS".to_string())),
             "the rejected value must not enter the map"
         );
@@ -433,7 +432,10 @@ mod tests {
                 r.scope
             );
         }
-        assert!(rows.iter().any(|r| r.key == "FLEETY_TZ"), "a Shared key is present");
+        assert!(
+            rows.iter().any(|r| r.key == "FLEETY_TZ"),
+            "a Shared key is present"
+        );
         assert!(
             !rows.iter().any(|r| r.key == "FLEETY_ADDR"),
             "a Server key is excluded"

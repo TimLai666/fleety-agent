@@ -57,7 +57,11 @@ pub struct CodexResponses {
 impl CodexResponses {
     /// `base_url` is the Codex responses endpoint, e.g.
     /// `https://chatgpt.com/backend-api/codex/responses`.
-    pub fn new(base_url: impl Into<String>, model: impl Into<String>, auth: Arc<dyn CodexAuth>) -> Self {
+    pub fn new(
+        base_url: impl Into<String>,
+        model: impl Into<String>,
+        auth: Arc<dyn CodexAuth>,
+    ) -> Self {
         Self {
             base_url: base_url.into(),
             model: model.into(),
@@ -121,7 +125,11 @@ pub fn build_request_body(
                 }));
             }
             Role::User | Role::Assistant => {
-                let role = if matches!(m.role, Role::User) { "user" } else { "assistant" };
+                let role = if matches!(m.role, Role::User) {
+                    "user"
+                } else {
+                    "assistant"
+                };
                 if let Some(c) = &m.content {
                     if !c.is_empty() {
                         input.push(json!({
@@ -159,7 +167,11 @@ pub fn build_request_body(
     body.insert("model".into(), json!(model));
     body.insert(
         "instructions".into(),
-        json!(if instructions.is_empty() { DEFAULT_INSTRUCTIONS.to_string() } else { instructions }),
+        json!(if instructions.is_empty() {
+            DEFAULT_INSTRUCTIONS.to_string()
+        } else {
+            instructions
+        }),
     );
     body.insert("input".into(), json!(input));
     body.insert("tools".into(), json!(tool_values));
@@ -240,7 +252,11 @@ fn function_call_from_item(item: &Value) -> Option<ToolCall> {
         Some(s) => serde_json::from_str(s).unwrap_or_else(|_| json!({ "_unparsed": s })),
         None => json!({}),
     };
-    Some(ToolCall { id, name, arguments })
+    Some(ToolCall {
+        id,
+        name,
+        arguments,
+    })
 }
 
 #[async_trait::async_trait]
@@ -279,10 +295,9 @@ impl ModelProvider for CodexResponses {
             request = request.header("chatgpt-account-id", account);
         }
 
-        let response = request
-            .send()
-            .await
-            .map_err(|e| CoreError::Provider(format!("request to {} failed: {e}", self.base_url)))?;
+        let response = request.send().await.map_err(|e| {
+            CoreError::Provider(format!("request to {} failed: {e}", self.base_url))
+        })?;
         let status = response.status();
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
@@ -295,7 +310,8 @@ impl ModelProvider for CodexResponses {
         let mut stream = response.bytes_stream();
         let mut raw = String::new();
         while let Some(chunk) = stream.next().await {
-            let bytes = chunk.map_err(|e| CoreError::Provider(format!("stream read failed: {e}")))?;
+            let bytes =
+                chunk.map_err(|e| CoreError::Provider(format!("stream read failed: {e}")))?;
             raw.push_str(&String::from_utf8_lossy(&bytes));
         }
         Ok(assemble_responses_sse(&raw, on_delta))
@@ -357,13 +373,21 @@ mod tests {
         .to_string();
         let (base, rx) = serve_sse_once(sse);
         let auth = Arc::new(StubAuth {
-            creds: Ok(CodexCreds { bearer: "tok-123".into(), account_id: Some("acc-9".into()) }),
+            creds: Ok(CodexCreds {
+                bearer: "tok-123".into(),
+                account_id: Some("acc-9".into()),
+            }),
         });
         let provider = CodexResponses::new(base, "gpt-5-codex", auth);
-        let resp = provider.complete(&[Message::user("hi")], &[]).await.expect("complete");
+        let resp = provider
+            .complete(&[Message::user("hi")], &[])
+            .await
+            .expect("complete");
         assert_eq!(resp.message.content.as_deref(), Some("ok"));
 
-        let req = rx.recv_timeout(Duration::from_secs(5)).expect("request captured");
+        let req = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("request captured");
         assert!(req.starts_with("POST "));
         assert!(req.contains("authorization: Bearer tok-123"));
         assert!(req.contains("chatgpt-account-id: acc-9"));
@@ -381,7 +405,10 @@ mod tests {
         });
         // An unroutable base URL: if it tried to POST it would error differently.
         let provider = CodexResponses::new("http://127.0.0.1:1/responses", "m", auth);
-        let err = provider.complete(&[Message::user("hi")], &[]).await.expect_err("logged out");
+        let err = provider
+            .complete(&[Message::user("hi")], &[])
+            .await
+            .expect_err("logged out");
         assert!(err.report().message.contains("auth login"));
     }
 
@@ -423,11 +450,17 @@ mod tests {
         assert_eq!(input[0]["type"], json!("message"));
         assert_eq!(input[0]["role"], json!("user"));
         assert_eq!(input[0]["content"][0]["text"], json!("hi"));
-        let fc = input.iter().find(|i| i["type"] == json!("function_call")).expect("fc");
+        let fc = input
+            .iter()
+            .find(|i| i["type"] == json!("function_call"))
+            .expect("fc");
         assert_eq!(fc["name"], json!("read_file"));
         assert_eq!(fc["call_id"], json!("c1"));
         assert_eq!(fc["arguments"], json!(r#"{"path":"a.txt"}"#));
-        let out = input.iter().find(|i| i["type"] == json!("function_call_output")).expect("out");
+        let out = input
+            .iter()
+            .find(|i| i["type"] == json!("function_call_output"))
+            .expect("out");
         assert_eq!(out["call_id"], json!("c1"));
         assert_eq!(out["output"], json!("file body"));
     }

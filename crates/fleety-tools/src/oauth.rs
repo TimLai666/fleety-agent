@@ -56,7 +56,10 @@ pub fn parse_account_id(id_token: &str) -> Option<String> {
     let first_org = claims
         .get("organizations")
         .and_then(Value::as_array)
-        .and_then(|orgs| orgs.iter().find_map(|o| o.get("id").and_then(Value::as_str)));
+        .and_then(|orgs| {
+            orgs.iter()
+                .find_map(|o| o.get("id").and_then(Value::as_str))
+        });
     direct.or(nested).or(first_org).map(String::from)
 }
 
@@ -108,8 +111,7 @@ pub fn save_tokens(path: &Path, tokens: &Tokens) -> Result<()> {
     }
     let json = serde_json::to_string_pretty(tokens)
         .map_err(|e| CoreError::Message(format!("serialize tokens: {e}")))?;
-    std::fs::write(path, json)
-        .map_err(|e| CoreError::Message(format!("write tokens: {e}")))?;
+    std::fs::write(path, json).map_err(|e| CoreError::Message(format!("write tokens: {e}")))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -149,7 +151,10 @@ pub fn append_auth_audit(event: &str, now_secs: u64) -> Result<()> {
         std::fs::create_dir_all(parent)
             .map_err(|e| CoreError::Message(format!("cannot create audit dir: {e}")))?;
     }
-    let line = format!("{}\n", serde_json::json!({ "ts_secs": now_secs, "event": event }));
+    let line = format!(
+        "{}\n",
+        serde_json::json!({ "ts_secs": now_secs, "event": event })
+    );
     use std::io::Write;
     let mut f = std::fs::OpenOptions::new()
         .create(true)
@@ -186,7 +191,9 @@ pub enum BearerPlan {
 pub fn plan_bearer(tokens: Option<&Tokens>, now_secs: u64) -> BearerPlan {
     match tokens {
         None => BearerPlan::NotLoggedIn,
-        Some(t) if t.refresh_token.is_empty() && t.access_token.is_empty() => BearerPlan::NotLoggedIn,
+        Some(t) if t.refresh_token.is_empty() && t.access_token.is_empty() => {
+            BearerPlan::NotLoggedIn
+        }
         Some(t) if needs_refresh(t.expires_at_secs, now_secs) => {
             if t.refresh_token.is_empty() {
                 BearerPlan::NotLoggedIn
@@ -326,7 +333,10 @@ pub async fn exchange_code(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    let expires_in = body.get("expires_in").and_then(Value::as_u64).unwrap_or(3600);
+    let expires_in = body
+        .get("expires_in")
+        .and_then(Value::as_u64)
+        .unwrap_or(3600);
     let token_type = body
         .get("token_type")
         .and_then(Value::as_str)
@@ -382,7 +392,10 @@ pub async fn refresh_access_token(
         .and_then(Value::as_str)
         .ok_or_else(|| CoreError::Provider("token refresh response missing access_token".into()))?
         .to_string();
-    let expires_in = body.get("expires_in").and_then(Value::as_u64).unwrap_or(3600);
+    let expires_in = body
+        .get("expires_in")
+        .and_then(Value::as_u64)
+        .unwrap_or(3600);
     let new_refresh = body
         .get("refresh_token")
         .and_then(Value::as_str)
@@ -578,8 +591,8 @@ mod tests {
     }
 
     fn fake_jwt(claims: serde_json::Value) -> String {
-        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(claims.to_string().as_bytes());
+        let payload =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string().as_bytes());
         format!("header.{payload}.sig")
     }
 
@@ -651,8 +664,14 @@ mod tests {
         assert!(!needs_refresh(1_000, 500));
 
         // Expired but no refresh token → must log in again.
-        let no_refresh = Tokens { refresh_token: "".into(), ..t.clone() };
-        assert_eq!(plan_bearer(Some(&no_refresh), 2_000), BearerPlan::NotLoggedIn);
+        let no_refresh = Tokens {
+            refresh_token: "".into(),
+            ..t.clone()
+        };
+        assert_eq!(
+            plan_bearer(Some(&no_refresh), 2_000),
+            BearerPlan::NotLoggedIn
+        );
     }
 
     /// One-shot HTTP responder: accepts a single connection, returns the given
@@ -694,9 +713,16 @@ mod tests {
             backend_base_url: "https://b".into(),
         };
         let client = reqwest::Client::new();
-        let tokens = exchange_code(&client, &config, "code", "verifier", "http://localhost:1455/auth/callback", 0)
-            .await
-            .expect("exchange");
+        let tokens = exchange_code(
+            &client,
+            &config,
+            "code",
+            "verifier",
+            "http://localhost:1455/auth/callback",
+            0,
+        )
+        .await
+        .expect("exchange");
         assert_eq!(tokens.account_id.as_deref(), Some("acct-XYZ"));
     }
 
@@ -711,9 +737,16 @@ mod tests {
         };
 
         // Logged out → actionable error.
-        let missing = std::env::temp_dir().join(format!("fleety-cauth-{}.json", uuid::Uuid::new_v4()));
+        let missing =
+            std::env::temp_dir().join(format!("fleety-cauth-{}.json", uuid::Uuid::new_v4()));
         let auth = OAuthCodexAuth::new(missing, &config);
-        assert!(auth.credentials().await.expect_err("logged out").report().message.contains("auth login"));
+        assert!(auth
+            .credentials()
+            .await
+            .expect_err("logged out")
+            .report()
+            .message
+            .contains("auth login"));
 
         // Logged in with a valid (unexpired) token → bearer + account id.
         let path = temp_token_path();
@@ -739,7 +772,8 @@ mod tests {
     async fn oauth_bearer_errors_actionably_when_not_logged_in() {
         use agent_core::BearerSource;
         // Point at a token path that does not exist → not signed in.
-        let missing = std::env::temp_dir().join(format!("fleety-noauth-{}.json", uuid::Uuid::new_v4()));
+        let missing =
+            std::env::temp_dir().join(format!("fleety-noauth-{}.json", uuid::Uuid::new_v4()));
         let config = OAuthConfig {
             client_id: "cid".into(),
             authorize_endpoint: "https://auth.example/authorize".into(),
@@ -760,9 +794,16 @@ mod tests {
             r#"{"access_token":"new-at","expires_in":3600,"token_type":"Bearer"}"#.to_string(),
         );
         let client = reqwest::Client::new();
-        let fresh = refresh_access_token(&client, &base, "client-x", "old-rt", Some("acc-prev"), 1_000)
-            .await
-            .expect("refresh");
+        let fresh = refresh_access_token(
+            &client,
+            &base,
+            "client-x",
+            "old-rt",
+            Some("acc-prev"),
+            1_000,
+        )
+        .await
+        .expect("refresh");
         assert_eq!(fresh.access_token, "new-at");
         assert_eq!(fresh.refresh_token, "old-rt"); // carried forward
         assert_eq!(fresh.expires_at_secs, 1_000 + 3600);
@@ -782,7 +823,11 @@ mod tests {
     #[test]
     fn generated_verifier_is_valid_length_and_charset() {
         let v = generate_verifier();
-        assert!((43..=128).contains(&v.len()), "len {} out of range", v.len());
+        assert!(
+            (43..=128).contains(&v.len()),
+            "len {} out of range",
+            v.len()
+        );
         // Unreserved set for base64url-no-pad: A-Z a-z 0-9 - _
         assert!(v
             .chars()

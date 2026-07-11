@@ -1,4 +1,4 @@
-﻿//! Site (場域 / location) registry: group devices by physical location so the
+//! Site (場域 / location) registry: group devices by physical location so the
 //! agent understands which devices live where (e.g. devices at "home-office"
 //! vs "warehouse"). Sites are first-class records under `fleet/sites/`; each
 //! `device.json` carries a `site` field set via `device_set_site`.
@@ -96,7 +96,11 @@ fn devices_at(devices_dir: &Path, site: &str) -> Vec<Value> {
 }
 
 /// Add a fingerprint to a site's set (idempotent). Errors if the site is absent.
-pub(crate) fn add_fingerprint_to_site(sites_dir: &Path, site: &str, fingerprint: &str) -> Result<()> {
+pub(crate) fn add_fingerprint_to_site(
+    sites_dir: &Path,
+    site: &str,
+    fingerprint: &str,
+) -> Result<()> {
     safe_id("site id", site)?;
     let path = sites_dir.join(format!("{site}.json"));
     let text = std::fs::read_to_string(&path).map_err(|e| {
@@ -109,7 +113,11 @@ pub(crate) fn add_fingerprint_to_site(sites_dir: &Path, site: &str, fingerprint:
     let mut fps: Vec<String> = record
         .get("fingerprints")
         .and_then(Value::as_array)
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     if !fps.iter().any(|f| f == fingerprint) {
         fps.push(fingerprint.to_string());
@@ -193,7 +201,11 @@ impl Tool for SiteSet {
         record["id"] = json!(id);
         record["name"] = json!(name);
         record["description"] = json!(description);
-        if record.get("fingerprints").and_then(Value::as_array).is_none() {
+        if record
+            .get("fingerprints")
+            .and_then(Value::as_array)
+            .is_none()
+        {
             record["fingerprints"] = json!([]);
         }
         let pretty = serde_json::to_string_pretty(&record)
@@ -500,7 +512,10 @@ mod tests {
         // Binding a fingerprint is idempotent and looks up by fingerprint.
         add_fingerprint_to_site(&sites_dir, "home", "fp-1").expect("bind");
         add_fingerprint_to_site(&sites_dir, "home", "fp-1").expect("bind again");
-        assert_eq!(site_for_fingerprint(&sites_dir, "fp-1").as_deref(), Some("home"));
+        assert_eq!(
+            site_for_fingerprint(&sites_dir, "fp-1").as_deref(),
+            Some("home")
+        );
         // Idempotent: the fingerprint appears exactly once in the record.
         let raw = std::fs::read_to_string(sites_dir.join("home.json")).expect("read");
         let rec: Value = serde_json::from_str(&raw).expect("json");
@@ -514,7 +529,10 @@ mod tests {
             .call("site_set", json!({ "id": "home", "name": "Home Office" }))
             .await
             .expect("edit name");
-        assert_eq!(site_for_fingerprint(&sites_dir, "fp-1").as_deref(), Some("home"));
+        assert_eq!(
+            site_for_fingerprint(&sites_dir, "fp-1").as_deref(),
+            Some("home")
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

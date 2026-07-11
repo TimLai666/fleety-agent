@@ -117,14 +117,16 @@ impl ModelProvider for PoolProvider {
         // supports it, so a mixed pool never blocks an attachment some member
         // could handle — the routed member degrades what it cannot take. Never
         // the first member's caps, nor the intersection.
-        self.members.iter().fold(ModelCapabilities::TEXT_ONLY, |acc, m| {
-            let c = m.capabilities();
-            ModelCapabilities {
-                image: acc.image || c.image,
-                audio: acc.audio || c.audio,
-                pdf: acc.pdf || c.pdf,
-            }
-        })
+        self.members
+            .iter()
+            .fold(ModelCapabilities::TEXT_ONLY, |acc, m| {
+                let c = m.capabilities();
+                ModelCapabilities {
+                    image: acc.image || c.image,
+                    audio: acc.audio || c.audio,
+                    pdf: acc.pdf || c.pdf,
+                }
+            })
     }
 
     fn with_effort(&self, effort: Option<Effort>) -> Option<Arc<dyn ModelProvider>> {
@@ -253,7 +255,13 @@ mod tests {
         });
         let pool = PoolProvider::new(vec![text_only, image_capable], Strategy::Failover);
         let caps = pool.capabilities();
-        assert!(caps.image, "union: image supported because a member supports it");
-        assert!(!caps.audio, "union: audio unsupported (no member supports it)");
+        assert!(
+            caps.image,
+            "union: image supported because a member supports it"
+        );
+        assert!(
+            !caps.audio,
+            "union: audio unsupported (no member supports it)"
+        );
     }
 }

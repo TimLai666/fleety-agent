@@ -163,7 +163,13 @@ pub(crate) fn spawn_watcher(spec: ServiceSpec) {
                 continue; // no pending request
             };
             let now = Instant::now();
-            match decide_request(requested_at, SystemTime::now(), now, is_idle(), last_restart) {
+            match decide_request(
+                requested_at,
+                SystemTime::now(),
+                now,
+                is_idle(),
+                last_restart,
+            ) {
                 Decision::Wait => {}
                 Decision::RestartNow => {
                     // Consume the marker before restarting so the fresh process

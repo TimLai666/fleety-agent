@@ -1,4 +1,4 @@
-﻿//! Interactive multi-pane TUI (ratatui): a conversation pane, an input box, and
+//! Interactive multi-pane TUI (ratatui): a conversation pane, an input box, and
 //! a status line. The `App` state, key handling, and rendering are unit-tested
 //! (ratatui `TestBackend` renders to an in-memory buffer); the live
 //! terminal/event/WebSocket loop in `main.rs` is the glue around them.
@@ -181,10 +181,7 @@ impl App {
             return format!("Approval required — y=approve · n=deny — {desc}");
         }
         if self.turn_in_flight {
-            return format!(
-                "{} Working… (Esc=cancel, Ctrl+C=quit)",
-                self.spinner_char()
-            );
+            return format!("{} Working… (Esc=cancel, Ctrl+C=quit)", self.spinner_char());
         }
         if self.pending_attachments.is_empty() {
             "Message (Enter=send, Ctrl+V=paste, PgUp/PgDn=scroll, Esc=quit)".to_string()
@@ -657,7 +654,10 @@ mod tests {
         // A turn in flight surfaces the current spinner glyph…
         app.turn_in_flight = true;
         let first = app.spinner_char();
-        assert!(app.input_title().contains(first), "waiting title shows spinner");
+        assert!(
+            app.input_title().contains(first),
+            "waiting title shows spinner"
+        );
         // …which changes as the outer loop ticks it forward.
         app.advance_spinner();
         assert_ne!(first, app.spinner_char(), "frame advanced on tick");
@@ -743,7 +743,10 @@ mod tests {
         // The code content survives and lands on a gutter-marked row ("│ code"),
         // set apart from the prose. (The pane border is also "│", so we assert
         // the gutter+content adjacency, not the bare glyph.)
-        assert!(rows.iter().any(|r| r.contains("let x = 1;")), "code visible");
+        assert!(
+            rows.iter().any(|r| r.contains("let x = 1;")),
+            "code visible"
+        );
         assert!(
             rows.iter().any(|r| r.contains("│ let x = 1;")),
             "code row carries the gutter marker"
@@ -757,7 +760,10 @@ mod tests {
             !rows.iter().any(|r| r.contains("│ intro line")),
             "prose is not gutter-marked"
         );
-        assert!(rows.iter().any(|r| r.contains("done")), "trailing prose kept");
+        assert!(
+            rows.iter().any(|r| r.contains("done")),
+            "trailing prose kept"
+        );
     }
 
     #[test]
@@ -881,10 +887,14 @@ mod tests {
         std::fs::write(&path, b"hello").expect("write");
 
         // A `/attach <existing>` submission stages the file and does NOT send.
-        app.input.set_text(format!("/attach {}", path.to_string_lossy()));
+        app.input
+            .set_text(format!("/attach {}", path.to_string_lossy()));
         assert_eq!(on_key(&mut app, key(KeyCode::Enter)), Action::None);
         assert_eq!(app.pending_attachments.len(), 1);
-        assert!(app.input.is_empty(), "input cleared after a successful attach");
+        assert!(
+            app.input.is_empty(),
+            "input cleared after a successful attach"
+        );
 
         // A missing path preserves the input and reports an error — nothing new
         // is staged and no message is sent.
@@ -893,7 +903,11 @@ mod tests {
         assert_eq!(on_key(&mut app, key(KeyCode::Enter)), Action::None);
         assert_eq!(app.pending_attachments.len(), 1, "no new attachment staged");
         assert_eq!(app.input.text(), missing, "input preserved on failure");
-        assert!(app.status.contains("could not attach"), "error reported: {}", app.status);
+        assert!(
+            app.status.contains("could not attach"),
+            "error reported: {}",
+            app.status
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

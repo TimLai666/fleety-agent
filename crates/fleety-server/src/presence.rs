@@ -104,7 +104,11 @@ pub fn server_subnet() -> Option<String> {
 /// Device-level departure signal: a mobile device whose home site is known but
 /// whose current site is elsewhere leans toward "the person left". Never a
 /// certainty — reachability is not presence.
-pub fn departure_confidence(mobility: &str, home_site: &str, current_site: &str) -> (f32, Vec<String>) {
+pub fn departure_confidence(
+    mobility: &str,
+    home_site: &str,
+    current_site: &str,
+) -> (f32, Vec<String>) {
     if mobility == "mobile" && !home_site.is_empty() && current_site != home_site {
         (
             0.5,
@@ -303,7 +307,10 @@ impl Tool for PresenceShow {
         let corroborated: Vec<String> = match server_subnet() {
             Some(server_sn) => present
                 .iter()
-                .filter(|d| self.storage.device_last_subnet(&d.device).as_deref() == Some(server_sn.as_str()))
+                .filter(|d| {
+                    self.storage.device_last_subnet(&d.device).as_deref()
+                        == Some(server_sn.as_str())
+                })
                 .map(|d| d.device.clone())
                 .collect(),
             None => Vec::new(),
@@ -460,7 +467,9 @@ impl Tool for DeviceSetPresenceOptIn {
         let enabled = args
             .get("enabled")
             .and_then(Value::as_bool)
-            .ok_or_else(|| CoreError::Message("missing required boolean argument 'enabled'".to_string()))?;
+            .ok_or_else(|| {
+                CoreError::Message("missing required boolean argument 'enabled'".to_string())
+            })?;
         self.storage.set_device_presence_opt_in(device, enabled)?;
         Ok(json!({ "device": device, "presence_opt_in": enabled, "set": true }))
     }
@@ -484,11 +493,17 @@ mod tests {
         let (low, _) = person_present_confidence(&[dev("desk", "stationary", true)]);
         // A mobile phone whose home_site is this site present → higher.
         let (higher, _) = person_present_confidence(&[dev("phone", "mobile", true)]);
-        assert!(higher > low, "mobile-at-home ({higher}) should beat stationary-only ({low})");
+        assert!(
+            higher > low,
+            "mobile-at-home ({higher}) should beat stationary-only ({low})"
+        );
 
         // A usually-home mobile device that is away → departure-leaning, not certain.
         let (dep, reasons) = departure_confidence("mobile", "home", "away");
-        assert!(dep > 0.0 && dep < 1.0, "departure is probabilistic, got {dep}");
+        assert!(
+            dep > 0.0 && dep < 1.0,
+            "departure is probabilistic, got {dep}"
+        );
         assert!(reasons.iter().any(|r| r.contains("departure")));
 
         // A stationary device that is elsewhere gives no departure signal.
@@ -506,9 +521,18 @@ mod tests {
 
         // Corroborated devices bump confidence and record why (clamped to 1.0).
         let mut reasons = Vec::new();
-        let raised = corroborate(0.4, &mut reasons, &["phone".to_string(), "laptop".to_string()]);
-        assert!(raised > 0.4, "corroboration should raise confidence, got {raised}");
-        assert!(reasons.iter().any(|r| r.contains("phone") && r.contains("server's own network")));
+        let raised = corroborate(
+            0.4,
+            &mut reasons,
+            &["phone".to_string(), "laptop".to_string()],
+        );
+        assert!(
+            raised > 0.4,
+            "corroboration should raise confidence, got {raised}"
+        );
+        assert!(reasons
+            .iter()
+            .any(|r| r.contains("phone") && r.contains("server's own network")));
         assert!(corroborate(0.95, &mut Vec::new(), &["a".into(), "b".into()]) <= 1.0);
     }
 
@@ -545,20 +569,37 @@ mod tests {
         );
         assert_eq!(storage.device_site("pi"), "unknown");
 
-        storage.set_device_presence_opt_in("pi", true).expect("opt in");
+        storage
+            .set_device_presence_opt_in("pi", true)
+            .expect("opt in");
 
         // Absent fingerprint → site unchanged (but the subnet is still recorded).
         assert_eq!(
-            apply_colocation(&storage, &sites_dir, "pi", None, Some("192.168.1.0/24"), 100),
+            apply_colocation(
+                &storage,
+                &sites_dir,
+                "pi",
+                None,
+                Some("192.168.1.0/24"),
+                100
+            ),
             ColocationOutcome::NoFingerprint
         );
-        assert_eq!(storage.device_last_subnet("pi").as_deref(), Some("192.168.1.0/24"));
+        assert_eq!(
+            storage.device_last_subnet("pi").as_deref(),
+            Some("192.168.1.0/24")
+        );
 
         // Known fingerprint → site moves to `home`, one timeline event written.
         let out = apply_colocation(&storage, &sites_dir, "pi", Some("fp-home"), None, 200);
         assert_eq!(
             out,
-            ColocationOutcome::Applied { changed: true, from: "unknown".into(), to: "home".into(), unbound: false }
+            ColocationOutcome::Applied {
+                changed: true,
+                from: "unknown".into(),
+                to: "home".into(),
+                unbound: false
+            }
         );
         assert_eq!(storage.device_site("pi"), "home");
         let timeline = std::fs::read_to_string(storage.presence_timeline_path()).expect("timeline");
@@ -568,7 +609,12 @@ mod tests {
         let out = apply_colocation(&storage, &sites_dir, "pi", Some("fp-home"), None, 300);
         assert_eq!(
             out,
-            ColocationOutcome::Applied { changed: false, from: "home".into(), to: "home".into(), unbound: false }
+            ColocationOutcome::Applied {
+                changed: false,
+                from: "home".into(),
+                to: "home".into(),
+                unbound: false
+            }
         );
         let timeline = std::fs::read_to_string(storage.presence_timeline_path()).expect("timeline");
         assert_eq!(timeline.lines().count(), 1);
@@ -577,7 +623,12 @@ mod tests {
         let out = apply_colocation(&storage, &sites_dir, "pi", Some("fp-elsewhere"), None, 400);
         assert_eq!(
             out,
-            ColocationOutcome::Applied { changed: true, from: "home".into(), to: "unknown".into(), unbound: true }
+            ColocationOutcome::Applied {
+                changed: true,
+                from: "home".into(),
+                to: "unknown".into(),
+                unbound: true
+            }
         );
         assert_eq!(storage.device_site("pi"), "unknown");
 
@@ -603,15 +654,24 @@ mod tests {
         let mut reg = ToolRegistry::new();
         register_presence(&mut reg, storage.home(), sites_dir.clone());
         crate::sites::register(&mut reg, &sites_dir, &storage.devices_dir());
-        reg.call("device_set_presence_opt_in", json!({ "device": "phone", "enabled": true }))
-            .await
-            .expect("opt in");
-        reg.call("device_set_mobility", json!({ "device": "phone", "mobility": "mobile" }))
-            .await
-            .expect("mobility");
-        reg.call("device_set_home_site", json!({ "device": "phone", "home_site": "home" }))
-            .await
-            .expect("home site");
+        reg.call(
+            "device_set_presence_opt_in",
+            json!({ "device": "phone", "enabled": true }),
+        )
+        .await
+        .expect("opt in");
+        reg.call(
+            "device_set_mobility",
+            json!({ "device": "phone", "mobility": "mobile" }),
+        )
+        .await
+        .expect("mobility");
+        reg.call(
+            "device_set_home_site",
+            json!({ "device": "phone", "home_site": "home" }),
+        )
+        .await
+        .expect("home site");
 
         // A device sends this exact frame over the wire.
         let wire = json!({
@@ -622,7 +682,12 @@ mod tests {
         .to_string();
         let msg: fleety_protocol::ClientMsg = serde_json::from_str(&wire).expect("de wire");
         // The connection handler routes it exactly like this.
-        let fleety_protocol::ClientMsg::Colocation { fingerprint, subnet, .. } = msg else {
+        let fleety_protocol::ClientMsg::Colocation {
+            fingerprint,
+            subnet,
+            ..
+        } = msg
+        else {
             panic!("expected a colocation frame");
         };
         let outcome = apply_colocation(
@@ -633,7 +698,10 @@ mod tests {
             subnet.as_deref(),
             1000,
         );
-        assert!(matches!(outcome, ColocationOutcome::Applied { changed: true, .. }));
+        assert!(matches!(
+            outcome,
+            ColocationOutcome::Applied { changed: true, .. }
+        ));
 
         // Server state moved: site updated + exactly one timeline event.
         assert_eq!(storage.device_site("phone"), "home");
@@ -648,7 +716,12 @@ mod tests {
         let devices = shown["devices"].as_array().expect("devices");
         assert_eq!(devices.len(), 1);
         assert_eq!(devices[0]["device"], json!("phone"));
-        assert!(shown["person_present"]["confidence"].as_f64().unwrap_or(0.0) > 0.0);
+        assert!(
+            shown["person_present"]["confidence"]
+                .as_f64()
+                .unwrap_or(0.0)
+                > 0.0
+        );
         assert!(shown["caveat"].is_string());
 
         let _ = std::fs::remove_dir_all(&home);
@@ -673,45 +746,71 @@ mod tests {
         crate::sites::register(&mut reg, &sites_dir, &storage.devices_dir());
 
         // opt-in tool sets the flag.
-        reg.call("device_set_presence_opt_in", json!({ "device": "phone", "enabled": true }))
-            .await
-            .expect("opt in");
+        reg.call(
+            "device_set_presence_opt_in",
+            json!({ "device": "phone", "enabled": true }),
+        )
+        .await
+        .expect("opt in");
         assert!(storage.device_presence_opt_in("phone"));
 
         // home-site tool: unknown site errors, registered site succeeds.
         assert!(reg
-            .call("device_set_home_site", json!({ "device": "phone", "home_site": "nope" }))
+            .call(
+                "device_set_home_site",
+                json!({ "device": "phone", "home_site": "nope" })
+            )
             .await
             .is_err());
-        reg.call("device_set_home_site", json!({ "device": "phone", "home_site": "home" }))
-            .await
-            .expect("home site");
+        reg.call(
+            "device_set_home_site",
+            json!({ "device": "phone", "home_site": "home" }),
+        )
+        .await
+        .expect("home site");
         assert_eq!(storage.device_home_site("phone"), "home");
 
         // bind fingerprint: errors before any report, succeeds after one.
         assert!(reg
-            .call("site_bind_fingerprint", json!({ "device": "phone", "site": "home" }))
+            .call(
+                "site_bind_fingerprint",
+                json!({ "device": "phone", "site": "home" })
+            )
             .await
             .is_err());
         storage
             .set_device_last_fingerprint("phone", "fp-home")
             .expect("record fp");
-        reg.call("site_bind_fingerprint", json!({ "device": "phone", "site": "home" }))
-            .await
-            .expect("bind");
-        assert_eq!(sites::site_for_fingerprint(&sites_dir, "fp-home").as_deref(), Some("home"));
+        reg.call(
+            "site_bind_fingerprint",
+            json!({ "device": "phone", "site": "home" }),
+        )
+        .await
+        .expect("bind");
+        assert_eq!(
+            sites::site_for_fingerprint(&sites_dir, "fp-home").as_deref(),
+            Some("home")
+        );
 
         // Place the mobile phone at home, then presence_show reflects it with a caveat.
         storage.set_device_site("phone", "home", 10).expect("site");
-        reg.call("device_set_mobility", json!({ "device": "phone", "mobility": "mobile" }))
-            .await
-            .expect("mobility");
+        reg.call(
+            "device_set_mobility",
+            json!({ "device": "phone", "mobility": "mobile" }),
+        )
+        .await
+        .expect("mobility");
         let shown = reg
             .call("presence_show", json!({ "site": "home" }))
             .await
             .expect("show");
         assert_eq!(shown["devices"].as_array().map(Vec::len).unwrap_or(0), 1);
-        assert!(shown["person_present"]["confidence"].as_f64().unwrap_or(0.0) > 0.0);
+        assert!(
+            shown["person_present"]["confidence"]
+                .as_f64()
+                .unwrap_or(0.0)
+                > 0.0
+        );
         assert!(shown["caveat"].is_string());
 
         // device_presence: mobile phone whose home is `home` but currently `away`

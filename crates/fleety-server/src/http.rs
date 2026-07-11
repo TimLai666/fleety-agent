@@ -503,15 +503,18 @@ mod tests {
         }
     }
 
-    type WsClient =
-        tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+    type WsClient = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
 
     /// Connect a raw tokio-tungstenite client — the same WebSocket layer an
     /// old (pre-liveness) fleetyd uses — say Hello, and read until Welcome.
     /// Returns the socket and the Welcome's conversation id.
     async fn ws_hello(base: &str, device: &str) -> (WsClient, String) {
         let url = base.replace("http://", "ws://");
-        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.expect("ws connect");
+        let (mut ws, _) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("ws connect");
         let hello = serde_json::to_string(&ClientMsg::Hello {
             device_id: device.into(),
             protocol: PROTOCOL_VERSION,
@@ -673,7 +676,10 @@ mod tests {
         })
         .await
         .expect("assistant reply after idle");
-        assert!(reply.contains("echo: still there?"), "unexpected reply: {reply}");
+        assert!(
+            reply.contains("echo: still there?"),
+            "unexpected reply: {reply}"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 

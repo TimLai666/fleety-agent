@@ -128,9 +128,9 @@ fn daemon_session_persists_token_from_welcome_to_connections() {
     // The minted token is persisted onto the current profile in connections.toml
     // (not the legacy fleetyd.token), so a restart reconnects without re-pairing.
     let conns_path = home.0.join(".fleety").join("connections.toml");
-    wait_until(|| {
-        matches!(std::fs::read_to_string(&conns_path), Ok(s) if s.contains("server-token"))
-    });
+    wait_until(
+        || matches!(std::fs::read_to_string(&conns_path), Ok(s) if s.contains("server-token")),
+    );
 }
 
 #[test]
@@ -165,9 +165,9 @@ fn daemon_clears_saved_token_when_server_rejects_auth() {
         }) if token == "old-token"
     ));
     // After the rejection the current profile's token is cleared.
-    wait_until(|| {
-        matches!(std::fs::read_to_string(&conns_path), Ok(s) if !s.contains("old-token"))
-    });
+    wait_until(
+        || matches!(std::fs::read_to_string(&conns_path), Ok(s) if !s.contains("old-token")),
+    );
 }
 
 #[test]

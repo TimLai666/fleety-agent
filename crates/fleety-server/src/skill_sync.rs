@@ -417,7 +417,7 @@ mod tests {
         assert!(should_sync("abc123", None, true)); // no local SHA → sync
         assert!(!should_sync("abc123", Some("abc123"), true)); // same + has skills → skip
         assert!(should_sync("def456", Some("abc123"), true)); // differ → sync
-        // Same SHA but the tier is empty (fault residue) → sync (self-heal).
+                                                              // Same SHA but the tier is empty (fault residue) → sync (self-heal).
         assert!(should_sync("abc123", Some("abc123"), false));
     }
 
@@ -435,7 +435,10 @@ mod tests {
             "only the SHA record left behind is still empty"
         );
         write_skill(&synced, "a", "# A");
-        assert!(synced_tier_has_skills(&synced), "a skill dir makes it non-empty");
+        assert!(
+            synced_tier_has_skills(&synced),
+            "a skill dir makes it non-empty"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 

@@ -30,6 +30,7 @@ pub use agent::{
     CompactionCache, LoopConfig, TurnOutcome, ATTENTION_SENTINEL, SPEECH_SENTINEL,
 };
 pub use approval::{ApprovalDecision, ApprovalGate, AutoApprove, AutoDeny, MandateGate, Policy};
+pub use codex_responses::{CodexAuth, CodexCreds, CodexResponses};
 pub use compress::{CacheAligner, CodeCompressor, ContextCompressor, Lang, SmartCrusher};
 pub use error::{CoreError, ErrorReport, Result};
 pub use event::{interrupted_tool_result, reconstruct_messages, Event, EventLog};
@@ -39,7 +40,6 @@ pub use model::{
     Attachment, Message, MockProvider, ModelProvider, ModelResponse, RiskLevel, Role, ToolCall,
     ToolSpec,
 };
-pub use codex_responses::{CodexAuth, CodexCreds, CodexResponses};
 pub use openai::{BearerSource, OpenAiCompat, StaticBearer};
 pub use subagent::{
     register_orchestration, SpawnRequest, SubagentHost, SubagentManager, SubagentMode,

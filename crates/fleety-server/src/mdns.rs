@@ -58,7 +58,8 @@ fn local_ips(bind_addr: &str) -> Vec<IpAddr> {
 /// reachable).
 fn detect_route_ip() -> Option<IpAddr> {
     let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-    sock.connect((std::net::Ipv4Addr::new(8, 8, 8, 8), 80)).ok()?;
+    sock.connect((std::net::Ipv4Addr::new(8, 8, 8, 8), 80))
+        .ok()?;
     let ip = sock.local_addr().ok()?.ip();
     if ip.is_loopback() || ip.is_unspecified() {
         None

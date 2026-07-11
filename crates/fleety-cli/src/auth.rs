@@ -66,13 +66,23 @@ pub async fn login(no_browser: bool) -> Result<()> {
     let code = wait_for_code(&listener, &state)?;
 
     let client = reqwest::Client::new();
-    let tokens = oauth::exchange_code(&client, &config, &code, &verifier, &redirect_uri, now_secs())
-        .await?;
+    let tokens = oauth::exchange_code(
+        &client,
+        &config,
+        &code,
+        &verifier,
+        &redirect_uri,
+        now_secs(),
+    )
+    .await?;
     oauth::save_tokens(&oauth::default_token_path(), &tokens)?;
     if let Err(e) = oauth::append_auth_audit("login", now_secs()) {
         tracing::warn!(report = ?e.report(), "could not record auth audit");
     }
-    println!("Signed in. Tokens saved to {}.", oauth::default_token_path().display());
+    println!(
+        "Signed in. Tokens saved to {}.",
+        oauth::default_token_path().display()
+    );
     Ok(())
 }
 
@@ -194,7 +204,10 @@ fn wait_for_code(listener: &TcpListener, expected_state: &str) -> Result<String>
     let (status, page): (&str, &str) = if result.is_ok() {
         ("200 OK", "Signed in to Fleety. You can close this window.")
     } else {
-        ("400 Bad Request", "Login failed. You can close this window.")
+        (
+            "400 Bad Request",
+            "Login failed. You can close this window.",
+        )
     };
     let body = format!("<html><body>{page}</body></html>");
     let resp = format!(
@@ -269,7 +282,10 @@ mod tests {
         let err = bind_loopback(port).expect_err("busy port must fail fast");
         let msg = err.to_string();
         assert!(msg.contains("fixed port"), "message not actionable: {msg}");
-        assert!(msg.contains("retry"), "message should tell the user to retry: {msg}");
+        assert!(
+            msg.contains("retry"),
+            "message should tell the user to retry: {msg}"
+        );
         assert!(!msg.contains('{'), "no Debug dump in the message: {msg}");
 
         // A free port binds successfully (login would proceed).

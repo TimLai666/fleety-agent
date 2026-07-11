@@ -166,8 +166,9 @@ fn conversation_meta(path: &Path) -> (u64, u64, String) {
             let is_user =
                 message.and_then(|m| m.get("role")).and_then(Value::as_str) == Some("user");
             if is_user {
-                if let Some(content) =
-                    message.and_then(|m| m.get("content")).and_then(Value::as_str)
+                if let Some(content) = message
+                    .and_then(|m| m.get("content"))
+                    .and_then(Value::as_str)
                 {
                     preview = preview_line(content);
                 }
@@ -1376,7 +1377,6 @@ impl Storage {
             .map(String::from)
     }
 
-
     /// A compact summary of one audit log line — what the CLI shows in
     /// `fleety audit list` so the user can browse without parsing the full
     /// event payload.
@@ -1782,7 +1782,9 @@ mod tests {
         assert_eq!(storage.device_site("ghost"), "unknown");
 
         // Setting the fields round-trips and preserves the existing `site`.
-        storage.set_device_home_site("pi", "home").expect("set home");
+        storage
+            .set_device_home_site("pi", "home")
+            .expect("set home");
         storage
             .set_device_presence_opt_in("pi", true)
             .expect("set opt-in");
@@ -2125,11 +2127,17 @@ mod tests {
         let users = home.join("fleet").join("users");
         // Two of alice's conversations, c-old older than c-new.
         write_conv(
-            &users.join("alice").join("conversations").join("c-old.jsonl"),
+            &users
+                .join("alice")
+                .join("conversations")
+                .join("c-old.jsonl"),
             &[(100, "user", "older question"), (110, "assistant", "a")],
         );
         write_conv(
-            &users.join("alice").join("conversations").join("c-new.jsonl"),
+            &users
+                .join("alice")
+                .join("conversations")
+                .join("c-new.jsonl"),
             &[(200, "user", "newer question"), (205, "assistant", "b")],
         );
         // Bob's conversation MUST NOT leak into alice's listing.
@@ -2185,7 +2193,10 @@ mod tests {
         let newest = &rows[0];
         assert_eq!(newest["conversation_id"], serde_json::json!("k4"));
         let preview = newest["preview"].as_str().expect("preview");
-        assert!(preview.chars().count() <= 80, "preview clipped to ≤ 80 chars");
+        assert!(
+            preview.chars().count() <= 80,
+            "preview clipped to ≤ 80 chars"
+        );
         assert!(!preview.contains('\n'), "preview is a single line");
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -2695,7 +2706,9 @@ mod tests {
 
         // Revoking again removes nothing and still succeeds (reveals nothing).
         assert_eq!(
-            storage.remove_grant("alice", "bob", None).expect("revoke-again"),
+            storage
+                .remove_grant("alice", "bob", None)
+                .expect("revoke-again"),
             0
         );
         // Path-traversal ids are rejected, same as add_grant.
@@ -2714,7 +2727,9 @@ mod tests {
         // Seed two grants; one thread adds a third while another revokes one of
         // the seeds. Under the shared lock neither write clobbers the other.
         storage.add_grant("alice", "bob", "trip").expect("seed bob");
-        storage.add_grant("alice", "carol", "notes").expect("seed carol");
+        storage
+            .add_grant("alice", "carol", "notes")
+            .expect("seed carol");
 
         let barrier = Arc::new(Barrier::new(2));
         let adder = {
@@ -2722,7 +2737,9 @@ mod tests {
             let barrier = Arc::clone(&barrier);
             std::thread::spawn(move || {
                 barrier.wait();
-                storage.add_grant("alice", "dave", "photos").expect("add dave");
+                storage
+                    .add_grant("alice", "dave", "photos")
+                    .expect("add dave");
             })
         };
         let remover = {
@@ -2730,7 +2747,9 @@ mod tests {
             let barrier = Arc::clone(&barrier);
             std::thread::spawn(move || {
                 barrier.wait();
-                storage.remove_grant("alice", "bob", None).expect("revoke bob");
+                storage
+                    .remove_grant("alice", "bob", None)
+                    .expect("revoke bob");
             })
         };
         adder.join().expect("adder");
@@ -2739,15 +2758,30 @@ mod tests {
         // Both writes survived: dave was added, carol kept, bob removed.
         let grants = storage.grants();
         assert_eq!(
-            can_access(&ActingUser::User("dave".to_string()), "alice", "photos", &grants),
+            can_access(
+                &ActingUser::User("dave".to_string()),
+                "alice",
+                "photos",
+                &grants
+            ),
             Decision::Allow
         );
         assert_eq!(
-            can_access(&ActingUser::User("carol".to_string()), "alice", "notes", &grants),
+            can_access(
+                &ActingUser::User("carol".to_string()),
+                "alice",
+                "notes",
+                &grants
+            ),
             Decision::Allow
         );
         assert_eq!(
-            can_access(&ActingUser::User("bob".to_string()), "alice", "trip", &grants),
+            can_access(
+                &ActingUser::User("bob".to_string()),
+                "alice",
+                "trip",
+                &grants
+            ),
             Decision::Deny
         );
         let _ = std::fs::remove_dir_all(&home);

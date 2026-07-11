@@ -69,7 +69,11 @@ pub fn to_fleety_mcp(claude: &Value) -> Vec<McpServer> {
         let args = spec
             .get("args")
             .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
         out.push(McpServer {
             name: name.clone(),
@@ -185,15 +189,13 @@ mod tests {
 
     #[test]
     fn collect_plugin_sources_is_best_effort() {
-        let got =
-            collect_plugin_sources(Path::new("/no/such/proj"), Path::new("/no/such/home"));
+        let got = collect_plugin_sources(Path::new("/no/such/proj"), Path::new("/no/such/home"));
         assert!(got.skill_dirs.is_empty() && got.mcp_servers.is_empty());
     }
 
     #[test]
     fn collect_plugin_sources_tags_scope() {
-        let home =
-            std::env::temp_dir().join(format!("fleety-plug-{}", uuid::Uuid::new_v4()));
+        let home = std::env::temp_dir().join(format!("fleety-plug-{}", uuid::Uuid::new_v4()));
         let plug = home.join(".claude").join("plugins").join("up");
         std::fs::create_dir_all(plug.join("skills")).expect("mk plugin skills");
         std::fs::write(
@@ -210,7 +212,11 @@ mod tests {
         std::fs::create_dir_all(&proj).expect("mk proj");
         let got = collect_plugin_sources(&proj, &home);
         assert_eq!(got.skill_dirs.len(), 1);
-        assert_eq!(got.skill_dirs[0].0, Scope::User, "user-enabled → user scope");
+        assert_eq!(
+            got.skill_dirs[0].0,
+            Scope::User,
+            "user-enabled → user scope"
+        );
         assert!(got.skill_dirs[0].1.ends_with("skills"));
         assert_eq!(got.mcp_servers.len(), 1);
         assert_eq!(got.mcp_servers[0].0, Scope::User);

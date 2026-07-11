@@ -1,4 +1,4 @@
-﻿//! fleetyd — the Fleety device background service.
+//! fleetyd — the Fleety device background service.
 //!
 //! Connects to the Agent on startup (registering this device) and stays
 //! connected across drops and device sleep via an exponential-backoff reconnect
@@ -32,7 +32,10 @@ use fleety_tools::connection::{self, Target};
 /// created and made current so the token has a home.
 fn persist_token(url: &str, token: &str) -> Result<()> {
     let mut conns = connection::load()?;
-    let name = conns.current.clone().unwrap_or_else(|| "default".to_string());
+    let name = conns
+        .current
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
     if conns.device_id.is_empty() {
         conns.device_id = fleety_tools::device::device_id();
     }
@@ -550,9 +553,8 @@ async fn serve(
     // device's co-location fingerprint so the server can infer its site. Absent
     // when disabled — nothing is computed or sent.
     let mut presence_tick = if colocation::presence_enabled() {
-        let mut iv = tokio::time::interval(std::time::Duration::from_secs(
-            colocation::interval_secs(),
-        ));
+        let mut iv =
+            tokio::time::interval(std::time::Duration::from_secs(colocation::interval_secs()));
         iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         Some(iv)
     } else {
@@ -614,7 +616,9 @@ async fn serve(
                     if let Err(e) = persist_token(url, &tok) {
                         tracing::warn!(report = ?e.report(), "could not persist fleetyd token");
                     } else {
-                        tracing::info!("fleetyd token persisted to the current profile in connections.toml");
+                        tracing::info!(
+                            "fleetyd token persisted to the current profile in connections.toml"
+                        );
                     }
                 }
                 tracing::info!(%session_id, "registered with agent");

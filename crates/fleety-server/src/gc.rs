@@ -80,7 +80,11 @@ pub fn spawn(storage: Arc<Storage>) {
         loop {
             ticker.tick().await;
             match run_sweep(&storage, backup_retention, rotate_bytes) {
-                Ok(r) if r.backups_deleted > 0 || r.histories_rotated > 0 || r.presence_rotated > 0 => {
+                Ok(r)
+                    if r.backups_deleted > 0
+                        || r.histories_rotated > 0
+                        || r.presence_rotated > 0 =>
+                {
                     tracing::info!(
                         backups_deleted = r.backups_deleted,
                         histories_rotated = r.histories_rotated,
@@ -250,10 +254,11 @@ mod tests {
         drop(f);
         assert_eq!(rotate_big_file(&timeline, 1024), 1);
         assert!(!timeline.exists());
-        let archived = fs::read_dir(&dir)
-            .expect("read")
-            .flatten()
-            .any(|e| e.file_name().to_string_lossy().starts_with("timeline.jsonl."));
+        let archived = fs::read_dir(&dir).expect("read").flatten().any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("timeline.jsonl.")
+        });
         assert!(archived, "an archive file should remain");
 
         // Missing file → nothing to do.

@@ -1,4 +1,4 @@
-﻿//! fleety — the Fleety CLI.
+//! fleety — the Fleety CLI.
 //!
 //! M2: `fleety ask "<message>"` connects to the Agent over WebSocket, does one
 //! conversation round-trip, and prints the reply. Interactive TUI comes later.
@@ -238,9 +238,7 @@ async fn main() -> std::process::ExitCode {
             let (target, rest) = config::split_target(&args[2..]);
             // Bare `fleety config` on a TTY → the three-region interactive panel
             // (connection / this device / server); no `--target` needed.
-            let res = if rest.is_empty()
-                && std::io::IsTerminal::is_terminal(&std::io::stdout())
-            {
+            let res = if rest.is_empty() && std::io::IsTerminal::is_terminal(&std::io::stdout()) {
                 config_panel::run().await
             } else if config::is_interactive_edit(&rest) || matches!(target, ConfigTarget::Local) {
                 config::run(&rest)
@@ -610,7 +608,10 @@ async fn reconnect(
 
         if let Ok(conn) = transport::connect(url, token).await {
             let (mut tx, rx) = conn.split();
-            if send(&mut tx, &hello(token.map(String::from), None)).await.is_ok() {
+            if send(&mut tx, &hello(token.map(String::from), None))
+                .await
+                .is_ok()
+            {
                 if let Some(cid) = app.last_conversation_id.clone() {
                     let _ = send(
                         &mut tx,
@@ -710,7 +711,10 @@ fn resolve_target() -> Result<connection::Resolved> {
     })?;
     match &r.source {
         connection::Source::Env => {
-            eprintln!("note: FLEETY_AGENT_URL overrides the current server ({})", r.url)
+            eprintln!(
+                "note: FLEETY_AGENT_URL overrides the current server ({})",
+                r.url
+            )
         }
         connection::Source::Mdns => eprintln!("discovered agent on the LAN: {}", r.url),
         connection::Source::Default => eprintln!(
@@ -768,7 +772,8 @@ fn set_current_token(token: &str) -> Result<()> {
     let mut conns = connection::load()?;
     let name = conns.current.clone().ok_or_else(|| {
         CoreError::Message(
-            "no current server to attach the token to — run `fleety init <ws-url>` first".to_string(),
+            "no current server to attach the token to — run `fleety init <ws-url>` first"
+                .to_string(),
         )
     })?;
     if let Some(p) = conns.profiles.get_mut(&name) {
@@ -861,11 +866,7 @@ async fn pair(code: String) -> Result<()> {
 fn server_msg_kind(msg: &ServerMsg) -> String {
     serde_json::to_value(msg)
         .ok()
-        .and_then(|v| {
-            v.get("type")
-                .and_then(|t| t.as_str())
-                .map(str::to_string)
-        })
+        .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_string))
         .unwrap_or_else(|| "unrecognized".to_string())
 }
 
@@ -1397,7 +1398,10 @@ async fn conversations(limit: Option<u32>) -> Result<()> {
                         .get("conversation_id")
                         .and_then(|v| v.as_str())
                         .unwrap_or("?");
-                    let ts = item.get("last_ts_secs").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let ts = item
+                        .get("last_ts_secs")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
                     let preview = item.get("preview").and_then(|v| v.as_str()).unwrap_or("");
                     let when = format_relative(now, ts);
                     let preview = truncate_preview(preview, 80);
@@ -1895,7 +1899,10 @@ mod tests {
         assert!(msg.contains("unexpected"), "message is descriptive: {msg}");
         assert!(msg.contains("retry"), "message states the next step: {msg}");
         // It names the frame kind from the wire tag (readable), not the type.
-        assert!(msg.contains("assistant_delta"), "names the frame kind: {msg}");
+        assert!(
+            msg.contains("assistant_delta"),
+            "names the frame kind: {msg}"
+        );
 
         // A closed connection (no reply) is its own readable message.
         let closed = unexpected_pair_reply(None);

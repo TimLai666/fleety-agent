@@ -107,7 +107,12 @@ pub fn assistant_update(session_id: &str, text: &str) -> Value {
 /// to the editor when the server asks for tool approval (require-approval policy).
 /// `tool_call_id` (we use the server's approval id) lets the editor associate
 /// the permission dialog with a tool call — ACP's ToolCallUpdate requires it.
-pub fn permission_request(session_id: &str, tool_call_id: &str, tool: &str, summary: &str) -> Value {
+pub fn permission_request(
+    session_id: &str,
+    tool_call_id: &str,
+    tool: &str,
+    summary: &str,
+) -> Value {
     json!({
         "sessionId": session_id,
         "toolCall": { "toolCallId": tool_call_id, "title": tool, "summary": summary },
@@ -171,15 +176,20 @@ pub fn load_session_result() -> Value {
 pub fn zed_settings_path() -> Option<std::path::PathBuf> {
     #[cfg(windows)]
     {
-        std::env::var("APPDATA")
-            .ok()
-            .map(|p| std::path::PathBuf::from(p).join("Zed").join("settings.json"))
+        std::env::var("APPDATA").ok().map(|p| {
+            std::path::PathBuf::from(p)
+                .join("Zed")
+                .join("settings.json")
+        })
     }
     #[cfg(not(windows))]
     {
-        std::env::var("HOME")
-            .ok()
-            .map(|p| std::path::PathBuf::from(p).join(".config").join("zed").join("settings.json"))
+        std::env::var("HOME").ok().map(|p| {
+            std::path::PathBuf::from(p)
+                .join(".config")
+                .join("zed")
+                .join("settings.json")
+        })
     }
 }
 
@@ -211,8 +221,9 @@ pub fn merge_zed_settings(
     let mut root: Value = if existing.trim().is_empty() {
         json!({})
     } else {
-        serde_json::from_str(existing)
-            .map_err(|e| format!("settings.json is not plain JSON ({e}); it may contain comments"))?
+        serde_json::from_str(existing).map_err(|e| {
+            format!("settings.json is not plain JSON ({e}); it may contain comments")
+        })?
     };
     let obj = root
         .as_object_mut()
@@ -241,7 +252,10 @@ pub fn refresh_installed(server: Option<&str>) {
     };
     if let Some(merged) = refresh_zed_settings(&existing, &current_exe_str(), server) {
         if std::fs::write(&path, merged).is_ok() {
-            println!("Refreshed the Fleety ACP agent in Zed ({}).", path.display());
+            println!(
+                "Refreshed the Fleety ACP agent in Zed ({}).",
+                path.display()
+            );
         }
     }
 }
@@ -566,7 +580,11 @@ pub async fn handle_message(msg: &Value, bridge: &dyn AcpBridge) -> Vec<Value> {
                 .map(str::to_string);
             match bridge.new_session(cwd).await {
                 Ok(sid) => vec![response_ok(reply_id(), json!({ "sessionId": sid }))],
-                Err(e) => vec![response_err(reply_id(), INTERNAL_ERROR, &e.report().message)],
+                Err(e) => vec![response_err(
+                    reply_id(),
+                    INTERNAL_ERROR,
+                    &e.report().message,
+                )],
             }
         }
         "session/prompt" => {
@@ -589,7 +607,11 @@ pub async fn handle_message(msg: &Value, bridge: &dyn AcpBridge) -> Vec<Value> {
                     ));
                     out
                 }
-                Err(e) => vec![response_err(reply_id(), INTERNAL_ERROR, &e.report().message)],
+                Err(e) => vec![response_err(
+                    reply_id(),
+                    INTERNAL_ERROR,
+                    &e.report().message,
+                )],
             }
         }
         "session/load" => {
@@ -605,7 +627,11 @@ pub async fn handle_message(msg: &Value, bridge: &dyn AcpBridge) -> Vec<Value> {
                     out.push(response_ok(reply_id(), load_session_result()));
                     out
                 }
-                Err(e) => vec![response_err(reply_id(), INTERNAL_ERROR, &e.report().message)],
+                Err(e) => vec![response_err(
+                    reply_id(),
+                    INTERNAL_ERROR,
+                    &e.report().message,
+                )],
             }
         }
         // Cancel is a notification (no id → no response). Forward it to the
@@ -1256,7 +1282,10 @@ mod tests {
         .await;
         assert_eq!(r.len(), 3, "two chunks + one response");
         assert_eq!(r[0]["method"], "session/update");
-        assert_eq!(r[0]["params"]["update"]["sessionUpdate"], "agent_message_chunk");
+        assert_eq!(
+            r[0]["params"]["update"]["sessionUpdate"],
+            "agent_message_chunk"
+        );
         assert_eq!(r[0]["params"]["update"]["content"]["text"], "hello");
         assert_eq!(r[2]["result"]["stopReason"], "end_turn");
         // unknown request → method-not-found error.
@@ -1285,7 +1314,10 @@ mod tests {
         // The history replay (session/update notifications) comes first...
         assert_eq!(r.len(), 2, "one replay update + one response");
         assert_eq!(r[0]["method"], "session/update");
-        assert_eq!(r[0]["params"]["update"]["sessionUpdate"], "agent_message_chunk");
+        assert_eq!(
+            r[0]["params"]["update"]["sessionUpdate"],
+            "agent_message_chunk"
+        );
         assert_eq!(r[0]["params"]["update"]["content"]["text"], "replayed");
         // ...then the load response, addressed to the request id.
         assert_eq!(r[1]["jsonrpc"], "2.0");
@@ -1416,8 +1448,10 @@ mod tests {
         assert_eq!(v["agent_servers"]["Fleety"]["command"], "/bin/fleety");
 
         // Merge preserves other keys and other agent servers; adds Fleety.
-        let existing = r#"{"theme":"dark","agent_servers":{"Other":{"type":"custom","command":"x"}}}"#;
-        let (out, updated) = merge_zed_settings(existing, "/new/fleety", None).expect("merge existing");
+        let existing =
+            r#"{"theme":"dark","agent_servers":{"Other":{"type":"custom","command":"x"}}}"#;
+        let (out, updated) =
+            merge_zed_settings(existing, "/new/fleety", None).expect("merge existing");
         assert!(!updated, "no prior Fleety entry → add");
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["theme"], "dark");
@@ -1429,16 +1463,25 @@ mod tests {
         assert!(updated, "existing Fleety entry → update");
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["agent_servers"]["Fleety"]["command"], "/updated/fleety");
-        assert_eq!(v["agent_servers"]["Other"]["command"], "x", "other agents preserved");
+        assert_eq!(
+            v["agent_servers"]["Other"]["command"], "x",
+            "other agents preserved"
+        );
 
         // JSONC with comments is refused (never clobbered).
-        assert!(merge_zed_settings("// my settings\n{\"theme\":\"dark\"}", "/bin/fleety", None).is_err());
+        assert!(
+            merge_zed_settings("// my settings\n{\"theme\":\"dark\"}", "/bin/fleety", None)
+                .is_err()
+        );
     }
 
     #[test]
     fn refresh_only_repoints_when_already_installed() {
         // Not installed → no refresh (never newly installs).
-        assert_eq!(refresh_zed_settings(r#"{"theme":"dark"}"#, "/bin/fleety", None), None);
+        assert_eq!(
+            refresh_zed_settings(r#"{"theme":"dark"}"#, "/bin/fleety", None),
+            None
+        );
         assert_eq!(refresh_zed_settings("", "/bin/fleety", None), None);
         // Unparseable (JSONC) → no refresh (never clobbers).
         assert_eq!(refresh_zed_settings("// c\n{}", "/bin/fleety", None), None);
@@ -1459,7 +1502,10 @@ mod tests {
         assert_eq!(u["method"], "session/update");
         assert_eq!(u["params"]["sessionId"], "s1");
         // ACP SessionUpdate: tagged by `sessionUpdate`, carrying a ContentBlock.
-        assert_eq!(u["params"]["update"]["sessionUpdate"], "agent_message_chunk");
+        assert_eq!(
+            u["params"]["update"]["sessionUpdate"],
+            "agent_message_chunk"
+        );
         assert_eq!(u["params"]["update"]["content"]["type"], "text");
         assert_eq!(u["params"]["update"]["content"]["text"], "hello");
         let p = permission_request("s1", "appr-1", "write_file", "edit foo");

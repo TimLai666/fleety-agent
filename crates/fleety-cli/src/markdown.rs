@@ -306,7 +306,10 @@ mod tests {
             .join("\n");
         assert!(joined.contains("intro"), "{joined:?}");
         assert!(joined.contains("still going"), "{joined:?}");
-        assert!(joined.contains("```"), "stray fence shown literally: {joined:?}");
+        assert!(
+            joined.contains("```"),
+            "stray fence shown literally: {joined:?}"
+        );
     }
 
     #[test]

@@ -109,7 +109,11 @@ const HOOK_LOCAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3
 
 async fn run_local_hook(command: &str, cwd: Option<&str>) -> crate::hooks_compat::HookOutcome {
     use crate::hooks_compat::HookOutcome;
-    let (shell, flag) = if cfg!(windows) { ("cmd", "/C") } else { ("sh", "-c") };
+    let (shell, flag) = if cfg!(windows) {
+        ("cmd", "/C")
+    } else {
+        ("sh", "-c")
+    };
     let mut child = tokio::process::Command::new(shell);
     child
         .arg(flag)
@@ -136,7 +140,10 @@ async fn run_local_hook(command: &str, cwd: Option<&str>) -> crate::hooks_compat
 /// [`HookOutcome`](crate::hooks_compat::HookOutcome).
 fn outcome_from_run_command(v: &serde_json::Value) -> crate::hooks_compat::HookOutcome {
     use crate::hooks_compat::HookOutcome;
-    if v.get("timed_out").and_then(serde_json::Value::as_bool).unwrap_or(false) {
+    if v.get("timed_out")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
         return HookOutcome::Failed("hook timed out on origin device".to_string());
     }
     match v.get("exit_code") {
@@ -1740,11 +1747,7 @@ fn apply_structured_changes(
             ChangeOp::Set => {
                 let Some(setting) = fleety_tools::config::find(&ch.key) else {
                     return (
-                        config_err(
-                            "invalid",
-                            format!("unknown setting '{}'", ch.key),
-                            None,
-                        ),
+                        config_err("invalid", format!("unknown setting '{}'", ch.key), None),
                         0,
                         vec![],
                     );
@@ -1763,11 +1766,7 @@ fn apply_structured_changes(
             ChangeOp::Clear => {
                 let Some(setting) = fleety_tools::config::find(&ch.key) else {
                     return (
-                        config_err(
-                            "invalid",
-                            format!("unknown setting '{}'", ch.key),
-                            None,
-                        ),
+                        config_err("invalid", format!("unknown setting '{}'", ch.key), None),
                         0,
                         vec![],
                     );
@@ -2164,7 +2163,11 @@ fn format_instruction_files(files: &[crate::instructions::InstructionFile]) -> O
          specific files override shallower ones):",
     );
     for f in files {
-        s.push_str(&format!("\n\n===== {} =====\n{}", f.path.display(), f.content));
+        s.push_str(&format!(
+            "\n\n===== {} =====\n{}",
+            f.path.display(),
+            f.content
+        ));
     }
     Some(s)
 }
@@ -2967,9 +2970,7 @@ mod tests {
         ));
         assert!(
             matches!(
-                outcome_from_run_command(
-                    &serde_json::json!({ "timed_out": true, "exit_code": 0 })
-                ),
+                outcome_from_run_command(&serde_json::json!({ "timed_out": true, "exit_code": 0 })),
                 HookOutcome::Failed(_)
             ),
             "a timed-out origin run is a Failed outcome, not a spurious success"
@@ -2978,8 +2979,7 @@ mod tests {
 
     #[tokio::test]
     async fn collect_conversation_hooks_same_host_reads_local_settings() {
-        let home =
-            std::env::temp_dir().join(format!("fleety-connhook-{}", uuid::Uuid::new_v4()));
+        let home = std::env::temp_dir().join(format!("fleety-connhook-{}", uuid::Uuid::new_v4()));
         let proj = home.join("proj");
         std::fs::create_dir_all(proj.join(".claude")).expect("mk proj/.claude");
         std::fs::write(
@@ -2990,15 +2990,9 @@ mod tests {
         let hub = crate::bridge::new_hub();
         let pending = crate::bridge::new_pending();
         // device None → same-host: reads local project + user settings, no hub use.
-        let got = collect_conversation_hooks(
-            None,
-            proj.to_str(),
-            None,
-            home.to_str(),
-            &hub,
-            &pending,
-        )
-        .await;
+        let got =
+            collect_conversation_hooks(None, proj.to_str(), None, home.to_str(), &hub, &pending)
+                .await;
         assert_eq!(got.len(), 1, "the project hook is collected");
         assert_eq!(got[0].command, "p.sh");
         assert_eq!(got[0].scope, crate::hooks_compat::HookScope::Project);
@@ -3049,7 +3043,9 @@ mod tests {
         let hub = crate::bridge::new_hub();
         let pending = crate::bridge::new_pending();
         let storage = temp_storage();
-        wrap_registry_with_hooks(&mut tools, &ctx, &hub, &pending, &storage, "dev-1", "conv-1");
+        wrap_registry_with_hooks(
+            &mut tools, &ctx, &hub, &pending, &storage, "dev-1", "conv-1",
+        );
         let out = tools.call("Bash", serde_json::json!({})).await.unwrap();
         assert_eq!(out["denied"], serde_json::json!(true));
         assert!(!*ran.lock().unwrap(), "denied tool must not run");
@@ -3071,7 +3067,9 @@ mod tests {
         let hub = crate::bridge::new_hub();
         let pending = crate::bridge::new_pending();
         let storage = temp_storage();
-        wrap_registry_with_hooks(&mut tools, &ctx, &hub, &pending, &storage, "dev-1", "conv-1");
+        wrap_registry_with_hooks(
+            &mut tools, &ctx, &hub, &pending, &storage, "dev-1", "conv-1",
+        );
         let out = tools.call("Bash", serde_json::json!({})).await.unwrap();
         assert_eq!(out["ok"], serde_json::json!(true), "tool runs normally");
         assert!(*ran.lock().unwrap(), "no hooks ⇒ unwrapped ⇒ tool ran");
@@ -3126,7 +3124,10 @@ mod tests {
 
         // Reconnect: the same (now-used) code is resent alongside the valid token.
         assert!(
-            matches!(authenticate(&auth, "dev", Some(&token), Some(&code)), Ok(None)),
+            matches!(
+                authenticate(&auth, "dev", Some(&token), Some(&code)),
+                Ok(None)
+            ),
             "a valid token must authenticate even when the spent pairing code is resent"
         );
 
@@ -3234,8 +3235,14 @@ mod tests {
                 entries,
                 providers_json,
             } => {
-                assert!(revision.contains(':'), "revision carries the boot id: {revision}");
-                let tok = entries.iter().find(|e| e.key == "FLEETY_TOKEN").expect("token entry");
+                assert!(
+                    revision.contains(':'),
+                    "revision carries the boot id: {revision}"
+                );
+                let tok = entries
+                    .iter()
+                    .find(|e| e.key == "FLEETY_TOKEN")
+                    .expect("token entry");
                 assert!(tok.secret && tok.value.is_empty(), "secret value omitted");
                 assert!(
                     serde_json::from_str::<serde_json::Value>(&providers_json).is_ok(),
@@ -3265,8 +3272,11 @@ mod tests {
         };
 
         // Stale base_revision → conflict, nothing applied.
-        let (r, applied, _) =
-            apply_structured_changes("stale:rev", &[set("FLEETY_POLICY", "require_approval")], true);
+        let (r, applied, _) = apply_structured_changes(
+            "stale:rev",
+            &[set("FLEETY_POLICY", "require_approval")],
+            true,
+        );
         assert!(
             matches!(&r, ServerMsg::ConfigResult { ok: false, error: Some(e), .. } if e.kind == "conflict")
         );
@@ -3287,8 +3297,11 @@ mod tests {
         );
 
         // Auth off + a mutating change → refused (unauthenticated).
-        let (r, _, _) =
-            apply_structured_changes(&config_revision(), &[set("FLEETY_TZ", "Asia/Taipei")], false);
+        let (r, _, _) = apply_structured_changes(
+            &config_revision(),
+            &[set("FLEETY_TZ", "Asia/Taipei")],
+            false,
+        );
         assert!(
             matches!(&r, ServerMsg::ConfigResult { ok: false, error: Some(e), .. } if e.kind == "unauthenticated")
         );
@@ -4019,8 +4032,7 @@ mod tests {
 
     #[test]
     fn instruction_preamble_injects_layered_files_per_conversation() {
-        let home =
-            std::env::temp_dir().join(format!("fleety-instr-{}", uuid::Uuid::new_v4()));
+        let home = std::env::temp_dir().join(format!("fleety-instr-{}", uuid::Uuid::new_v4()));
         let proj = home.join("proj");
         std::fs::create_dir_all(&proj).expect("mk proj");
         std::fs::write(home.join("AGENTS.md"), "root-rule").expect("w root");
@@ -4072,12 +4084,14 @@ mod tests {
                     risk: RiskLevel::Read,
                 }
             }
-            async fn call(&self, _args: serde_json::Value) -> agent_core::Result<serde_json::Value> {
+            async fn call(
+                &self,
+                _args: serde_json::Value,
+            ) -> agent_core::Result<serde_json::Value> {
                 Ok(serde_json::json!({ "content": "remote-rule" }))
             }
         }
-        let home =
-            std::env::temp_dir().join(format!("fleety-xdev-{}", uuid::Uuid::new_v4()));
+        let home = std::env::temp_dir().join(format!("fleety-xdev-{}", uuid::Uuid::new_v4()));
         let storage = Arc::new(Storage::new(home.clone()));
         storage
             .set_conversation_workspace("c1", &cross_device_binding())
@@ -4093,8 +4107,7 @@ mod tests {
 
     #[tokio::test]
     async fn cross_device_read_failure_is_skipped() {
-        let home =
-            std::env::temp_dir().join(format!("fleety-xdev2-{}", uuid::Uuid::new_v4()));
+        let home = std::env::temp_dir().join(format!("fleety-xdev2-{}", uuid::Uuid::new_v4()));
         let storage = Arc::new(Storage::new(home.clone()));
         storage
             .set_conversation_workspace("c1", &cross_device_binding())
@@ -4924,10 +4937,9 @@ mod tests {
 
         // If the block fails, the provider would answer "processed" — a clear
         // failure signal versus the expected "blocked" notice.
-        let provider: Arc<dyn ModelProvider> =
-            Arc::new(MockProvider::new(vec![ModelResponse {
-                message: Message::assistant("PROVIDER_REACHED_SENTINEL"),
-            }]));
+        let provider: Arc<dyn ModelProvider> = Arc::new(MockProvider::new(vec![ModelResponse {
+            message: Message::assistant("PROVIDER_REACHED_SENTINEL"),
+        }]));
         let storage = Arc::new(Storage::new(home.clone()));
         let workspace = Arc::new(ws_root.clone());
 
@@ -5136,7 +5148,10 @@ mod tests {
             !project.join("x.txt").exists(),
             "PreToolUse-denied write must not happen"
         );
-        assert!(!ws_root.join("x.txt").exists(), "no write in the fallback either");
+        assert!(
+            !ws_root.join("x.txt").exists(),
+            "no write in the fallback either"
+        );
 
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -5266,7 +5281,10 @@ mod tests {
                 None => break,
             }
         }
-        assert!(saw_cancelled, "closing reply should say it was cancelled at the user's request");
+        assert!(
+            saw_cancelled,
+            "closing reply should say it was cancelled at the user's request"
+        );
         assert!(saw_done, "turn should complete with Done");
 
         let _ = std::fs::remove_dir_all(&home);
@@ -5277,10 +5295,9 @@ mod tests {
     /// emits nothing for it, so a following ping-like turn still works.
     #[tokio::test]
     async fn idle_cancel_turn_is_ignored_silently() {
-        let provider: Arc<dyn ModelProvider> =
-            Arc::new(MockProvider::new(vec![ModelResponse {
-                message: Message::assistant("hello there"),
-            }]));
+        let provider: Arc<dyn ModelProvider> = Arc::new(MockProvider::new(vec![ModelResponse {
+            message: Message::assistant("hello there"),
+        }]));
         let home = std::env::temp_dir().join(format!("fleety-idlecancel-{}", uuid::Uuid::new_v4()));
         let ws_root = home.join("ws");
         std::fs::create_dir_all(&ws_root).expect("mk ws");

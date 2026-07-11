@@ -163,11 +163,8 @@ mod tests {
 
     #[test]
     fn collect_instruction_paths_layers_and_dedupes() {
-        let got = collect_instruction_paths(
-            Path::new("/a"),
-            Path::new("/a/b/c"),
-            Path::new("/home/u"),
-        );
+        let got =
+            collect_instruction_paths(Path::new("/a"), Path::new("/a/b/c"), Path::new("/home/u"));
         let expect: Vec<PathBuf> = [
             "/a/CLAUDE.md",
             "/a/AGENTS.md",
@@ -187,8 +184,7 @@ mod tests {
 
     #[test]
     fn collect_single_layer_when_root_equals_cwd() {
-        let got =
-            collect_instruction_paths(Path::new("/a"), Path::new("/a"), Path::new("/home/u"));
+        let got = collect_instruction_paths(Path::new("/a"), Path::new("/a"), Path::new("/home/u"));
         // One layer (/a) → 2 files, plus 3 user-global files (.claude/.agents/.codex).
         assert_eq!(got.len(), 5);
         assert_eq!(got[0], PathBuf::from("/a/CLAUDE.md"));

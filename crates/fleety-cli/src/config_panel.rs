@@ -97,10 +97,8 @@ impl Panel {
         entries: Vec<ConfigEntry>,
         revision: String,
     ) -> Self {
-        let local = fleety_tools::config::rows_in_scopes(
-            &local_map,
-            fleety_tools::config::LOCAL_SCOPES,
-        );
+        let local =
+            fleety_tools::config::rows_in_scopes(&local_map, fleety_tools::config::LOCAL_SCOPES);
         Self {
             region: Region::Connection,
             sel: 0,
@@ -114,8 +112,7 @@ impl Panel {
             revision,
             staged: BTreeMap::new(),
             apply_now: false,
-            status: "Tab: region · ↑/↓: move · Enter: edit · a: apply server · q: quit"
-                .to_string(),
+            status: "Tab: region · ↑/↓: move · Enter: edit · a: apply server · q: quit".to_string(),
             quit: false,
         }
     }
@@ -212,7 +209,8 @@ impl Panel {
                             value: if value.is_empty() { None } else { Some(value) },
                         },
                     );
-                    self.status = format!("staged '{}' — press a to apply to the server", entry.key);
+                    self.status =
+                        format!("staged '{}' — press a to apply to the server", entry.key);
                 }
                 false
             }
@@ -302,7 +300,11 @@ fn on_key(p: &mut Panel, code: KeyCode) -> bool {
 fn render(f: &mut Frame, p: &Panel) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(3), Constraint::Length(3)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(3),
+            Constraint::Length(3),
+        ])
         .split(f.area());
 
     // Region tab bar.
@@ -325,17 +327,30 @@ fn render(f: &mut Frame, p: &Panel) {
         Region::Connection => {
             for (i, name) in p.profile_names().iter().enumerate() {
                 let marker = if i == p.sel { "▶" } else { " " };
-                let cur = if p.conns.current.as_deref() == Some(name) { "*" } else { " " };
-                let url = p.conns.profiles.get(name).map(|x| x.url.clone()).unwrap_or_default();
+                let cur = if p.conns.current.as_deref() == Some(name) {
+                    "*"
+                } else {
+                    " "
+                };
+                let url = p
+                    .conns
+                    .profiles
+                    .get(name)
+                    .map(|x| x.url.clone())
+                    .unwrap_or_default();
                 lines.push(Line::from(format!("{marker}{cur} {name:<14} {url}")));
             }
             lines.push(Line::from(""));
-            lines.push(Line::from("(u: switch current · Enter: edit url · s: save)"));
+            lines.push(Line::from(
+                "(u: switch current · Enter: edit url · s: save)",
+            ));
         }
         Region::Local => {
             for (i, (key, scope, value, source)) in p.local.iter().enumerate() {
                 let marker = if i == p.sel { "▶" } else { " " };
-                lines.push(Line::from(format!("{marker} [{scope:6}] {key:<24} = {value}  ({source})")));
+                lines.push(Line::from(format!(
+                    "{marker} [{scope:6}] {key:<24} = {value}  ({source})"
+                )));
             }
         }
         Region::Server => {
@@ -348,11 +363,19 @@ fn render(f: &mut Frame, p: &Panel) {
                 for (i, e) in p.entries.iter().enumerate() {
                     let marker = if i == p.sel { "▶" } else { " " };
                     let shown = if e.secret {
-                        if e.is_set { "********" } else { "(unset)" }
+                        if e.is_set {
+                            "********"
+                        } else {
+                            "(unset)"
+                        }
                     } else {
                         &e.value
                     };
-                    let staged = if p.staged.contains_key(&e.key) { " *staged" } else { "" };
+                    let staged = if p.staged.contains_key(&e.key) {
+                        " *staged"
+                    } else {
+                        ""
+                    };
                     lines.push(Line::from(format!(
                         "{marker} [{:6}] {:<24} = {shown}{staged}",
                         e.scope, e.key
@@ -397,18 +420,23 @@ pub async fn run() -> Result<()> {
     // Resolve + connect, capturing the Welcome so we know the server's config
     // protocol. On any connection failure, the panel still opens for the local
     // + connection regions; the server region reports it is unavailable.
-    let (mut conn, cp): (Option<(fleety_tools::transport::Sender, fleety_tools::transport::Receiver)>, Option<u32>) =
-        match crate::open_panel().await {
-            Ok((streams, cp)) => (Some(streams), Some(cp)),
-            Err(e) => {
-                eprintln!(
-                    "note: could not reach the server ({}) — the Server region is unavailable; \
+    let (mut conn, cp): (
+        Option<(
+            fleety_tools::transport::Sender,
+            fleety_tools::transport::Receiver,
+        )>,
+        Option<u32>,
+    ) = match crate::open_panel().await {
+        Ok((streams, cp)) => (Some(streams), Some(cp)),
+        Err(e) => {
+            eprintln!(
+                "note: could not reach the server ({}) — the Server region is unavailable; \
                      the Connection and This-device regions still work.",
-                    e.report().message
-                );
-                (None, None)
-            }
-        };
+                e.report().message
+            );
+            (None, None)
+        }
+    };
     let mut server_supported = false;
     let mut entries: Vec<ConfigEntry> = Vec::new();
     let mut revision = String::new();
@@ -422,7 +450,10 @@ pub async fn run() -> Result<()> {
                 }
                 Err(e) => {
                     server_supported = false;
-                    eprintln!("note: snapshot failed ({}); Server region read-only.", e.report().message);
+                    eprintln!(
+                        "note: snapshot failed ({}); Server region read-only.",
+                        e.report().message
+                    );
                 }
             }
         }
@@ -466,10 +497,9 @@ pub async fn run() -> Result<()> {
             };
         }
         if persist {
-            if let Err(e) = fleety_tools::config::save(
-                &fleety_tools::config::config_path(),
-                &app.local_map,
-            ) {
+            if let Err(e) =
+                fleety_tools::config::save(&fleety_tools::config::config_path(), &app.local_map)
+            {
                 app.status = format!("save failed: {}", e.report().message);
             }
         }
@@ -504,14 +534,21 @@ async fn pull_snapshot(
     tx: &mut fleety_tools::transport::Sender,
     rx: &mut fleety_tools::transport::Receiver,
 ) -> Result<(String, Vec<ConfigEntry>)> {
-    crate::send(tx, &ClientMsg::ConfigSnapshot {
-        target: ConfigTarget::Server,
-    })
+    crate::send(
+        tx,
+        &ClientMsg::ConfigSnapshot {
+            target: ConfigTarget::Server,
+        },
+    )
     .await?;
     match crate::recv(rx).await? {
-        Some(ServerMsg::ConfigSnapshotResult { revision, entries, .. }) => Ok((revision, entries)),
+        Some(ServerMsg::ConfigSnapshotResult {
+            revision, entries, ..
+        }) => Ok((revision, entries)),
         Some(ServerMsg::Error { error }) => Err(CoreError::Provider(error.message)),
-        other => Err(CoreError::Provider(format!("expected a config snapshot, got {other:?}"))),
+        other => Err(CoreError::Provider(format!(
+            "expected a config snapshot, got {other:?}"
+        ))),
     }
 }
 
@@ -522,22 +559,33 @@ async fn apply_changes(
     base_revision: &str,
     changes: Vec<ConfigChange>,
 ) -> Result<String> {
-    crate::send(tx, &ClientMsg::ConfigApply {
-        target: ConfigTarget::Server,
-        base_revision: base_revision.to_string(),
-        changes,
-    })
+    crate::send(
+        tx,
+        &ClientMsg::ConfigApply {
+            target: ConfigTarget::Server,
+            base_revision: base_revision.to_string(),
+            changes,
+        },
+    )
     .await?;
     match crate::recv(rx).await? {
-        Some(ServerMsg::ConfigResult { ok: true, output, .. }) => Ok(if output.is_empty() {
+        Some(ServerMsg::ConfigResult {
+            ok: true, output, ..
+        }) => Ok(if output.is_empty() {
             "applied".to_string()
         } else {
             output
         }),
-        Some(ServerMsg::ConfigResult { ok: false, error, .. }) => Err(CoreError::Provider(
-            error.map(|e| e.message).unwrap_or_else(|| "apply rejected".to_string()),
+        Some(ServerMsg::ConfigResult {
+            ok: false, error, ..
+        }) => Err(CoreError::Provider(
+            error
+                .map(|e| e.message)
+                .unwrap_or_else(|| "apply rejected".to_string()),
         )),
-        other => Err(CoreError::Provider(format!("unexpected apply reply: {other:?}"))),
+        other => Err(CoreError::Provider(format!(
+            "unexpected apply reply: {other:?}"
+        ))),
     }
 }
 

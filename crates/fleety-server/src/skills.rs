@@ -466,7 +466,9 @@ impl Tool for UseSkill {
             .parent()
             .map(|p| p.display().to_string())
             .unwrap_or_default();
-        Ok(json!({ "name": name, "source": info.source, "path": dir, "content": content, "device": info.device.clone() }))
+        Ok(
+            json!({ "name": name, "source": info.source, "path": dir, "content": content, "device": info.device.clone() }),
+        )
     }
 }
 
@@ -1436,7 +1438,10 @@ mod tests {
                 .any(|e| e["name"] == json!("projskill"))
         };
         assert!(has(&list_a), "conversation A sees its project skill");
-        assert!(!has(&list_b), "conversation B does not see A's project skill");
+        assert!(
+            !has(&list_b),
+            "conversation B does not see A's project skill"
+        );
         for d in [&b, &a, &i, &s, &proj] {
             let _ = std::fs::remove_dir_all(d);
         }
@@ -1499,7 +1504,14 @@ mod tests {
             "---\nname: dup\ndescription: the claude version of the dup skill here now.\n---\nclaude-body\n",
         );
         let mut reg = ToolRegistry::new();
-        register(&mut reg, &b, &a, &i, &s, &[agents_dir.clone(), claude_dir.clone()]);
+        register(
+            &mut reg,
+            &b,
+            &a,
+            &i,
+            &s,
+            &[agents_dir.clone(), claude_dir.clone()],
+        );
         let used = reg
             .call("use_skill", json!({ "name": "dup" }))
             .await
@@ -1552,7 +1564,14 @@ mod tests {
             "---\nname: pskill\ndescription: a plugin-provided skill for this conversation now.\n---\n# P\n",
         );
         let mut reg = ToolRegistry::new();
-        register(&mut reg, &b, &a, &i, &s, std::slice::from_ref(&plugin_skills));
+        register(
+            &mut reg,
+            &b,
+            &a,
+            &i,
+            &s,
+            std::slice::from_ref(&plugin_skills),
+        );
         let listed = reg.call("list_skills", json!({})).await.expect("list");
         assert!(listed["skills"]
             .as_array()

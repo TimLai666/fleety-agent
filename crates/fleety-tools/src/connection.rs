@@ -252,11 +252,7 @@ pub fn migrate_from_config_json_at(dir: &Path) -> Result<Migration> {
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             return Ok(Migration::AlreadyPresent);
         }
-        Err(e) => {
-            return Err(CoreError::Message(format!(
-                "create connections.toml: {e}"
-            )))
-        }
+        Err(e) => return Err(CoreError::Message(format!("create connections.toml: {e}"))),
     }
 
     // Back up (never delete) the old files so the migration is reversible.
@@ -546,7 +542,10 @@ mod tests {
         assert_eq!(default.url, "ws://srv:8787");
         assert_eq!(default.token.as_deref(), Some("tok-x"));
         // config.json backed up (renamed), not deleted.
-        assert!(!dir.join("config.json").exists(), "config.json renamed away");
+        assert!(
+            !dir.join("config.json").exists(),
+            "config.json renamed away"
+        );
         assert!(
             dir.join("config.json.migrated").exists(),
             "backup kept for rollback"
@@ -557,11 +556,7 @@ mod tests {
     #[test]
     fn migrate_is_idempotent() {
         let dir = tmp_dir();
-        std::fs::write(
-            dir.join("config.json"),
-            r#"{"agent_url":"ws://srv:8787"}"#,
-        )
-        .expect("seed");
+        std::fs::write(dir.join("config.json"), r#"{"agent_url":"ws://srv:8787"}"#).expect("seed");
         assert_eq!(
             migrate_from_config_json_at(&dir).expect("first"),
             Migration::Migrated
@@ -694,7 +689,10 @@ mod tests {
         Connections {
             device_id: "dev".to_string(),
             current: current.map(String::from),
-            profiles: profiles.iter().map(|(n, p)| (n.to_string(), p.clone())).collect(),
+            profiles: profiles
+                .iter()
+                .map(|(n, p)| (n.to_string(), p.clone()))
+                .collect(),
         }
     }
 
@@ -702,7 +700,10 @@ mod tests {
     fn resolve_named_override_uses_that_profile_and_errors_on_unknown() {
         let mut work = profile("ws://work:8787");
         work.token = Some("work-tok".to_string());
-        let conns = conns_with(Some("home"), &[("home", profile("ws://home:8787")), ("work", work)]);
+        let conns = conns_with(
+            Some("home"),
+            &[("home", profile("ws://home:8787")), ("work", work)],
+        );
         let r = resolve(&conns, &Target::Named("work".into()), None, None, no_mdns).expect("named");
         assert_eq!(r.url, "ws://work:8787");
         assert_eq!(r.token.as_deref(), Some("work-tok"));
@@ -715,8 +716,14 @@ mod tests {
     fn resolve_url_override_is_direct_with_pinned_token_only() {
         let conns = conns_with(Some("home"), &[("home", profile("ws://home:8787"))]);
         // A url with no matching profile → no token.
-        let r = resolve(&conns, &Target::Url("ws://adhoc:9000".into()), None, None, no_mdns)
-            .expect("url");
+        let r = resolve(
+            &conns,
+            &Target::Url("ws://adhoc:9000".into()),
+            None,
+            None,
+            no_mdns,
+        )
+        .expect("url");
         assert_eq!(r.url, "ws://adhoc:9000");
         assert!(r.token.is_none());
         assert_eq!(r.source, Source::Override);
@@ -770,7 +777,10 @@ mod tests {
         .expect("mdns");
         assert_eq!(r.url, "ws://192.168.1.99:8787");
         assert_eq!(r.source, Source::Mdns);
-        assert!(r.token.is_none(), "mismatched fingerprint must not receive the token");
+        assert!(
+            r.token.is_none(),
+            "mismatched fingerprint must not receive the token"
+        );
     }
 
     #[test]

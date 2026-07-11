@@ -1,4 +1,4 @@
-﻿//! The tool-calling loop.
+//! The tool-calling loop.
 //!
 //! Drives a [`ModelProvider`] and a [`ToolRegistry`]: ask the model, run any
 //! tool calls it requests, feed the results back, and repeat until the model
@@ -316,7 +316,10 @@ pub async fn run_turn_streaming_cached(
                         id: skipped.id.clone(),
                         result: sentinel.clone(),
                     });
-                    messages.push(Message::tool_result(skipped.id.clone(), sentinel.to_string()));
+                    messages.push(Message::tool_result(
+                        skipped.id.clone(),
+                        sentinel.to_string(),
+                    ));
                 }
                 return Ok(TurnOutcome {
                     output: String::new(),
@@ -1402,8 +1405,7 @@ mod tests {
         }
 
         async fn call(&self, _args: Value) -> Result<Value> {
-            self.flag
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+            self.flag.store(true, std::sync::atomic::Ordering::Relaxed);
             Ok(json!({ "flag_set": true }))
         }
     }
@@ -1567,7 +1569,11 @@ mod tests {
             .iter()
             .find(|m| m.tool_call_id.as_deref() == Some("c1"))
             .expect("tool result message");
-        assert!(fed.content.as_deref().unwrap_or_default().contains("echoed"));
+        assert!(fed
+            .content
+            .as_deref()
+            .unwrap_or_default()
+            .contains("echoed"));
         assert!(!messages.iter().any(|m| m
             .content
             .as_deref()

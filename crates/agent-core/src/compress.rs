@@ -477,7 +477,10 @@ mod tests {
         let big: Vec<Value> = (0..60).map(|i| json!(i)).collect();
         let v = json!({ "items": big });
         let out = compress_tool_result(&v, 8000, "call_9");
-        assert!(out.chars().count() <= 8000, "the crushed result fits the budget");
+        assert!(
+            out.chars().count() <= 8000,
+            "the crushed result fits the budget"
+        );
         assert!(out.contains("more items"), "content was actually trimmed");
         assert!(
             out.contains("fetch_tool_result id=\"call_9\""),
@@ -503,7 +506,8 @@ mod tests {
     fn dropping_only_empty_fields_is_not_marked() {
         // drop_empty removes empties losslessly — that is not a truncation, so no
         // fetch marker should be attached.
-        let (v, truncated) = SmartCrusher::default().crush_tracked(&json!({ "keep": 1, "empty": [] }));
+        let (v, truncated) =
+            SmartCrusher::default().crush_tracked(&json!({ "keep": 1, "empty": [] }));
         assert!(!truncated, "dropping empty fields is lossless");
         let _ = v;
     }

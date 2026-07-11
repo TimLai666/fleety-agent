@@ -264,7 +264,9 @@ mod tests {
         assert_eq!(guess_mime_from_path(Path::new("a.js")), "text/javascript");
         // Every source type is under text/* so the server treats it as text, not
         // an opaque blob. Case-insensitive on the extension.
-        for f in ["main.RS", "app.py", "lib.go", "a.ts", "a.js", "x.c", "y.cpp"] {
+        for f in [
+            "main.RS", "app.py", "lib.go", "a.ts", "a.js", "x.c", "y.cpp",
+        ] {
             assert!(
                 guess_mime_from_path(Path::new(f)).starts_with("text/"),
                 "{f} should map to a text/* type"

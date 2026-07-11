@@ -184,7 +184,11 @@ pub fn collect_hooks(project_cwd: &Path, user_home: &Path) -> Vec<HookEntry> {
 /// project-scope hooks (user-scope hooks continue to run). This is the
 /// supply-chain kill-switch for hooks that may originate from an untrusted repo.
 pub fn apply_env_policy(hooks: Vec<HookEntry>) -> Vec<HookEntry> {
-    if std::env::var("FLEETY_DISABLE_PROJECT_HOOKS").ok().as_deref() == Some("1") {
+    if std::env::var("FLEETY_DISABLE_PROJECT_HOOKS")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
         hooks
             .into_iter()
             .filter(|h| h.scope != HookScope::Project)
@@ -372,7 +376,10 @@ mod tests {
         });
         let got = parse_hooks(&settings, HookScope::User);
         assert_eq!(got.len(), 2);
-        let pre = got.iter().find(|h| h.event == HookEvent::PreToolUse).unwrap();
+        let pre = got
+            .iter()
+            .find(|h| h.event == HookEvent::PreToolUse)
+            .unwrap();
         assert_eq!(pre.matcher, "Bash");
         assert_eq!(pre.command, "lint.sh");
         assert_eq!(pre.scope, HookScope::User);
@@ -420,7 +427,10 @@ mod tests {
             (HookEvent::Stop, "stop"),
             (HookEvent::SubagentStop, "sstop"),
         ] {
-            let e = got.iter().find(|h| h.event == event).expect("event present");
+            let e = got
+                .iter()
+                .find(|h| h.event == event)
+                .expect("event present");
             assert_eq!(e.command, cmd);
         }
     }
@@ -454,8 +464,7 @@ mod tests {
         let proceed_ups =
             run_event_hooks(HookEvent::UserPromptSubmit, &hooks, &runner_ups, &audit_dyn).await;
         assert!(!proceed_ups, "non-zero UserPromptSubmit blocks");
-        let proceed_stop =
-            run_event_hooks(HookEvent::Stop, &hooks, &runner_ups, &audit_dyn).await;
+        let proceed_stop = run_event_hooks(HookEvent::Stop, &hooks, &runner_ups, &audit_dyn).await;
         assert!(proceed_stop, "non-zero Stop still proceeds");
         assert_eq!(audit.0.lock().unwrap().len(), 2, "both events audited");
     }
@@ -618,7 +627,12 @@ mod tests {
             [("deny.sh".to_string(), HookOutcome::Exited(2))].into(),
         ));
         let audit = Arc::new(FakeAudit::default());
-        let wrapped = wrap_one(tool, hooks, runner, Arc::clone(&audit) as Arc<dyn HookAudit>);
+        let wrapped = wrap_one(
+            tool,
+            hooks,
+            runner,
+            Arc::clone(&audit) as Arc<dyn HookAudit>,
+        );
         let out = wrapped.call(json!({})).await.unwrap();
         assert_eq!(out["denied"], json!(true));
         assert_eq!(out["tool"], json!("Bash"));
@@ -647,7 +661,12 @@ mod tests {
             .into(),
         ));
         let audit = Arc::new(FakeAudit::default());
-        let wrapped = wrap_one(tool, hooks, runner, Arc::clone(&audit) as Arc<dyn HookAudit>);
+        let wrapped = wrap_one(
+            tool,
+            hooks,
+            runner,
+            Arc::clone(&audit) as Arc<dyn HookAudit>,
+        );
         let out = wrapped.call(json!({})).await.unwrap();
         assert_eq!(out["ok"], json!(true), "tool result still returned");
         assert!(*ran.lock().unwrap(), "inner tool ran");
@@ -678,7 +697,12 @@ mod tests {
         ];
         let runner = Arc::new(FakeRunner(Default::default())); // all Exited(0)
         let audit = Arc::new(FakeAudit::default());
-        let wrapped = wrap_one(tool, hooks, runner, Arc::clone(&audit) as Arc<dyn HookAudit>);
+        let wrapped = wrap_one(
+            tool,
+            hooks,
+            runner,
+            Arc::clone(&audit) as Arc<dyn HookAudit>,
+        );
         wrapped.call(json!({})).await.unwrap();
         let recorded = audit.0.lock().unwrap();
         assert_eq!(recorded.len(), 2, "both hooks audited");

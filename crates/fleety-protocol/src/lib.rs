@@ -1,4 +1,4 @@
-﻿//! fleety-protocol — wire types shared across the Fleety client runtime and server.
+//! fleety-protocol — wire types shared across the Fleety client runtime and server.
 //!
 //! Pure data: this crate carries no logic and depends only on `serde`, so it can
 //! act as the contract between components (and, later, across languages).
@@ -688,8 +688,7 @@ mod tests {
 
         // Absent fingerprint (could not be determined) still round-trips, and a
         // minimal wire form (only the tag) deserializes to all-empty fields.
-        let bare: ClientMsg =
-            serde_json::from_str(r#"{"type":"colocation"}"#).expect("de bare");
+        let bare: ClientMsg = serde_json::from_str(r#"{"type":"colocation"}"#).expect("de bare");
         assert_eq!(
             bare,
             ClientMsg::Colocation {
@@ -764,7 +763,8 @@ mod tests {
 
         // The reply round-trips.
         let reply = ServerMsg::ConversationListResult {
-            conversations_json: r#"[{"conversation_id":"c1","last_ts_secs":5,"events":3,"preview":"hi"}]"#.into(),
+            conversations_json:
+                r#"[{"conversation_id":"c1","last_ts_secs":5,"events":3,"preview":"hi"}]"#.into(),
         };
         let json = serde_json::to_string(&reply).expect("ser");
         assert_eq!(reply, serde_json::from_str(&json).expect("de"));

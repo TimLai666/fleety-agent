@@ -460,7 +460,8 @@ pub fn validate(setting: &Setting, value: &str) -> Result<()> {
     let Some(check) = setting.validator else {
         return Ok(());
     };
-    check(value).map_err(|why| CoreError::Message(format!("invalid value for {}: {why}", setting.key)))
+    check(value)
+        .map_err(|why| CoreError::Message(format!("invalid value for {}: {why}", setting.key)))
 }
 
 /// Find a setting by key (unknown keys are rejected by callers).
@@ -614,7 +615,9 @@ pub fn setting_choices(key: &str) -> Vec<&'static str> {
         "FLEETY_VOICE_AUDIO" => vec!["auto", "on", "off"],
         "FLEETY_PRESENCE" => vec!["on", "off"],
         "FLEETY_MODEL_EFFORT" | "FLEETY_CHEAP_MODEL_EFFORT" => vec!["low", "medium", "high"],
-        "FLEETY_REQUIRE_AUTH" | "FLEETY_AUTO_INSTALL_DEPS" | "FLEETY_FORCE_SSE"
+        "FLEETY_REQUIRE_AUTH"
+        | "FLEETY_AUTO_INSTALL_DEPS"
+        | "FLEETY_FORCE_SSE"
         | "FLEETY_DISABLE_SSE" => vec!["0", "1"],
         _ => vec![],
     }
@@ -794,7 +797,10 @@ fn source_label(s: Source) -> &'static str {
 
 /// Display rows for `list`: (key, scope, shown value [secrets masked], source).
 pub fn rows(map: &ConfigMap) -> Vec<(String, String, String, String)> {
-    rows_in_scopes(map, &[Scope::Server, Scope::Daemon, Scope::Cli, Scope::Shared])
+    rows_in_scopes(
+        map,
+        &[Scope::Server, Scope::Daemon, Scope::Cli, Scope::Shared],
+    )
 }
 
 /// The scopes a local CLI edits — its own device behavior. Server/Daemon
@@ -854,10 +860,7 @@ pub fn run(args: &[String]) -> Result<()> {
 pub fn run_scoped(args: &[String], scopes: Option<&[Scope]>) -> Result<()> {
     // Interactive flat-key edit stays local + line-based; everything else
     // renders to text (so the same code serves the remote handler).
-    let is_providers = matches!(
-        args.first().map(String::as_str),
-        Some("provider" | "model")
-    );
+    let is_providers = matches!(args.first().map(String::as_str), Some("provider" | "model"));
     if !is_providers && matches!(parse(args), Command::Edit) {
         return edit_line_based(&config_path());
     }
@@ -880,10 +883,7 @@ pub fn run_rendered(args: &[String]) -> Result<String> {
 /// key outside them is refused (see [`ensure_scope`]). `provider`/`model`
 /// manage the structured providers.toml; `edit` is interactive (an error here).
 pub fn run_rendered_scoped(args: &[String], scopes: Option<&[Scope]>) -> Result<String> {
-    if matches!(
-        args.first().map(String::as_str),
-        Some("provider" | "model")
-    ) {
+    if matches!(args.first().map(String::as_str), Some("provider" | "model")) {
         return run_providers_at(&pc::providers_path(), args);
     }
     let path = config_path();
@@ -1100,7 +1100,9 @@ fn parse_model_set(role: String, rest: &[String]) -> Result<ProviderCmd> {
             "--stream" => {
                 members
                     .last_mut()
-                    .ok_or_else(|| CoreError::Message("--stream must follow a --member".to_string()))?
+                    .ok_or_else(|| {
+                        CoreError::Message("--stream must follow a --member".to_string())
+                    })?
                     .stream = true;
                 i += 1;
             }
@@ -1124,7 +1126,9 @@ fn parse_model_set(role: String, rest: &[String]) -> Result<ProviderCmd> {
                     .clone();
                 members
                     .last_mut()
-                    .ok_or_else(|| CoreError::Message("--effort must follow a --member".to_string()))?
+                    .ok_or_else(|| {
+                        CoreError::Message("--effort must follow a --member".to_string())
+                    })?
                     .effort = Some(v);
                 i += 2;
             }
@@ -1171,16 +1175,17 @@ pub fn parse_providers(args: &[String]) -> Result<ProviderCmd> {
     };
     match (kind, verb) {
         (Some("provider"), Some("list")) => Ok(ProviderCmd::ProviderList),
-        (Some("provider"), Some("remove")) => {
-            Ok(ProviderCmd::ProviderRemove(need(rest.first(), "provider name")?))
-        }
+        (Some("provider"), Some("remove")) => Ok(ProviderCmd::ProviderRemove(need(
+            rest.first(),
+            "provider name",
+        )?)),
         (Some("provider"), Some("add")) => {
             let name = need(rest.first(), "provider name")?;
             let (mut kv, bare) = split_flags(rest.get(1..).unwrap_or(&[]))?;
             reject_bare(&bare)?;
-            let kind = kv
-                .remove("type")
-                .ok_or_else(|| CoreError::Message("missing --type (api|oauth:codex)".to_string()))?;
+            let kind = kv.remove("type").ok_or_else(|| {
+                CoreError::Message("missing --type (api|oauth:codex)".to_string())
+            })?;
             let base_url = kv.remove("base-url");
             let key = kv.remove("key");
             no_unknown_flags(&kv)?;
@@ -1216,7 +1221,8 @@ pub fn parse_providers(args: &[String]) -> Result<ProviderCmd> {
             parse_model_set(role, rest.get(1..).unwrap_or(&[]))
         }
         _ => Err(CoreError::Message(
-            "usage: config provider <add|set|remove|list> | model <set|show|unset|list>".to_string(),
+            "usage: config provider <add|set|remove|list> | model <set|show|unset|list>"
+                .to_string(),
         )),
     }
 }
@@ -1295,8 +1301,14 @@ pub fn run_providers_at(path: &std::path::Path, args: &[String]) -> Result<Strin
                     "provider '{name}' already exists (use `provider set` to change it)"
                 )));
             }
-            cfg.providers
-                .insert(name.clone(), Provider { kind, base_url, key });
+            cfg.providers.insert(
+                name.clone(),
+                Provider {
+                    kind,
+                    base_url,
+                    key,
+                },
+            );
             // `write_providers` validates type field rules before persisting.
             pc::write_providers(path, &cfg)?;
             Ok(format!("added provider '{name}'"))
@@ -1384,7 +1396,8 @@ pub fn run_providers_at(path: &std::path::Path, args: &[String]) -> Result<Strin
             strategy,
         } => {
             let mut cfg = pc::load_or_default(path)?;
-            cfg.models.insert(role.clone(), ModelPool { strategy, members });
+            cfg.models
+                .insert(role.clone(), ModelPool { strategy, members });
             // `write_providers` validates member references + single≠1 before persisting.
             pc::write_providers(path, &cfg)?;
             Ok(format!("set model role '{role}'"))
@@ -1532,7 +1545,11 @@ mod tests {
             assert!(validate(s, "45").is_ok(), "{}: '45' should pass", s.key);
             for bad in ["0", "-5", "abc"] {
                 let err = validate(s, bad).unwrap_err().to_string();
-                assert!(err.contains(s.key), "{}: '{bad}' rejection should name the key, got: {err}", s.key);
+                assert!(
+                    err.contains(s.key),
+                    "{}: '{bad}' rejection should name the key, got: {err}",
+                    s.key
+                );
             }
         }
     }
@@ -1547,16 +1564,22 @@ mod tests {
     fn rows_in_scopes_and_ensure_scope_restrict_to_local() {
         // rows_in_scopes lists only the requested scopes.
         let rows = rows_in_scopes(&ConfigMap::new(), LOCAL_SCOPES);
-        assert!(rows.iter().all(|(_, scope, _, _)| scope == "cli" || scope == "shared"));
+        assert!(rows
+            .iter()
+            .all(|(_, scope, _, _)| scope == "cli" || scope == "shared"));
         assert!(rows.iter().any(|(k, _, _, _)| k == "FLEETY_VOICE_AUDIO")); // a Cli key
         assert!(!rows.iter().any(|(k, _, _, _)| k == "FLEETY_ADDR")); // a Server key excluded
-        // ensure_scope: a Cli/Shared key passes; a Server/Daemon key is refused
-        // with direction; an unknown key is the usual unknown error.
+                                                                      // ensure_scope: a Cli/Shared key passes; a Server/Daemon key is refused
+                                                                      // with direction; an unknown key is the usual unknown error.
         assert!(ensure_scope("FLEETY_VOICE_AUDIO", LOCAL_SCOPES).is_ok());
         assert!(ensure_scope("FLEETY_TZ", LOCAL_SCOPES).is_ok());
-        let err = ensure_scope("FLEETY_ADDR", LOCAL_SCOPES).unwrap_err().to_string();
+        let err = ensure_scope("FLEETY_ADDR", LOCAL_SCOPES)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("server"), "server key redirected: {err}");
-        let derr = ensure_scope("FLEETY_DEVICE_ID", LOCAL_SCOPES).unwrap_err().to_string();
+        let derr = ensure_scope("FLEETY_DEVICE_ID", LOCAL_SCOPES)
+            .unwrap_err()
+            .to_string();
         assert!(derr.contains("daemon"), "daemon key redirected: {derr}");
         assert!(ensure_scope("FLEETY_NOPE", LOCAL_SCOPES).is_err());
     }
@@ -1574,17 +1597,25 @@ mod tests {
         assert!(!list.contains("FLEETY_ADDR"), "server key hidden: {list}");
         assert!(list.contains("FLEETY_TZ"), "shared key shown: {list}");
         // Unfiltered list (server/daemon) still shows everything.
-        assert!(run_rendered_scoped(&v(&["list"]), None).unwrap().contains("FLEETY_ADDR"));
+        assert!(run_rendered_scoped(&v(&["list"]), None)
+            .unwrap()
+            .contains("FLEETY_ADDR"));
         // Local set of a Server key is refused and writes nothing.
+        assert!(run_rendered_scoped(
+            &v(&["set", "FLEETY_ADDR", "0.0.0.0:8787"]),
+            Some(LOCAL_SCOPES)
+        )
+        .is_err());
         assert!(
-            run_rendered_scoped(&v(&["set", "FLEETY_ADDR", "0.0.0.0:8787"]), Some(LOCAL_SCOPES))
-                .is_err()
+            !path.exists(),
+            "a refused local set must not create the file"
         );
-        assert!(!path.exists(), "a refused local set must not create the file");
         // Local set of a Shared key works.
         run_rendered_scoped(&v(&["set", "FLEETY_TZ", "Asia/Taipei"]), Some(LOCAL_SCOPES)).unwrap();
         assert_eq!(
-            load(&path).get(&(Scope::Shared, "FLEETY_TZ".to_string())).map(String::as_str),
+            load(&path)
+                .get(&(Scope::Shared, "FLEETY_TZ".to_string()))
+                .map(String::as_str),
             Some("Asia/Taipei")
         );
         std::env::remove_var("FLEETY_CONFIG");
@@ -1600,9 +1631,18 @@ mod tests {
 
         // Snapshot: a secret carries no value, only is_set; enums carry choices.
         let entries = snapshot_entries(&ConfigMap::new(), None);
-        let tok = entries.iter().find(|e| e.key == "FLEETY_TOKEN").expect("token entry");
-        assert!(tok.secret && tok.value.is_empty() && !tok.is_set, "secret unset, no value");
-        let policy = entries.iter().find(|e| e.key == "FLEETY_POLICY").expect("policy entry");
+        let tok = entries
+            .iter()
+            .find(|e| e.key == "FLEETY_TOKEN")
+            .expect("token entry");
+        assert!(
+            tok.secret && tok.value.is_empty() && !tok.is_set,
+            "secret unset, no value"
+        );
+        let policy = entries
+            .iter()
+            .find(|e| e.key == "FLEETY_POLICY")
+            .expect("policy entry");
         assert_eq!(policy.choices, vec!["full_access", "require_approval"]);
         assert_eq!(policy.effect, Some(ConfigEffect::Restart));
 
@@ -1611,7 +1651,10 @@ mod tests {
         save(&path, &m).unwrap();
         let r1 = revision(&path);
         assert_eq!(r1, revision(&path), "stable for same content");
-        m.insert((Scope::Server, "FLEETY_POLICY".into()), "require_approval".into());
+        m.insert(
+            (Scope::Server, "FLEETY_POLICY".into()),
+            "require_approval".into(),
+        );
         save(&path, &m).unwrap();
         assert_ne!(revision(&path), r1, "changes when content changes");
 
@@ -1624,7 +1667,10 @@ mod tests {
             Some("require_approval")
         );
         std::fs::write(&path, "{ not toml ::").unwrap();
-        assert!(load_strict(&path).is_err(), "broken file errors under load_strict");
+        assert!(
+            load_strict(&path).is_err(),
+            "broken file errors under load_strict"
+        );
         assert!(load(&path).is_empty(), "load() stays fail-soft");
         let _ = std::fs::remove_file(&path);
     }
@@ -1671,9 +1717,15 @@ mod tests {
         // … and it is never seeded into the env from config.toml.
         std::env::remove_var("FLEETY_AGENT_URL");
         let mut map = ConfigMap::new();
-        map.insert((Scope::Daemon, "FLEETY_AGENT_URL".into()), "ws://seeded".into());
+        map.insert(
+            (Scope::Daemon, "FLEETY_AGENT_URL".into()),
+            "ws://seeded".into(),
+        );
         seed_env_from_config(&map);
-        assert!(std::env::var("FLEETY_AGENT_URL").is_err(), "must not seed a non-registry key");
+        assert!(
+            std::env::var("FLEETY_AGENT_URL").is_err(),
+            "must not seed a non-registry key"
+        );
     }
 
     #[test]
@@ -1761,8 +1813,15 @@ mod tests {
         // provider add (api) → a typed provider.
         assert_eq!(
             parse_providers(&v(&[
-                "provider", "add", "openai1", "--type", "api", "--base-url", "https://x/v1",
-                "--key", "sk",
+                "provider",
+                "add",
+                "openai1",
+                "--type",
+                "api",
+                "--base-url",
+                "https://x/v1",
+                "--key",
+                "sk",
             ]))
             .expect("add parses"),
             ProviderCmd::ProviderAdd {
@@ -1784,12 +1843,26 @@ mod tests {
         );
         // model set: per-member traits attach to the preceding --member; strategy pool-level.
         match parse_providers(&v(&[
-            "model", "set", "main", "--member", "openai1/gpt-4o", "--stream", "--modalities",
-            "text,image", "--member", "codex1/gpt-5", "--strategy", "failover",
+            "model",
+            "set",
+            "main",
+            "--member",
+            "openai1/gpt-4o",
+            "--stream",
+            "--modalities",
+            "text,image",
+            "--member",
+            "codex1/gpt-5",
+            "--strategy",
+            "failover",
         ]))
         .expect("model set parses")
         {
-            ProviderCmd::ModelSet { role, members, strategy } => {
+            ProviderCmd::ModelSet {
+                role,
+                members,
+                strategy,
+            } => {
                 assert_eq!(role, "main");
                 assert_eq!(strategy, Strategy::Failover);
                 assert_eq!(members.len(), 2);
@@ -1803,10 +1876,18 @@ mod tests {
             other => panic!("wrong variant: {other:?}"),
         }
         // one member with no --strategy defaults to single.
-        match parse_providers(&v(&["model", "set", "cheap", "--member", "openai1/gpt-4o-mini"]))
-            .unwrap()
+        match parse_providers(&v(&[
+            "model",
+            "set",
+            "cheap",
+            "--member",
+            "openai1/gpt-4o-mini",
+        ]))
+        .unwrap()
         {
-            ProviderCmd::ModelSet { strategy, members, .. } => {
+            ProviderCmd::ModelSet {
+                strategy, members, ..
+            } => {
                 assert_eq!(strategy, Strategy::Single);
                 assert_eq!(members.len(), 1);
             }
@@ -1816,7 +1897,13 @@ mod tests {
         assert!(parse_providers(&v(&["provider", "frobnicate"])).is_err());
         assert!(parse_providers(&v(&["provider", "add", "p"])).is_err()); // missing --type
         assert!(parse_providers(&v(&[
-            "model", "set", "main", "--member", "p/m", "--strategy", "random"
+            "model",
+            "set",
+            "main",
+            "--member",
+            "p/m",
+            "--strategy",
+            "random"
         ]))
         .is_err());
         assert!(parse_providers(&v(&["model", "set", "main", "--member", "no-slash"])).is_err());
@@ -1832,7 +1919,15 @@ mod tests {
             Some(ConfigEffect::NextConnection)
         );
         assert_eq!(
-            eff(&["model", "set", "main", "--member", "p/m", "--strategy", "single"]),
+            eff(&[
+                "model",
+                "set",
+                "main",
+                "--member",
+                "p/m",
+                "--strategy",
+                "single"
+            ]),
             Some(ConfigEffect::NextConnection)
         );
         // flat set/unset → restart.
@@ -1858,32 +1953,71 @@ mod tests {
         // Add two api providers, then a model role pooling them.
         run_providers_at(
             &path,
-            &v(&["provider", "add", "p1", "--type", "api", "--base-url", "https://u1/v1"]),
-        )
-        .unwrap();
-        run_providers_at(
-            &path,
-            &v(&["provider", "add", "p2", "--type", "api", "--base-url", "https://u2/v1"]),
+            &v(&[
+                "provider",
+                "add",
+                "p1",
+                "--type",
+                "api",
+                "--base-url",
+                "https://u1/v1",
+            ]),
         )
         .unwrap();
         run_providers_at(
             &path,
             &v(&[
-                "model", "set", "main", "--member", "p1/gpt-4o", "--member", "p2/gpt-4o",
-                "--strategy", "failover",
+                "provider",
+                "add",
+                "p2",
+                "--type",
+                "api",
+                "--base-url",
+                "https://u2/v1",
+            ]),
+        )
+        .unwrap();
+        run_providers_at(
+            &path,
+            &v(&[
+                "model",
+                "set",
+                "main",
+                "--member",
+                "p1/gpt-4o",
+                "--member",
+                "p2/gpt-4o",
+                "--strategy",
+                "failover",
             ]),
         )
         .unwrap();
         // Adding a duplicate name fails.
         assert!(run_providers_at(
             &path,
-            &v(&["provider", "add", "p1", "--type", "api", "--base-url", "https://x/v1"])
+            &v(&[
+                "provider",
+                "add",
+                "p1",
+                "--type",
+                "api",
+                "--base-url",
+                "https://x/v1"
+            ])
         )
         .is_err());
         // A model member referencing an undefined provider is rejected on write.
         assert!(run_providers_at(
             &path,
-            &v(&["model", "set", "cheap", "--member", "ghost/x", "--strategy", "single"])
+            &v(&[
+                "model",
+                "set",
+                "cheap",
+                "--member",
+                "ghost/x",
+                "--strategy",
+                "single"
+            ])
         )
         .is_err());
         // A referenced provider can't be removed (the main role names it).
@@ -1934,7 +2068,10 @@ mod tests {
             assert!(s.validator.is_some(), "{key} should carry a validator");
             assert!(validate(s, good).is_ok(), "{key}: '{good}' should pass");
             let err = validate(s, bad).unwrap_err().to_string();
-            assert!(err.contains(key), "{key}: error should name the key, got: {err}");
+            assert!(
+                err.contains(key),
+                "{key}: error should name the key, got: {err}"
+            );
         }
         // A key with no validator accepts anything (pass-through).
         let tz = find("FLEETY_TZ").unwrap();
@@ -1977,7 +2114,10 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("FLEETY_REQUIRE_AUTH"), "got: {err}");
-        assert!(!path.exists(), "an invalid set must not create the config file");
+        assert!(
+            !path.exists(),
+            "an invalid set must not create the config file"
+        );
 
         // Valid value → written under the setting's scope and readable back.
         run_rendered(&v(&["set", "FLEETY_POLICY", "require_approval"])).unwrap();

@@ -332,7 +332,10 @@ pub(crate) fn pending_notifications(dir: &Path) -> Vec<PendingNotification> {
             continue;
         };
         let ts = outcome.get("ts").and_then(Value::as_u64).unwrap_or(0);
-        let last_notified = value.get("last_notified").and_then(Value::as_u64).unwrap_or(0);
+        let last_notified = value
+            .get("last_notified")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
         if ts <= last_notified {
             continue;
         }

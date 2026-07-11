@@ -522,9 +522,15 @@ mod tests {
         std::env::set_var("FLEETY_PROVIDERS", &path);
         let tiers = ProviderTiers::from_env();
         // Both roles resolve; an unknown selector falls back to main.
-        assert!(Arc::ptr_eq(&tiers.resolve("zzz-unknown"), &tiers.resolve("main")));
+        assert!(Arc::ptr_eq(
+            &tiers.resolve("zzz-unknown"),
+            &tiers.resolve("main")
+        ));
         // main (a pool) and cheap (a single) are distinct providers.
-        assert!(!Arc::ptr_eq(&tiers.resolve("main"), &tiers.resolve("cheap")));
+        assert!(!Arc::ptr_eq(
+            &tiers.resolve("main"),
+            &tiers.resolve("cheap")
+        ));
         let _ = std::fs::remove_file(&path);
         clear();
     }
@@ -544,7 +550,10 @@ mod tests {
             "[models.main]\nstrategy = \"single\"\nmembers = [ { provider = \"ghost\", model = \"m\" } ]\n",
         )
         .expect("write");
-        assert!(migrate_and_check().is_err(), "broken structured config must refuse to boot");
+        assert!(
+            migrate_and_check().is_err(),
+            "broken structured config must refuse to boot"
+        );
         let _ = std::fs::remove_file(&path);
         clear();
     }

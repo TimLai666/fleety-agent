@@ -1376,7 +1376,10 @@ mod tests {
                     .collect()
             })
             .unwrap_or_default();
-        assert!(files.iter().any(|f| f.ends_with("text.txt")), "text match expected");
+        assert!(
+            files.iter().any(|f| f.ends_with("text.txt")),
+            "text match expected"
+        );
         assert!(
             !files.iter().any(|f| f.ends_with("blob.bin")),
             "binary file must be skipped, got {files:?}"
@@ -1397,7 +1400,10 @@ mod tests {
         // A genuinely-in-workspace path still resolves.
         let ok = resolve_lenient(&root, "inside/x");
         std::env::remove_var("FLEETY_FS_SCOPE");
-        assert!(escaped.is_err(), "symlink escape must be blocked when confined");
+        assert!(
+            escaped.is_err(),
+            "symlink escape must be blocked when confined"
+        );
         assert!(ok.is_ok(), "an in-workspace path should resolve");
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&outside);

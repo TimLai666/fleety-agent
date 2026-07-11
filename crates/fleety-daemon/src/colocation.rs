@@ -117,16 +117,21 @@ fn linux_gateway_and_subnet() -> (Option<String>, Option<String>) {
     let subnet = gw_ip
         .rsplit_once('.')
         .map(|(prefix, _)| format!("{prefix}.0/24"));
-    let mac = std::fs::read_to_string("/proc/net/arp").ok().and_then(|arp| {
-        arp.lines().skip(1).find_map(|line| {
-            let cols: Vec<&str> = line.split_whitespace().collect();
-            if cols.first() == Some(&gw_ip.as_str()) && cols.len() >= 4 && cols[3] != "00:00:00:00:00:00" {
-                Some(cols[3].to_string())
-            } else {
-                None
-            }
-        })
-    });
+    let mac = std::fs::read_to_string("/proc/net/arp")
+        .ok()
+        .and_then(|arp| {
+            arp.lines().skip(1).find_map(|line| {
+                let cols: Vec<&str> = line.split_whitespace().collect();
+                if cols.first() == Some(&gw_ip.as_str())
+                    && cols.len() >= 4
+                    && cols[3] != "00:00:00:00:00:00"
+                {
+                    Some(cols[3].to_string())
+                } else {
+                    None
+                }
+            })
+        });
     (Some(mac.unwrap_or(gw_ip)), subnet)
 }
 
@@ -204,7 +209,11 @@ fn arp_mac_for(gw_ip: &str) -> Option<String> {
             for tok in line.split_whitespace() {
                 let sep = if tok.contains('-') { '-' } else { ':' };
                 let parts: Vec<&str> = tok.split(sep).collect();
-                if parts.len() == 6 && parts.iter().all(|p| p.len() == 2 && p.chars().all(|c| c.is_ascii_hexdigit())) {
+                if parts.len() == 6
+                    && parts
+                        .iter()
+                        .all(|p| p.len() == 2 && p.chars().all(|c| c.is_ascii_hexdigit()))
+                {
                     return Some(tok.replace('-', ":").to_ascii_lowercase());
                 }
             }
@@ -237,8 +246,9 @@ mod tests {
 
     #[test]
     fn frame_shape_roundtrips_with_and_without_fingerprint() {
-        let with = build_colocation_frame(Some("sha256:abcd".into()), Some("192.168.1.0/24".into()))
-            .expect("ser");
+        let with =
+            build_colocation_frame(Some("sha256:abcd".into()), Some("192.168.1.0/24".into()))
+                .expect("ser");
         let parsed: ClientMsg = serde_json::from_str(&with).expect("de");
         assert_eq!(
             parsed,
@@ -254,7 +264,11 @@ mod tests {
         let parsed: ClientMsg = serde_json::from_str(&without).expect("de");
         assert_eq!(
             parsed,
-            ClientMsg::Colocation { fingerprint: None, subnet: None, peers: vec![] }
+            ClientMsg::Colocation {
+                fingerprint: None,
+                subnet: None,
+                peers: vec![]
+            }
         );
     }
 

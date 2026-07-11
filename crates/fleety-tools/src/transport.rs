@@ -292,7 +292,9 @@ async fn connect_sse(agent_url: &str, token: Option<&str>) -> Result<Connection>
         } else {
             ""
         };
-        return Err(CoreError::Message(format!("SSE open rejected: {status}{hint}")));
+        return Err(CoreError::Message(format!(
+            "SSE open rejected: {status}{hint}"
+        )));
     }
     let (tx, rx) = mpsc::unbounded_channel::<String>();
     tokio::spawn(read_sse(resp, tx));
@@ -360,7 +362,9 @@ mod tests {
     /// Wrap a connected client socket in a `Receiver` with a short deadline
     /// (bypassing env so parallel tests don't race on process globals).
     async fn ws_receiver(addr: std::net::SocketAddr, deadline: Duration) -> Receiver {
-        let (ws, _) = connect_async(format!("ws://{addr}")).await.expect("connect");
+        let (ws, _) = connect_async(format!("ws://{addr}"))
+            .await
+            .expect("connect");
         let (_tx, rx) = ws.split();
         Receiver::Ws(WsReceiver {
             rx,

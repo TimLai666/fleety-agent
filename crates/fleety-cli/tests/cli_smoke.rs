@@ -130,7 +130,9 @@ fn no_args_prints_top_level_help() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("usage: fleety"));
     // The full command surface is listed, not just a teaser.
-    for cmd in ["ask", "tui", "config", "audit", "rollback", "pair", "update"] {
+    for cmd in [
+        "ask", "tui", "config", "audit", "rollback", "pair", "update",
+    ] {
         assert!(stdout.contains(cmd), "help lists {cmd}");
     }
 
@@ -189,7 +191,10 @@ fn init_and_pair_write_the_connection_profile() {
 
     let conns = std::fs::read_to_string(&connections_path).expect("connections.toml");
     assert!(conns.contains(&init_url), "profile url persisted: {conns}");
-    assert!(conns.contains("current = \"default\""), "made current: {conns}");
+    assert!(
+        conns.contains("current = \"default\""),
+        "made current: {conns}"
+    );
 
     // `fleety pair <code>` enrolls the current server and writes the minted token
     // onto that profile (here the connect target is the env-override server).
@@ -244,7 +249,10 @@ fn server_commands_manage_connection_profiles() {
     run_srv(&["server", "add", "work", "ws://work:8787"]);
     let list = run_srv(&["server", "list"]);
     let list_s = String::from_utf8_lossy(&list.stdout);
-    assert!(list_s.contains("* home"), "list stars the current: {list_s}");
+    assert!(
+        list_s.contains("* home"),
+        "list stars the current: {list_s}"
+    );
     assert!(list_s.contains("work"), "list shows every server: {list_s}");
 
     // Removing the current server without --force is rejected (non-zero exit).

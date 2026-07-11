@@ -1,4 +1,4 @@
-﻿//! Schedule fire loop: periodically run due schedules unattended.
+//! Schedule fire loop: periodically run due schedules unattended.
 //!
 //! Due `at:`/`every:` schedules run through the agent with an **unattended
 //! policy** (`RequireApproval` + `MandateGate`): reads/reporting proceed, and a
@@ -466,7 +466,9 @@ mod tests {
         assert_eq!(read_status("bad"), "error");
 
         // Both were marked fired, so neither `at:` is due on the next tick.
-        assert!(schedules::due_schedules(&sdir, 2000).expect("due").is_empty());
+        assert!(schedules::due_schedules(&sdir, 2000)
+            .expect("due")
+            .is_empty());
         let again = tick(&storage, &SelectiveFailProvider, &workspace, dt, 2000)
             .await
             .expect("tick2");

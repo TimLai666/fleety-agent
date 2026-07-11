@@ -238,11 +238,7 @@ impl LineEditor {
             .char_indices()
             .map(|(b, c)| (b, ch_width(c)))
             .collect();
-        let cursor_col: usize = chars
-            .iter()
-            .take(self.cursor)
-            .map(|&(_, w)| w)
-            .sum();
+        let cursor_col: usize = chars.iter().take(self.cursor).map(|&(_, w)| w).sum();
         let total: usize = chars.iter().map(|&(_, w)| w).sum();
         // `<` not `<=`: the cursor needs its own column when sitting past the
         // last char.
@@ -272,8 +268,14 @@ impl LineEditor {
             used += w;
             end_idx += 1;
         }
-        let start_b = chars.get(start_idx).map(|&(b, _)| b).unwrap_or(self.text.len());
-        let end_b = chars.get(end_idx).map(|&(b, _)| b).unwrap_or(self.text.len());
+        let start_b = chars
+            .get(start_idx)
+            .map(|&(b, _)| b)
+            .unwrap_or(self.text.len());
+        let end_b = chars
+            .get(end_idx)
+            .map(|&(b, _)| b)
+            .unwrap_or(self.text.len());
         (
             &self.text[start_b..end_b],
             u16::try_from(cursor_col - start_col).unwrap_or(u16::MAX),

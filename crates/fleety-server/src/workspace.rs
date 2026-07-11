@@ -202,7 +202,14 @@ mod tests {
             }
         );
         assert_eq!(
-            resolve_binding(Some("   "), Some("alice-box"), None, "dev1", "alice-box", &fb()),
+            resolve_binding(
+                Some("   "),
+                Some("alice-box"),
+                None,
+                "dev1",
+                "alice-box",
+                &fb()
+            ),
             WorkspaceBinding {
                 root: fb(),
                 device: None,
@@ -231,8 +238,7 @@ mod tests {
     fn old_binding_json_loads_origin_as_none() {
         // A binding persisted before the origin fields existed still loads.
         let json = r#"{"root":"/srv/workspace","device":null}"#;
-        let b: WorkspaceBinding =
-            serde_json::from_str(json).expect("deserialize old binding");
+        let b: WorkspaceBinding = serde_json::from_str(json).expect("deserialize old binding");
         assert_eq!(b.root, PathBuf::from("/srv/workspace"));
         assert_eq!(b.device, None);
         assert_eq!(b.origin_cwd, None);

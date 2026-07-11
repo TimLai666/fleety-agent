@@ -84,13 +84,7 @@ fn parse_manifest_for(text: &str, triple: Option<&str>) -> Result<Manifest> {
 fn local_platform_desc() -> String {
     crate::deps::target_triple()
         .map(String::from)
-        .unwrap_or_else(|| {
-            format!(
-                "{}/{}",
-                std::env::consts::ARCH,
-                std::env::consts::OS
-            )
-        })
+        .unwrap_or_else(|| format!("{}/{}", std::env::consts::ARCH, std::env::consts::OS))
 }
 
 /// Whether `latest` differs from `current` (ignoring a leading `v`).
@@ -540,8 +534,16 @@ mod tests {
         // write the running binary's bytes over the sibling's executable.
         let versioned_only = "https://h/dl/fleetyd/{version}/m.json";
         assert!(manifest_covers_bin(versioned_only, "fleetyd", "fleetyd"));
-        assert!(!manifest_covers_bin(versioned_only, "fleety-server", "fleetyd"));
-        assert!(!manifest_covers_bin("https://h/plain.json", "fleety", "fleetyd"));
+        assert!(!manifest_covers_bin(
+            versioned_only,
+            "fleety-server",
+            "fleetyd"
+        ));
+        assert!(!manifest_covers_bin(
+            "https://h/plain.json",
+            "fleety",
+            "fleetyd"
+        ));
         // A {bin} template resolves any binary.
         let templated = "https://h/dl/{bin}/latest.json";
         assert!(manifest_covers_bin(templated, "fleety-server", "fleetyd"));
@@ -552,7 +554,12 @@ mod tests {
     fn resolve_pin_three_branches() {
         // Latest already matches the target (v prefix ignored) → use it directly.
         assert_eq!(
-            resolve_pin("0.3.0", Some("https://h/{bin}/{version}"), "fleetyd", "v0.3.0"),
+            resolve_pin(
+                "0.3.0",
+                Some("https://h/{bin}/{version}"),
+                "fleetyd",
+                "v0.3.0"
+            ),
             PinResolution::UseLatest
         );
         // Latest moved past the target → follow its versioned_manifest template.

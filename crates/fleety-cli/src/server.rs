@@ -186,13 +186,19 @@ pub fn apply_at(path: &Path, cmd: Cmd, env_url: Option<String>) -> Result<String
             let conns = connection::load_at(path)?;
             let name = match name.or_else(|| conns.current.clone()) {
                 Some(n) => n,
-                None => return Ok("(no current server — add one with `fleety server add`)".to_string()),
+                None => {
+                    return Ok("(no current server — add one with `fleety server add`)".to_string())
+                }
             };
             let p = conns
                 .profiles
                 .get(&name)
                 .ok_or_else(|| unknown_server(&name, &conns))?;
-            Ok(render_show(&name, p, conns.current.as_deref() == Some(&name)))
+            Ok(render_show(
+                &name,
+                p,
+                conns.current.as_deref() == Some(&name),
+            ))
         }
         Cmd::Current => {
             let conns = connection::load_at(path)?;
@@ -299,7 +305,11 @@ fn render_list(conns: &Connections, env_url: Option<String>) -> String {
         } else {
             p.url.clone()
         };
-        let auth = if p.token.is_some() { "paired" } else { "no token" };
+        let auth = if p.token.is_some() {
+            "paired"
+        } else {
+            "no token"
+        };
         out.push_str(&format!("{marker} {name:<16} {url}  [{auth}]\n"));
     }
     out.push_str("\n(* = current; switch with `fleety server use <name>`)");
@@ -307,7 +317,10 @@ fn render_list(conns: &Connections, env_url: Option<String>) -> String {
 }
 
 fn render_show(name: &str, p: &Profile, is_current: bool) -> String {
-    let mut out = format!("server '{name}'{}\n", if is_current { " (current)" } else { "" });
+    let mut out = format!(
+        "server '{name}'{}\n",
+        if is_current { " (current)" } else { "" }
+    );
     out.push_str(&format!(
         "  url:          {}\n",
         if p.url.is_empty() {
@@ -361,7 +374,15 @@ mod tests {
     #[test]
     fn parse_add_flags_and_errors() {
         assert_eq!(
-            parse(&v(&["add", "home", "ws://h:8787", "--use", "--label", "Home"])).unwrap(),
+            parse(&v(&[
+                "add",
+                "home",
+                "ws://h:8787",
+                "--use",
+                "--label",
+                "Home"
+            ]))
+            .unwrap(),
             Cmd::Add {
                 name: "home".into(),
                 url: "ws://h:8787".into(),
@@ -378,22 +399,46 @@ mod tests {
     #[test]
     fn add_first_becomes_current_and_list_marks_it() {
         let p = tmp();
-        let out = apply_at(&p, parse(&v(&["add", "home", "ws://home:8787"])).unwrap(), None).unwrap();
-        assert!(out.contains("switched to it"), "first add auto-selects: {out}");
+        let out = apply_at(
+            &p,
+            parse(&v(&["add", "home", "ws://home:8787"])).unwrap(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            out.contains("switched to it"),
+            "first add auto-selects: {out}"
+        );
         let list = apply_at(&p, Cmd::List, None).unwrap();
         assert!(list.contains("* home"), "current is starred: {list}");
         // `current` prints the name + url.
         let cur = apply_at(&p, Cmd::Current, None).unwrap();
-        assert!(cur.contains("home") && cur.contains("ws://home:8787"), "{cur}");
+        assert!(
+            cur.contains("home") && cur.contains("ws://home:8787"),
+            "{cur}"
+        );
         let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn add_second_without_use_keeps_current_then_use_switches() {
         let p = tmp();
-        apply_at(&p, parse(&v(&["add", "home", "ws://home:8787"])).unwrap(), None).unwrap();
-        let out = apply_at(&p, parse(&v(&["add", "work", "ws://work:8787"])).unwrap(), None).unwrap();
-        assert!(out.contains("use it with"), "second add without --use stays: {out}");
+        apply_at(
+            &p,
+            parse(&v(&["add", "home", "ws://home:8787"])).unwrap(),
+            None,
+        )
+        .unwrap();
+        let out = apply_at(
+            &p,
+            parse(&v(&["add", "work", "ws://work:8787"])).unwrap(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            out.contains("use it with"),
+            "second add without --use stays: {out}"
+        );
         // home is still current.
         assert!(apply_at(&p, Cmd::List, None).unwrap().contains("* home"));
         // `use work` switches.
@@ -407,7 +452,12 @@ mod tests {
     #[test]
     fn remove_current_requires_force() {
         let p = tmp();
-        apply_at(&p, parse(&v(&["add", "home", "ws://home:8787"])).unwrap(), None).unwrap();
+        apply_at(
+            &p,
+            parse(&v(&["add", "home", "ws://home:8787"])).unwrap(),
+            None,
+        )
+        .unwrap();
         // Removing the current server without --force is rejected.
         let err = apply_at(&p, parse(&v(&["remove", "home"])).unwrap(), None)
             .unwrap_err()
@@ -415,14 +465,21 @@ mod tests {
         assert!(err.contains("--force"), "must demand --force: {err}");
         // With --force it is removed and current is cleared.
         apply_at(&p, parse(&v(&["remove", "home", "--force"])).unwrap(), None).unwrap();
-        assert!(apply_at(&p, Cmd::Current, None).unwrap().contains("no current"));
+        assert!(apply_at(&p, Cmd::Current, None)
+            .unwrap()
+            .contains("no current"));
         let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn rename_moves_profile_and_follows_current() {
         let p = tmp();
-        apply_at(&p, parse(&v(&["add", "home", "ws://home:8787"])).unwrap(), None).unwrap();
+        apply_at(
+            &p,
+            parse(&v(&["add", "home", "ws://home:8787"])).unwrap(),
+            None,
+        )
+        .unwrap();
         apply_at(&p, parse(&v(&["rename", "home", "house"])).unwrap(), None).unwrap();
         // current followed the rename.
         assert!(apply_at(&p, Cmd::List, None).unwrap().contains("* house"));
@@ -433,8 +490,18 @@ mod tests {
     #[test]
     fn set_url_changes_target_and_show_reports_it() {
         let p = tmp();
-        apply_at(&p, parse(&v(&["add", "home", "ws://old:8787"])).unwrap(), None).unwrap();
-        apply_at(&p, parse(&v(&["set-url", "home", "ws://new:9000"])).unwrap(), None).unwrap();
+        apply_at(
+            &p,
+            parse(&v(&["add", "home", "ws://old:8787"])).unwrap(),
+            None,
+        )
+        .unwrap();
+        apply_at(
+            &p,
+            parse(&v(&["set-url", "home", "ws://new:9000"])).unwrap(),
+            None,
+        )
+        .unwrap();
         let show = apply_at(&p, Cmd::Show(Some("home".into())), None).unwrap();
         assert!(show.contains("ws://new:9000"), "{show}");
         let _ = std::fs::remove_file(&p);
@@ -443,16 +510,29 @@ mod tests {
     #[test]
     fn list_warns_when_env_override_is_active() {
         let p = tmp();
-        apply_at(&p, parse(&v(&["add", "home", "ws://home:8787"])).unwrap(), None).unwrap();
+        apply_at(
+            &p,
+            parse(&v(&["add", "home", "ws://home:8787"])).unwrap(),
+            None,
+        )
+        .unwrap();
         let list = apply_at(&p, Cmd::List, Some("ws://env:8787".to_string())).unwrap();
-        assert!(list.contains("FLEETY_AGENT_URL"), "env override warned: {list}");
+        assert!(
+            list.contains("FLEETY_AGENT_URL"),
+            "env override warned: {list}"
+        );
         let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn add_rejects_non_ws_url() {
         let p = tmp();
-        assert!(apply_at(&p, parse(&v(&["add", "home", "http://h:8787"])).unwrap(), None).is_err());
+        assert!(apply_at(
+            &p,
+            parse(&v(&["add", "home", "http://h:8787"])).unwrap(),
+            None
+        )
+        .is_err());
         assert!(!p.exists(), "an invalid add must not create the file");
     }
 }

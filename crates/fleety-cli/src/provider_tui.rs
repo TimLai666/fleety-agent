@@ -16,7 +16,9 @@
 use std::path::Path;
 
 use agent_core::{CoreError, Result};
-use fleety_tools::providers_config::{self as pc, Member, ModelPool, Provider, ProvidersConfig, Strategy};
+use fleety_tools::providers_config::{
+    self as pc, Member, ModelPool, Provider, ProvidersConfig, Strategy,
+};
 use ratatui::crossterm::event::KeyCode;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::text::Line;
@@ -56,9 +58,14 @@ impl ProviderEditor {
                 "provider '{name}' already exists"
             )));
         }
-        self.cfg
-            .providers
-            .insert(name, Provider { kind, base_url, key });
+        self.cfg.providers.insert(
+            name,
+            Provider {
+                kind,
+                base_url,
+                key,
+            },
+        );
         Ok(())
     }
 
@@ -79,7 +86,9 @@ impl ProviderEditor {
 
     /// Create or replace a model role's member pool.
     pub fn set_model(&mut self, role: String, members: Vec<Member>, strategy: Strategy) {
-        self.cfg.models.insert(role, ModelPool { strategy, members });
+        self.cfg
+            .models
+            .insert(role, ModelPool { strategy, members });
     }
 
     /// Unset a model role; an undefined role is reported by name.
@@ -112,9 +121,9 @@ fn strategy_word(s: &str) -> Result<Strategy> {
 fn parse_members(s: &str) -> Result<Vec<Member>> {
     let mut out = Vec::new();
     for spec in s.split('|').map(str::trim).filter(|s| !s.is_empty()) {
-        let (provider, model) = spec
-            .split_once('/')
-            .ok_or_else(|| CoreError::Message(format!("member '{spec}' must be <provider>/<model>")))?;
+        let (provider, model) = spec.split_once('/').ok_or_else(|| {
+            CoreError::Message(format!("member '{spec}' must be <provider>/<model>"))
+        })?;
         out.push(Member {
             provider: provider.to_string(),
             model: model.to_string(),
@@ -171,8 +180,9 @@ impl App {
             ed: ProviderEditor::new(cfg),
             sel: 0,
             mode: Mode::Browse,
-            status: "a add-provider · d del-provider · m set-model · u unset-model · s save · q quit"
-                .to_string(),
+            status:
+                "a add-provider · d del-provider · m set-model · u unset-model · s save · q quit"
+                    .to_string(),
             save_now: false,
             quit: false,
         }
@@ -187,7 +197,8 @@ impl App {
                 [name, kind, rest @ ..] if !name.is_empty() && !kind.is_empty() => {
                     let base_url = rest.first().filter(|s| !s.is_empty()).cloned();
                     let key = rest.get(1).filter(|s| !s.is_empty()).cloned();
-                    self.ed.add_provider(name.clone(), kind.clone(), base_url, key)
+                    self.ed
+                        .add_provider(name.clone(), kind.clone(), base_url, key)
                 }
                 _ => Err(CoreError::Message(
                     "expected: name, type [, base_url [, key]]".to_string(),
@@ -429,8 +440,13 @@ mod tests {
             .to_string()
             .contains("main"));
         // Unreferenced provider removes fine.
-        ed.add_provider("p2".into(), "api".into(), Some("https://u2/v1".into()), None)
-            .unwrap();
+        ed.add_provider(
+            "p2".into(),
+            "api".into(),
+            Some("https://u2/v1".into()),
+            None,
+        )
+        .unwrap();
         ed.remove_provider("p2").unwrap();
         assert_eq!(ed.provider_names(), vec!["p1".to_string()]);
     }
@@ -479,7 +495,11 @@ mod tests {
         );
         ed.unset_model("main").unwrap();
         assert!(ed.cfg.model("main").is_none());
-        assert!(ed.unset_model("ghost").unwrap_err().to_string().contains("ghost"));
+        assert!(ed
+            .unset_model("ghost")
+            .unwrap_err()
+            .to_string()
+            .contains("ghost"));
     }
 
     /// Feed each char of `s` to the app as a key press (input typing helper).
@@ -512,7 +532,10 @@ mod tests {
         type_str(&mut app, "main, p1/gpt-4o|p1/gpt-4o-2, failover");
         on_key(&mut app, KeyCode::Enter);
         assert_eq!(app.ed.cfg.model("main").unwrap().members.len(), 2);
-        assert_eq!(app.ed.cfg.model("main").unwrap().strategy, Strategy::Failover);
+        assert_eq!(
+            app.ed.cfg.model("main").unwrap().strategy,
+            Strategy::Failover
+        );
     }
 
     #[test]
