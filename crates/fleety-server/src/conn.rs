@@ -4277,7 +4277,6 @@ mod tests {
     async fn startup_recovers_interrupted_interactive_turn() {
         use crate::auth::AuthStore;
         use crate::echo::EchoProvider;
-        use serde_json::json;
 
         let home = std::env::temp_dir().join(format!("fleety-erec-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&home).expect("mk home");

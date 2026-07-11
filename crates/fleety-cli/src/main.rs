@@ -1834,8 +1834,10 @@ mod tests {
         assert_eq!(token.as_deref(), Some("minted-token"));
 
         // With no current server, pairing has nowhere to put the token.
-        let mut empty = connection::Connections::default();
-        empty.current = None;
+        let empty = connection::Connections {
+            current: None,
+            ..Default::default()
+        };
         connection::save(&empty).expect("clear");
         assert!(set_current_token("x").is_err());
     }
