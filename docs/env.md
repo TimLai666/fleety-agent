@@ -308,7 +308,13 @@ reversible, then prints a restart prompt. It never runs automatically at boot.
 ## mDNS service discovery
 
 Server announces `_fleety._tcp.local.`; CLI / fleetyd browse for it as the
-last fallback when no URL is configured.
+last fallback when no URL is configured. Bare `fleety init` on a TTY uses the
+same discovery interactively: it scans for a few seconds, lists **every**
+announced server by name (the instance name minus the `fleety-` prefix; saved
+ones are marked), lets you pick one, saves it as the current profile, and
+prompts for a pairing code in the same flow. With mDNS disabled, no TTY, or
+nothing found, it falls back to the explicit `fleety init ws://host:8787`
+guidance.
 
 | Var | Default | Meaning |
 |---|---|---|

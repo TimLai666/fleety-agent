@@ -155,13 +155,17 @@ updates, troubleshooting): [`docs/acp.md`](docs/acp.md).
 4. mDNS discovery on the LAN (a short 2 s probe; sticky once enrolled), else
 5. the local default `ws://127.0.0.1:8787`.
 
-So on one machine `fleety tui` just works; for a remote server run
-`fleety init ws://host:8787` once (or `fleety server add <name> <url> --use`) and
-every later command uses it. Auth is **required by default**, so enroll this
-device with `fleety pair <code>` — a fresh server prints a first-run pairing code
-at startup, and on an already-paired server the `pair_create` tool mints more.
-The very first device can instead connect with the server's bootstrap admin token
-(`FLEETY_TOKEN`, the same value set on the server) and pair the rest from there.
+So on one machine `fleety tui` just works. For a remote server the easiest path
+is bare `fleety init` on a TTY: it scans the LAN, lists every announced server by
+name (marking ones you already saved), lets you pick, saves the profile, and
+prompts for the pairing code in one flow. Or point it explicitly with
+`fleety init ws://host:8787` (or `fleety server add <name> <url> --use`) — every
+later command uses the saved profile. Auth is **required by default**, so enroll
+this device with a pairing code — a fresh server prints a first-run code at
+startup, and on an already-paired server the `pair_create` tool mints more
+(`fleety pair <code>` also works standalone). The very first device can instead
+connect with the server's bootstrap admin token (`FLEETY_TOKEN`, the same value
+set on the server) and pair the rest from there.
 
 ### Configure the model (server side)
 

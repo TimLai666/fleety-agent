@@ -102,15 +102,17 @@ async fn main() -> std::process::ExitCode {
     match args.get(1).map(String::as_str) {
         Some("init") => {
             // `fleety init <ws-url> [--name <name>]` — positional url plus an
-            // optional profile name (default `default`).
+            // optional profile name (default `default`). With NO url on a TTY,
+            // init turns into the guided first run: scan the LAN, pick a server
+            // from the list, save it, and offer to pair right away.
             let mut url = String::new();
-            let mut name = "default".to_string();
+            let mut name: Option<String> = None;
             let mut it = args.iter().skip(2);
             while let Some(a) = it.next() {
                 match a.as_str() {
                     "--name" => {
                         if let Some(n) = it.next() {
-                            name = n.clone();
+                            name = Some(n.clone());
                         }
                     }
                     _ if url.is_empty() => url = a.clone(),
@@ -118,10 +120,16 @@ async fn main() -> std::process::ExitCode {
                 }
             }
             if url.is_empty() {
+                if std::io::IsTerminal::is_terminal(&std::io::stdout())
+                    && std::env::var("FLEETY_MDNS_DISABLED").is_err()
+                {
+                    return done(init_interactive(name).await);
+                }
                 return usage(
                     "usage: fleety init <ws-url> [--name <name>]   (e.g. ws://host:8787)",
                 );
             }
+            let name = name.unwrap_or_else(|| "default".to_string());
             // Catch the common scheme mistakes before any network work — the
             // raw connect error that would follow is much harder to act on.
             if !url.starts_with("ws://") && !url.starts_with("wss://") {
@@ -786,6 +794,163 @@ fn set_current_token(token: &str) -> Result<()> {
         p.token = Some(token.to_string());
     }
     connection::save(&conns)
+}
+
+/// One server found on the LAN during a collecting scan (guided `fleety init`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiscoveredServer {
+    name: String,
+    url: String,
+}
+
+/// The picker's parse of one input line: a 1-based pick mapped to its index,
+/// a cancel (empty input / EOF), or garbage worth a re-prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Selection {
+    Pick(usize),
+    Cancel,
+    Invalid,
+}
+
+/// Display name from an advertised mDNS instance: the `fleety-` prefix the
+/// server prepends is stripped; an empty leftover falls back to the URL. Pure.
+fn display_name_from_instance(instance: &str, url: &str) -> String {
+    let stripped = instance.strip_prefix("fleety-").unwrap_or(instance).trim();
+    if stripped.is_empty() {
+        url.to_string()
+    } else {
+        stripped.to_string()
+    }
+}
+
+/// Fold one resolved announcement into the collection, de-duplicating by URL
+/// (the same server re-announces during a browse window). Pure.
+fn push_discovered(found: &mut Vec<DiscoveredServer>, name: String, url: String) {
+    if !found.iter().any(|d| d.url == url) {
+        found.push(DiscoveredServer { name, url });
+    }
+}
+
+/// Parse the picker input against a list of `n` entries. Pure.
+fn parse_selection(input: &str, n: usize) -> Selection {
+    let t = input.trim();
+    if t.is_empty() {
+        return Selection::Cancel;
+    }
+    match t.parse::<usize>() {
+        Ok(i) if (1..=n).contains(&i) => Selection::Pick(i - 1),
+        _ => Selection::Invalid,
+    }
+}
+
+/// One numbered picker line; servers whose URL is already in a saved profile
+/// are flagged so a re-run is recognizable. Pure.
+fn render_pick_line(idx: usize, s: &DiscoveredServer, saved_urls: &[String]) -> String {
+    let saved = if saved_urls.iter().any(|u| u == &s.url) {
+        "  (saved)"
+    } else {
+        ""
+    };
+    format!("  {}. {}  {}{}", idx + 1, s.name, s.url, saved)
+}
+
+/// Browse the LAN for the full collection window and return EVERY resolved
+/// `_fleety._tcp.local.` server (name + url, de-duplicated). Empty when mDNS
+/// is disabled or the browse cannot start — the caller falls back to usage
+/// guidance, never an error.
+fn discover_all_via_mdns(window: std::time::Duration) -> Vec<DiscoveredServer> {
+    let mut found = Vec::new();
+    if std::env::var("FLEETY_MDNS_DISABLED").is_ok() {
+        return found;
+    }
+    let Ok(daemon) = mdns_sd::ServiceDaemon::new() else {
+        return found;
+    };
+    let Ok(receiver) = daemon.browse("_fleety._tcp.local.") else {
+        return found;
+    };
+    let deadline = std::time::Instant::now() + window;
+    while std::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let recv_timeout = remaining.min(std::time::Duration::from_millis(500));
+        match receiver.recv_timeout(recv_timeout) {
+            Ok(mdns_sd::ServiceEvent::ServiceResolved(info)) => {
+                let addrs = info.get_addresses_v4();
+                if let Some(ip) = addrs.iter().next() {
+                    let url = format!("ws://{}:{}", ip, info.get_port());
+                    let instance = info
+                        .get_fullname()
+                        .strip_suffix("._fleety._tcp.local.")
+                        .unwrap_or_else(|| info.get_fullname());
+                    let name = display_name_from_instance(instance, &url);
+                    push_discovered(&mut found, name, url);
+                }
+            }
+            Ok(_) => continue,
+            Err(_) => continue,
+        }
+    }
+    let _ = daemon.shutdown();
+    found
+}
+
+/// Read one line from stdin (the picker / pairing prompts); EOF reads as empty.
+fn read_prompt_line() -> String {
+    let mut line = String::new();
+    let _ = std::io::stdin().read_line(&mut line);
+    line
+}
+
+/// Guided first-run `fleety init` (no URL, on a TTY): scan the LAN, pick a
+/// server from a numbered list, save it as the current profile, and offer to
+/// pair right away. Falls back to the usage guidance when nothing is found.
+async fn init_interactive(name_override: Option<String>) -> Result<()> {
+    println!("Scanning the LAN for Fleety servers… (3s)");
+    let found = discover_all_via_mdns(std::time::Duration::from_secs(3));
+    if found.is_empty() {
+        println!("No Fleety server found on this network.");
+        println!("Point the CLI at one explicitly: fleety init ws://host:8787 [--name <name>]");
+        println!(
+            "(the server announces itself on the LAN only when it is running and mDNS is enabled)"
+        );
+        return Ok(());
+    }
+    let saved_urls: Vec<String> = connection::load()
+        .map(|c| c.profiles.values().map(|p| p.url.clone()).collect())
+        .unwrap_or_default();
+    println!("Found {} server(s):", found.len());
+    for (i, s) in found.iter().enumerate() {
+        println!("{}", render_pick_line(i, s, &saved_urls));
+    }
+    let picked = loop {
+        eprint!("Pick a server [1-{}] (Enter to cancel): ", found.len());
+        match parse_selection(&read_prompt_line(), found.len()) {
+            Selection::Pick(i) => break i,
+            Selection::Cancel => {
+                println!("Cancelled. Connect later with: fleety init ws://host:8787");
+                return Ok(());
+            }
+            Selection::Invalid => continue,
+        }
+    };
+    let chosen = found[picked].clone();
+    let profile = name_override.unwrap_or_else(|| chosen.name.clone());
+    // Upsert keeps an existing profile's token, so re-running init on an
+    // already-paired server never loses the enrollment.
+    upsert_profile_and_use(&profile, &chosen.url)?;
+    println!("Using '{profile}' ({}) as the current server.", chosen.url);
+    eprint!(
+        "Pairing code — printed on the server's first run, or minted by `pair_create` on an \
+         already-paired device (Enter to skip): "
+    );
+    let code = read_prompt_line().trim().to_string();
+    if code.is_empty() {
+        println!("Skipped pairing — run `fleety pair <code>` when you have one.");
+        return Ok(());
+    }
+    pair(code).await?;
+    println!("Paired; '{profile}' is now your current server.");
+    Ok(())
 }
 
 /// Browse the LAN for a `_fleety._tcp.local.` service and return the first
@@ -1739,6 +1904,72 @@ mod tests {
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn discovery_display_names_strip_the_service_prefix() {
+        // Advertised instance → human name; a missing name falls back to the URL.
+        assert_eq!(
+            display_name_from_instance("fleety-mini", "ws://10.0.0.2:8787"),
+            "mini"
+        );
+        assert_eq!(
+            display_name_from_instance("fleety-nas-01", "ws://10.0.0.3:8787"),
+            "nas-01"
+        );
+        assert_eq!(
+            display_name_from_instance("custom-name", "ws://10.0.0.4:8787"),
+            "custom-name"
+        );
+        assert_eq!(
+            display_name_from_instance("", "ws://10.0.0.5:8787"),
+            "ws://10.0.0.5:8787"
+        );
+        assert_eq!(
+            display_name_from_instance("fleety-", "ws://10.0.0.6:8787"),
+            "ws://10.0.0.6:8787"
+        );
+    }
+
+    #[test]
+    fn discovery_collection_dedupes_by_url() {
+        let mut found = Vec::new();
+        push_discovered(&mut found, "mini".into(), "ws://10.0.0.2:8787".into());
+        push_discovered(&mut found, "mini".into(), "ws://10.0.0.2:8787".into()); // dup
+        push_discovered(&mut found, "nas".into(), "ws://10.0.0.3:8787".into());
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].name, "mini");
+        assert_eq!(found[1].name, "nas");
+    }
+
+    #[test]
+    fn pick_selection_parses_bounds_cancel_and_garbage() {
+        // 1-based picks within bounds; empty input cancels; anything else re-prompts.
+        assert_eq!(parse_selection("1", 3), Selection::Pick(0));
+        assert_eq!(parse_selection(" 3 ", 3), Selection::Pick(2));
+        assert_eq!(parse_selection("", 3), Selection::Cancel);
+        assert_eq!(parse_selection("  \n", 3), Selection::Cancel);
+        assert_eq!(parse_selection("0", 3), Selection::Invalid);
+        assert_eq!(parse_selection("4", 3), Selection::Invalid);
+        assert_eq!(parse_selection("abc", 3), Selection::Invalid);
+    }
+
+    #[test]
+    fn pick_lines_number_and_flag_saved_servers() {
+        let s = DiscoveredServer {
+            name: "mini".into(),
+            url: "ws://10.0.0.2:8787".into(),
+        };
+        let saved = vec!["ws://10.0.0.2:8787".to_string()];
+        let line = render_pick_line(0, &s, &saved);
+        assert!(line.starts_with("  1."));
+        assert!(line.contains("mini") && line.contains("ws://10.0.0.2:8787"));
+        assert!(line.contains("(saved)"));
+        let other = DiscoveredServer {
+            name: "nas".into(),
+            url: "ws://10.0.0.3:8787".into(),
+        };
+        assert!(!render_pick_line(1, &other, &saved).contains("(saved)"));
+    }
 
     struct EnvGuard {
         saved: Vec<(&'static str, Option<String>)>,
