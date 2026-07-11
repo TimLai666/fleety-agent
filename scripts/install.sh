@@ -23,7 +23,8 @@ case "$os" in
   Darwin)
     case "$arch" in
       arm64 | aarch64) target="aarch64-apple-darwin" ;;
-      x86_64) target="x86_64-apple-darwin" ;;
+      # No Intel macOS prebuilt (the ONNX runtime dependency ships none).
+      x86_64) echo "fleety: no prebuilt binaries for Intel macOS; build from source: cargo build --release --bin fleety" >&2; exit 1 ;;
       *) echo "fleety: unsupported macOS arch '$arch'" >&2; exit 1 ;;
     esac
     ;;

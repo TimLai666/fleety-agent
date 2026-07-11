@@ -599,8 +599,9 @@ SHA-256, and swaps the raw executable in place — no archive extraction, so `ur
 must point at a raw binary (the release attaches these per target alongside the
 install archives). A manifest with no entry for the local platform still answers
 version probes (notify polling keeps working); installing reports a clear "no
-artifact for this platform" error — ARM/RISC-V hosts running a source-built
-fleetyd keep updating from source. Unknown manifest fields are ignored.
+artifact for this platform" error — ARM/RISC-V Linux and Intel macOS hosts
+running source-built binaries keep updating from source. Unknown manifest
+fields are ignored.
 
 **Recommended setup (GitHub releases, zero self-hosting).** Every release attaches
 one `<bin>-manifest.json` per binary, so a single line enables every update path
