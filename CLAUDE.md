@@ -33,6 +33,25 @@ Workspace-wide engineering rules live in the code (`#![warn(clippy::unwrap_used,
 clippy::expect_used)]`, never-crash errors-as-messages, `agent-core` depends on
 no Fleety crate). This file holds things that aren't derivable from the code.
 
+## Spectra pitfalls (verified 2026-07-11, spectra 2.3.1)
+
+- **Never delete `.spectra/touched/<change>.json` before `spectra archive`.** The
+  CLI reads it at archive time to inject `@trace` blocks into the main specs, and
+  it never cleans the file up itself — delete it only after a successful archive.
+  The generated skill files (`.claude/.agents/.opencode` spectra-archive copies)
+  used to get this order backwards; they are locally patched, but `spectra update`
+  (even without `--force`) regenerates them and silently reverts local patches —
+  re-check the step order after any spectra update. Not yet reported upstream:
+  `spectra feedback` only prints the message (transmits nothing) and points at
+  github.com/kaochenlong/Spectra/issues, which is not publicly accessible as of
+  2026-07-11 (nor is the spectra-app/spectra URL from the config comments) —
+  re-report if the repo ever becomes reachable.
+- **`spectra archive` run inside a git worktree** false-positives with "Change 'X'
+  exists in both the main repository and a worktree" — both printed paths are the
+  same directory, compared with mismatched `\` vs `/` separators. Workaround: run
+  the archive from the main checkout's cwd; it then operates on the worktree copy
+  correctly (verified: main checkout stays untouched).
+
 ## Releasing
 
 **Before cutting a release, update the bundled Insyra — the library and the two

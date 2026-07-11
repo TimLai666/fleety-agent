@@ -67,17 +67,7 @@ Archive a completed change.
 
    If user chooses sync, use Task tool (subagent_type: "general-purpose", prompt: "Use Skill tool to invoke spectra-sync-specs for change '<name>'. Delta spec analysis: <include the analyzed delta spec summary>"). Proceed to archive regardless of choice.
 
-5. **Clean up tracking file**
-
-   Delete `.spectra/touched/<change-name>.json` if it exists. This file contains implementation tracking data that is not needed after archiving.
-
-   ```bash
-   rm -f .spectra/touched/<change-name>.json
-   ```
-
-   If the file does not exist, silently continue.
-
-6. **Perform the archive**
+5. **Perform the archive**
 
    Use the `spectra archive` CLI command which handles the full archive workflow
    (spec snapshot, delta application, @trace injection, identity recording, vector indexing):
@@ -86,12 +76,31 @@ Archive a completed change.
    spectra archive <name>
    ```
 
+   The tracking file at `.spectra/touched/<change-name>.json` MUST still exist at
+   this point: `spectra archive` reads it to build the `@trace` code lists it
+   injects into the main specs, and the CLI does not delete the file itself.
+   Deleting it before archiving silently strips `@trace` provenance from the
+   archived specs.
+
    **Optional flags:**
    - `--skip-specs` — skip delta spec application (for tooling/doc-only changes)
    - `--mark-tasks-complete` — mark all incomplete tasks as complete before archiving
    - `--no-validate` — skip delta spec validation
 
    **If archive fails** with "already exists" error, suggest renaming existing archive.
+
+6. **Clean up tracking file (only after a successful archive)**
+
+   After `spectra archive` completed successfully, delete
+   `.spectra/touched/<change-name>.json` — the CLI has already consumed it for
+   `@trace` injection but leaves it behind, so removing it keeps
+   `.spectra/touched/` from accumulating stale entries.
+
+   ```bash
+   rm -f .spectra/touched/<change-name>.json
+   ```
+
+   If the file does not exist, silently continue.
 
 7. **Display summary**
 
