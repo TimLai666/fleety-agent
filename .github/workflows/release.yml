@@ -99,12 +99,14 @@ jobs:
       # Each runner's arch matches its target, so a native `go build` is correct.
       # Ship the sidecar as a RAW per-target binary (not archived) so installers
       # and `fleetyd update` just download + chmod — no tar/zip extraction.
+      # `-s -w` drops DWARF + symbol table (~30% smaller); Go panic tracebacks
+      # are unaffected.
       - name: Build insyra sidecar
         shell: bash
         run: |
           raw="$GITHUB_WORKSPACE/fleety-insyra-${{ matrix.target }}"
           [ "${{ matrix.archive }}" = "zip" ] && raw="$raw.exe"
-          (cd sidecars/fleety-insyra && go build -trimpath -o "$raw" .)
+          (cd sidecars/fleety-insyra && go build -trimpath -ldflags "-s -w" -o "$raw" .)
       - name: Package (tar.gz)
         if: matrix.archive == 'tar.gz'
         run: |
@@ -131,3 +133,44 @@ jobs:
             fleetyd-${{ matrix.target }}.${{ matrix.archive }}
             fleety-insyra-${{ matrix.target }}
             fleety-insyra-${{ matrix.target }}.exe
+
+  # The Go sidecar also ships for ARM/RISC-V Linux SBCs (Pi, LicheeRV, NAS…)
+  # that have no Rust release target yet: a source-built fleetyd there still
+  # downloads its sidecar from the release page (deps::insyra maps arch/os to
+  # these triples — keep both lists in sync). Pure-Go cross builds; CGO is
+  # pinned off so a future cgo dependency fails loudly here instead of silently
+  # changing linkage. No 32-bit ARM: Insyra's thrift dependency doesn't build
+  # where Go's `int` is 32-bit.
+  sidecar-cross:
+    name: build sidecar (linux arm64/riscv64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      # Same "ship the latest Insyra" posture as the main jobs. The vendored
+      # skills mirroring isn't repeated here — this job runs no cargo build, so
+      # nothing embeds them.
+      - name: Update Insyra to latest release
+        run: |
+          cd sidecars/fleety-insyra
+          go get -u github.com/HazelnutParadise/insyra@latest
+          go get -u ./...
+          go mod tidy
+          go test ./...
+      - name: Cross-build insyra sidecar
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+        run: |
+          cd sidecars/fleety-insyra
+          GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o "$GITHUB_WORKSPACE/fleety-insyra-aarch64-unknown-linux-gnu" .
+          GOARCH=riscv64 go build -trimpath -ldflags "-s -w" -o "$GITHUB_WORKSPACE/fleety-insyra-riscv64gc-unknown-linux-gnu" .
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            fleety-insyra-aarch64-unknown-linux-gnu
+            fleety-insyra-riscv64gc-unknown-linux-gnu
