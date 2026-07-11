@@ -196,11 +196,19 @@ authenticated connection — use TLS for remote/untrusted networks.
 ## Codex ChatGPT OAuth (sign in instead of an API key)
 
 `fleety auth login` signs in to ChatGPT (OAuth 2.0 with PKCE, the same public
-client id and simplified flow as the upstream Codex CLI) and stores tokens at
-`~/.fleety/codex-oauth.json` (0600 on Unix), refreshed automatically and never
-printed. `fleety auth status` / `fleety auth logout` manage the session. Login
-uses a **fixed loopback redirect** (`http://localhost:1455/auth/callback`) because
-the client id is registered with it — port 1455 must be free during login.
+client id and simplified flow as the upstream Codex CLI) **for the connected
+server**: the browser flow runs on the CLI host, and the exchanged tokens are
+delivered over the paired connection and stored on the server at its
+`~/.fleety/codex-oauth.json` (0600 on Unix), refreshed automatically by the
+server and never printed. Nothing is persisted on the CLI host (login also
+cleans up a leftover token file from older versions). This is distinct from
+`fleety pair`, which enrolls the device itself. `fleety auth status` /
+`fleety auth logout` query / clear the **server-side** credential; a server
+too old to store credentials (config protocol < 2) is refused up front with an
+update hint, and a server running without authentication refuses credential
+operations entirely (enable auth and pair first). Login uses a **fixed loopback
+redirect** (`http://localhost:1455/auth/callback`) because the client id is
+registered with it — port 1455 must be free on the CLI host during login.
 
 The defaults work out of the box; override only for a non-default install.
 
@@ -211,7 +219,7 @@ The defaults work out of the box; override only for a non-default install.
 | `FLEETY_CODEX_TOKEN_URL` | `https://auth.openai.com/oauth/token` | Token endpoint. |
 | `FLEETY_CODEX_BACKEND_URL` | `https://chatgpt.com/backend-api/codex` | Codex backend base; the provider calls `<base>/responses`. |
 | `FLEETY_CODEX_ORIGINATOR` | `codex_cli_rs` | Originator sent on the Responses call (`fleety` is used on the authorize request). |
-| `FLEETY_CODEX_TOKENS` | `~/.fleety/codex-oauth.json` | Override the token-store path (tests / non-default installs). |
+| `FLEETY_CODEX_TOKENS` | `~/.fleety/codex-oauth.json` | Override the token-store path **on the server host** (tests / non-default installs). |
 | `FLEETY_CODEX_AUDIT` | `~/.fleety/` (auth audit file) | Override the auth-audit log path (login/logout events, never token values). |
 | `FLEETY_MODEL_AUTH` / `FLEETY_CHEAP_MODEL_AUTH` | unset | Bootstrap-seed twin of a provider's `type`: set `oauth:codex` to route the env-seeded main / economy tier through the Codex Responses backend without a providers.toml. |
 

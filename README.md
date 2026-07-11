@@ -192,9 +192,12 @@ Use a ChatGPT subscription rather than a static key:
 
 1. `fleety auth login` — opens the browser (or `fleety auth login --no-browser`
    prints the URL), captures the redirect on the fixed loopback port
-   `http://localhost:1455/auth/callback` (must be free during login), and stores
-   tokens at `~/.fleety/codex-oauth.json` (0600 on Unix; refreshed automatically,
-   never printed). The public Codex client id is the default — no setup needed.
+   `http://localhost:1455/auth/callback` (must be free during login), and
+   **delivers the tokens to the connected server**, which stores them at its
+   `~/.fleety/codex-oauth.json` (0600 on Unix; refreshed automatically, never
+   printed — nothing is persisted on the CLI host). Requires a paired,
+   up-to-date server; `fleety auth status` / `logout` act on the same server.
+   The public Codex client id is the default — no setup needed.
 2. Point a provider at it with `type = "oauth:codex"` in `providers.toml` (or
    `FLEETY_MODEL_AUTH=oauth:codex`). Fleety then calls the ChatGPT/Codex backend
    over the **Responses API** with your account's token (auto-refreshed) — no key.

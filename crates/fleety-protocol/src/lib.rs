@@ -13,9 +13,10 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 /// The structured-config protocol version the server advertises in `Welcome`
 /// (`0` = only the legacy `ConfigExec`). A client compares this to decide
-/// whether to use `ConfigSnapshot`/`ConfigApply` or fall back. Additive — an
-/// older server omits it and the client sees `0`.
-pub const CONFIG_PROTOCOL_VERSION: u32 = 1;
+/// which remote-config surfaces it can use. `1` adds `ConfigSnapshot`/
+/// `ConfigApply`; `2` adds the credential frames (`CredentialPut`/`Status`/
+/// `Delete`). Additive — an older server omits it and the client sees `0`.
+pub const CONFIG_PROTOCOL_VERSION: u32 = 2;
 
 /// Wire form of an actionable error (mirrors `agent_core::ErrorReport`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -275,6 +276,18 @@ pub enum ClientMsg {
         base_revision: String,
         changes: Vec<ConfigChange>,
     },
+    /// Store a credential in the connected server's credential store. `kind`
+    /// discriminates the credential (first kind: `codex-oauth`, whose
+    /// `payload_json` is the serde shape of the OAuth `Tokens`). Requires an
+    /// authenticated connection; accepted writes are audited (never with token
+    /// values). Reply: `CredentialResult`. Advertised by `config_protocol >= 2`.
+    CredentialPut { kind: String, payload_json: String },
+    /// Query whether the server holds a credential of `kind`. Reply:
+    /// `CredentialStatusResult` — presence and expiry only, never token values.
+    CredentialStatus { kind: String },
+    /// Remove the server-side credential of `kind`. Requires an authenticated
+    /// connection; audited. Reply: `CredentialResult`.
+    CredentialDelete { kind: String },
     /// Any frame this build does not recognize. `#[serde(other)]` routes an
     /// unknown `type` here instead of failing to parse — so a newer peer's
     /// additive frame is answered with an `unsupported` error rather than
@@ -427,6 +440,24 @@ pub enum ServerMsg {
         /// JSON-encoded structured provider/model config (providers.toml shape).
         providers_json: String,
     },
+    /// Reply to `CredentialPut` / `CredentialDelete`.
+    CredentialResult {
+        ok: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<WireError>,
+    },
+    /// Reply to `CredentialStatus`: presence and expiry only — token values
+    /// never cross this frame. `detail` is a non-secret label (e.g. an account
+    /// hint); `error` is set when the query itself was refused.
+    CredentialStatusResult {
+        present: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expires_at_secs: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<WireError>,
+    },
 }
 
 #[cfg(test)]
@@ -480,7 +511,7 @@ mod tests {
         let json = serde_json::to_string(&w).expect("ser");
         assert!(json.contains("\"server_version\":\"0.3.0\""));
         assert!(json.contains("\"audio_input\":true"));
-        assert!(json.contains("\"config_protocol\":1"));
+        assert!(json.contains("\"config_protocol\":2"));
         // An old server's frame (no server_version / audio_input / config_protocol)
         // still parses → defaults ("" / false / 0 → legacy ConfigExec + local STT).
         let old = r#"{"type":"welcome","session_id":"s","conversation_id":"c","protocol":0}"#;
@@ -557,6 +588,72 @@ mod tests {
             serde_json::from_str::<ClientMsg>(unknown).expect("unknown parses"),
             ClientMsg::Unknown
         );
+    }
+
+    #[test]
+    fn credential_frames_roundtrip_and_status_never_carries_tokens() {
+        // Put / status / delete round-trip.
+        let put = ClientMsg::CredentialPut {
+            kind: "codex-oauth".into(),
+            payload_json: r#"{"access_token":"a","refresh_token":"r","expires_at_secs":1}"#.into(),
+        };
+        assert_eq!(
+            serde_json::from_str::<ClientMsg>(&serde_json::to_string(&put).expect("ser"))
+                .expect("de"),
+            put
+        );
+        let status = ClientMsg::CredentialStatus {
+            kind: "codex-oauth".into(),
+        };
+        assert_eq!(
+            serde_json::from_str::<ClientMsg>(&serde_json::to_string(&status).expect("ser"))
+                .expect("de"),
+            status
+        );
+        let del = ClientMsg::CredentialDelete {
+            kind: "codex-oauth".into(),
+        };
+        assert_eq!(
+            serde_json::from_str::<ClientMsg>(&serde_json::to_string(&del).expect("ser"))
+                .expect("de"),
+            del
+        );
+
+        let ok = ServerMsg::CredentialResult {
+            ok: true,
+            error: None,
+        };
+        let json = serde_json::to_string(&ok).expect("ser");
+        assert!(!json.contains("error"), "None error is omitted: {json}");
+        assert_eq!(serde_json::from_str::<ServerMsg>(&json).expect("de"), ok);
+
+        // The status reply carries presence + expiry only — by shape it has no
+        // field a token value could travel in.
+        let st = ServerMsg::CredentialStatusResult {
+            present: true,
+            expires_at_secs: Some(123),
+            detail: Some("account abc".into()),
+            error: None,
+        };
+        let json = serde_json::to_string(&st).expect("ser");
+        assert!(json.contains("\"present\":true"));
+        assert!(json.contains("\"expires_at_secs\":123"));
+        assert!(!json.contains("token"));
+        assert_eq!(serde_json::from_str::<ServerMsg>(&json).expect("de"), st);
+
+        // A frame from a newer peer with extra fields still parses (additive).
+        let extra = r#"{"type":"credential_status_result","present":false,"future_field":1}"#;
+        match serde_json::from_str::<ServerMsg>(extra).expect("de extra") {
+            ServerMsg::CredentialStatusResult {
+                present,
+                expires_at_secs,
+                ..
+            } => {
+                assert!(!present);
+                assert!(expires_at_secs.is_none());
+            }
+            _ => panic!("not a credential status result"),
+        }
     }
 
     #[test]

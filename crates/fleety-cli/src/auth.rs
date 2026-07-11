@@ -1,13 +1,21 @@
-//! `fleety auth` — sign in to ChatGPT (Codex OAuth) so providers configured with
-//! `auth = oauth:codex` can call the model without a static API key. Tokens are
-//! stored locally (`~/.fleety/codex-oauth.json`, 0600 on Unix); this command
-//! never prints them.
+//! `fleety auth` — sign in to ChatGPT (Codex OAuth) for the **connected
+//! server**: the PKCE browser flow runs here (the authorization page must open
+//! in front of the user), but the exchanged tokens are delivered over the
+//! authenticated connection and stored on the server — the machine whose
+//! provider (`auth = oauth:codex`) actually calls the model. No token is
+//! persisted on the CLI host, and this command never prints token values.
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
 
 use agent_core::{CoreError, Result};
-use fleety_tools::oauth;
+use fleety_protocol::{ClientMsg, ServerMsg};
+use fleety_tools::{connection, oauth};
+
+use crate::{connect_hello_for_auth, recv, send};
+
+/// The credential kind this command manages on the server.
+const CREDENTIAL_KIND: &str = "codex-oauth";
 
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -20,8 +28,8 @@ fn now_secs() -> u64 {
 pub async fn run(args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
         Some("login") => login(args.iter().any(|a| a == "--no-browser")).await,
-        Some("status") => status(),
-        Some("logout") => logout(),
+        Some("status") => status().await,
+        Some("logout") => logout().await,
         _ => {
             println!("usage: fleety auth <login|status|logout> [--no-browser]");
             Ok(())
@@ -29,8 +37,101 @@ pub async fn run(args: &[String]) -> Result<()> {
     }
 }
 
-/// Run the PKCE authorization-code login: open the browser, capture the code on a
-/// loopback listener, exchange it, and store the tokens.
+/// The version gate: a server that does not advertise credential support
+/// (config protocol 2) cannot store the login — refuse up front, before any
+/// browser opens, with the fix spelled out.
+fn credential_support_err(config_protocol: u32) -> Option<CoreError> {
+    (config_protocol < 2).then(|| {
+        CoreError::Message(
+            "the connected server is too old to store credentials remotely — update it first \
+             (run `fleety update` on the server host, or let fleet convergence catch it up), \
+             then re-run `fleety auth login`"
+                .to_string(),
+        )
+    })
+}
+
+/// Human-readable name of the server a credential operation acted on.
+fn server_label(target: &connection::Resolved) -> String {
+    match &target.source {
+        connection::Source::Profile(name) => format!("'{name}' ({})", target.url),
+        _ => target.url.clone(),
+    }
+}
+
+/// The status line for the server-side credential — presence and expiry only
+/// (by construction this function never sees a token value).
+fn remote_status_line(
+    present: bool,
+    expires_at_secs: Option<u64>,
+    detail: Option<&str>,
+    server: &str,
+) -> String {
+    if !present {
+        return format!("Not signed in on server {server}. Run `fleety auth login`.");
+    }
+    let expiry = expires_at_secs
+        .map(|s| format!("expires at unix {s}"))
+        .unwrap_or_else(|| "no expiry recorded".to_string());
+    let detail = detail.map(|d| format!(" ({d})")).unwrap_or_default();
+    format!(
+        "Signed in to ChatGPT (Codex OAuth) on server {server}{detail}. Access token: {expiry}."
+    )
+}
+
+/// Remove a leftover token file from the pre-server-side era on this CLI host.
+/// Returns the note to print when one was cleaned up.
+fn cleanup_legacy_local_file(path: &std::path::Path) -> Option<String> {
+    if !path.exists() {
+        return None;
+    }
+    let note = match oauth::clear_tokens(path) {
+        Ok(()) => format!(
+            "Removed the leftover local token file at {} — credentials now live on the server.",
+            path.display()
+        ),
+        Err(e) => format!(
+            "A leftover local token file at {} is no longer used, but could not be removed: {}",
+            path.display(),
+            e.report().message
+        ),
+    };
+    Some(note)
+}
+
+/// The note `auth status` prints when a stale local token file still exists.
+fn legacy_local_note(path: &std::path::Path) -> Option<String> {
+    path.exists().then(|| {
+        format!(
+            "Note: the local token file at {} is no longer read by any flow; re-run \
+             `fleety auth login` to store credentials on the server (login also cleans it up).",
+            path.display()
+        )
+    })
+}
+
+/// Map a `CredentialResult` reply to a `Result`, surfacing the server's error.
+fn credential_result(reply: Option<ServerMsg>) -> Result<()> {
+    match reply {
+        Some(ServerMsg::CredentialResult { ok: true, .. }) => Ok(()),
+        Some(ServerMsg::CredentialResult { error: Some(e), .. }) => {
+            Err(CoreError::Message(match e.remediation {
+                Some(r) => format!("{} — {r}", e.message),
+                None => e.message,
+            }))
+        }
+        Some(ServerMsg::CredentialResult { .. }) => Err(CoreError::Message(
+            "the server refused the credential operation without a reason".to_string(),
+        )),
+        other => Err(CoreError::Provider(format!(
+            "expected a credential reply, got {other:?}"
+        ))),
+    }
+}
+
+/// Run the PKCE authorization-code login: open the browser, capture the code on
+/// a loopback listener, exchange it, and deliver the tokens to the connected
+/// server for storage (nothing is persisted on this host).
 pub async fn login(no_browser: bool) -> Result<()> {
     let config = oauth::oauth_config();
     if config.client_id.is_empty() {
@@ -40,6 +141,24 @@ pub async fn login(no_browser: bool) -> Result<()> {
              then re-run `fleety auth login`."
                 .into(),
         ));
+    }
+
+    // Gate on the server BEFORE the browser opens: an unreachable, unpaired, or
+    // too-old server must not cost the user a full authorization round-trip.
+    // This probe connection is then dropped — the authorization can take minutes
+    // and an idle link would trip the keepalive; delivery reconnects afresh.
+    {
+        let (_tx, _rx, config_protocol, _target) = connect_hello_for_auth().await.map_err(|e| {
+            CoreError::Message(format!(
+                "could not reach the server that would store this login: {} — check the \
+                     connection (`fleety status`), pair this device first (`fleety pair <code>`), \
+                     or set the server URL with `fleety init <ws-url>`",
+                e.report().message
+            ))
+        })?;
+        if let Some(err) = credential_support_err(config_protocol) {
+            return Err(err);
+        }
     }
 
     let verifier = oauth::generate_verifier();
@@ -75,49 +194,114 @@ pub async fn login(no_browser: bool) -> Result<()> {
         now_secs(),
     )
     .await?;
-    oauth::save_tokens(&oauth::default_token_path(), &tokens)?;
+
+    // Deliver to the server that owns the credential from here on. A failure
+    // fails the whole login — the tokens are dropped, never stored locally
+    // (re-running login is cheap; a silent local fallback would recreate the
+    // very split-brain this flow removes).
+    let payload_json = serde_json::to_string(&tokens)
+        .map_err(|e| CoreError::Message(format!("serialize tokens: {e}")))?;
+    let (mut tx, mut rx, config_protocol, target) =
+        connect_hello_for_auth().await.map_err(|e| {
+            CoreError::Message(format!(
+                "authorization succeeded, but the server could not be reached to store it: {} — \
+             re-run `fleety auth login` once the connection is back",
+                e.report().message
+            ))
+        })?;
+    if let Some(err) = credential_support_err(config_protocol) {
+        return Err(err);
+    }
+    send(
+        &mut tx,
+        &ClientMsg::CredentialPut {
+            kind: CREDENTIAL_KIND.to_string(),
+            payload_json,
+        },
+    )
+    .await?;
+    credential_result(recv(&mut rx).await?)?;
+
     if let Err(e) = oauth::append_auth_audit("login", now_secs()) {
         tracing::warn!(report = ?e.report(), "could not record auth audit");
     }
     println!(
-        "Signed in. Tokens saved to {}.",
-        oauth::default_token_path().display()
+        "Signed in. Credentials delivered to server {}.",
+        server_label(&target)
     );
-    Ok(())
-}
-
-/// Report whether the user is signed in and when the token expires — never the
-/// token values.
-pub fn status() -> Result<()> {
-    println!("{}", status_line());
-    Ok(())
-}
-
-/// The status message (no token values), split out so it is unit-testable.
-fn status_line() -> String {
-    match oauth::load_tokens(&oauth::default_token_path()) {
-        Some(t) => {
-            let state = if oauth::needs_refresh(t.expires_at_secs, now_secs()) {
-                "expired (will refresh on next use)"
-            } else {
-                "valid"
-            };
-            format!(
-                "Signed in to ChatGPT (Codex OAuth). Access token: {state}; expires at unix {}.",
-                t.expires_at_secs
-            )
-        }
-        None => "Not signed in. Run `fleety auth login`.".to_string(),
+    if let Some(note) = cleanup_legacy_local_file(&oauth::default_token_path()) {
+        println!("{note}");
     }
+    Ok(())
 }
 
-/// Remove the stored tokens.
-pub fn logout() -> Result<()> {
-    oauth::clear_tokens(&oauth::default_token_path())?;
+/// Report whether the connected server holds a credential and when it expires —
+/// never the token values (the status frame carries none by shape).
+pub async fn status() -> Result<()> {
+    let (mut tx, mut rx, config_protocol, target) = connect_hello_for_auth().await?;
+    if let Some(err) = credential_support_err(config_protocol) {
+        return Err(err);
+    }
+    send(
+        &mut tx,
+        &ClientMsg::CredentialStatus {
+            kind: CREDENTIAL_KIND.to_string(),
+        },
+    )
+    .await?;
+    match recv(&mut rx).await? {
+        Some(ServerMsg::CredentialStatusResult { error: Some(e), .. }) => {
+            return Err(CoreError::Message(match e.remediation {
+                Some(r) => format!("{} — {r}", e.message),
+                None => e.message,
+            }))
+        }
+        Some(ServerMsg::CredentialStatusResult {
+            present,
+            expires_at_secs,
+            detail,
+            ..
+        }) => {
+            println!(
+                "{}",
+                remote_status_line(
+                    present,
+                    expires_at_secs,
+                    detail.as_deref(),
+                    &server_label(&target)
+                )
+            );
+        }
+        other => {
+            return Err(CoreError::Provider(format!(
+                "expected a credential status reply, got {other:?}"
+            )))
+        }
+    }
+    if let Some(note) = legacy_local_note(&oauth::default_token_path()) {
+        println!("{note}");
+    }
+    Ok(())
+}
+
+/// Remove the credential stored on the connected server.
+pub async fn logout() -> Result<()> {
+    let (mut tx, mut rx, config_protocol, target) = connect_hello_for_auth().await?;
+    if let Some(err) = credential_support_err(config_protocol) {
+        return Err(err);
+    }
+    send(
+        &mut tx,
+        &ClientMsg::CredentialDelete {
+            kind: CREDENTIAL_KIND.to_string(),
+        },
+    )
+    .await?;
+    credential_result(recv(&mut rx).await?)?;
     if let Err(e) = oauth::append_auth_audit("logout", now_secs()) {
         tracing::warn!(report = ?e.report(), "could not record auth audit");
     }
-    println!("Signed out; local tokens removed.");
+    println!("Signed out on server {}.", server_label(&target));
     Ok(())
 }
 
@@ -238,41 +422,71 @@ mod tests {
     }
 
     #[test]
-    fn status_hides_tokens_and_logout_clears_and_audits() {
-        // Redirect the token store + audit to temp paths (process-global env, so
-        // this is the only auth test that sets them — avoids a parallel-test race).
-        let dir = std::env::temp_dir().join(format!("fleety-authcmd-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).expect("mk");
-        let tokens_path = dir.join("codex-oauth.json");
-        let audit_path = dir.join("auth-audit.jsonl");
-        std::env::set_var("FLEETY_CODEX_TOKENS", &tokens_path);
-        std::env::set_var("FLEETY_CODEX_AUDIT", &audit_path);
+    fn version_gate_refuses_old_servers_before_any_flow() {
+        // config protocol < 2 → refuse with the fix; 2+ → proceed.
+        let err = credential_support_err(1).expect("old server refused");
+        let msg = err.to_string();
+        assert!(msg.contains("update"), "gate names the remedy: {msg}");
+        assert!(credential_support_err(0).is_some());
+        assert!(credential_support_err(2).is_none());
+        assert!(credential_support_err(3).is_none(), "future versions pass");
+    }
 
-        // Logged out.
-        assert!(status_line().contains("Not signed in"));
+    #[test]
+    fn remote_status_line_reports_server_state_without_secrets() {
+        // Signed out.
+        let out = remote_status_line(false, None, None, "'home' (ws://mini:8787)");
+        assert!(out.contains("Not signed in"));
+        assert!(out.contains("ws://mini:8787"), "names the server: {out}");
 
-        // Sign in with a secret access token; status must not leak it.
-        let tokens = oauth::Tokens {
-            access_token: "SECRET-ACCESS".into(),
-            refresh_token: "SECRET-REFRESH".into(),
-            expires_at_secs: now_secs() + 3600,
-            token_type: "Bearer".into(),
-            account_id: None,
+        // Signed in: presence + expiry + detail only — the function cannot even
+        // receive a token value (shape-level guarantee).
+        let out = remote_status_line(
+            true,
+            Some(1234),
+            Some("account abc"),
+            "'home' (ws://mini:8787)",
+        );
+        assert!(out.contains("Signed in"));
+        assert!(out.contains("1234"));
+        assert!(out.contains("account abc"));
+    }
+
+    #[test]
+    fn server_label_names_profile_or_url() {
+        let profiled = connection::Resolved {
+            url: "ws://mini:8787".into(),
+            token: Some("t".into()),
+            source: connection::Source::Profile("home".into()),
         };
-        oauth::save_tokens(&oauth::default_token_path(), &tokens).expect("save");
-        let line = status_line();
-        assert!(line.contains("Signed in"));
-        assert!(!line.contains("SECRET-ACCESS"));
-        assert!(!line.contains("SECRET-REFRESH"));
+        assert_eq!(server_label(&profiled), "'home' (ws://mini:8787)");
+        let discovered = connection::Resolved {
+            url: "ws://found:8787".into(),
+            token: None,
+            source: connection::Source::Mdns,
+        };
+        assert_eq!(server_label(&discovered), "ws://found:8787");
+    }
 
-        // Logout removes the token file and records an audit event.
-        logout().expect("logout");
-        assert!(oauth::load_tokens(&oauth::default_token_path()).is_none());
-        let audit = std::fs::read_to_string(&audit_path).expect("audit");
-        assert!(audit.contains("\"logout\""));
+    #[test]
+    fn legacy_local_file_is_cleaned_up_and_flagged() {
+        let dir = std::env::temp_dir().join(format!("fleety-authleg-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("mk");
+        let path = dir.join("codex-oauth.json");
 
-        std::env::remove_var("FLEETY_CODEX_TOKENS");
-        std::env::remove_var("FLEETY_CODEX_AUDIT");
+        // Nothing there → no note, no cleanup message.
+        assert!(legacy_local_note(&path).is_none());
+        assert!(cleanup_legacy_local_file(&path).is_none());
+
+        // A leftover pre-server-side file → status flags it, login cleanup
+        // removes it and says where credentials live now.
+        std::fs::write(&path, "{}").expect("write");
+        let note = legacy_local_note(&path).expect("flagged");
+        assert!(note.contains("no longer read"));
+        let cleaned = cleanup_legacy_local_file(&path).expect("cleaned");
+        assert!(cleaned.contains("now live on the server"));
+        assert!(!path.exists(), "login cleanup removes the leftover file");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

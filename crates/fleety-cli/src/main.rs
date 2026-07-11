@@ -1049,6 +1049,10 @@ async fn ask(text: String, attachments: Vec<WireAttachment>) -> Result<()> {
                 };
                 send(&mut tx, &ClientMsg::ToolError { call_id, error }).await?;
             }
+            // Credential replies belong to the `fleety auth` command's own
+            // request/reply exchange; in the ask loop they are stray noise.
+            Some(ServerMsg::CredentialResult { .. })
+            | Some(ServerMsg::CredentialStatusResult { .. }) => {}
             Some(ServerMsg::ApprovalRequested {
                 approval_id,
                 tool,
@@ -1278,6 +1282,22 @@ async fn connect_hello() -> Result<(Tx, Rx)> {
     send(&mut tx, &hello(target.token.clone(), None)).await?;
     match recv(&mut rx).await? {
         Some(ServerMsg::Welcome { .. }) => Ok((tx, rx)),
+        other => Err(CoreError::Provider(format!(
+            "expected welcome, got {other:?}"
+        ))),
+    }
+}
+
+/// `connect_hello` for the `auth` command: also returns the server's advertised
+/// config protocol (the credential-support gate) and the resolved target, so
+/// auth can refuse an old server up front and name the server it acts on.
+pub(crate) async fn connect_hello_for_auth() -> Result<(Tx, Rx, u32, connection::Resolved)> {
+    let (mut tx, mut rx, target) = open().await?;
+    send(&mut tx, &hello(target.token.clone(), None)).await?;
+    match recv(&mut rx).await? {
+        Some(ServerMsg::Welcome {
+            config_protocol, ..
+        }) => Ok((tx, rx, config_protocol, target)),
         other => Err(CoreError::Provider(format!(
             "expected welcome, got {other:?}"
         ))),
