@@ -435,9 +435,219 @@ fn set_owner_only(path: &Path) {
 #[cfg(not(unix))]
 fn set_owner_only(_path: &Path) {}
 
+// ---- collecting discovery + fingerprint pinning + sticky healing ----
+
+/// One server found during a collecting LAN scan (guided init, sticky healing).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredServer {
+    pub name: String,
+    pub url: String,
+    /// The advertised persistent identity fingerprint (absent on old servers).
+    pub fingerprint: Option<String>,
+}
+
+/// Display name from an advertised mDNS instance: the `fleety-` prefix the
+/// server prepends is stripped; an empty leftover falls back to the URL. Pure.
+pub fn display_name_from_instance(instance: &str, url: &str) -> String {
+    let stripped = instance.strip_prefix("fleety-").unwrap_or(instance).trim();
+    if stripped.is_empty() {
+        url.to_string()
+    } else {
+        stripped.to_string()
+    }
+}
+
+/// Fold one resolved announcement into the collection, de-duplicating by URL
+/// (the same server re-announces during a browse window). Pure.
+pub fn push_discovered(found: &mut Vec<DiscoveredServer>, entry: DiscoveredServer) {
+    if !found.iter().any(|d| d.url == entry.url) {
+        found.push(entry);
+    }
+}
+
+/// Browse the LAN for the full collection window and return EVERY resolved
+/// `_fleety._tcp.local.` server (name + url + advertised fingerprint,
+/// de-duplicated by URL, discovery order). Empty when mDNS is disabled or the
+/// browse cannot start — callers fall back, never error.
+pub fn discover_all_via_mdns(window: std::time::Duration) -> Vec<DiscoveredServer> {
+    let mut found = Vec::new();
+    if std::env::var("FLEETY_MDNS_DISABLED").is_ok() {
+        return found;
+    }
+    let Ok(daemon) = mdns_sd::ServiceDaemon::new() else {
+        return found;
+    };
+    let Ok(receiver) = daemon.browse("_fleety._tcp.local.") else {
+        return found;
+    };
+    let deadline = std::time::Instant::now() + window;
+    while std::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let recv_timeout = remaining.min(std::time::Duration::from_millis(500));
+        match receiver.recv_timeout(recv_timeout) {
+            Ok(mdns_sd::ServiceEvent::ServiceResolved(info)) => {
+                let addrs = info.get_addresses_v4();
+                if let Some(ip) = addrs.iter().next() {
+                    let url = format!("ws://{}:{}", ip, info.get_port());
+                    let instance = info
+                        .get_fullname()
+                        .strip_suffix("._fleety._tcp.local.")
+                        .unwrap_or_else(|| info.get_fullname());
+                    let fingerprint = info
+                        .get_property_val_str("fp")
+                        .filter(|v| !v.is_empty())
+                        .map(String::from);
+                    let name = display_name_from_instance(instance, &url);
+                    push_discovered(
+                        &mut found,
+                        DiscoveredServer {
+                            name,
+                            url,
+                            fingerprint,
+                        },
+                    );
+                }
+            }
+            Ok(_) => continue,
+            Err(_) => continue,
+        }
+    }
+    let _ = daemon.shutdown();
+    found
+}
+
+/// The trust-on-authenticated-connect rule for a server fingerprint seen on an
+/// authenticated connection (or minted at pairing). Pure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinDecision {
+    /// No pin yet → adopt the seen fingerprint.
+    Pin,
+    /// Already pinned to this fingerprint → nothing to do.
+    AlreadyPinned,
+    /// Pinned to a DIFFERENT fingerprint → never overwrite; warn and suggest
+    /// re-pairing (a changed server identity is an anomaly, not a rotation).
+    IdentityChanged,
+}
+
+/// Decide what to do with a fingerprint seen on a trusted (authenticated or
+/// pairing) connection, against the profile's existing pin. Pure.
+pub fn tofu_pin_decision(existing: Option<&str>, seen: &str) -> PinDecision {
+    match existing {
+        None => PinDecision::Pin,
+        Some(p) if p == seen => PinDecision::AlreadyPinned,
+        Some(_) => PinDecision::IdentityChanged,
+    }
+}
+
+/// Apply [`tofu_pin_decision`] to the CURRENT profile, persisting a new pin.
+/// Returns the decision so callers can warn on `IdentityChanged`.
+pub fn pin_current_fingerprint(seen: &str) -> Result<PinDecision> {
+    let mut conns = load()?;
+    let Some(name) = conns.current.clone() else {
+        return Ok(PinDecision::AlreadyPinned); // no current profile → nothing to pin onto
+    };
+    let Some(profile) = conns.profiles.get_mut(&name) else {
+        return Ok(PinDecision::AlreadyPinned);
+    };
+    let decision = tofu_pin_decision(profile.fingerprint.as_deref(), seen);
+    if decision == PinDecision::Pin {
+        profile.fingerprint = Some(seen.to_string());
+        save(&conns)?;
+    }
+    Ok(decision)
+}
+
+/// The sticky-heal candidate: among `found`, the advertiser whose fingerprint
+/// exactly equals `pinned` and whose URL differs from the failing one. Anything
+/// fingerprint-less or different is excluded — the stored token is never handed
+/// to an unverified advertiser. Pure.
+pub fn heal_candidate(pinned: &str, old_url: &str, found: &[DiscoveredServer]) -> Option<String> {
+    found
+        .iter()
+        .find(|d| d.fingerprint.as_deref() == Some(pinned) && d.url != old_url)
+        .map(|d| d.url.clone())
+}
+
+/// One sticky-heal attempt after a failed connect to the current profile's
+/// `old_url`: scan the LAN, adopt ONLY an advertiser matching the pinned
+/// fingerprint, persist its URL onto the profile, and return it. `None` (no
+/// pin, disabled mDNS, no match, or persistence failure) leaves everything
+/// untouched — the caller surfaces the original connection failure.
+pub fn heal_current_profile(old_url: &str) -> Option<String> {
+    if std::env::var("FLEETY_MDNS_DISABLED").is_ok() {
+        return None;
+    }
+    let mut conns = load().ok()?;
+    let name = conns.current.clone()?;
+    let pinned = conns.profiles.get(&name)?.fingerprint.clone()?;
+    let found = discover_all_via_mdns(std::time::Duration::from_secs(3));
+    let new_url = heal_candidate(&pinned, old_url, &found)?;
+    if let Some(profile) = conns.profiles.get_mut(&name) {
+        profile.url = new_url.clone();
+    }
+    save(&conns).ok()?;
+    Some(new_url)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tofu_pin_rules() {
+        assert_eq!(tofu_pin_decision(None, "fp-1"), PinDecision::Pin);
+        assert_eq!(
+            tofu_pin_decision(Some("fp-1"), "fp-1"),
+            PinDecision::AlreadyPinned
+        );
+        assert_eq!(
+            tofu_pin_decision(Some("fp-1"), "fp-2"),
+            PinDecision::IdentityChanged
+        );
+    }
+
+    #[test]
+    fn heal_adopts_only_the_pinned_fingerprint_at_a_new_url() {
+        let mk = |name: &str, url: &str, fp: Option<&str>| DiscoveredServer {
+            name: name.into(),
+            url: url.into(),
+            fingerprint: fp.map(String::from),
+        };
+        let found = vec![
+            mk("other", "ws://10.0.0.9:8787", Some("fp-other")),
+            mk("bare", "ws://10.0.0.8:8787", None),
+            mk("mine", "ws://10.0.0.7:8787", Some("fp-mine")),
+        ];
+        // Only the exact pinned fingerprint is adopted — never the others.
+        assert_eq!(
+            heal_candidate("fp-mine", "ws://10.0.0.2:8787", &found),
+            Some("ws://10.0.0.7:8787".to_string())
+        );
+        // A match at the SAME (failing) url is not a heal.
+        assert_eq!(
+            heal_candidate("fp-mine", "ws://10.0.0.7:8787", &found),
+            None
+        );
+        // No match → nothing adopted.
+        assert_eq!(heal_candidate("fp-unknown", "ws://x", &found), None);
+    }
+
+    #[test]
+    fn discovery_names_and_dedupe() {
+        assert_eq!(display_name_from_instance("fleety-mini", "ws://u"), "mini");
+        assert_eq!(display_name_from_instance("", "ws://u"), "ws://u");
+        assert_eq!(display_name_from_instance("fleety-", "ws://u"), "ws://u");
+        let mut found = Vec::new();
+        let entry = |url: &str| DiscoveredServer {
+            name: "n".into(),
+            url: url.into(),
+            fingerprint: None,
+        };
+        push_discovered(&mut found, entry("ws://a"));
+        push_discovered(&mut found, entry("ws://a"));
+        push_discovered(&mut found, entry("ws://b"));
+        assert_eq!(found.len(), 2);
+    }
 
     fn tmp_path() -> PathBuf {
         std::env::temp_dir().join(format!("fleety-conn-{}.toml", uuid::Uuid::new_v4()))

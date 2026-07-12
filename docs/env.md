@@ -316,6 +316,22 @@ prompts for a pairing code in the same flow. With mDNS disabled, no TTY, or
 nothing found, it falls back to the explicit `fleety init ws://host:8787`
 guidance.
 
+**Server identity + sticky healing.** Each server mints a persistent identity
+fingerprint on first start (stored at `<agent home>/server-id`, stable across
+restarts and address changes) and advertises it in the mDNS TXT record (`fp`)
+and in `Welcome`. A device pins it when pairing and back-fills it on the next
+authenticated connection (devices enrolled before this existed need no
+re-pairing). Then, if the saved server URL stops answering, the CLI and fleetyd
+scan once and reconnect to the **same identity** at its new address — updating
+the saved profile automatically. Only an advertiser whose fingerprint exactly
+matches the pin is adopted; a different or absent fingerprint is ignored and the
+saved token is never sent to it, so the device never latches onto a different
+server on the LAN. Deleting `server-id` (or rebuilding the server) rotates the
+identity: pinned devices then warn "identity changed" and need a re-pair. The
+fingerprint is a plaintext identifier over the current `ws://` LAN transport — it
+prevents mix-ups and mistakes, not an active impersonator who could already
+sniff the token; TLS / challenge-based proof is a separate follow-up.
+
 | Var | Default | Meaning |
 |---|---|---|
 | `FLEETY_MDNS_DISABLED` | (unset) | Set anything to skip both announce and browse. Useful on corporate networks that block mDNS. |
@@ -669,7 +685,7 @@ to run it; `fleetyd update` (one-shot) restarts the installed service the same w
 |---|---|---|
 | `FLEETY_UPDATE_MANIFEST` | (unset → no poll) | URL of the JSON update manifest (flat or multi-target form). `{bin}` substitutes the binary name; `{version}` substitutes the exact version when pinning and the literal `latest` otherwise. |
 | `FLEETY_UPDATE_POLL_SECS` | `86400` (24 h) | How often to check. Floor 60 s. |
-| `FLEETY_AUTO_UPDATE` | `notify` | Set to `apply` to run the full update on each tick (`fleetyd update` equivalent). |
+| `FLEETY_AUTO_UPDATE` | `apply` | Each tick that finds a newer version runs the full host-wide update (fleetyd + sidecar + the host sibling binaries). Set `notify` (or `0`) for log-only. |
 
 ## Sidecar binaries (`fleetyd` + tools)
 

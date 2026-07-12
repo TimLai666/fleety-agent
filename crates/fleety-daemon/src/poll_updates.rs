@@ -15,9 +15,15 @@ use agent_core::Result;
 const DEFAULT_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const MIN_INTERVAL: Duration = Duration::from_secs(60); // floor; lets tests opt in
 
-/// Whether the user explicitly turned on background auto-apply.
+/// Background auto-apply is the default: a host that configured an update
+/// manifest has already opted into updates, so notify-only would be intent
+/// without follow-through. `FLEETY_AUTO_UPDATE=notify` (or `0`) opts back
+/// down to log-only.
 fn auto_apply_enabled() -> bool {
-    std::env::var("FLEETY_AUTO_UPDATE").as_deref() == Ok("apply")
+    !matches!(
+        std::env::var("FLEETY_AUTO_UPDATE").as_deref(),
+        Ok("notify") | Ok("0")
+    )
 }
 
 /// Interval read from `FLEETY_UPDATE_POLL_SECS`, or default. Clamped to a
@@ -61,15 +67,28 @@ pub fn spawn() {
     });
 }
 
-/// One poll. Notify-only by default; if `auto_apply`, run the full `update()`
-/// flow (which itself short-circuits when no newer version exists).
+/// One poll. Applies by default (the full host-wide update, which
+/// short-circuits when everything is current); notify-only when the user
+/// opted down with `FLEETY_AUTO_UPDATE=notify`.
 async fn tick(auto_apply: bool) -> Result<()> {
     if auto_apply {
         // Reuse the on-demand path verbatim — it logs version transitions and
-        // returns Ok(false) when already up to date. If it installed a new
-        // binary, request a self-restart that the serve loop carries out at the
-        // next idle frame boundary (so an update never interrupts a running tool).
-        if fleety_tools::update::self_update().await? {
+        // returns Ok(false) when already up to date.
+        let updated = fleety_tools::update::self_update().await?;
+        // Bring the host's sibling binaries along BEFORE scheduling our own
+        // restart, so the restart never interrupts a sibling download.
+        // Best-effort — a sibling failure never fails the tick.
+        if let Err(e) = fleety_tools::update::update_siblings_to_latest(
+            &fleety_tools::update::host_siblings_of("fleetyd"),
+        )
+        .await
+        {
+            tracing::warn!(report = ?e.report(), "sibling updates did not complete");
+        }
+        if updated {
+            // Request a self-restart that the serve loop carries out at the
+            // next idle frame boundary (an update never interrupts a running
+            // tool).
             crate::request_self_restart("self-update");
         }
         return Ok(());
@@ -82,7 +101,7 @@ async fn tick(auto_apply: bool) -> Result<()> {
         tracing::warn!(
             current,
             latest = %latest,
-            "fleetyd update available; run `fleetyd update` to apply (or set FLEETY_AUTO_UPDATE=apply)"
+            "fleetyd update available; run `fleetyd update` to apply (or unset FLEETY_AUTO_UPDATE)"
         );
     } else {
         tracing::info!(current, "fleetyd is up to date");
@@ -107,12 +126,15 @@ mod tests {
         assert_eq!(interval_from_env(), MIN_INTERVAL);
         std::env::remove_var("FLEETY_UPDATE_POLL_SECS");
 
-        // Auto-apply flag.
+        // Auto-apply is the default; `notify` (or `0`) opts down to log-only.
+        std::env::remove_var("FLEETY_AUTO_UPDATE");
+        assert!(auto_apply_enabled(), "unset defaults to apply");
         std::env::set_var("FLEETY_AUTO_UPDATE", "apply");
         assert!(auto_apply_enabled());
         std::env::set_var("FLEETY_AUTO_UPDATE", "notify");
         assert!(!auto_apply_enabled());
-        std::env::remove_var("FLEETY_AUTO_UPDATE");
+        std::env::set_var("FLEETY_AUTO_UPDATE", "0");
         assert!(!auto_apply_enabled());
+        std::env::remove_var("FLEETY_AUTO_UPDATE");
     }
 }

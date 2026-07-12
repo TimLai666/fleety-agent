@@ -30,8 +30,9 @@ irm https://raw.githubusercontent.com/TimLai666/fleety-agent/main/scripts/instal
 Then point it at your agent and chat:
 
 ```sh
-fleety init ws://your-agent-host:8787   # save the agent URL
-fleety tui                              # interactive UI  (or: fleety ask "hello")
+fleety init          # scan the LAN, pick a server from the list, pair — one flow
+fleety tui           # interactive UI  (or: fleety ask "hello")
+# (or point it somewhere explicitly: fleety init ws://your-agent-host:8787)
 ```
 
 Override the install location with `FLEETY_INSTALL_DIR`. The one-liners pull from
@@ -305,7 +306,7 @@ server, plus self-update:
 | `fleetyd install` / `uninstall` | register / remove the daemon service (install leaves autostart off until `enable`). |
 | `fleetyd start` / `stop` / `restart` / `enable` / `disable` / `status` | as above. A manual restart is immediate; only the *self-update* path defers its restart until the daemon is idle (no running on-device tool). |
 | `fleetyd config <list\|get\|set\|unset\|edit>` | Inspect/edit **this host's** settings (incl. `config provider\|model …`); same surface as `fleety config`. |
-| `fleetyd update` | self-update to the latest release (also refreshes the `fleety-insyra` sidecar). For a host-wide update of all components, prefer `fleety update`. |
+| `fleetyd update` | host-wide update: fleetyd + the `fleety-insyra` sidecar + the sibling `fleety`/`fleety-server` on this host. `fleety-server update` is the server-only-host equivalent. |
 | `fleetyd run-service` | internal service entry point. |
 
 Configuration for all three is environment-first (`FLEETY_*`) with a `config.toml`

@@ -103,7 +103,12 @@ pub fn spawn_advertise(bind_addr: &str) {
         .unwrap_or_else(|| "fleety".to_string());
     let host_label = format!("{hostname}.local.");
     let instance = format!("fleety-{hostname}");
-    let txt: &[(&str, &str)] = &[("version", agent_core::VERSION)];
+    let txt: &[(&str, &str)] = &[
+        ("version", agent_core::VERSION),
+        // The persistent identity fingerprint: enrolled devices use it to
+        // re-find this exact server after an IP change (sticky healing).
+        ("fp", crate::server_fingerprint()),
+    ];
     let info = ServiceInfo::new(
         SERVICE_TYPE,
         &instance,

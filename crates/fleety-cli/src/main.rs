@@ -343,37 +343,12 @@ async fn update_all() -> Result<()> {
     println!("Updating fleety (CLI)…");
     fleety_tools::update::self_update().await?;
 
-    // fleety-server: update the binary, then restart its service. Resolving its
-    // artifact needs a `{bin}` manifest template (a plain URL is the CLI's own).
-    if let Some(exe) = sibling_bin("fleety-server") {
-        if fleety_tools::update::manifest_is_templated() {
-            match fleety_tools::update::update_named("fleety-server", &exe).await {
-                Ok(true) => {
-                    // Bare `restart` (no --force) → the running server defers the
-                    // restart until it is idle rather than interrupting a turn.
-                    println!(
-                        "fleety-server updated — requesting a restart. The running server \
-                         restarts once it is idle (no in-flight turn), or after the deferral \
-                         deadline; an interrupted turn is recovered from the journal, not lost."
-                    );
-                    let _ = std::process::Command::new(&exe).arg("restart").status();
-                }
-                Ok(false) => {}
-                Err(e) => {
-                    eprintln!(
-                        "warning: fleety-server update failed: {}",
-                        e.report().message
-                    )
-                }
-            }
-        } else {
-            println!(
-                "note: set FLEETY_UPDATE_MANIFEST to a URL containing {{bin}} to also update fleety-server."
-            );
-        }
-    }
+    // fleety-server: the shared host-wide sibling path ({bin}-template gated;
+    // an updated server restarts idle-deferred).
+    fleety_tools::update::update_siblings_to_latest(&["fleety-server"]).await?;
 
-    // fleetyd: delegate to its own complete update (binary + insyra + restart).
+    // fleetyd: delegate to its own complete update (binary + insyra + restart +
+    // its own sibling pass, which is a no-op after the update above).
     if let Some(exe) = sibling_bin("fleetyd") {
         let _ = std::process::Command::new(&exe).arg("update").status();
     }
@@ -752,12 +727,38 @@ fn agent_url() -> String {
 /// Resolve + connect in one step: returns the split streams plus the resolved
 /// target (so callers can read its url/token). Every non-`init` connect site
 /// goes through here so they share one resolution (one mDNS probe, one token).
+/// When the sticky profile URL fails and the profile carries a pinned server
+/// fingerprint, one heal scan runs: an advertiser with the SAME fingerprint at
+/// a new address is adopted (persisted) and the connect retried once — any
+/// other advertiser is ignored and the original failure surfaces.
 async fn open() -> Result<(Tx, Rx, connection::Resolved)> {
-    let target = resolve_target()?;
-    let (tx, rx) = transport::connect(&target.url, target.token.as_deref())
-        .await?
-        .split();
-    Ok((tx, rx, target))
+    let mut target = resolve_target()?;
+    match transport::connect(&target.url, target.token.as_deref()).await {
+        Ok(ws) => {
+            let (tx, rx) = ws.split();
+            Ok((tx, rx, target))
+        }
+        Err(e) => {
+            if !matches!(target.source, connection::Source::Profile(_)) {
+                return Err(e);
+            }
+            let Some(new_url) = connection::heal_current_profile(&target.url) else {
+                return Err(e);
+            };
+            println!(
+                "server '{}' moved to {new_url} (same identity fingerprint); reconnecting…",
+                match &target.source {
+                    connection::Source::Profile(name) => name.as_str(),
+                    _ => "current",
+                }
+            );
+            target.url = new_url;
+            let (tx, rx) = transport::connect(&target.url, target.token.as_deref())
+                .await?
+                .split();
+            Ok((tx, rx, target))
+        }
+    }
 }
 
 /// Add-or-update a named profile's url and make it current — the shared core of
@@ -796,12 +797,9 @@ fn set_current_token(token: &str) -> Result<()> {
     connection::save(&conns)
 }
 
-/// One server found on the LAN during a collecting scan (guided `fleety init`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DiscoveredServer {
-    name: String,
-    url: String,
-}
+/// The collecting scan + entry type live in `fleety_tools::connection` (shared
+/// with the daemon's sticky healing); the picker below is CLI-only.
+use fleety_tools::connection::{discover_all_via_mdns, DiscoveredServer};
 
 /// The picker's parse of one input line: a 1-based pick mapped to its index,
 /// a cancel (empty input / EOF), or garbage worth a re-prompt.
@@ -810,25 +808,6 @@ enum Selection {
     Pick(usize),
     Cancel,
     Invalid,
-}
-
-/// Display name from an advertised mDNS instance: the `fleety-` prefix the
-/// server prepends is stripped; an empty leftover falls back to the URL. Pure.
-fn display_name_from_instance(instance: &str, url: &str) -> String {
-    let stripped = instance.strip_prefix("fleety-").unwrap_or(instance).trim();
-    if stripped.is_empty() {
-        url.to_string()
-    } else {
-        stripped.to_string()
-    }
-}
-
-/// Fold one resolved announcement into the collection, de-duplicating by URL
-/// (the same server re-announces during a browse window). Pure.
-fn push_discovered(found: &mut Vec<DiscoveredServer>, name: String, url: String) {
-    if !found.iter().any(|d| d.url == url) {
-        found.push(DiscoveredServer { name, url });
-    }
 }
 
 /// Parse the picker input against a list of `n` entries. Pure.
@@ -852,46 +831,6 @@ fn render_pick_line(idx: usize, s: &DiscoveredServer, saved_urls: &[String]) -> 
         ""
     };
     format!("  {}. {}  {}{}", idx + 1, s.name, s.url, saved)
-}
-
-/// Browse the LAN for the full collection window and return EVERY resolved
-/// `_fleety._tcp.local.` server (name + url, de-duplicated). Empty when mDNS
-/// is disabled or the browse cannot start — the caller falls back to usage
-/// guidance, never an error.
-fn discover_all_via_mdns(window: std::time::Duration) -> Vec<DiscoveredServer> {
-    let mut found = Vec::new();
-    if std::env::var("FLEETY_MDNS_DISABLED").is_ok() {
-        return found;
-    }
-    let Ok(daemon) = mdns_sd::ServiceDaemon::new() else {
-        return found;
-    };
-    let Ok(receiver) = daemon.browse("_fleety._tcp.local.") else {
-        return found;
-    };
-    let deadline = std::time::Instant::now() + window;
-    while std::time::Instant::now() < deadline {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        let recv_timeout = remaining.min(std::time::Duration::from_millis(500));
-        match receiver.recv_timeout(recv_timeout) {
-            Ok(mdns_sd::ServiceEvent::ServiceResolved(info)) => {
-                let addrs = info.get_addresses_v4();
-                if let Some(ip) = addrs.iter().next() {
-                    let url = format!("ws://{}:{}", ip, info.get_port());
-                    let instance = info
-                        .get_fullname()
-                        .strip_suffix("._fleety._tcp.local.")
-                        .unwrap_or_else(|| info.get_fullname());
-                    let name = display_name_from_instance(instance, &url);
-                    push_discovered(&mut found, name, url);
-                }
-            }
-            Ok(_) => continue,
-            Err(_) => continue,
-        }
-    }
-    let _ = daemon.shutdown();
-    found
 }
 
 /// Read one line from stdin (the picker / pairing prompts); EOF reads as empty.
@@ -1012,9 +951,24 @@ async fn pair(code: String) -> Result<()> {
     send(&mut tx, &hello(target.token.clone(), Some(code))).await?;
     let result = match recv(&mut rx).await? {
         Some(ServerMsg::Welcome {
-            token: Some(tok), ..
+            token: Some(tok),
+            server_fingerprint,
+            ..
         }) => {
             set_current_token(&tok)?;
+            // Pin the server's identity so a later IP change can heal to this
+            // exact server (and only this one).
+            if let Some(fp) = server_fingerprint.as_deref() {
+                if let Ok(connection::PinDecision::IdentityChanged) =
+                    connection::pin_current_fingerprint(fp)
+                {
+                    eprintln!(
+                        "warning: this server's identity fingerprint differs from the one \
+                         previously pinned; keeping the old pin — re-run `fleety init` if the \
+                         server was intentionally rebuilt"
+                    );
+                }
+            }
             println!("✓ paired with {url}; token saved");
             Ok(())
         }
@@ -1452,10 +1406,35 @@ async fn connect_hello() -> Result<(Tx, Rx)> {
     let (mut tx, mut rx, target) = open().await?;
     send(&mut tx, &hello(target.token.clone(), None)).await?;
     match recv(&mut rx).await? {
-        Some(ServerMsg::Welcome { .. }) => Ok((tx, rx)),
+        Some(ServerMsg::Welcome {
+            server_fingerprint, ..
+        }) => {
+            tofu_pin(server_fingerprint.as_deref(), &target);
+            Ok((tx, rx))
+        }
         other => Err(CoreError::Provider(format!(
             "expected welcome, got {other:?}"
         ))),
+    }
+}
+
+/// Trust-on-authenticated-connect: back-fill the current profile's server
+/// fingerprint from a successful Welcome (devices enrolled before fingerprints
+/// existed gain healing without re-pairing); warn — never overwrite — when the
+/// identity changed. Best-effort and quiet on the happy path.
+fn tofu_pin(fingerprint: Option<&str>, target: &connection::Resolved) {
+    let Some(fp) = fingerprint.filter(|f| !f.is_empty()) else {
+        return;
+    };
+    if !matches!(target.source, connection::Source::Profile(_)) {
+        return;
+    }
+    if let Ok(connection::PinDecision::IdentityChanged) = connection::pin_current_fingerprint(fp) {
+        eprintln!(
+            "warning: the server's identity fingerprint changed since it was pinned; keeping \
+             the old pin — re-pair (`fleety init` / `fleety pair`) if the server was \
+             intentionally rebuilt"
+        );
     }
 }
 
@@ -1467,8 +1446,13 @@ pub(crate) async fn connect_hello_for_auth() -> Result<(Tx, Rx, u32, connection:
     send(&mut tx, &hello(target.token.clone(), None)).await?;
     match recv(&mut rx).await? {
         Some(ServerMsg::Welcome {
-            config_protocol, ..
-        }) => Ok((tx, rx, config_protocol, target)),
+            config_protocol,
+            server_fingerprint,
+            ..
+        }) => {
+            tofu_pin(server_fingerprint.as_deref(), &target);
+            Ok((tx, rx, config_protocol, target))
+        }
         other => Err(CoreError::Provider(format!(
             "expected welcome, got {other:?}"
         ))),
@@ -1905,41 +1889,8 @@ mod tests {
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    #[test]
-    fn discovery_display_names_strip_the_service_prefix() {
-        // Advertised instance → human name; a missing name falls back to the URL.
-        assert_eq!(
-            display_name_from_instance("fleety-mini", "ws://10.0.0.2:8787"),
-            "mini"
-        );
-        assert_eq!(
-            display_name_from_instance("fleety-nas-01", "ws://10.0.0.3:8787"),
-            "nas-01"
-        );
-        assert_eq!(
-            display_name_from_instance("custom-name", "ws://10.0.0.4:8787"),
-            "custom-name"
-        );
-        assert_eq!(
-            display_name_from_instance("", "ws://10.0.0.5:8787"),
-            "ws://10.0.0.5:8787"
-        );
-        assert_eq!(
-            display_name_from_instance("fleety-", "ws://10.0.0.6:8787"),
-            "ws://10.0.0.6:8787"
-        );
-    }
-
-    #[test]
-    fn discovery_collection_dedupes_by_url() {
-        let mut found = Vec::new();
-        push_discovered(&mut found, "mini".into(), "ws://10.0.0.2:8787".into());
-        push_discovered(&mut found, "mini".into(), "ws://10.0.0.2:8787".into()); // dup
-        push_discovered(&mut found, "nas".into(), "ws://10.0.0.3:8787".into());
-        assert_eq!(found.len(), 2);
-        assert_eq!(found[0].name, "mini");
-        assert_eq!(found[1].name, "nas");
-    }
+    // (Display-name derivation and URL de-dup live in fleety_tools::connection
+    // now, tested there.)
 
     #[test]
     fn pick_selection_parses_bounds_cancel_and_garbage() {
@@ -1958,6 +1909,7 @@ mod tests {
         let s = DiscoveredServer {
             name: "mini".into(),
             url: "ws://10.0.0.2:8787".into(),
+            fingerprint: Some("fp-1".into()),
         };
         let saved = vec!["ws://10.0.0.2:8787".to_string()];
         let line = render_pick_line(0, &s, &saved);
@@ -1967,6 +1919,7 @@ mod tests {
         let other = DiscoveredServer {
             name: "nas".into(),
             url: "ws://10.0.0.3:8787".into(),
+            fingerprint: None,
         };
         assert!(!render_pick_line(1, &other, &saved).contains("(saved)"));
     }

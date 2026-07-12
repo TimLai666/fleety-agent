@@ -328,6 +328,11 @@ pub enum ServerMsg {
         /// it, so the client falls back to the legacy `ConfigExec`.
         #[serde(default)]
         config_protocol: u32,
+        /// The server's persistent identity fingerprint (also advertised over
+        /// mDNS): clients pin it at pairing and use it to re-find this exact
+        /// server after an address change. Additive; absent on older servers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        server_fingerprint: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         token: Option<String>,
     },
@@ -512,12 +517,14 @@ mod tests {
             server_version: "0.3.0".into(),
             audio_input: true,
             config_protocol: CONFIG_PROTOCOL_VERSION,
+            server_fingerprint: Some("srv-fp-1".into()),
             token: None,
         };
         let json = serde_json::to_string(&w).expect("ser");
         assert!(json.contains("\"server_version\":\"0.3.0\""));
         assert!(json.contains("\"audio_input\":true"));
         assert!(json.contains("\"config_protocol\":2"));
+        assert!(json.contains("\"server_fingerprint\":\"srv-fp-1\""));
         // An old server's frame (no server_version / audio_input / config_protocol)
         // still parses → defaults ("" / false / 0 → legacy ConfigExec + local STT).
         let old = r#"{"type":"welcome","session_id":"s","conversation_id":"c","protocol":0}"#;

@@ -238,6 +238,20 @@ async fn async_main(cmd: Option<String>) -> std::process::ExitCode {
                     e.report().message
                 );
             }
+            // Host-wide: bring the sibling fleety binaries on this machine
+            // along (gated on a {bin} template; fleety-server restarts
+            // deferred). Best-effort — a sibling failure never fails the
+            // daemon's own update.
+            if let Err(e) = fleety_tools::update::update_siblings_to_latest(
+                &fleety_tools::update::host_siblings_of("fleetyd"),
+            )
+            .await
+            {
+                eprintln!(
+                    "note: sibling updates did not complete: {}",
+                    e.report().message
+                );
+            }
             return code;
         }
         _ => {}
@@ -450,6 +464,23 @@ async fn run(shutdown: Option<tokio::sync::watch::Receiver<bool>>) -> Result<()>
                     }
                     Err(e) => {
                         tracing::warn!(report = ?e.report(), "connect failed; will retry");
+                        // Sticky healing: the profile URL stopped answering — scan
+                        // once for an advertiser with the SAME pinned fingerprint
+                        // and adopt its new address (persisted; the next loop
+                        // iteration resolves to it). Anything else is ignored.
+                        if matches!(target.source, fleety_tools::connection::Source::Profile(_)) {
+                            if let Some(new_url) =
+                                fleety_tools::connection::heal_current_profile(&target.url)
+                            {
+                                tracing::info!(
+                                    %new_url,
+                                    "server moved (same identity fingerprint); reconnecting to \
+                                     the new address"
+                                );
+                                bo.reset();
+                                continue;
+                            }
+                        }
                     }
                 }
             }
@@ -610,6 +641,7 @@ async fn serve(
                 session_id,
                 token,
                 server_version,
+                server_fingerprint,
                 ..
             } => {
                 if let Some(tok) = token {
@@ -619,6 +651,24 @@ async fn serve(
                         tracing::info!(
                             "fleetyd token persisted to the current profile in connections.toml"
                         );
+                    }
+                }
+                // Pin (or back-fill) the server's identity fingerprint so an IP
+                // change can heal to this exact server; never overwrite a
+                // different pin — that is an anomaly worth a warning.
+                if let Some(fp) = server_fingerprint.as_deref().filter(|f| !f.is_empty()) {
+                    match fleety_tools::connection::pin_current_fingerprint(fp) {
+                        Ok(fleety_tools::connection::PinDecision::IdentityChanged) => {
+                            tracing::warn!(
+                                "the server's identity fingerprint changed since it was pinned; \
+                                 keeping the old pin — re-pair this device if the server was \
+                                 intentionally rebuilt"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(report = ?e.report(), "could not pin the server fingerprint");
+                        }
                     }
                 }
                 tracing::info!(%session_id, "registered with agent");

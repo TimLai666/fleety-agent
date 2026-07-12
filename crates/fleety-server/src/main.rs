@@ -220,6 +220,42 @@ async fn wait_stop(shutdown: Option<tokio::sync::watch::Receiver<bool>>) {
     }
 }
 
+/// The server's persistent identity fingerprint: a UUID minted on first start
+/// and stored at `<agent home>/server-id`, stable across restarts and address
+/// changes. Clients pin it at pairing and use it to re-find this exact server
+/// when its address moves. Empty until initialized.
+static SERVER_FINGERPRINT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+pub fn server_fingerprint() -> &'static str {
+    SERVER_FINGERPRINT.get().map(String::as_str).unwrap_or("")
+}
+
+fn init_server_fingerprint(home: &std::path::Path) {
+    let id_path = home.join("server-id");
+    let _ = SERVER_FINGERPRINT.set(load_or_mint_server_id(&id_path));
+}
+
+/// Load the persisted server id, or mint and persist a new one. An unreadable
+/// or unwritable id file degrades to a per-run id with a warning — the server
+/// never fails to start over identity bookkeeping (but sticky healing on
+/// enrolled devices will not recognize a fingerprint that changes per run).
+fn load_or_mint_server_id(path: &std::path::Path) -> String {
+    if let Ok(existing) = std::fs::read_to_string(path) {
+        let trimmed = existing.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = std::fs::write(path, &id) {
+        tracing::warn!(path = %path.display(), error = %e, "could not persist the server identity id; using a per-run id (sticky healing will not survive restarts until this is writable)");
+    }
+    id
+}
+
 async fn async_main(cmd: Option<String>) -> std::process::ExitCode {
     // Service lifecycle subcommands (install/uninstall/start/stop/restart/
     // enable/disable/status/up/down) act on the manager and exit.
@@ -248,6 +284,45 @@ async fn async_main(cmd: Option<String>) -> std::process::ExitCode {
             }
         }
         return log_action(name, result);
+    }
+
+    // `update`: self-update from the release manifest (the {bin} template
+    // resolves this binary's own manifest), refresh the sidecar either way, and
+    // — when a new binary landed — hand over via the idle-deferred restart so
+    // an in-flight turn is never interrupted. The server-only-host counterpart
+    // of `fleetyd update` / `fleety update`.
+    if cmd.as_deref() == Some("update") {
+        let mut code = std::process::ExitCode::SUCCESS;
+        match fleety_tools::update::self_update().await {
+            Ok(true) => {
+                println!("requesting an idle-deferred restart to run the new version…");
+                if let Err(e) = service::restart(false) {
+                    eprintln!(
+                        "updated, but could not restart automatically ({}) — restart \
+                         fleety-server to apply",
+                        e.report().message
+                    );
+                }
+            }
+            Ok(false) => {}
+            Err(e) => {
+                let r = e.report();
+                eprintln!("error: {}", r.message);
+                if let Some(hint) = r.remediation {
+                    eprintln!("hint: {hint}");
+                }
+                code = std::process::ExitCode::FAILURE;
+            }
+        }
+        // Refresh the data-analysis sidecar alongside the server (best-effort).
+        if let Err(e) = fleety_tools::deps::insyra::ensure_insyra(true).await {
+            eprintln!(
+                "note: could not refresh the fleety-insyra sidecar ({}); insyra_exec may stay \
+                 on the old version or be unavailable",
+                e.report().message
+            );
+        }
+        return code;
     }
 
     // `backup now` / `backup restore` run once against the user-configured repo
@@ -434,6 +509,10 @@ async fn run_server(shutdown: Option<tokio::sync::watch::Receiver<bool>>) {
     }
 
     let storage = Arc::new(Storage::new(home));
+    // Mint-or-load the persistent server identity (advertised over mDNS and in
+    // Welcome) so enrolled devices can re-find this exact server after an IP
+    // change.
+    init_server_fingerprint(&storage.home());
     // One-time, idempotent, lossless migration of legacy per-device conversations
     // to the user-primary layout (privacy model). Best-effort: a failure leaves
     // the legacy layout in place and never stops the server.
@@ -616,6 +695,23 @@ async fn run_server(shutdown: Option<tokio::sync::watch::Receiver<bool>>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn server_id_is_minted_once_and_persists() {
+        let dir = std::env::temp_dir().join(format!("fleety-srvid-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("mk");
+        let path = dir.join("server-id");
+        let first = super::load_or_mint_server_id(&path);
+        assert!(!first.is_empty());
+        let second = super::load_or_mint_server_id(&path);
+        assert_eq!(first, second, "the persisted id is stable across loads");
+        // An unwritable location degrades to a per-run id without panicking.
+        let blocked = dir.join("blocker");
+        std::fs::write(&blocked, "file").expect("write");
+        let degraded = super::load_or_mint_server_id(&blocked.join("server-id"));
+        assert!(!degraded.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
     use agent_core::Message;
     use std::io::{Read, Write};

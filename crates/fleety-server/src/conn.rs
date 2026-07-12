@@ -630,6 +630,10 @@ async fn serve(
             server_version: agent_core::VERSION.to_string(),
             audio_input: provider.capabilities().audio,
             config_protocol: fleety_protocol::CONFIG_PROTOCOL_VERSION,
+            server_fingerprint: {
+                let fp = crate::server_fingerprint();
+                (!fp.is_empty()).then(|| fp.to_string())
+            },
             token: minted_token,
         },
     )?;

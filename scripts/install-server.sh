@@ -131,6 +131,8 @@ echo "launchd on macOS; one step = install + enable + start):"
 echo "  $BIN up"
 echo
 echo "Prefer loopback-only? Persist it first:  $BIN config set FLEETY_ADDR 127.0.0.1:8787"
+echo
+echo "Update later with:  $BIN update   (self-update + sidecar refresh; restarts when idle)"
 case ":$PATH:" in
   *":$dir:"*) ;;
   *) echo; echo "$BIN: add $dir to your PATH" ;;

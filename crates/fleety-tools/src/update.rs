@@ -374,6 +374,64 @@ pub fn resolve_pin(
     }
 }
 
+/// The fleety binaries that live next to `current_bin` on a host — everything
+/// except the running one. Pure.
+pub fn host_siblings_of(current_bin: &str) -> Vec<&'static str> {
+    ["fleety", "fleety-server", "fleetyd"]
+        .into_iter()
+        .filter(|b| *b != current_bin)
+        .collect()
+}
+
+/// The note printed when a bin-less template makes sibling updates unsafe (the
+/// template would resolve to the RUNNING binary's manifest).
+fn siblings_skip_note(bins: &[&str]) -> String {
+    format!(
+        "note: set FLEETY_UPDATE_MANIFEST to a URL containing {{bin}} to also update {}.",
+        bins.join(", ")
+    )
+}
+
+/// Update the named sibling binaries (those installed next to the running
+/// executable) to the latest manifest version — the one shared host-wide
+/// implementation behind `fleety update`, `fleetyd update`, and the polling
+/// apply path. Gated on a `{bin}` template (skipped with an actionable note
+/// otherwise); per-binary failures warn and continue (best-effort, matching
+/// convergence); a sibling `fleety-server` that swapped gets a bare
+/// (idle-deferred) restart.
+pub async fn update_siblings_to_latest(bins: &[&str]) -> Result<()> {
+    let present: Vec<&str> = bins
+        .iter()
+        .copied()
+        .filter(|b| sibling_exe(b).is_some())
+        .collect();
+    if present.is_empty() {
+        return Ok(());
+    }
+    if !manifest_is_templated() {
+        println!("{}", siblings_skip_note(&present));
+        return Ok(());
+    }
+    for bin in present {
+        let Some(exe) = sibling_exe(bin) else {
+            continue;
+        };
+        match update_named(bin, &exe).await {
+            Ok(true) if bin == "fleety-server" => {
+                // Bare restart (no --force): the running server restarts once
+                // idle rather than mid-turn.
+                println!("fleety-server updated — requesting an idle-deferred restart.");
+                let _ = std::process::Command::new(&exe).arg("restart").status();
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("warning: {bin} update failed: {}", e.report().message);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Update `bin` at `exe_path` to an exact `version` (via its versioned manifest;
 /// a manifest declaring any other version is refused).
 pub async fn update_to_version(bin: &str, exe_path: &Path, version: &str) -> Result<bool> {
@@ -525,6 +583,20 @@ mod tests {
         assert!(!is_newer("0.1.0", "0.1.0")); // equal → not newer
         assert!(!is_newer("0.1.0", "0.2.0")); // older → not newer
         assert!(!is_newer("garbage", "0.1.0")); // unparseable → not newer (safe)
+    }
+
+    #[test]
+    fn host_siblings_exclude_the_running_binary() {
+        assert_eq!(host_siblings_of("fleetyd"), vec!["fleety", "fleety-server"]);
+        assert_eq!(host_siblings_of("fleety"), vec!["fleety-server", "fleetyd"]);
+        assert_eq!(host_siblings_of("fleety-server"), vec!["fleety", "fleetyd"]);
+    }
+
+    #[test]
+    fn sibling_skip_note_names_the_fix_and_the_binaries() {
+        let note = siblings_skip_note(&["fleety", "fleety-server"]);
+        assert!(note.contains("{bin}"), "names the missing placeholder");
+        assert!(note.contains("fleety-server"));
     }
 
     #[test]
