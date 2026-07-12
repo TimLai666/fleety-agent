@@ -345,6 +345,30 @@ the upgrade). Force or disable it with `FLEETY_FORCE_SSE` / `FLEETY_DISABLE_SSE`
 - [`docs/roadmap.md`](docs/roadmap.md) — open gaps + implementation plans
 - [`prompts/`](prompts/) — protocol / memory / policy / rules (the agent system prompt)
 
+## Acknowledgements
+
+Fleety stands on a lot of open-source work — thank you to everyone who made it:
+
+- **[Insyra](https://github.com/HazelnutParadise/insyra)** — the Go data-analysis
+  DSL Fleety bundles as the [`fleety-insyra`](sidecars/fleety-insyra) sidecar and
+  drives through the `insyra_exec` tool.
+- **[claude-real-video](https://github.com/HUANGCHIHHUNGLeo/claude-real-video)** —
+  the video-understanding technique behind the `video_extract` tool.
+- **OpenAI's Codex CLI** — Fleety's "sign in with ChatGPT" flow and its Codex
+  Responses provider follow the Codex CLI's documented OAuth + Responses
+  contract; **codex-openai-proxy** and **heddle** were a great help for
+  cross-checking the request/header/SSE shapes.
+- The Rust ecosystem Fleety is built on — among many:
+  [tokio](https://github.com/tokio-rs/tokio) (async runtime),
+  [ratatui](https://github.com/ratatui/ratatui) (the interactive `fleety config`
+  / `fleety tui` screens),
+  [tokio-tungstenite](https://github.com/snapview/tokio-tungstenite) (the
+  WebSocket transport), [reqwest](https://github.com/seanmonstar/reqwest),
+  [serde](https://github.com/serde-rs/serde),
+  [mdns-sd](https://github.com/keepsimple1/mdns-sd) (LAN discovery),
+  [chrono-tz](https://github.com/chronotope/chrono-tz), and the many other crates
+  listed across the workspace `Cargo.toml`s.
+
 ## License
 
 Apache-2.0 (see [`LICENSE`](LICENSE)).
