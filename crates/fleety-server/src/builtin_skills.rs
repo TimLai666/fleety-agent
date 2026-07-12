@@ -33,6 +33,10 @@ const SKILLS: &[(&str, &Dir<'static>)] = &[
         "insyra",
         &include_dir!("$CARGO_MANIFEST_DIR/builtin-skills/insyra"),
     ),
+    (
+        "fleety-real-video",
+        &include_dir!("$CARGO_MANIFEST_DIR/builtin-skills/fleety-real-video"),
+    ),
 ];
 
 /// Recursively write every embedded file (root-relative paths preserved) under

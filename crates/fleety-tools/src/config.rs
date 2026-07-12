@@ -262,6 +262,30 @@ pub fn registry() -> &'static [Setting] {
             secret: false,
             validator: Some(v_bool),
         },
+        Setting {
+            key: "FLEETY_CRV_AUTO_INSTALL",
+            scope: Server,
+            default: "1",
+            description: "Auto-install the claude-real-video (`crv`) engine behind `video_extract` (1/0).",
+            secret: false,
+            validator: Some(v_bool),
+        },
+        Setting {
+            key: "FLEETY_FFMPEG_AUTO_INSTALL",
+            scope: Server,
+            default: "1",
+            description: "Auto-install ffmpeg (needed by `video_extract`) via the platform package manager (1/0).",
+            secret: false,
+            validator: Some(v_bool),
+        },
+        Setting {
+            key: "FLEETY_VIDEO_WHISPER",
+            scope: Server,
+            default: "off",
+            description: "Enable Whisper audio transcription in `video_extract` — installs the heavy transcription stack; keeps it off otherwise (on/off).",
+            secret: false,
+            validator: Some(v_onoff),
+        },
         // FLEETY_AGENT_URL is deliberately NOT a registry setting: the connection
         // target lives in ~/.fleety/connections.toml and is managed via
         // `fleety server` (see fleety_tools::connection). It survives only as a
@@ -635,9 +659,12 @@ pub fn setting_choices(key: &str) -> Vec<&'static str> {
         "FLEETY_VOICE_AUDIO" => vec!["auto", "on", "off"],
         "FLEETY_PRESENCE" => vec!["on", "off"],
         "FLEETY_AUTO_EFFORT" => vec!["on", "off"],
+        "FLEETY_VIDEO_WHISPER" => vec!["on", "off"],
         "FLEETY_MODEL_EFFORT" | "FLEETY_CHEAP_MODEL_EFFORT" => vec!["low", "medium", "high"],
         "FLEETY_REQUIRE_AUTH"
         | "FLEETY_AUTO_INSTALL_DEPS"
+        | "FLEETY_CRV_AUTO_INSTALL"
+        | "FLEETY_FFMPEG_AUTO_INSTALL"
         | "FLEETY_FORCE_SSE"
         | "FLEETY_DISABLE_SSE" => vec!["0", "1"],
         _ => vec![],

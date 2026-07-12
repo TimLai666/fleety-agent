@@ -203,6 +203,23 @@ tool="insyra_exec", args={…})`.
 > `.isr` DSL command reference. Resolved via `FLEETY_INSYRA_BIN` → beside the
 > exe → `PATH`. fleetyd auto-provisions it on `install` / `update`.
 
+## Video (scene-aware extraction)
+
+**Runs on:** any device. Registered on `fleety-server` and every `fleetyd` (like
+the workspace tools), so `device_exec(device="phone", tool="video_extract", …)`
+extracts on the device that holds the video; a bare call runs on the server.
+
+| Tool | Purpose | Key inputs | Risk |
+|---|---|---|---|
+| `video_extract` | Turn a video (URL — YouTube/Instagram/TikTok/… — or a workspace file) into **scene-aware** keyframes (real visual changes, not fixed-interval samples) plus an optional transcript and a manifest, via the `claude-real-video` (`crv`) engine. Returns `{out_dir, manifest_path, manifest, frames[], frame_count, transcript_path?, notes[]}` — read frames with `read_file_bytes` (JPEGs) and the transcript with `read_file`. | `source`, `out?`, `scene?`, `fps_floor?`, `max_frames?`, `lang?`, `transcribe?` | mutate |
+
+> Downloads via yt-dlp and runs ffmpeg, so it egresses + writes files. Transcription
+> needs Whisper and is opt-in (`FLEETY_VIDEO_WHISPER=on`); without it, frames are
+> still extracted and a note says transcription was skipped. `crv` is auto-installed
+> (pip/pipx), `ffmpeg` via the platform package manager; override with
+> `FLEETY_CRV_BIN` / `FLEETY_FFMPEG_BIN`, bound by `FLEETY_VIDEO_TIMEOUT_SECS`
+> (default 900s). Load the built-in `fleety-real-video` skill for the workflow.
+
 ## Agent memory
 
 **Runs on:** server only. These tools operate on the agent's **core** memory
@@ -497,6 +514,8 @@ so the surface is complete.
 | `fleety-insyra` (Go) | `insyra_exec` over NDJSON | `fleetyd install` / `fleetyd update` |
 | `fleety-use-insyra-dsl` (built-in skill, shipped in-binary) | DSL reference for `insyra_exec` | `builtin_skills::seed` at server boot |
 | `insyra` (built-in skill, shipped in-binary) | upstream Insyra skill, vendored verbatim | `builtin_skills::seed` at server boot |
+| `claude-real-video` (`crv`, Python CLI) | the `video_extract` engine (scene-aware frames + transcript) | server dep auto-install (pip/pipx); ffmpeg via OS package manager |
+| `fleety-real-video` (built-in skill, shipped in-binary) | how to use `video_extract` | `builtin_skills::seed` at server boot |
 
 ## Risk class → policy (summary)
 

@@ -24,6 +24,7 @@ pub fn build_local_registry(root: &Path) -> ToolRegistry {
     let backups = root.join(".fleety-backups");
     fleety_tools::register_workspace(&mut registry, root, &backups);
     fleety_tools::register_insyra(&mut registry, root);
+    fleety_tools::register_video(&mut registry, root);
     // Browser (CDP) tools so the agent can drive this device's browser via
     // device_exec; Chrome is auto-provisioned on first use.
     fleety_tools::register_browser(&mut registry);

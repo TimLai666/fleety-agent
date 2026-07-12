@@ -23,6 +23,8 @@ use std::sync::Arc;
 
 use agent_core::Result;
 
+pub mod crv;
+pub mod ffmpeg;
 pub mod insyra;
 pub mod runtime;
 
@@ -48,6 +50,8 @@ pub fn python_dependency() -> Dependency {
     )
 }
 
+pub use crv::crv_dependency;
+pub use ffmpeg::ffmpeg_dependency;
 pub use insyra::insyra_dependency;
 
 /// The release asset target triple for this build, or None if unsupported.
@@ -173,7 +177,7 @@ pub fn selected_dep_names(env_val: Option<&str>, default: &[&str]) -> Vec<String
 
 /// fleety-server's default dependency subset.
 pub fn server_default_deps() -> &'static [&'static str] {
-    &["python", "ddgs", "node", "insyra"]
+    &["python", "ddgs", "node", "insyra", "crv", "ffmpeg"]
 }
 
 /// fleetyd's default dependency subset.
@@ -332,7 +336,10 @@ mod tests {
 
     #[test]
     fn default_subsets() {
-        assert_eq!(server_default_deps(), &["python", "ddgs", "node", "insyra"]);
+        assert_eq!(
+            server_default_deps(),
+            &["python", "ddgs", "node", "insyra", "crv", "ffmpeg"]
+        );
         assert_eq!(daemon_default_deps(), &["insyra"]);
     }
 }

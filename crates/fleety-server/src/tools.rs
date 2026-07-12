@@ -31,6 +31,7 @@ pub fn build_registry(
     let mut registry = ToolRegistry::new();
     fleety_tools::register_workspace(&mut registry, workspace, backups_dir);
     fleety_tools::register_insyra(&mut registry, workspace);
+    fleety_tools::register_video(&mut registry, workspace);
     // Interactive PTY terminal sessions (local + ssh -tt); sessions live in this
     // server process's registry.
     fleety_tools::register_terminal(&mut registry);

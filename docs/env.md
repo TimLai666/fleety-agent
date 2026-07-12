@@ -614,6 +614,9 @@ insyra (add node/python via `FLEETY_DEPS` for device-side skills/MCP).
 | `FLEETY_RUNTIMES_DIR` | `~/.fleety/runtimes` | Where managed portable runtimes are installed. |
 | `FLEETY_NODE_VERSION` | pinned default | Portable node version to fetch. |
 | `FLEETY_DDGS_AUTO_INSTALL` | (on) | Per-dep opt-out for ddgs (`0` = don't auto-install ddgs). |
+| `FLEETY_CRV_AUTO_INSTALL` | (on) | Per-dep opt-out for the `claude-real-video` (`crv`) engine behind `video_extract` (`0` = don't auto-install it via pip/pipx). |
+| `FLEETY_FFMPEG_AUTO_INSTALL` | (on) | Per-dep opt-out for ffmpeg (needed by `video_extract`), installed via the platform package manager (`0` = don't). |
+| `FLEETY_VIDEO_WHISPER` | `off` | `on` installs and enables Whisper audio transcription for `video_extract` (a heavy stack); off keeps frame extraction only. |
 | `FLEETY_INSYRA_URL` | release asset | Override the insyra sidecar download URL. |
 
 ## Self-update
@@ -701,6 +704,9 @@ to run it; `fleetyd update` (one-shot) restarts the installed service the same w
 |---|---|---|
 | `FLEETY_INSYRA_BIN` | (auto: beside exe) | Path to the `fleety-insyra` Go sidecar. The `insyra_exec` tool spawns this. |
 | `FLEETY_INSYRA_URL` | `releases/latest/download/…` | Override the download URL for `fleetyd install` / `fleetyd update`. |
+| `FLEETY_CRV_BIN` | (auto: `crv` on PATH) | Path to the `claude-real-video` CLI the `video_extract` tool spawns. |
+| `FLEETY_FFMPEG_BIN` | (auto: `ffmpeg` on PATH) | Path to the `ffmpeg` binary `video_extract`/`crv` use. |
+| `FLEETY_VIDEO_TIMEOUT_SECS` | `900` | Wall-clock ceiling for one `video_extract` run (download + ffmpeg + optional transcription). `0` disables the limit. |
 
 ## Built-in MCP: ddgs (web search)
 

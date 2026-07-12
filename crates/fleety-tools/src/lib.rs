@@ -44,11 +44,13 @@ pub mod service;
 mod terminal;
 pub mod transport;
 pub mod update;
+mod video;
 pub use browser::register_browser;
 pub use chrome::{ensure_chrome, upgrade_managed_chrome};
 pub use computer::register_computer;
 pub use insyra::register_insyra;
 pub use terminal::register_terminal;
+pub use video::register_video;
 
 /// Register the workspace tools rooted at `root`; mutations back up to `backups_dir`.
 pub fn register_workspace(registry: &mut ToolRegistry, root: &Path, backups_dir: &Path) {

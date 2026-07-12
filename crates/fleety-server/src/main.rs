@@ -458,6 +458,8 @@ async fn ensure_dependencies() {
             "node" => Some(deps::node_dependency()),
             "python" => Some(deps::python_dependency()),
             "insyra" => Some(deps::insyra_dependency()),
+            "crv" => Some(deps::crv_dependency()),
+            "ffmpeg" => Some(deps::ffmpeg_dependency()),
             "ddgs" => Some(builtin_mcp::ddgs_dependency()),
             other => {
                 tracing::warn!(dep = %other, "unknown dependency in FLEETY_DEPS; ignoring");
