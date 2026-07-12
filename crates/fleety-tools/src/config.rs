@@ -191,6 +191,14 @@ pub fn registry() -> &'static [Setting] {
             validator: Some(v_effort),
         },
         Setting {
+            key: "FLEETY_AUTO_EFFORT",
+            scope: Server,
+            default: "on",
+            description: "Auto-select reasoning effort per top-level message by difficulty when the agent hasn't pinned one (on/off). Adds one cheap classification call per such message.",
+            secret: false,
+            validator: Some(v_onoff),
+        },
+        Setting {
             key: "FLEETY_VOICE_AUDIO",
             scope: Cli,
             default: "auto",
@@ -422,6 +430,10 @@ fn v_effort(value: &str) -> std::result::Result<(), String> {
     check_enum(value, &["low", "medium", "high"])
 }
 
+fn v_onoff(value: &str) -> std::result::Result<(), String> {
+    check_enum(value, &["on", "off"])
+}
+
 /// Accept only the boolean forms `0` or `1`.
 fn v_bool(value: &str) -> std::result::Result<(), String> {
     match value {
@@ -622,6 +634,7 @@ pub fn setting_choices(key: &str) -> Vec<&'static str> {
         "FLEETY_FS_SCOPE" => vec!["full", "workspace"],
         "FLEETY_VOICE_AUDIO" => vec!["auto", "on", "off"],
         "FLEETY_PRESENCE" => vec!["on", "off"],
+        "FLEETY_AUTO_EFFORT" => vec!["on", "off"],
         "FLEETY_MODEL_EFFORT" | "FLEETY_CHEAP_MODEL_EFFORT" => vec!["low", "medium", "high"],
         "FLEETY_REQUIRE_AUTH"
         | "FLEETY_AUTO_INSTALL_DEPS"

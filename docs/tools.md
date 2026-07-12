@@ -329,6 +329,26 @@ loop and emission/voice gating live in `crates/fleety-server/src/conn.rs`.
 | `complete_goal` | **Terminal.** Declare the goal achieved — the loop stops and your reply goes to the user. Call only when the whole goal is genuinely done. | `summary?` | read |
 | `ask_user` | **Terminal.** Ask a question you genuinely cannot proceed without — the loop stops and the question goes to the user. Use sparingly; not for "shall I continue?". | `question` | read |
 
+## Reasoning effort (self-tuning)
+
+**Runs on:** server only (top-level tool). Registered ONLY for the main agent —
+a subagent's registry omits it (a subagent's effort is fixed by its parent at
+spawn). Lives in `crates/fleety-server/src/effort.rs`; the connection loop
+re-reads the chosen effort before **every** turn it drives — including each
+goal-continuation turn — and selects an effort-variant provider (see
+`per-task-effort`).
+
+| Tool | Purpose | Key inputs | Risk |
+|---|---|---|---|
+| `set_effort` | Set YOUR OWN reasoning effort. Does **not** change the step you are on — it applies from your **next** turn onward (including the next goal-continuation turn of the current request) and persists until you change it again. `auto` clears your manual choice and hands control back to the runtime's automatic, difficulty-based selection. | `level` (`low` / `medium` / `high` / `auto`) | read |
+
+> When you have not pinned a level and `FLEETY_AUTO_EFFORT` is on (the default),
+> the runtime classifies each incoming message's difficulty on the economy tier
+> and starts that turn in the right gear. So raising effort mid-task mainly helps
+> the *continuation* turns of the current request; for a one-shot turn, the
+> auto-classifier is what gets the first inference right. See
+> [`docs/env.md`](env.md).
+
 ## Skills
 
 **Runs on:** server only. Skills live in `{FLEETY_AGENT_HOME}/skills/` across

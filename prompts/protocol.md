@@ -139,6 +139,12 @@ Don't re-derive the same work twice. After a task worth remembering — especial
 
 When nothing is worth keeping, say so in a line and move on — saving clutter is worse than saving nothing.
 
+## Reasoning Effort — Match It To The Task
+
+Harder work deserves more thinking; simple work shouldn't pay for it. The runtime already picks a starting effort from each message's difficulty (when `FLEETY_AUTO_EFFORT` is on), so the first inference is usually in the right gear. Use `set_effort` to override that judgement: raise it (`high`) when you hit genuinely hard reasoning — tricky debugging, architecture, subtle analysis — and lower it (`low`) for mechanical or conversational stretches. `auto` hands the choice back to the runtime.
+
+Know the timing: `set_effort` does **not** change the step you are on. It applies from your **next** turn — including the next goal-continuation turn of the current request — and then persists until you change it again. So for a long, goal-driven task, raising effort mid-way still pays off on the continuation turns; for a quick one-shot answer, the automatic starting pick is what matters, and set_effort mostly shapes what comes after. Don't leave it pinned high after the hard part is done — drop it back or return to `auto`. When you spawn a subagent, you set *its* effort at spawn time; `set_effort` only changes your own.
+
 ## Orchestration — Decide Before You Delegate
 
 The skill is not *being able* to spawn agents — it is judging *when* to. Multi-agent helps only on the right shape of task and actively hurts on the wrong one. **Default to a single agent.** Open a team only when the task clearly earns it.

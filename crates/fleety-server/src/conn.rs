@@ -928,8 +928,11 @@ async fn serve(
                 let _turn_guard = subagent_host.lock_turn().await;
                 subagent_host.set_active_conversation(&conversation).await;
 
-                // Apply the agent's self-selected effort (set_effort) to this
-                // turn's model calls; None keeps the model's configured default.
+                // The agent's manual effort pin (set_effort) drives the recovery
+                // of any interrupted prior turn below. The turn for THIS message
+                // is driven by drive_to_goal, which re-reads the pin (and this
+                // message's difficulty baseline) before every turn it runs, so
+                // the effort here is only for recovery. None keeps the default.
                 let session_eff = *session_effort.lock().await;
                 let effort_provider = session_eff.and_then(|e| provider.with_effort(Some(e)));
                 let turn_provider: &dyn ModelProvider =
@@ -958,6 +961,21 @@ async fn serve(
                 {
                     tracing::warn!(%device_id, conversation = %conversation, report = ?e.report(), "could not recover interrupted turn");
                 }
+
+                // Auto-effort: when the agent hasn't pinned an effort and
+                // FLEETY_AUTO_EFFORT is on, classify this message's difficulty
+                // once (economy tier) so even the FIRST inference of this request
+                // starts in the right gear. The pick is NOT written to the pin
+                // slot — it is this message's baseline only, so it never persists
+                // of its own accord (drive_to_goal treats a manual pin as higher
+                // precedence). See crate::effort and the per-task-effort spec.
+                let turn_baseline = if session_eff.is_none() && crate::effort::auto_effort_enabled()
+                {
+                    let cheap = crate::providers::ProviderTiers::from_env().resolve("cheap");
+                    crate::effort::assess_effort(&text, cheap.as_ref()).await
+                } else {
+                    None
+                };
 
                 // Persist the user message and open a durable turn journal, then
                 // run the turn over the history. Wire attachments map 1:1 onto
@@ -1023,7 +1041,7 @@ async fn serve(
                     let turn = drive_to_goal(
                         out,
                         storage,
-                        turn_provider,
+                        provider,
                         &tools,
                         policy,
                         device_id,
@@ -1035,6 +1053,8 @@ async fn serve(
                         voice,
                         &acting,
                         &cancel,
+                        &session_effort,
+                        turn_baseline,
                     );
                     tokio::pin!(turn);
                     let mut pending: Option<(String, Vec<agent_core::Attachment>)> = None;
@@ -1115,7 +1135,7 @@ async fn serve(
                         let s2 = drive_to_goal(
                             out,
                             storage,
-                            turn_provider,
+                            provider,
                             &tools,
                             policy,
                             device_id,
@@ -1127,6 +1147,11 @@ async fn serve(
                             voice,
                             &acting,
                             &cancel2,
+                            &session_effort,
+                            // A queued follow-up is a distinct message; it isn't
+                            // auto-classified here. A manual pin still applies via
+                            // the slot re-read inside drive_to_goal.
+                            None,
                         )
                         .await?;
                         first_steps + s2
@@ -1145,7 +1170,7 @@ async fn serve(
                     drive_to_goal(
                         out,
                         storage,
-                        turn_provider,
+                        provider,
                         &tools,
                         policy,
                         device_id,
@@ -1157,6 +1182,8 @@ async fn serve(
                         voice,
                         &acting,
                         &cancel,
+                        &session_effort,
+                        turn_baseline,
                     )
                     .await?
                 };
@@ -2394,6 +2421,8 @@ pub(crate) async fn drive_to_goal(
     voice: bool,
     acting: &crate::identity::ActingUser,
     cancel: &CancelFlag,
+    session_effort: &crate::effort::SessionEffort,
+    turn_baseline: Option<agent_core::model::Effort>,
 ) -> Result<usize> {
     // Fresh goal state for this user message.
     *goal_state.lock().await = GoalState::new();
@@ -2401,13 +2430,22 @@ pub(crate) async fn drive_to_goal(
     let mut continues: u32 = 0;
     let mut total_steps: usize = 0;
     loop {
+        // Re-read the agent's effort before EACH turn it drives — including every
+        // goal-continuation turn of this same request — so a mid-request
+        // `set_effort` takes effect on the next continuation instead of being
+        // deferred to the next user message. Precedence: the manual pin (slot)
+        // wins; otherwise this message's difficulty baseline; otherwise the
+        // provider's configured default (with_effort(None)).
+        let effective_effort = (*session_effort.lock().await).or(turn_baseline);
+        let effort_provider = effective_effort.and_then(|e| provider.with_effort(Some(e)));
+        let turn_provider: &dyn ModelProvider = effort_provider.as_deref().unwrap_or(provider);
         // Run silently; whether this turn is terminal is only known afterward.
         // Each turn runs with the message's voice flag so the terminal turn can
         // carry a spoken reply; intermediate turns' speech is discarded.
         let turn = drive_turn(
             out,
             storage,
-            provider,
+            turn_provider,
             tools,
             policy,
             device_id,
@@ -4115,6 +4153,8 @@ mod tests {
             false,
             &crate::identity::ActingUser::Guest,
             &cancel,
+            &crate::effort::new_session_effort(),
+            None,
         )
         .await
         .expect("cancelled run still returns Ok (did not loop/exhaust the provider)");
@@ -4154,6 +4194,8 @@ mod tests {
             false,
             &crate::identity::ActingUser::Guest,
             &cancel,
+            &crate::effort::new_session_effort(),
+            None,
         )
         .await
         .expect("explicit cancel returns Ok");
@@ -4235,6 +4277,8 @@ mod tests {
             false,
             &crate::identity::ActingUser::Guest,
             &CancelFlag::new(),
+            &crate::effort::new_session_effort(),
+            None,
         )
         .await
         .unwrap();
@@ -4276,6 +4320,8 @@ mod tests {
             false,
             &crate::identity::ActingUser::Guest,
             &CancelFlag::new(),
+            &crate::effort::new_session_effort(),
+            None,
         )
         .await
         .unwrap();
@@ -4311,6 +4357,8 @@ mod tests {
             false,
             &crate::identity::ActingUser::Guest,
             &CancelFlag::new(),
+            &crate::effort::new_session_effort(),
+            None,
         )
         .await
         .unwrap();
@@ -4348,6 +4396,8 @@ mod tests {
             false,
             &crate::identity::ActingUser::Guest,
             &CancelFlag::new(),
+            &crate::effort::new_session_effort(),
+            None,
         )
         .await
         .unwrap();
@@ -4416,6 +4466,8 @@ mod tests {
             true,
             &crate::identity::ActingUser::Guest,
             &CancelFlag::new(),
+            &crate::effort::new_session_effort(),
+            None,
         )
         .await
         .unwrap();
@@ -4448,6 +4500,8 @@ mod tests {
             false,
             &crate::identity::ActingUser::Guest,
             &CancelFlag::new(),
+            &crate::effort::new_session_effort(),
+            None,
         )
         .await
         .unwrap();
@@ -4490,10 +4544,136 @@ mod tests {
             false,
             &crate::identity::ActingUser::Guest,
             &CancelFlag::new(),
+            &crate::effort::new_session_effort(),
+            None,
         )
         .await
         .unwrap();
         assert!(steps >= 1, "a completed turn reports its step count");
+        let _ = drain(&mut rx);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    // Shared state for the effort-recording provider below: the effort each
+    // `drive_turn` was invoked at (via `with_effort`), the scripted responses,
+    // and the same session-effort slot drive_to_goal reads — so `complete` can
+    // mutate it mid-request the way `set_effort` would.
+    struct EffortRecShared {
+        log: std::sync::Mutex<Vec<Option<agent_core::model::Effort>>>,
+        script: std::sync::Mutex<std::collections::VecDeque<ModelResponse>>,
+        slot: crate::effort::SessionEffort,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    struct EffortRec {
+        my_effort: Option<agent_core::model::Effort>,
+        shared: Arc<EffortRecShared>,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for EffortRec {
+        async fn complete(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+        ) -> agent_core::Result<ModelResponse> {
+            // Record the effort this variant represents, then (once) simulate the
+            // agent pinning high mid-request as set_effort would.
+            self.shared.log.lock().unwrap().push(self.my_effort);
+            if self
+                .shared
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                == 0
+            {
+                *self.shared.slot.lock().await = Some(agent_core::model::Effort::High);
+            }
+            let resp = self
+                .shared
+                .script
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| ModelResponse {
+                    message: Message::assistant("done"),
+                });
+            Ok(resp)
+        }
+
+        fn with_effort(
+            &self,
+            effort: Option<agent_core::model::Effort>,
+        ) -> Option<Arc<dyn ModelProvider>> {
+            Some(Arc::new(EffortRec {
+                my_effort: effort,
+                shared: Arc::clone(&self.shared),
+            }))
+        }
+    }
+
+    /// drive_to_goal re-reads the effort before EACH turn: the first turn runs at
+    /// this message's difficulty baseline, and after a mid-request pin the next
+    /// goal-continuation turn picks it up — not deferred to the next message.
+    #[tokio::test]
+    async fn effort_reread_per_continuation_picks_up_mid_request_pin() {
+        let (storage, tools, goal_state, home, out, mut rx) = goal_env();
+        let slot = crate::effort::new_session_effort();
+        let shared = Arc::new(EffortRecShared {
+            log: std::sync::Mutex::new(Vec::new()),
+            // Turn 1: set a goal (forces a continuation) then finish. Turn 2:
+            // complete the goal (terminal) then finish.
+            script: std::sync::Mutex::new(std::collections::VecDeque::from(vec![
+                call_resp("g", "set_goal", serde_json::json!({ "goal": "x" })),
+                text_resp("t1"),
+                call_resp(
+                    "d",
+                    "complete_goal",
+                    serde_json::json!({ "summary": "done" }),
+                ),
+                text_resp("all done"),
+            ])),
+            slot: Arc::clone(&slot),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let base = EffortRec {
+            my_effort: None,
+            shared: Arc::clone(&shared),
+        };
+        let mut gate = agent_core::AutoApprove;
+        drive_to_goal(
+            &out,
+            &storage,
+            &base,
+            &tools,
+            Policy::FullAccess,
+            "dev",
+            "c1",
+            Message::user("go"),
+            &mut gate,
+            &goal_state,
+            5,
+            false,
+            &crate::identity::ActingUser::Guest,
+            &CancelFlag::new(),
+            &slot,
+            // This message's difficulty baseline (no manual pin yet). Turn 1 uses
+            // it; had the slot stayed None a continuation would fall back to it too
+            // (the `auto`-cleared case).
+            Some(agent_core::model::Effort::Low),
+        )
+        .await
+        .unwrap();
+        let log = shared.log.lock().unwrap().clone();
+        assert_eq!(
+            log.first(),
+            Some(&Some(agent_core::model::Effort::Low)),
+            "turn 1 runs at the difficulty baseline"
+        );
+        assert_eq!(
+            log.last(),
+            Some(&Some(agent_core::model::Effort::High)),
+            "a continuation picks up the mid-request pin without a new user message"
+        );
         let _ = drain(&mut rx);
         let _ = std::fs::remove_dir_all(home);
     }
@@ -4534,6 +4714,8 @@ mod tests {
             false,
             &crate::identity::ActingUser::Guest,
             &CancelFlag::new(),
+            &crate::effort::new_session_effort(),
+            None,
         )
         .await
         .unwrap();
@@ -4595,6 +4777,8 @@ mod tests {
             false,
             &crate::identity::ActingUser::Guest,
             &CancelFlag::new(),
+            &crate::effort::new_session_effort(),
+            None,
         )
         .await
         .unwrap();
@@ -4629,6 +4813,8 @@ mod tests {
             false,
             &crate::identity::ActingUser::Guest,
             &CancelFlag::new(),
+            &crate::effort::new_session_effort(),
+            None,
         )
         .await
         .unwrap();
@@ -4830,6 +5016,8 @@ mod tests {
             true,
             &crate::identity::ActingUser::Guest,
             &CancelFlag::new(),
+            &crate::effort::new_session_effort(),
+            None,
         )
         .await
         .unwrap();
@@ -4862,6 +5050,8 @@ mod tests {
             false,
             &crate::identity::ActingUser::Guest,
             &CancelFlag::new(),
+            &crate::effort::new_session_effort(),
+            None,
         )
         .await
         .unwrap();
