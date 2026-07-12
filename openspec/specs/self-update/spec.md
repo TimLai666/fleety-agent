@@ -134,38 +134,30 @@ code:
 ---
 ### Requirement: Manifest URL templating
 
-`FLEETY_UPDATE_MANIFEST` SHALL hold a single URL or URL template serving every resolution mode. The updater SHALL substitute `{bin}` with the name of the binary being updated. For latest resolution (background polling, `fleetyd update`, `fleety update`), the updater SHALL substitute `{version}` with the literal string `latest`. For pinned resolution, the updater SHALL substitute `{version}` with the exact target version and SHALL fail when the template lacks `{version}`. A template without `{bin}` SHALL be treated as the manifest of the running binary only: the updater SHALL NOT resolve a manifest for a different binary from a template lacking `{bin}`, and SHALL skip that binary's update with a warning naming the missing `{bin}` placeholder.
+`FLEETY_UPDATE_MANIFEST` SHALL hold a single URL or URL template serving every resolution mode; when it is unset, the updater SHALL fall back to a built-in default template pointing at this project's own GitHub releases (`https://github.com/<owner>/<repo>/releases/latest/download/{bin}-manifest.json`), so a stock install's manual `fleety update` works with no configuration and a fork or mirror overrides it by setting the variable. The updater SHALL substitute `{bin}` with the name of the binary being updated. For latest resolution (background polling, `fleetyd update`, `fleety update`), the updater SHALL substitute `{version}` with the literal string `latest`. For pinned resolution, the updater SHALL substitute `{version}` with the exact target version and SHALL fail when the effective template lacks `{version}` (the built-in default is the latest form and carries no `{version}`, so pinned resolution requires either an env template with `{version}` or the manifest's own `versioned_manifest` field). A template without `{bin}` SHALL be treated as the manifest of the running binary only: the updater SHALL NOT resolve a manifest for a different binary from a template lacking `{bin}`, and SHALL skip that binary's update with a warning naming the missing `{bin}` placeholder. The built-in default fallback SHALL NOT enable the daemon's unattended auto-update poll, which SHALL continue to require `FLEETY_UPDATE_MANIFEST` to be set explicitly.
 
-#### Scenario: latest resolution of a versioned template
+#### Scenario: unset variable resolves the built-in default
+
+- **WHEN** `FLEETY_UPDATE_MANIFEST` is unset and `fleety update` resolves the latest manifest URL for `fleety`
+- **THEN** it resolves `https://github.com/<owner>/<repo>/releases/latest/download/fleety-manifest.json` and treats the template as `{bin}`-templated
+
+#### Scenario: environment variable overrides the built-in default
 
 - **WHEN** `FLEETY_UPDATE_MANIFEST` is `https://host/dl/{bin}/{version}/manifest.json` and fleetyd resolves its latest manifest URL
-- **THEN** the resolved URL is `https://host/dl/fleetyd/latest/manifest.json`
-
-##### Example: substitution matrix
-
-| Template                             | Binary               | Mode            | Resolved URL                          |
-| ------------------------------------ | -------------------- | --------------- | ------------------------------------- |
-| https://h/dl/{bin}/latest.json       | fleety-server        | latest          | https://h/dl/fleety-server/latest.json |
-| https://h/dl/{bin}/{version}/m.json  | fleetyd              | latest          | https://h/dl/fleetyd/latest/m.json     |
-| https://h/dl/{bin}/{version}/m.json  | fleetyd              | pinned to 0.3.0 | https://h/dl/fleetyd/0.3.0/m.json      |
-| https://h/fleetyd.json               | fleetyd (running)    | latest          | https://h/fleetyd.json                 |
+- **THEN** it substitutes `{version}` with `latest`, yielding `https://host/dl/fleetyd/latest/manifest.json`
 
 #### Scenario: sibling update requires the bin placeholder
 
 - **WHEN** the daemon updates sibling binaries and `FLEETY_UPDATE_MANIFEST` holds `{version}` but not `{bin}`
-- **THEN** each sibling is skipped with a warning naming the missing `{bin}` placeholder, and the daemon's own self-update still proceeds
+- **THEN** it skips the sibling binaries with a warning naming the missing `{bin}` placeholder
+
 
 <!-- @trace
-source: update-manifest-pipeline
-updated: 2026-07-11
+source: default-update-manifest
+updated: 2026-07-12
 code:
-  - crates/fleety-tools/src/update.rs
-  - crates/fleety-tools/src/deps.rs
-  - crates/fleety-tools/src/deps/insyra.rs
-  - crates/fleety-daemon/src/main.rs
-  - .github/workflows/release.yml
   - docs/env.md
-  - docs/STATUS.md
+  - crates/fleety-tools/src/update.rs
 -->
 
 ---

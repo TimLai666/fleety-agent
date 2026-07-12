@@ -116,33 +116,43 @@ fn current_bin_name() -> String {
         .unwrap_or_else(|| "fleety".to_string())
 }
 
-/// Whether `FLEETY_UPDATE_MANIFEST` is a per-binary template (`{bin}` form) —
-/// required to safely resolve a *different* binary's manifest.
+/// The built-in default update manifest — this project's own GitHub releases —
+/// so a stock install's manual `fleety update` works with no configuration.
+/// `FLEETY_UPDATE_MANIFEST` overrides it (a fork / private mirror). It is the
+/// `{bin}` "latest" form; per-version pinning comes from each manifest's own
+/// `versioned_manifest` field, not from this template.
+pub const DEFAULT_UPDATE_MANIFEST: &str =
+    "https://github.com/TimLai666/fleety-agent/releases/latest/download/{bin}-manifest.json";
+
+/// The manifest URL template: `FLEETY_UPDATE_MANIFEST` when set, else the
+/// built-in [`DEFAULT_UPDATE_MANIFEST`].
+fn manifest_template() -> String {
+    std::env::var("FLEETY_UPDATE_MANIFEST").unwrap_or_else(|_| DEFAULT_UPDATE_MANIFEST.to_string())
+}
+
+/// Whether the manifest template is a per-binary template (`{bin}` form) —
+/// required to safely resolve a *different* binary's manifest. True by default
+/// (the built-in template carries `{bin}`).
 pub fn manifest_is_templated() -> bool {
-    std::env::var("FLEETY_UPDATE_MANIFEST")
-        .map(|b| b.contains("{bin}"))
-        .unwrap_or(false)
+    manifest_template().contains("{bin}")
 }
 
-/// Whether `FLEETY_UPDATE_MANIFEST` can resolve an exact `{version}` — required
-/// for forward-only convergence to a specific (server) version.
+/// Whether the manifest template can resolve an exact `{version}` — required
+/// for forward-only convergence to a specific (server) version. The built-in
+/// default is the `latest` form (no `{version}`), so this is false unless
+/// `FLEETY_UPDATE_MANIFEST` supplies a `{version}` template.
 pub fn manifest_supports_version() -> bool {
-    std::env::var("FLEETY_UPDATE_MANIFEST")
-        .map(|b| b.contains("{version}"))
-        .unwrap_or(false)
+    manifest_template().contains("{version}")
 }
 
-/// The *latest*-manifest URL for `bin`, from `FLEETY_UPDATE_MANIFEST`. `{bin}`
-/// is substituted with the binary name; `{version}` — a template kept for
-/// pinned resolution — is substituted with the literal `latest`, so one env var
-/// serves both modes (a self-hosted layout serves a `latest` alias directory).
+/// The *latest*-manifest URL for `bin`, from the manifest template (env override
+/// or built-in default). `{bin}` is substituted with the binary name;
+/// `{version}` — a template kept for pinned resolution — is substituted with the
+/// literal `latest`, so one template serves both modes.
 pub fn manifest_url_for(bin: &str) -> Result<String> {
-    let base = std::env::var("FLEETY_UPDATE_MANIFEST").map_err(|_| {
-        CoreError::Message(
-            "set FLEETY_UPDATE_MANIFEST to the update manifest URL (may contain {bin})".to_string(),
-        )
-    })?;
-    Ok(base.replace("{bin}", bin).replace("{version}", "latest"))
+    Ok(manifest_template()
+        .replace("{bin}", bin)
+        .replace("{version}", "latest"))
 }
 
 async fn fetch_text(url: &str) -> Result<String> {
@@ -719,5 +729,23 @@ mod tests {
             "https://h/fleetyd.json"
         );
         std::env::remove_var("FLEETY_UPDATE_MANIFEST");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn unset_env_falls_back_to_built_in_github_manifest() {
+        // A stock install (no FLEETY_UPDATE_MANIFEST) resolves against the
+        // project's own releases, so bare `fleety update` works unconfigured.
+        std::env::remove_var("FLEETY_UPDATE_MANIFEST");
+        assert!(manifest_is_templated());
+        assert!(!manifest_supports_version()); // built-in default is the latest form
+        assert_eq!(
+            manifest_url_for("fleety").unwrap(),
+            "https://github.com/TimLai666/fleety-agent/releases/latest/download/fleety-manifest.json"
+        );
+        assert_eq!(
+            manifest_url_for("fleety-server").unwrap(),
+            "https://github.com/TimLai666/fleety-agent/releases/latest/download/fleety-server-manifest.json"
+        );
     }
 }
