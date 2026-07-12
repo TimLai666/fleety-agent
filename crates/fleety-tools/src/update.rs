@@ -39,8 +39,14 @@ struct Manifest {
 /// optional `versioned_manifest` URL template. Unknown fields are ignored so
 /// future manifests stay readable by old binaries.
 fn parse_manifest_for(text: &str, triple: Option<&str>) -> Result<Manifest> {
-    let v: Value = serde_json::from_str(text)
-        .map_err(|e| CoreError::Message(format!("invalid update manifest: {e}")))?;
+    let v: Value = serde_json::from_str(text).map_err(|e| {
+        // A non-JSON body (e.g. a 404 page that slipped through) is far more
+        // legible with a snippet of what was actually received.
+        let snippet: String = text.trim().chars().take(120).collect();
+        CoreError::Message(format!(
+            "invalid update manifest: {e} — the response was not JSON (starts with: {snippet:?})"
+        ))
+    })?;
     let str_field = |obj: &Value, key: &str| -> Result<String> {
         obj.get(key)
             .and_then(Value::as_str)
@@ -156,14 +162,28 @@ pub fn manifest_url_for(bin: &str) -> Result<String> {
 }
 
 async fn fetch_text(url: &str) -> Result<String> {
-    reqwest::Client::new()
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| CoreError::Provider(format!("fetch manifest failed: {e}")))?
-        .text()
-        .await
-        .map_err(|e| CoreError::Provider(format!("read manifest failed: {e}")))
+    let resp = reqwest::Client::new().get(url).send().await.map_err(|e| {
+        CoreError::Provider(format!(
+            "fetching the update manifest from {url} failed: {e}"
+        ))
+    })?;
+    // A non-2xx (typically a 404 for a not-yet-attached manifest asset) returns an
+    // HTML/plain body that would otherwise reach the JSON parser as the useless
+    // "expected value at line 1 column 1". Surface the status and the URL instead.
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(CoreError::Provider(format!(
+            "the update manifest at {url} returned HTTP {}. If a release is currently \
+             publishing, its manifest may not be attached yet — retry in a minute. Otherwise \
+             check FLEETY_UPDATE_MANIFEST.",
+            status.as_u16()
+        )));
+    }
+    resp.text().await.map_err(|e| {
+        CoreError::Provider(format!(
+            "reading the update manifest from {url} failed: {e}"
+        ))
+    })
 }
 
 /// Probe the latest published version for `bin` (background poller). Works even
