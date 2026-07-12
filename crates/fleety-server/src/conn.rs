@@ -1601,6 +1601,12 @@ async fn serve(
                 }
                 emit(out, &reply)?;
             }
+            ClientMsg::MintPairingCode => {
+                // The connection is already past Hello auth / loopback trust, so
+                // no extra privilege check is needed. Codes only matter when auth
+                // is required.
+                emit(out, &mint_pairing_code(auth))?;
+            }
             ClientMsg::Unknown => {
                 // A frame this build doesn't recognize (a newer client's additive
                 // frame). Reply with an unsupported error and KEEP the connection
@@ -1813,6 +1819,41 @@ fn credential_delete(token_path: &std::path::Path, kind: &str, auth_required: bo
             error: Some(fleety_protocol::WireError {
                 kind: "io".to_string(),
                 message: format!("could not remove the credential: {}", e.report().message),
+                remediation: None,
+            }),
+        },
+    }
+}
+
+/// Mint a short-lived pairing code for enrolling another device (the same store
+/// the first-run code and the `pair_create` tool use). Only meaningful when auth
+/// is required; when it is disabled, codes aren't used — say so.
+fn mint_pairing_code(auth: &AuthStore) -> ServerMsg {
+    if !auth.required() {
+        return ServerMsg::PairingCode {
+            code: None,
+            error: Some(fleety_protocol::WireError {
+                kind: "auth_disabled".to_string(),
+                message: "this server does not require authentication, so pairing codes are not \
+                          used — devices can connect without one"
+                    .to_string(),
+                remediation: Some(
+                    "enable auth first: set FLEETY_REQUIRE_AUTH=1 on the server and restart"
+                        .to_string(),
+                ),
+            }),
+        };
+    }
+    match auth.create_pairing() {
+        Ok(code) => ServerMsg::PairingCode {
+            code: Some(code),
+            error: None,
+        },
+        Err(e) => ServerMsg::PairingCode {
+            code: None,
+            error: Some(fleety_protocol::WireError {
+                kind: "io".to_string(),
+                message: format!("could not mint a pairing code: {}", e.report().message),
                 remediation: None,
             }),
         },
@@ -3355,6 +3396,38 @@ mod tests {
         std::env::remove_var("FLEETY_CONFIG");
         std::env::remove_var("FLEETY_PROVIDERS");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mint_pairing_code_gated_on_auth() {
+        // Auth required → a code is minted (and is redeemable in-memory).
+        let path = std::env::temp_dir().join(format!("fleety-mint-{}.json", uuid::Uuid::new_v4()));
+        let auth = AuthStore::load(path, None, true);
+        match mint_pairing_code(&auth) {
+            ServerMsg::PairingCode {
+                code: Some(code),
+                error: None,
+            } => {
+                assert!(!code.is_empty());
+                // The freshly minted code redeems (same in-memory store).
+                assert!(auth.redeem(&code, "dev").is_ok());
+            }
+            other => panic!("expected a minted code, got {other:?}"),
+        }
+
+        // Auth disabled → no code, an actionable error.
+        let path2 = std::env::temp_dir().join(format!("fleety-mint-{}.json", uuid::Uuid::new_v4()));
+        let auth_off = AuthStore::load(path2, None, false);
+        match mint_pairing_code(&auth_off) {
+            ServerMsg::PairingCode {
+                code: None,
+                error: Some(e),
+            } => {
+                assert_eq!(e.kind, "auth_disabled");
+                assert!(e.remediation.is_some());
+            }
+            other => panic!("expected an auth-disabled error, got {other:?}"),
+        }
     }
 
     #[test]

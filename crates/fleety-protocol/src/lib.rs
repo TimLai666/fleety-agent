@@ -294,6 +294,10 @@ pub enum ClientMsg {
     /// Remove the server-side credential of `kind`. Requires an authenticated
     /// connection; audited. Reply: `CredentialResult`.
     CredentialDelete { kind: String },
+    /// Ask the connected server to mint a short-lived pairing code (for enrolling
+    /// another device). Only reaches the server past Hello auth / loopback trust.
+    /// Reply: `PairingCode`.
+    MintPairingCode,
     /// Any frame this build does not recognize. `#[serde(other)]` routes an
     /// unknown `type` here instead of failing to parse — so a newer peer's
     /// additive frame is answered with an `unsupported` error rather than
@@ -471,6 +475,14 @@ pub enum ServerMsg {
         expires_at_secs: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<WireError>,
+    },
+    /// Reply to `MintPairingCode`: `code` is the minted short-lived pairing code
+    /// on success; `error` explains why not (e.g. authentication is disabled).
+    PairingCode {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<WireError>,
     },
@@ -701,6 +713,30 @@ mod tests {
                 assert!(expires_at_secs.is_none());
             }
             _ => panic!("not a credential status result"),
+        }
+    }
+
+    #[test]
+    fn pairing_code_frames_roundtrip_and_tolerate_unknown() {
+        let req = ClientMsg::MintPairingCode;
+        assert_eq!(
+            serde_json::from_str::<ClientMsg>(&serde_json::to_string(&req).expect("ser"))
+                .expect("de"),
+            req
+        );
+        let ok = ServerMsg::PairingCode {
+            code: Some("abc123".into()),
+            error: None,
+        };
+        let json = serde_json::to_string(&ok).expect("ser");
+        assert!(json.contains("\"code\":\"abc123\""));
+        assert!(!json.contains("error"));
+        assert_eq!(serde_json::from_str::<ServerMsg>(&json).expect("de"), ok);
+        // A future peer's extra field still parses (additive).
+        let extra = r#"{"type":"pairing_code","code":"x","future":1}"#;
+        match serde_json::from_str::<ServerMsg>(extra).expect("de extra") {
+            ServerMsg::PairingCode { code, .. } => assert_eq!(code.as_deref(), Some("x")),
+            _ => panic!("not a pairing code"),
         }
     }
 

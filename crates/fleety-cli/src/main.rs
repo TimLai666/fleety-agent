@@ -79,6 +79,7 @@ fn print_help() {
     println!("  rollback list                    backups available to restore");
     println!("  rollback apply <backup_id>       restore a file from a backup");
     println!("  pair <code>                      enroll this device (auth-required servers)");
+    println!("  pair-code                        mint a pairing code on the current server");
     println!("  daemon <verb>                    manage the local daemon (install/start/...)");
     println!("  update                           update every fleety component on this host");
     println!("  acp [install [zed]]              run as an ACP agent (editors launch this)");
@@ -305,11 +306,12 @@ async fn main() -> std::process::ExitCode {
             let code = args.get(2).cloned().unwrap_or_default();
             if code.is_empty() {
                 return usage(
-                    "usage: fleety pair <pairing-code>   (from `pair_create` on a paired device)",
+                    "usage: fleety pair <pairing-code>   (mint one with `fleety pair-code` on the server)",
                 );
             }
             done(pair(code).await)
         }
+        Some("pair-code") => done(pair_code().await),
         Some("help") | Some("--help") | Some("-h") => {
             print_help();
             std::process::ExitCode::SUCCESS
@@ -382,6 +384,12 @@ fn daemon_delegate(args: &[String]) -> Result<()> {
 }
 
 /// Interactive TUI: connect, then loop over key events and server frames.
+/// Whether a server `Error.kind` is an authentication rejection — terminal for
+/// the TUI (no amount of reconnecting fixes an unpaired device). Pure.
+fn is_auth_rejection(kind: &str) -> bool {
+    kind == "unauthenticated"
+}
+
 async fn run_tui() -> Result<()> {
     use ratatui::crossterm::event::{Event, KeyEventKind};
 
@@ -531,10 +539,21 @@ async fn run_tui() -> Result<()> {
                         }
                     }
                     Ok(ServerMsg::Error { error }) => {
-                        // The turn ended (with an error): clear the in-flight
-                        // state so Esc goes back to quitting.
                         app.turn_in_flight = false;
-                        app.status = format!("agent error: {}", error.message);
+                        if is_auth_rejection(&error.kind) {
+                            // Not a transient drop — the server won't take us
+                            // without pairing. Say so and stop, instead of
+                            // reconnecting forever.
+                            app.status = "Not paired with this server — run `fleety pair <code>` \
+                                          (mint one with `fleety pair-code` on the server host), \
+                                          then reopen the TUI."
+                                .to_string();
+                            app.should_quit = true;
+                        } else {
+                            // The turn ended with an error: clear in-flight so
+                            // Esc goes back to quitting.
+                            app.status = format!("agent error: {}", error.message);
+                        }
                     }
                     _ => {}
                 },
@@ -1047,6 +1066,39 @@ async fn pair(code: String) -> Result<()> {
     result
 }
 
+/// `fleety pair-code`: ask the connected server (local via loopback trust, or a
+/// token-authenticated remote) to mint a short-lived pairing code, and print it
+/// for enrolling another device.
+async fn pair_code() -> Result<()> {
+    let (mut tx, mut rx) = connect_hello().await?;
+    send(&mut tx, &ClientMsg::MintPairingCode).await?;
+    let reply = recv(&mut rx).await?;
+    let _ = tx.close().await;
+    match reply {
+        Some(ServerMsg::PairingCode {
+            code: Some(code), ..
+        }) => {
+            println!("Pairing code: {code}");
+            println!("On the other device, run:  fleety pair {code}   (expires soon)");
+            Ok(())
+        }
+        Some(ServerMsg::PairingCode { error: Some(e), .. }) => {
+            Err(CoreError::Message(match e.remediation {
+                Some(r) => format!("{} — {r}", e.message),
+                None => e.message,
+            }))
+        }
+        Some(ServerMsg::Error { error }) => Err(CoreError::Message(format!(
+            "the server is too old to mint pairing codes ({}) — update it (`fleety update` on the \
+             server host), or use the code printed at the server's first run",
+            error.message
+        ))),
+        other => Err(CoreError::Provider(format!(
+            "expected a pairing-code reply, got {other:?}"
+        ))),
+    }
+}
+
 /// The wire tag of a server frame (`"assistant"`, `"done"`, …) for human-readable
 /// messages — read from the serde `type` tag, never the Debug form (which would
 /// dump the internal type's fields).
@@ -1236,10 +1288,11 @@ async fn ask(text: String, attachments: Vec<WireAttachment>) -> Result<()> {
                 };
                 send(&mut tx, &ClientMsg::ToolError { call_id, error }).await?;
             }
-            // Credential replies belong to the `fleety auth` command's own
-            // request/reply exchange; in the ask loop they are stray noise.
+            // Credential / pairing-code replies belong to their own commands'
+            // request/reply exchanges; in the ask loop they are stray noise.
             Some(ServerMsg::CredentialResult { .. })
-            | Some(ServerMsg::CredentialStatusResult { .. }) => {}
+            | Some(ServerMsg::CredentialStatusResult { .. })
+            | Some(ServerMsg::PairingCode { .. }) => {}
             Some(ServerMsg::ApprovalRequested {
                 approval_id,
                 tool,
@@ -1992,6 +2045,15 @@ mod tests {
         };
         let line = render_pick_line(0, &local, &[], Some("ws://127.0.0.1:8787"));
         assert!(line.contains("(local, no pairing)"));
+    }
+
+    #[test]
+    fn auth_rejection_is_terminal_only_for_unauthenticated() {
+        assert!(is_auth_rejection("unauthenticated"));
+        assert!(!is_auth_rejection("unsupported"));
+        assert!(!is_auth_rejection("invalid"));
+        assert!(!is_auth_rejection("io"));
+        assert!(!is_auth_rejection(""));
     }
 
     #[test]
