@@ -214,9 +214,12 @@ Use a ChatGPT subscription rather than a static key:
 
 `fleety auth status` lists each `oauth:codex` provider's sign-in state (or
 `fleety auth status <provider>` for one); `fleety auth logout <provider>` clears
-that provider's credential. You can also do all of this from `fleety config`
-(Providers → select the codex provider → `e` → sign in / out / switch account).
-Upgrading to per-provider Codex clears any old global login — sign in again per provider.
+that provider's credential. You can also do all of this from **`fleety config`**
+(the Providers menu): it edits the **connected server's** providers over the
+connection (never a local file), so **adding an `oauth:codex` provider goes
+straight into sign-in**, and selecting an existing one → `e` offers sign in /
+out / switch account. Upgrading to per-provider Codex clears any old global
+login — sign in again per provider.
 
 > **Note:** end-to-end behavior against the live Codex backend is network-gated
 > and unverified from CI (the request/SSE shapes follow the documented Codex CLI

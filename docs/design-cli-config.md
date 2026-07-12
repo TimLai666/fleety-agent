@@ -224,9 +224,11 @@ fleety server use <name>          # 同時設定 CLI 與本機 daemon(一台一�
 一個 ratatui 面板,Tab 三區,**不用打 `--target`**。這是「一個入口設定任何東西」。
 
 > 現行實作:裸 `fleety config` 先開**頂層選單**(Providers / Models / Settings),
-> 用選的再往下鑽 —— Providers/Models 進 provider 編輯器(選 type 逐欄新增 provider、
-> 選 provider 再從其 `/models` 挑 model),Settings 進下方這個三區面板。提示列常駐;
-> Esc 回選單、q 離開。下方 mockup 即 Settings 那一層。
+> 用選的再往下鑽 —— Providers/Models 進 provider 編輯器,編的是**連線那台 server**
+> 的 providers(snapshot → 編 → `ConfigApply`,不是本機檔),所以新增的 provider
+> 對 server 立即可見;新增 `oauth:codex` 直接進登入,選既有 oauth provider 按 `e`
+> 可登入/登出/換帳號。Settings 進下方這個三區面板。提示列常駐;Esc 回選單、q 離開。
+> 下方 mockup 即 Settings 那一層。
 
 ```
 ┌─ fleety config ─────────────────────────────────────┐
