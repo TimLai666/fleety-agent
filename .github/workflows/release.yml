@@ -185,6 +185,12 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
+          # Do NOT promote this release to "latest" yet: the per-binary manifests
+          # aren't attached until the `manifests` job (which needs all builds), so
+          # if a build made it latest here, `releases/latest/download/{bin}-manifest.json`
+          # would 404 for the whole build window and break `fleety update`. The
+          # `manifests` job flips make_latest=true once the release is complete.
+          make_latest: false
           files: |
             fleety-${{ matrix.target }}.${{ matrix.archive }}
             fleety-server-${{ matrix.target }}.${{ matrix.archive }}
@@ -206,7 +212,10 @@ jobs:
   # immutable, so a manifest's sha256 stays valid after newer releases ship.
   manifests:
     name: build update manifests
-    needs: build
+    # Needs sidecar-cross too (not for its artifacts — for ordering): this job is
+    # the LAST attach and the only one that sets make_latest=true, so no later
+    # job can flip the release back to non-latest after it is promoted.
+    needs: [build, sidecar-cross]
     # Run even if a build target failed (but not if the run was cancelled): a
     # missing target then makes THIS job fail loudly at the missing-binary check
     # below, instead of `needs: build` silently SKIPPING manifests — which once
@@ -283,6 +292,11 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
+          # This is the final attach (needs all builds + sidecar-cross), so the
+          # release is complete — NOW promote it to "latest". Until this runs,
+          # `releases/latest` stays on the previous complete release, so
+          # `fleety update` never sees a manifest-less "latest".
+          make_latest: true
           files: manifests/*.json
 
   # The Go sidecar also ships for ARM/RISC-V Linux SBCs (Pi, LicheeRV, NAS…)
@@ -334,6 +348,9 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
+          # Not latest yet (see the build job) — the `manifests` job, which needs
+          # this one, is the sole promoter of the completed release to "latest".
+          make_latest: false
           files: |
             fleety-insyra-aarch64-unknown-linux-gnu
             fleety-insyra-riscv64gc-unknown-linux-gnu
