@@ -257,6 +257,15 @@ fn load_or_mint_server_id(path: &std::path::Path) -> String {
 }
 
 async fn async_main(cmd: Option<String>) -> std::process::ExitCode {
+    // Print the version and exit — before anything else, so `-v` never falls
+    // through to accidentally starting the server (which then fails to bind).
+    if matches!(
+        cmd.as_deref(),
+        Some("version") | Some("--version") | Some("-v") | Some("-V")
+    ) {
+        println!("fleety-server {}", agent_core::VERSION);
+        return std::process::ExitCode::SUCCESS;
+    }
     // Service lifecycle subcommands (install/uninstall/start/stop/restart/
     // enable/disable/status/up/down) act on the manager and exit.
     if let Some(action) = cmd.as_deref().and_then(service::action_from_arg) {

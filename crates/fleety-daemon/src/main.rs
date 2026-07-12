@@ -188,6 +188,10 @@ async fn async_main(cmd: Option<String>) -> std::process::ExitCode {
     // Lifecycle subcommands act on the OS service manager and exit; `run-service`
     // and no subcommand fall through to actually run the daemon.
     match cmd.as_deref() {
+        Some("version") | Some("--version") | Some("-v") | Some("-V") => {
+            println!("fleetyd {}", agent_core::VERSION);
+            return std::process::ExitCode::SUCCESS;
+        }
         Some("install") => {
             if let Err(e) = service::install() {
                 return log_verb("install", Err(e));

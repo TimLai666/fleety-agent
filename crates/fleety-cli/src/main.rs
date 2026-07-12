@@ -70,7 +70,10 @@ fn print_help() {
     println!("  conversations [<limit>]          list recent conversations to resume");
     println!("  tui                              interactive terminal UI");
     println!("  voice                            voice conversation");
-    println!("  status                           server health: version, uptime, devices");
+    println!(
+        "  status                           this host (cli version, daemon) + the connected server"
+    );
+    println!("  version                          print the CLI version (also --version / -v)");
     println!("  config <list|get|set|unset|edit> [--target server|local|<device-id>]");
     println!("  config provider|model <...>      manage providers + model roles (providers.toml)");
     println!("  auth <login|status|logout>       ChatGPT/Codex OAuth sign-in");
@@ -314,6 +317,10 @@ async fn main() -> std::process::ExitCode {
         Some("pair-code") => done(pair_code().await),
         Some("help") | Some("--help") | Some("-h") => {
             print_help();
+            std::process::ExitCode::SUCCESS
+        }
+        Some("version") | Some("--version") | Some("-v") | Some("-V") => {
+            println!("fleety {}", agent_core::VERSION);
             std::process::ExitCode::SUCCESS
         }
         Some(other) => {
@@ -1976,7 +1983,44 @@ async fn rollback_list() -> Result<()> {
     Ok(())
 }
 
+/// Local (this host) daemon status: running (from its pidfile), else installed
+/// (binary present) but stopped, else not installed. A server install does not
+/// include a daemon, so "not installed" is the normal case there.
+fn local_daemon_status() -> String {
+    let pid = fleety_tools::service::read_pid(&fleety_tools::service::pidfile_path("fleetyd"));
+    match pid.filter(|p| fleety_tools::service::pid_alive(*p)) {
+        Some(p) => format!("running (pid {p})"),
+        None => {
+            let name = if cfg!(windows) {
+                "fleetyd.exe"
+            } else {
+                "fleetyd"
+            };
+            let beside = std::env::current_exe()
+                .ok()
+                .and_then(|e| e.parent().map(|d| d.join(name)))
+                .map(|p| p.is_file())
+                .unwrap_or(false);
+            let on_path = std::env::var_os("PATH")
+                .map(|paths| std::env::split_paths(&paths).any(|d| d.join(name).is_file()))
+                .unwrap_or(false);
+            if beside || on_path {
+                "installed, not running".to_string()
+            } else {
+                "not installed".to_string()
+            }
+        }
+    }
+}
+
 async fn status() -> Result<()> {
+    // This host first: the CLI's own version and whether a daemon runs here.
+    println!("fleety (this host)");
+    println!("  cli version:    {}", agent_core::VERSION);
+    println!("  daemon:         {}", local_daemon_status());
+    let server_url = resolve_target().map(|r| r.url).unwrap_or_default();
+    println!();
+
     let (mut tx, mut rx) = connect_hello().await?;
     send(&mut tx, &ClientMsg::ServerStatus).await?;
     match recv(&mut rx).await? {
@@ -1988,7 +2032,7 @@ async fn status() -> Result<()> {
             extra_json,
         }) => {
             let ids: Vec<String> = serde_json::from_str(&device_ids_json).unwrap_or_default();
-            println!("fleety-server");
+            println!("fleety-server ({server_url})");
             println!("  version:        {version}");
             println!("  uptime:         {}", format_uptime(uptime_secs));
             println!("  connected:      {connected_devices} device(s)");
