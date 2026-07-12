@@ -71,7 +71,7 @@ it as a boot service with `fleety-server up` (systemd --user / launchd / SCM).
 | [`crates/fleety-tools`](crates/fleety-tools) | Shared, root-relative workspace tools (read/list/search-ripgrep/write/edit/run/git + unified diff). Used by the server **and** the daemon, so every device gets the full toolset. |
 | [`crates/fleety-server`](crates/fleety-server) | Fleety Agent server (`fleety-server`): runs the agent loop, the tool surface, cross-device routing, and the scheduler. |
 | [`crates/fleety-daemon`](crates/fleety-daemon) | Device background service (`fleetyd`): connects, runs on-device tools, `install`/`update` (also provisions the `fleety-insyra` sidecar so `insyra_exec` works on the device). |
-| [`crates/fleety-cli`](crates/fleety-cli) | CLI + interactive TUI (`fleety`): `init` / `ask` / `resume` / `conversations` / `tui` / `voice` / `status` / `config` / `audit` / `rollback` / `daemon` / `update` / `acp` / `pair` (see [Command reference](#command-reference)). |
+| [`crates/fleety-cli`](crates/fleety-cli) | CLI + interactive TUI (`fleety`): `init` / `ask` / `resume` / `conversations` / `tui` / `voice` / `status` / `config` / `audit` / `rollback` / `daemon` / `update` / `acp` / `pair` / `pair-code` (see [Command reference](#command-reference)). |
 
 Dependency rule: everything may depend on `agent-core`; `agent-core` depends on
 nothing Fleety-specific, so it can later be extracted to its own repo and mounted
@@ -162,11 +162,14 @@ name (marking ones you already saved), lets you pick, saves the profile, and
 prompts for the pairing code in one flow. Or point it explicitly with
 `fleety init ws://host:8787` (or `fleety server add <name> <url> --use`) — every
 later command uses the saved profile. Auth is **required by default**, so enroll
-this device with a pairing code — a fresh server prints a first-run code at
-startup, and on an already-paired server the `pair_create` tool mints more
-(`fleety pair <code>` also works standalone). The very first device can instead
-connect with the server's bootstrap admin token (`FLEETY_TOKEN`, the same value
-set on the server) and pair the rest from there.
+this device with a pairing code. Mint one on the **server host** with
+`fleety pair-code` — same-host loopback trust means it needs no auth there, and
+it prints the exact `fleety pair <code>` to run on the new device (from an
+already-paired device it works too with that device's token; the agent's
+`pair_create` tool mints one in-conversation as well). A fresh server also prints
+a first-run code at startup. The very first device can instead connect with the
+server's bootstrap admin token (`FLEETY_TOKEN`, the same value set on the server)
+and pair the rest from there.
 
 ### Configure the model (server side)
 
@@ -273,6 +276,7 @@ launchd / Windows SCM).
 | `fleety config provider\|model <…>` | Manage providers + model roles (`providers.toml`): `provider add\|set\|remove\|list`, `model set\|show\|unset\|list`. Same `--target` rule (default server). Bare `fleety config` on a TTY opens the three-region panel; `config provider edit` is the provider-only interactive editor. |
 | `fleety audit list [<limit>]` / `fleety audit show <index>` | List this device's audit-log entries (tool calls/results/replies) / show one in full. |
 | `fleety rollback list` / `fleety rollback apply <backup_id>` | List backups / restore a file from a backup. |
+| `fleety pair-code` | Mint a short-lived pairing code on the connected server (loopback-trusted on the server host, else token-authed) and print the `fleety pair <code>` to run on the new device. |
 | `fleety pair` | Enroll this device with a pairing code (auth-required servers). |
 | `fleety daemon <verb>` | Manage the local daemon from the unified CLI — forwards to `fleetyd` (`install`/`start`/`stop`/`restart`/`status`/`update`/…). |
 | `fleety update` | Update **every** fleety component installed on this host (CLI + any local server + daemon, incl. the `fleety-insyra` sidecar). One command. |
