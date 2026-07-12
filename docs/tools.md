@@ -73,6 +73,8 @@ root (the old `..`/absolute/symlink-tight sandbox).
 | `list_dir` | List a directory. | `path?` (default `.`) | read |
 | `search_files` | ripgrep over the workspace (respects `.gitignore`, skips binaries). | `query`, `path?`, `max_results?` | read |
 | `write_file` | Write a whole file (overwrite). Returns `backup` + unified `diff`. | `path`, `content` | mutate |
+| `read_file_bytes` | Read **any** file (binary-safe) as base64 — returns `content_b64` + `sha256` + `bytes`. The byte-exact counterpart to `read_file` (which is UTF-8 only); the read half of cross-device transfer. Refuses over `FLEETY_TRANSFER_MAX_BYTES` (64 MiB default). | `path` | read |
+| `write_file_bytes` | Write **any** file (binary-safe) from base64 — decodes, size-checks, sensitive-path-guards, backs up if it existed, returns `sha256` + `bytes` + `backup?`. Overwrites by default (like `write_file`); pass `overwrite: false` to refuse an existing target. The write half of cross-device transfer. | `path`, `content_b64`, `overwrite?` | mutate |
 | `edit_file` | Precise edit — substring mode (`old`→`new`, unique) or line-range mode (`start_line`..`end_line`→`new`). Returns `backup` + `diff` + `applied` (numbered post-edit region). | `path`, `new`, and `old?` or `start_line?`/`end_line?` | mutate |
 | `delete_file` | Delete a file (backup first). | `path` | mutate |
 | `move_file` | Move / rename (backs up destination if it exists). | `from`, `to` | mutate |
@@ -244,7 +246,8 @@ onboard a new device.
 | `device_show` | One device's record + NOTES + **advertised tools** (what `device_exec` can call there). | `device` | read |
 | `device_set_site` | Assign a device to a site (or `away` / `unknown`). | `device`, `site` | mutate |
 | `device_set_mobility` | Mark `stationary` / `mobile` / `unknown`. | `device`, `mobility` | mutate |
-| `device_exec` | Run a tool on a connected device by id (routes a `RunTool` frame to that daemon, awaits the reply). **Strict**-checks `tool` against the device's advertised list when the device advertised; legacy devices that didn't advertise are not strict-checked. | `device`, `tool`, `args?`, `handle?` | mutate |
+| `device_exec` | Run a tool on a connected device by id (routes a `RunTool` frame to that daemon, awaits the reply). **Strict**-checks `tool` against the device's advertised list when the device advertised; legacy devices that didn't advertise are not strict-checked. Byte tools (`read_file_bytes` / `write_file_bytes`) route through here too. | `device`, `tool`, `args?`, `handle?` | mutate |
+| `transfer_file` | Copy one file between two endpoints — an endpoint is a device id, or `"server"`/empty for the server workspace. Reads the source (`read_file_bytes`, locally or via `device_exec`), writes the dest (`write_file_bytes`), and **verifies the sha256 end-to-end** — a mismatch is a corruption error, not a success. Returns `{ok, bytes, sha256, from, to}`. Device↔device, device↔server, either direction. | `from`, `from_path`, `to`, `to_path`, `overwrite?` (default true) | mutate |
 | `pair_create` | Mint a short-lived pairing code (10 min) so a new device can enroll. | — | mutate |
 | `site_list` | List known sites. | — | read |
 | `site_show` | A site plus the devices located there. | `site` | read |

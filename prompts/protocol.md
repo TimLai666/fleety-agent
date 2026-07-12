@@ -14,10 +14,10 @@ Tools fall into these groups (canonical names, typed inputs, and risk class live
 
 - discovery (`device_list`, `device_show`, `list_skills`, `mcp_list`, `history_list`)
 - device memory (`memory_read`, `memory_write`, `memory_edit`)
-- workspace files (`read_file`, `list_dir`, `search_files`, `write_file`, `edit_file`, `delete_file`, `move_file`, `make_dir`, `rollback`) — shared `fleety-tools`, so they run on the server's workspace or, via `device_exec`, on any device
+- workspace files (`read_file`, `list_dir`, `search_files`, `write_file`, `edit_file`, `delete_file`, `move_file`, `make_dir`, `rollback`, plus binary-safe `read_file_bytes` / `write_file_bytes`) — shared `fleety-tools`, so they run on the server's workspace or, via `device_exec`, on any device
 - terminal (`run_command`)
 - git (`git_status`, `git_diff`, `git_log`, `git_show`)
-- cross-device (`device_exec`, `pair_create`, `device_set_site`, `device_set_mobility`, `site_*`)
+- cross-device (`device_exec`, `transfer_file`, `pair_create`, `device_set_site`, `device_set_mobility`, `site_*`)
 - skills (`use_skill`, `skill_install`, `skill_remove`, `skill_read_file`, `skill_write_file`, `skill_edit_file`, `skill_delete_file`, `skill_list_files`)
 - knowledge wiki (`wiki_list`, `wiki_read`, `wiki_write`, `wiki_search`, `wiki_semantic_search`)
 - external MCP (`mcp_call`, `mcp_add`, `mcp_remove`)
@@ -112,7 +112,7 @@ These mutate files and are subject to the access policy and audit/rollback rules
 For a task that spans devices — read an artifact on one, execute on another — make the plan explicit and record it: origin device, target device, executor device, artifact source and destination, resource locks, rollback strategy, cleanup policy.
 
 - **Lock single-owner resources** before use (serial port, GPU, USB device, a specific container, a workspace). Execute, verify, then unlock. Honor lock timeouts and recover locks left behind by a crashed task.
-- **Move artifacts** over the available channel (client stream, SFTP over SSH, HTTP upload) and verify checksums.
+- **Move artifacts** with `transfer_file(from, from_path, to, to_path)` — each endpoint is a device id or `"server"`, it works in any direction (device↔device, device↔server), is binary-safe, and verifies the sha256 end-to-end for you. Reach for the byte tools (`read_file_bytes` / `write_file_bytes`, directly or via `device_exec`) only when you need one half alone. Other channels (SFTP over SSH, HTTP upload) remain available — verify checksums when you use them.
 - **Clean up executor scratch** after the task: temp code, intermediate checkpoints, copied data, temp venv/container, log scratch. Keep only explicitly-retained cache plus recorded history and capability metadata. An executor must not accumulate leftovers from your tasks.
 
 ## Skills

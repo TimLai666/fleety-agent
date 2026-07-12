@@ -747,6 +747,7 @@ current automatically (re-embeds notes whose content hash changed).
 | Var | Default | Meaning |
 |---|---|---|
 | `FLEETY_CMD_TIMEOUT_SECS` | `120` | Wall-clock limit for `run_command` and `ssh_exec` (shared by the server and every device). On expiry the child is terminated and the result has `"timed_out": true`. `0` disables the limit; a per-call `timeout_secs` argument overrides it. These tools are **non-interactive** — they capture output and return when the process exits, so they cannot answer a prompt or drive a TUI; use non-interactive flags. |
+| `FLEETY_TRANSFER_MAX_BYTES` | `67108864` | Ceiling (bytes, default 64 MiB) for a single `read_file_bytes` / `write_file_bytes` / `transfer_file`. A larger file/payload is refused — the whole file rides one base64 tool result, so there is no chunking yet. Raise it for bigger files if your memory and network allow. |
 
 ## Interactive terminal sessions
 

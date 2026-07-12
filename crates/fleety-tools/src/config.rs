@@ -239,6 +239,14 @@ pub fn registry() -> &'static [Setting] {
             validator: Some(v_uint),
         },
         Setting {
+            key: "FLEETY_TRANSFER_MAX_BYTES",
+            scope: Shared,
+            default: "67108864",
+            description: "Max bytes for a single read_file_bytes / write_file_bytes / transfer_file (default 64 MiB). A larger file is refused (whole-file base64 has no chunking yet).",
+            secret: false,
+            validator: Some(v_uint),
+        },
+        Setting {
             key: "FLEETY_AUTO_INSTALL_DEPS",
             scope: Shared,
             default: "1",

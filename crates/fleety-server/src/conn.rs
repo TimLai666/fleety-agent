@@ -2944,6 +2944,16 @@ pub(crate) fn build_full_registry(
         Arc::clone(handles),
         Arc::clone(device_tools),
     );
+    // Cross-device file transfer: relays bytes between two endpoints (a device
+    // or the server's own workspace). Uses the server's workspace root/backups
+    // for the `server` endpoint.
+    bridge::register_transfer(
+        &mut tools,
+        Arc::clone(hub),
+        Arc::clone(pending),
+        workspace.to_path_buf(),
+        storage.backups_dir(),
+    );
     tools
 }
 

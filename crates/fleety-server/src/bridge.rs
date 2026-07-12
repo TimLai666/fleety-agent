@@ -353,6 +353,159 @@ pub async fn route_run_tool_via(
     }
 }
 
+/// Register the `transfer_file` relay tool. Needs the server's own workspace
+/// root + backups for the `server` endpoint, and the hub/pending to dispatch to
+/// device endpoints.
+pub fn register_transfer(
+    registry: &mut ToolRegistry,
+    hub: Hub,
+    pending: Pending,
+    root: std::path::PathBuf,
+    backups: std::path::PathBuf,
+) {
+    registry.register(Box::new(TransferFile {
+        hub,
+        pending,
+        root,
+        backups,
+    }));
+}
+
+/// Whether an endpoint string names the server itself (its own workspace) rather
+/// than a connected device. `server` or empty → server. Pure.
+pub(crate) fn is_server_endpoint(s: &str) -> bool {
+    let t = s.trim();
+    t.is_empty() || t.eq_ignore_ascii_case("server")
+}
+
+struct TransferFile {
+    hub: Hub,
+    pending: Pending,
+    root: std::path::PathBuf,
+    backups: std::path::PathBuf,
+}
+
+impl TransferFile {
+    /// The outbound sender for a connected device, or an error if it isn't in
+    /// the hub.
+    async fn device_sender(&self, device: &str) -> Result<mpsc::UnboundedSender<WsMessage>> {
+        self.hub.lock().await.get(device).cloned().ok_or_else(|| {
+            CoreError::Message(format!(
+                "device '{device}' is not connected; use device_list to see connected devices"
+            ))
+        })
+    }
+}
+
+#[async_trait]
+impl Tool for TransferFile {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "transfer_file".to_string(),
+            description: "Copy a single file between two endpoints — each is a connected device \
+                          (its device_id) or the server (`server`). Reads the source bytes and \
+                          writes them to the destination, verifying SHA-256 (binary-safe, bounded \
+                          by FLEETY_TRANSFER_MAX_BYTES). Backs up an existing destination."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "from": { "type": "string", "description": "source device_id, or `server`" },
+                    "from_path": { "type": "string", "description": "workspace-relative source path" },
+                    "to": { "type": "string", "description": "destination device_id, or `server`" },
+                    "to_path": { "type": "string", "description": "workspace-relative destination path" },
+                    "overwrite": { "type": "boolean", "description": "replace an existing destination (default true; a backup is kept)" }
+                },
+                "required": ["from", "from_path", "to", "to_path"]
+            }),
+            risk: RiskLevel::Mutate,
+        }
+    }
+
+    async fn call(&self, args: Value) -> Result<Value> {
+        let s = |k: &str| -> Result<String> {
+            args.get(k)
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    CoreError::Message(format!("missing required string argument '{k}'"))
+                })
+        };
+        let from = s("from")?;
+        let from_path = s("from_path")?;
+        let to = s("to")?;
+        let to_path = s("to_path")?;
+        let overwrite = args
+            .get("overwrite")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+
+        // Read the source bytes (server-local via the shared helper, or a device
+        // via the on-device `read_file_bytes`).
+        let read = if is_server_endpoint(&from) {
+            fleety_tools::read_file_bytes_at(&self.root, &from_path)?
+        } else {
+            let sender = self.device_sender(&from).await?;
+            route_run_tool_via(
+                &sender,
+                &self.pending,
+                "read_file_bytes",
+                json!({ "path": from_path }),
+            )
+            .await?
+        };
+        let content_b64 = read
+            .get("content_b64")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                CoreError::Message("source did not return file bytes (old daemon?)".to_string())
+            })?;
+        let src_sha = read
+            .get("sha256")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+
+        // Write to the destination (server-local or device), then verify the
+        // hashes match — a mismatch is a corrupted relay, not a success.
+        let write = if is_server_endpoint(&to) {
+            fleety_tools::write_file_bytes_at(
+                &self.root,
+                &self.backups,
+                &to_path,
+                content_b64,
+                overwrite,
+            )?
+        } else {
+            let sender = self.device_sender(&to).await?;
+            route_run_tool_via(
+                &sender,
+                &self.pending,
+                "write_file_bytes",
+                json!({ "path": to_path, "content_b64": content_b64, "overwrite": overwrite }),
+            )
+            .await?
+        };
+        let dst_sha = write
+            .get("sha256")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !src_sha.is_empty() && dst_sha != src_sha {
+            return Err(CoreError::Message(format!(
+                "transfer corrupted: source sha256 {src_sha} != destination {dst_sha} — the \
+                 destination backup can be rolled back; retry the transfer"
+            )));
+        }
+        Ok(json!({
+            "ok": true,
+            "bytes": read.get("bytes").cloned().unwrap_or(Value::Null),
+            "sha256": src_sha,
+            "from": from,
+            "to": to,
+        }))
+    }
+}
+
 /// Dispatch a daemon's tool reply to the waiting `device_exec` call.
 pub async fn dispatch_result(
     pending: &Pending,
@@ -368,6 +521,54 @@ pub async fn dispatch_result(
 mod tests {
     use super::*;
     use agent_core::ToolRegistry;
+
+    #[test]
+    fn server_endpoint_classification() {
+        assert!(is_server_endpoint("server"));
+        assert!(is_server_endpoint("SERVER"));
+        assert!(is_server_endpoint(""));
+        assert!(is_server_endpoint("  "));
+        assert!(!is_server_endpoint("pi"));
+        assert!(!is_server_endpoint("laptop-01"));
+    }
+
+    #[tokio::test]
+    async fn transfer_server_to_server_copies_and_verifies() {
+        let root = std::env::temp_dir().join(format!("fleety-xfer-{}", uuid::Uuid::new_v4()));
+        let backups = std::env::temp_dir().join(format!("fleety-xferbk-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("mk root");
+        // A binary source the text tools couldn't move.
+        std::fs::write(root.join("src.bin"), [0u8, 0xff, 0x42, 0x00]).expect("seed");
+
+        let tool = TransferFile {
+            hub: new_hub(),
+            pending: new_pending(),
+            root: root.clone(),
+            backups: backups.clone(),
+        };
+        // server → server: both endpoints are the local workspace.
+        let out = tool
+            .call(json!({
+                "from": "server", "from_path": "src.bin",
+                "to": "server", "to_path": "dst.bin"
+            }))
+            .await
+            .expect("transfer");
+        assert_eq!(out["ok"], json!(true));
+        assert_eq!(out["bytes"], json!(4));
+        assert_eq!(
+            std::fs::read(root.join("dst.bin")).expect("read dst"),
+            vec![0u8, 0xff, 0x42, 0x00]
+        );
+        // A missing source surfaces a readable error, not a panic.
+        assert!(tool
+            .call(json!({"from":"server","from_path":"nope.bin","to":"server","to_path":"x.bin"}))
+            .await
+            .is_err());
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&backups);
+    }
 
     #[test]
     fn handle_scoping_rejects_cross_device() {

@@ -54,9 +54,14 @@ pub use terminal::register_terminal;
 pub fn register_workspace(registry: &mut ToolRegistry, root: &Path, backups_dir: &Path) {
     let r = || root.to_path_buf();
     registry.register(Box::new(ReadFile { root: r() }));
+    registry.register(Box::new(ReadFileBytes { root: r() }));
     registry.register(Box::new(ListDir { root: r() }));
     registry.register(Box::new(SearchFiles { root: r() }));
     registry.register(Box::new(WriteFile {
+        root: r(),
+        backups: backups_dir.to_path_buf(),
+    }));
+    registry.register(Box::new(WriteFileBytes {
         root: r(),
         backups: backups_dir.to_path_buf(),
     }));
@@ -383,6 +388,90 @@ pub fn backup_existing(backups: &Path, rel: &str, resolved: &Path) -> Result<Val
     Ok(json!({ "id": id, "path": backup_path.display().to_string() }))
 }
 
+/// The byte-transfer size ceiling from `FLEETY_TRANSFER_MAX_BYTES` (default
+/// 64 MiB). Bounds a whole-file base64 read/write so a huge file can't OOM the
+/// process or overflow a single tool result.
+pub fn transfer_max_bytes() -> usize {
+    std::env::var("FLEETY_TRANSFER_MAX_BYTES")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(64 * 1024 * 1024)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Read a file's raw bytes as `{content_b64, sha256, bytes}`. Reuses the
+/// workspace read-path resolution; rejects a file over `transfer_max_bytes()`
+/// without loading a result. The byte counterpart of `read_file` (UTF-8),
+/// shared by the `read_file_bytes` tool and the server's transfer relay.
+pub fn read_file_bytes_at(root: &Path, rel: &str) -> Result<Value> {
+    let resolved = resolve_in_root(root, rel)?;
+    let bytes = std::fs::read(&resolved)
+        .map_err(|e| CoreError::Message(format!("cannot read '{rel}': {e}")))?;
+    let max = transfer_max_bytes();
+    if bytes.len() > max {
+        return Err(CoreError::Message(format!(
+            "file '{rel}' is {} bytes, over the {max}-byte limit (FLEETY_TRANSFER_MAX_BYTES)",
+            bytes.len()
+        )));
+    }
+    use base64::Engine;
+    Ok(json!({
+        "content_b64": base64::engine::general_purpose::STANDARD.encode(&bytes),
+        "sha256": sha256_hex(&bytes),
+        "bytes": bytes.len(),
+    }))
+}
+
+/// Decode base64 `content_b64` and write it at `rel`, backing up an existing
+/// target first (like `write_file`) and refusing when it exists and `overwrite`
+/// is false. Reuses the write-path resolution + sensitive guard; rejects a
+/// payload over `transfer_max_bytes()` without writing.
+pub fn write_file_bytes_at(
+    root: &Path,
+    backups: &Path,
+    rel: &str,
+    content_b64: &str,
+    overwrite: bool,
+) -> Result<Value> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(content_b64.trim())
+        .map_err(|e| CoreError::Message(format!("content_b64 is not valid base64: {e}")))?;
+    let max = transfer_max_bytes();
+    if bytes.len() > max {
+        return Err(CoreError::Message(format!(
+            "payload is {} bytes, over the {max}-byte limit (FLEETY_TRANSFER_MAX_BYTES)",
+            bytes.len()
+        )));
+    }
+    let resolved = resolve_for_write(root, rel)?;
+    guard_sensitive(&resolved)?;
+    let existed = resolved.exists();
+    if existed && !overwrite {
+        return Err(CoreError::Message(format!(
+            "'{rel}' already exists; pass overwrite=true to replace it"
+        )));
+    }
+    let backup = if existed {
+        Some(backup_existing(backups, rel, &resolved)?)
+    } else {
+        None
+    };
+    std::fs::write(&resolved, &bytes)
+        .map_err(|e| CoreError::Message(format!("cannot write '{rel}': {e}")))?;
+    Ok(json!({
+        "sha256": sha256_hex(&bytes),
+        "bytes": bytes.len(),
+        "backup": backup,
+    }))
+}
+
 /// A unified diff of a single file's change (works on any device, not just git).
 fn unified_diff(old: &str, new: &str, path: &str) -> String {
     similar::TextDiff::from_lines(old, new)
@@ -650,6 +739,91 @@ pub fn command_timeout(per_call: Option<u64>) -> Option<Duration> {
 
 struct ReadFile {
     root: PathBuf,
+}
+
+/// Byte-accurate read (base64) — the binary counterpart of `read_file`, and the
+/// source side of cross-device `transfer_file`.
+struct ReadFileBytes {
+    root: PathBuf,
+}
+
+#[async_trait]
+impl Tool for ReadFileBytes {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "read_file_bytes".to_string(),
+            description: "Read a file's raw bytes within the workspace as base64 (works for \
+                          binary files, unlike read_file). Returns `content_b64`, `sha256`, and \
+                          `bytes`. Bounded by FLEETY_TRANSFER_MAX_BYTES. Used by transfer_file."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "workspace-relative path" }
+                },
+                "required": ["path"]
+            }),
+            risk: RiskLevel::Read,
+        }
+    }
+
+    async fn call(&self, args: Value) -> Result<Value> {
+        let path = args
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| CoreError::Message("missing required string argument 'path'".into()))?;
+        read_file_bytes_at(&self.root, path)
+    }
+}
+
+/// Byte-accurate write (base64) — the binary counterpart of `write_file`, and
+/// the destination side of cross-device `transfer_file`.
+struct WriteFileBytes {
+    root: PathBuf,
+    backups: PathBuf,
+}
+
+#[async_trait]
+impl Tool for WriteFileBytes {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "write_file_bytes".to_string(),
+            description:
+                "Write base64 `content_b64` to a file within the workspace (binary-safe). \
+                          Backs up an existing target first; pass overwrite=false to refuse when \
+                          it exists. Returns `sha256` and `bytes`. Bounded by \
+                          FLEETY_TRANSFER_MAX_BYTES."
+                    .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "workspace-relative path" },
+                    "content_b64": { "type": "string", "description": "base64-encoded file bytes" },
+                    "overwrite": { "type": "boolean", "description": "replace an existing file (default true; a backup is kept)" }
+                },
+                "required": ["path", "content_b64"]
+            }),
+            risk: RiskLevel::Mutate,
+        }
+    }
+
+    async fn call(&self, args: Value) -> Result<Value> {
+        let path = args
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| CoreError::Message("missing required string argument 'path'".into()))?;
+        let content_b64 = args
+            .get("content_b64")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                CoreError::Message("missing required string argument 'content_b64'".into())
+            })?;
+        let overwrite = args
+            .get("overwrite")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        write_file_bytes_at(&self.root, &self.backups, path, content_b64, overwrite)
+    }
 }
 
 #[async_trait]
@@ -1281,6 +1455,53 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fleety-tools-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("mk temp");
         dir
+    }
+
+    #[test]
+    fn file_bytes_roundtrip_binary_and_verify_sha() {
+        let root = temp();
+        let backups = temp();
+        // Non-UTF-8 bytes read_file (text) couldn't handle.
+        let raw: Vec<u8> = vec![0x00, 0xff, 0x10, 0x80, b'h', b'i', 0xfe];
+        std::fs::write(root.join("blob.bin"), &raw).expect("seed");
+
+        let read = read_file_bytes_at(&root, "blob.bin").expect("read bytes");
+        let b64 = read["content_b64"].as_str().expect("b64");
+        let src_sha = read["sha256"].as_str().expect("sha").to_string();
+        assert_eq!(read["bytes"].as_u64(), Some(raw.len() as u64));
+
+        // Write the base64 elsewhere; bytes and sha must match exactly.
+        let wr = write_file_bytes_at(&root, &backups, "copy.bin", b64, true).expect("write bytes");
+        assert_eq!(wr["sha256"].as_str(), Some(src_sha.as_str()));
+        assert_eq!(
+            std::fs::read(root.join("copy.bin")).expect("read back"),
+            raw
+        );
+
+        // overwrite=false refuses an existing target.
+        assert!(write_file_bytes_at(&root, &backups, "copy.bin", b64, false).is_err());
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&backups);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn file_bytes_reject_oversize() {
+        let root = temp();
+        let backups = temp();
+        std::env::set_var("FLEETY_TRANSFER_MAX_BYTES", "8");
+        std::fs::write(root.join("big.bin"), vec![0u8; 20]).expect("seed");
+        let read = read_file_bytes_at(&root, "big.bin");
+        assert!(read.is_err(), "oversize read is rejected");
+        // Oversize write is rejected too, and nothing is written.
+        use base64::Engine;
+        let big = base64::engine::general_purpose::STANDARD.encode(vec![0u8; 20]);
+        assert!(write_file_bytes_at(&root, &backups, "out.bin", &big, true).is_err());
+        assert!(!root.join("out.bin").exists());
+        std::env::remove_var("FLEETY_TRANSFER_MAX_BYTES");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&backups);
     }
 
     #[test]
