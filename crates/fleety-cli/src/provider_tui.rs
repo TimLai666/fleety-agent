@@ -619,14 +619,30 @@ fn on_key_add_wizard(app: &mut App, code: KeyCode) {
             if let Mode::AddProvider(w) = std::mem::replace(&mut app.mode, Mode::Browse) {
                 let base_url = (!w.base_url.is_empty()).then_some(w.base_url);
                 let key = (!w.key.is_empty()).then_some(w.key);
-                app.status =
-                    match app
-                        .ed
-                        .add_provider(w.name.clone(), w.kind.clone(), base_url, key)
-                    {
-                        Ok(()) => format!("added provider '{}'", w.name),
-                        Err(e) => format!("error: {e}"),
-                    };
+                let is_oauth = w.kind.eq_ignore_ascii_case("oauth:codex");
+                match app
+                    .ed
+                    .add_provider(w.name.clone(), w.kind.clone(), base_url, key)
+                {
+                    Ok(()) => {
+                        // An oauth:codex provider is useless until it is signed in,
+                        // so go straight into login: save the new provider (to the
+                        // server, via the caller) then run the sign-in flow —
+                        // exactly what the OAuth-action menu does.
+                        if is_oauth {
+                            app.auth_request = Some(AuthRequest {
+                                action: AuthAction::Login,
+                                provider: w.name.clone(),
+                            });
+                            app.save_now = true;
+                            app.quit = true;
+                            app.status = format!("added '{}' — signing in…", w.name);
+                        } else {
+                            app.status = format!("added provider '{}'", w.name);
+                        }
+                    }
+                    Err(e) => app.status = format!("error: {e}"),
+                }
             }
         }
     }
@@ -1581,6 +1597,27 @@ mod tests {
             Some("orig"),
             "blank key keeps the current one"
         );
+    }
+
+    #[test]
+    fn adding_an_oauth_provider_goes_straight_to_login() {
+        let mut app = App::new(ProvidersConfig::default());
+        on_key(&mut app, KeyCode::Char('a')); // add wizard: PickType (api at 0)
+        on_key(&mut app, KeyCode::Down); // move to oauth:codex (index 1)
+        on_key(&mut app, KeyCode::Enter); // pick oauth:codex → Name step
+        type_str(&mut app, "tingzhen-codex");
+        on_key(&mut app, KeyCode::Enter); // oauth has no base_url/key → Complete
+                                          // The provider is added AND a sign-in is requested (save + quit), so the
+                                          // caller runs login right away instead of leaving a signed-out shell.
+        assert!(app.ed.cfg.provider("tingzhen-codex").is_some());
+        let req = app
+            .auth_request
+            .as_ref()
+            .expect("login request on oauth add");
+        assert_eq!(req.action, AuthAction::Login);
+        assert_eq!(req.provider, "tingzhen-codex");
+        assert!(app.save_now, "saves the new provider before signing in");
+        assert!(app.quit, "leaves the editor to run the browser flow");
     }
 
     #[test]

@@ -112,6 +112,14 @@ async fn fetch_providers(tx: &mut Tx, rx: &mut Rx) -> Result<ProvidersConfig> {
                 None => e.message,
             }))
         }
+        // A bare error frame (e.g. auth/permission) → surface its message, not a
+        // Debug dump.
+        Some(ServerMsg::Error { error }) => {
+            return Err(CoreError::Message(match error.remediation {
+                Some(r) => format!("{} — {r}", error.message),
+                None => error.message,
+            }))
+        }
         other => {
             return Err(CoreError::Provider(format!(
                 "expected a config snapshot, got {other:?}"
@@ -339,7 +347,14 @@ pub async fn status(provider: Option<String>) -> Result<()> {
     }
     let label = server_label(&target);
     let names = match provider {
-        Some(p) => vec![p],
+        Some(p) => {
+            // Validate the name the same way login/logout do, so a typo or a
+            // non-oauth provider reports "no such provider" rather than the
+            // misleading "not signed in".
+            let cfg = fetch_providers(&mut tx, &mut rx).await?;
+            validate_codex_provider(&cfg, &p)?;
+            vec![p]
+        }
         None => {
             let cfg = fetch_providers(&mut tx, &mut rx).await?;
             let names = codex_provider_names(&cfg);

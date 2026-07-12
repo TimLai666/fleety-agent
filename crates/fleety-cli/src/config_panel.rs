@@ -579,9 +579,22 @@ pub async fn run() -> Result<()> {
     loop {
         match run_menu().await? {
             Some(MenuChoice::Settings) => run_settings().await?,
-            // Providers + Models share the interactive providers editor for now
-            // (it does both add-provider and set-model).
-            Some(MenuChoice::Providers) | Some(MenuChoice::Models) => run_providers().await?,
+            // Providers + Models are SERVER config: edit the connected server's
+            // providers over the connection (snapshot → edit → apply), so an
+            // added provider is real on the server and Codex sign-in can find it.
+            // (Never a local file — providers live on the server.) A failure here
+            // (e.g. server unreachable) returns to the menu rather than tearing
+            // down the whole config session.
+            Some(MenuChoice::Providers) | Some(MenuChoice::Models) => {
+                if let Err(e) = crate::config::provider_edit_remote().await {
+                    eprintln!("\n{}", e.report().message);
+                    eprint!("(press Enter to return to the menu) ");
+                    use std::io::Write;
+                    let _ = std::io::stdout().flush();
+                    let mut buf = String::new();
+                    let _ = std::io::stdin().read_line(&mut buf);
+                }
+            }
             Some(MenuChoice::Quit) | None => return Ok(()),
         }
     }
@@ -647,11 +660,13 @@ fn render_menu(f: &mut Frame, sel: usize) {
     );
 }
 
-/// Launch the interactive providers/models editor over this host's providers.toml
-/// (from the "Providers"/"Models" menu items). When the editor asks for an OAuth
-/// action (sign in / out / switch on an `oauth:codex` provider), run it after the
-/// full-screen UI is torn down — the browser flow needs the plain terminal — then
-/// reopen the editor.
+/// Launch the interactive providers/models editor over **this host's own**
+/// `providers.toml` — the explicit `fleety config --target local provider edit`
+/// escape hatch (editing a local file directly, e.g. on a server host). The
+/// menu and the default (server) `provider edit` go through
+/// [`crate::config::provider_edit_remote`] instead, which edits the connected
+/// server's providers over the wire. When the editor asks for an OAuth action,
+/// run it after the full-screen UI is torn down, then reopen.
 pub async fn run_providers() -> Result<()> {
     let path = fleety_tools::providers_config::providers_path();
     loop {
@@ -664,16 +679,19 @@ pub async fn run_providers() -> Result<()> {
 
 /// Run a provider's requested OAuth action (the editor exited to let us), print
 /// the outcome, and wait for Enter so the user can read it before the editor
-/// reopens. Switch = sign out then in.
-async fn run_auth_action(req: &crate::provider_tui::AuthRequest) {
+/// reopens. Switch = sign out then in. Shared by the local and remote editors.
+pub(crate) async fn run_auth_action(req: &crate::provider_tui::AuthRequest) {
     use crate::provider_tui::AuthAction;
     let result = match req.action {
         AuthAction::Login => crate::auth::login(&req.provider, false).await,
         AuthAction::Logout => crate::auth::logout(&req.provider).await,
-        AuthAction::Switch => match crate::auth::logout(&req.provider).await {
-            Ok(()) => crate::auth::login(&req.provider, false).await,
-            other => other,
-        },
+        AuthAction::Switch => {
+            // "Switch account" = sign in as a different account. Tolerate a logout
+            // failure (e.g. this provider was never signed in) — reaching login is
+            // what matters, so a delete of an absent credential must not abort it.
+            let _ = crate::auth::logout(&req.provider).await;
+            crate::auth::login(&req.provider, false).await
+        }
     };
     if let Err(e) = result {
         eprintln!("auth for '{}': {}", req.provider, e.report().message);

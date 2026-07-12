@@ -133,7 +133,7 @@ pub async fn provider_edit_remote() -> Result<()> {
         // The editor loop is synchronous (crossterm events); each save runs the
         // async apply on the runtime from inside it.
         let handle = tokio::runtime::Handle::current();
-        let conflict = tokio::task::block_in_place(|| {
+        let outcome = tokio::task::block_in_place(|| {
             crate::provider_tui::run_with_saver(cfg, |edited| {
                 let json = serde_json::to_string(edited)
                     .map_err(|e| CoreError::Message(format!("serialize providers: {e}")))?;
@@ -185,10 +185,17 @@ pub async fn provider_edit_remote() -> Result<()> {
                 })
             })
         })?;
-        // The remote provider-edit path ignores an OAuth action request (Codex
-        // sign-in is a local flow, out of scope for the remote editor here); only
-        // a concurrent-edit conflict reopens.
-        match conflict.conflict {
+        // An OAuth action the editor asked for: the just-added/edited provider is
+        // already applied to the server (the save above ran the ConfigApply), and
+        // the editor tore down the full-screen UI so the browser flow can use the
+        // plain terminal. Run the sign-in/out/switch against THIS server, then
+        // reopen the editor on a fresh snapshot.
+        if let Some(req) = outcome.auth_request {
+            crate::config_panel::run_auth_action(&req).await;
+            continue;
+        }
+        // A concurrent-edit conflict: reload from a fresh snapshot and reopen.
+        match outcome.conflict {
             None => return Ok(()),
             Some(msg) => {
                 println!("{msg} — reloading the current server configuration…");

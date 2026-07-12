@@ -176,6 +176,18 @@ fn build_codex_responses(
     let cfg = fleety_tools::oauth::oauth_config();
     let endpoint = format!("{}/responses", cfg.backend_base_url.trim_end_matches('/'));
     tracing::info!(%endpoint, %model, %label, provider = provider_name.unwrap_or("(env)"), "using Codex Responses provider (oauth:codex)");
+    if provider_name.is_none() {
+        // Env-bootstrapped oauth:codex (no providers.toml name) reads the legacy
+        // global store, which is cleared every boot and can never be written
+        // (credentials are per-provider now) — so it can never sign in. Warn once
+        // at build time; a named providers.toml oauth:codex provider is required.
+        tracing::warn!(
+            %label,
+            "oauth:codex configured via env has no provider name to sign in as; it cannot \
+             authenticate — add a named oauth:codex provider in providers.toml and \
+             `fleety auth login <provider>`"
+        );
+    }
     let auth_src = fleety_tools::oauth::OAuthCodexAuth::new(codex_token_path(provider_name), &cfg);
     Arc::new(
         CodexResponses::new(endpoint, model, Arc::new(auth_src))
