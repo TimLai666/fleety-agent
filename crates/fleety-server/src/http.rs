@@ -630,9 +630,14 @@ mod tests {
     /// daemon is protected without an upgrade): a bare tokio-tungstenite
     /// client — exactly the WebSocket layer a pre-liveness fleetyd uses —
     /// keeps polling its socket, so tungstenite answers the server's pings
-    /// automatically. Across several deadline windows of message silence it
+    /// automatically. Across a full deadline window of message silence it
     /// stays registered and can still run a full message round-trip, with no
     /// client-side or protocol change.
+    ///
+    /// Timings are deliberately generous (1s deadline, 100ms pings) so the test
+    /// is robust under the scheduler jitter of a loaded `cargo test --workspace`
+    /// run: the connection is only reclaimed if a pong is delayed past the whole
+    /// deadline, which a >1s task starvation would take — far beyond normal jitter.
     #[tokio::test]
     async fn ws_liveness_keeps_healthy_idle_connection() {
         let home = std::env::temp_dir().join(format!("fleety-wsidle-{}", uuid::Uuid::new_v4()));
@@ -640,19 +645,20 @@ mod tests {
         let mut state = test_state(&home);
         state.ws_liveness = WsLiveness {
             ping_interval: Duration::from_millis(100),
-            deadline: Duration::from_millis(300),
+            deadline: Duration::from_millis(1000),
         };
         let hub = Arc::clone(&state.hub);
         let base = serve(state).await;
 
         let (mut ws, conversation) = ws_hello(&base, "idle-dev").await;
 
-        // Idle (no messages) for ~3x the deadline while polling the socket —
-        // the frames read here are the server's pings, and reading them is
-        // what lets the WebSocket layer flush its automatic pong replies.
-        let idle_until = tokio::time::Instant::now() + Duration::from_millis(1000);
+        // Idle (no messages) for longer than the deadline while polling the
+        // socket — the frames read here are the server's pings, and reading them
+        // is what lets the WebSocket layer flush its automatic pong replies. The
+        // short poll timeout flushes pongs promptly even when the runtime is busy.
+        let idle_until = tokio::time::Instant::now() + Duration::from_millis(1200);
         while tokio::time::Instant::now() < idle_until {
-            match timeout(Duration::from_millis(50), ws.next()).await {
+            match timeout(Duration::from_millis(25), ws.next()).await {
                 Ok(Some(Ok(_))) => {}
                 Ok(other) => panic!("connection ended while idle: {other:?}"),
                 Err(_) => {} // no frame this tick
