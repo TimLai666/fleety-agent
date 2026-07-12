@@ -233,8 +233,8 @@ pub fn registry() -> &'static [Setting] {
         Setting {
             key: "FLEETY_TZ",
             scope: Shared,
-            default: "UTC",
-            description: "Fallback timezone for display (IANA).",
+            default: "(device)",
+            description: "Fallback timezone for display (IANA). Unset → the host device's local timezone, then UTC.",
             secret: false,
             validator: None,
         },

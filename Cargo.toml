@@ -38,5 +38,6 @@ png = "0.17"
 cron = "0.15"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 chrono-tz = { version = "0.10", default-features = false }
+iana-time-zone = "0.1"
 mdns-sd = "0.13"
 zip = { version = "2", default-features = false, features = ["deflate"] }

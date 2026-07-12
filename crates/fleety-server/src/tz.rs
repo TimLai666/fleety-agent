@@ -1,7 +1,9 @@
 //! Per-user timezone rendering. Storage keeps timestamps as Unix epoch (UTC);
 //! this module resolves the acting user's IANA timezone (profile → `FLEETY_TZ`
-//! → UTC) and renders an epoch for display / "now". Reuses `chrono-tz` (the same
-//! library schedules use for cron zones).
+//! → the host device's local timezone → UTC) and renders an epoch for display /
+//! "now". Reuses `chrono-tz` (the same library schedules use for cron zones) and
+//! `iana-time-zone` to detect the host's own zone so times follow the device by
+//! default instead of always UTC.
 
 use std::sync::Arc;
 
@@ -79,8 +81,22 @@ impl Tool for SetTimezone {
 
 /// Resolve the timezone: the acting user's configured zone, else `FLEETY_TZ`,
 /// else UTC. An invalid zone string falls through to the next source.
+/// The host device's own IANA timezone (e.g. `Asia/Taipei`), or `None` if it
+/// can't be detected or isn't a zone `chrono-tz` knows.
+pub fn device_tz() -> Option<Tz> {
+    iana_time_zone::get_timezone()
+        .ok()
+        .and_then(|name| name.parse::<Tz>().ok())
+}
+
+/// Resolve the timezone to render "now" in: the acting user's saved zone, else
+/// `FLEETY_TZ`, else the **host device's** local zone, else UTC. So a stock
+/// server shows times in the device's timezone rather than always UTC.
 pub fn resolve_tz(user_tz: Option<&str>, env_tz: Option<&str>) -> Tz {
-    parse(user_tz).or_else(|| parse(env_tz)).unwrap_or(Tz::UTC)
+    parse(user_tz)
+        .or_else(|| parse(env_tz))
+        .or_else(device_tz)
+        .unwrap_or(Tz::UTC)
 }
 
 /// Render a Unix epoch (seconds) as a human string in `tz`, e.g.
@@ -97,7 +113,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn precedence_user_then_env_then_utc() {
+    fn precedence_user_then_env_then_device_then_utc() {
         // Valid user tz wins.
         assert_eq!(
             resolve_tz(Some("Asia/Taipei"), Some("Europe/Paris")),
@@ -108,11 +124,12 @@ mod tests {
             resolve_tz(Some("Not/AZone"), Some("Europe/Paris")),
             Tz::Europe__Paris
         );
-        // Invalid/absent env → UTC.
-        assert_eq!(resolve_tz(Some("bad"), Some("also-bad")), Tz::UTC);
-        assert_eq!(resolve_tz(None, None), Tz::UTC);
-        // Blank strings fall through.
-        assert_eq!(resolve_tz(Some("  "), None), Tz::UTC);
+        // Invalid/absent user+env → the host device's zone, else UTC.
+        let device_fallback = device_tz().unwrap_or(Tz::UTC);
+        assert_eq!(resolve_tz(Some("bad"), Some("also-bad")), device_fallback);
+        assert_eq!(resolve_tz(None, None), device_fallback);
+        // Blank strings fall through to the same fallback.
+        assert_eq!(resolve_tz(Some("  "), None), device_fallback);
     }
 
     #[tokio::test]
