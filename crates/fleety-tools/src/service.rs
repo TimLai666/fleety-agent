@@ -13,7 +13,7 @@
 //! and verified manually.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use agent_core::{CoreError, Result};
 
@@ -137,7 +137,13 @@ pub fn verb_argv(os: Os, spec: &ServiceSpec, verb: Verb, domain: &str) -> Vec<Ve
             let target = format!("{domain}/{label}");
             match verb {
                 Verb::Install => {
-                    vec![s(&["launchctl", "bootstrap", domain]).plus(unit_path(os, spec))]
+                    // bootout first (best-effort — see run_verb) so re-installing
+                    // an already-loaded service reloads cleanly instead of
+                    // failing bootstrap with EIO ("service already loaded").
+                    vec![
+                        s(&["launchctl", "bootout", &target]),
+                        s(&["launchctl", "bootstrap", domain]).plus(unit_path(os, spec)),
+                    ]
                 }
                 Verb::Uninstall => vec![s(&["launchctl", "bootout", &target])],
                 Verb::Start => vec![s(&["launchctl", "kickstart", &target])],
@@ -192,18 +198,27 @@ pub fn run_verb(spec: &ServiceSpec, verb: Verb) -> Result<()> {
         }
     }
     let domain = launchd_domain();
-    for argv in verb_argv(os, spec, verb, &domain) {
+    for (i, argv) in verb_argv(os, spec, verb, &domain).into_iter().enumerate() {
         let Some((program, args)) = argv.split_first() else {
             continue;
         };
-        let status = Command::new(program).args(args).status().map_err(|e| {
+        // macOS Install runs `[bootout, bootstrap]`; the leading bootout is
+        // best-effort (it fails when nothing is loaded yet) and its "not loaded"
+        // stderr must not leak, so only the bootstrap has to succeed.
+        let best_effort = os == Os::Macos && verb == Verb::Install && i == 0;
+        let mut cmd = Command::new(program);
+        cmd.args(args);
+        if best_effort {
+            cmd.stdout(Stdio::null()).stderr(Stdio::null());
+        }
+        let status = cmd.status().map_err(|e| {
             CoreError::Message(format!(
                 "service command '{program}' failed to run: {e}{}",
                 admin_hint(os, verb)
             ))
         })?;
         // Status verbs are queries; a non-zero just means "not active/enabled".
-        if !status.success() && verb != Verb::Status {
+        if !status.success() && verb != Verb::Status && !best_effort {
             return Err(CoreError::Message(format!(
                 "service command '{}' exited with failure{}",
                 argv.join(" "),
@@ -394,8 +409,12 @@ pub fn pid_alive(pid: u32) -> bool {
             })
             .unwrap_or(false)
     } else {
+        // `-0` only probes; suppress output so a dead pid doesn't leak
+        // "kill: <pid>: No such process" to the terminal (it is expected here).
         Command::new("kill")
             .args(["-0", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status()
             .map(|s| s.success())
             .unwrap_or(false)
@@ -514,6 +533,13 @@ mod tests {
                 "gui/501/com.fleety.fleetyd".to_string()
             ]]
         );
+        // Install is idempotent: bootout (best-effort) then bootstrap, so a
+        // re-run against an already-loaded service reloads instead of failing.
+        let install = verb_argv(Os::Macos, &s, Verb::Install, "gui/501");
+        assert_eq!(install.len(), 2);
+        assert_eq!(install[0][1], "bootout");
+        assert_eq!(install[0][2], "gui/501/com.fleety.fleetyd");
+        assert_eq!(install[1][1], "bootstrap");
     }
 
     #[test]
