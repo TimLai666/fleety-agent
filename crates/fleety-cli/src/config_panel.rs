@@ -344,7 +344,7 @@ fn render(f: &mut Frame, p: &Panel) {
             }
             lines.push(Line::from(""));
             lines.push(Line::from(
-                "(u: switch current · Enter: edit url · s: save)",
+                "(u: switch current · Enter: edit url · s: save · 'local' needs no pairing)",
             ));
         }
         Region::Local => {
@@ -418,6 +418,12 @@ fn render(f: &mut Frame, p: &Panel) {
 /// negotiate the structured-config capability, pull a snapshot if supported,
 /// then run the three-region editor. Connection/local edits persist to their
 /// files; server edits are staged and applied via `ConfigApply`.
+/// Whether any saved profile already targets `local_url` (so the panel need not
+/// inject a `local` entry). Pure.
+fn has_local_profile(conns: &Connections, local_url: &str) -> bool {
+    conns.profiles.values().any(|p| p.url == local_url)
+}
+
 pub async fn run() -> Result<()> {
     // Resolve + connect, capturing the Welcome so we know the server's config
     // protocol. On any connection failure, the panel still opens for the local
@@ -461,7 +467,24 @@ pub async fn run() -> Result<()> {
         }
     }
 
-    let conns = connection::load()?;
+    let mut conns = connection::load()?;
+    // Offer the local server (like guided init): if one answers on loopback and
+    // no saved profile already targets it, inject a `local` entry so it shows in
+    // the Connection region. Kept in memory — only persisted if the user saves.
+    let local_url = crate::local_server_url();
+    if !has_local_profile(&conns, &local_url)
+        && crate::probe_local_server(&local_url, std::time::Duration::from_secs(1))
+            .await
+            .is_some()
+    {
+        conns
+            .profiles
+            .entry("local".to_string())
+            .or_insert_with(|| connection::Profile {
+                url: local_url.clone(),
+                ..Default::default()
+            });
+    }
     let local_map = fleety_tools::config::load(&fleety_tools::config::config_path());
     let mut app = Panel::new(conns, local_map, server_supported, entries, revision);
 
@@ -595,6 +618,28 @@ async fn apply_changes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn has_local_profile_matches_by_url() {
+        let mut conns = Connections::default();
+        assert!(!has_local_profile(&conns, "ws://127.0.0.1:8787"));
+        conns.profiles.insert(
+            "home".into(),
+            connection::Profile {
+                url: "ws://mini:8787".into(),
+                ..Default::default()
+            },
+        );
+        assert!(!has_local_profile(&conns, "ws://127.0.0.1:8787"));
+        conns.profiles.insert(
+            "local".into(),
+            connection::Profile {
+                url: "ws://127.0.0.1:8787".into(),
+                ..Default::default()
+            },
+        );
+        assert!(has_local_profile(&conns, "ws://127.0.0.1:8787"));
+    }
 
     fn panel_with_entries(entries: Vec<ConfigEntry>) -> Panel {
         Panel::new(

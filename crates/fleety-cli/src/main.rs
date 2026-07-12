@@ -861,7 +861,7 @@ fn render_pick_line(
 
 /// The local server's WebSocket URL: `ws://127.0.0.1:<port>`, port taken from
 /// `FLEETY_ADDR` (`host:port`) or the default. Pure.
-fn local_server_url() -> String {
+pub(crate) fn local_server_url() -> String {
     let port = std::env::var("FLEETY_ADDR")
         .ok()
         .and_then(|a| a.rsplit(':').next().map(String::from))
@@ -874,7 +874,10 @@ fn local_server_url() -> String {
 /// `Welcome`. Returns it as a discovery entry named `local` (carrying any
 /// advertised fingerprint) when it answers, else `None` — a host with no local
 /// server is not delayed beyond the timeout, and the probe never errors init.
-async fn probe_local_server(url: &str, timeout: std::time::Duration) -> Option<DiscoveredServer> {
+pub(crate) async fn probe_local_server(
+    url: &str,
+    timeout: std::time::Duration,
+) -> Option<DiscoveredServer> {
     let ws = tokio::time::timeout(timeout, transport::connect(url, None))
         .await
         .ok()?
@@ -1238,11 +1241,7 @@ async fn ask(text: String, attachments: Vec<WireAttachment>) -> Result<()> {
     send(&mut tx, &hello(target.token.clone(), None)).await?;
     match recv(&mut rx).await? {
         Some(ServerMsg::Welcome { .. }) => {}
-        other => {
-            return Err(CoreError::Provider(format!(
-                "expected welcome, got {other:?}"
-            )))
-        }
+        other => return Err(CoreError::Message(hello_failure_message(other.as_ref()))),
     }
 
     send(
@@ -1364,11 +1363,7 @@ async fn voice_chat() -> Result<()> {
             audio_input,
             ..
         }) => (conversation_id, audio_input),
-        other => {
-            return Err(CoreError::Provider(format!(
-                "expected welcome, got {other:?}"
-            )))
-        }
+        other => return Err(CoreError::Message(hello_failure_message(other.as_ref()))),
     };
     // Decide once: send audio to an audio-capable model, else transcribe locally.
     let voice_mode = voice::voice_mode(audio_input, voice::voice_audio_setting());
@@ -1483,11 +1478,7 @@ async fn resume(conversation_id: String, after_seq: u64) -> Result<()> {
     send(&mut tx, &hello(target.token.clone(), None)).await?;
     match recv(&mut rx).await? {
         Some(ServerMsg::Welcome { .. }) => {}
-        other => {
-            return Err(CoreError::Provider(format!(
-                "expected welcome, got {other:?}"
-            )))
-        }
+        other => return Err(CoreError::Message(hello_failure_message(other.as_ref()))),
     }
 
     send(
@@ -1527,9 +1518,25 @@ async fn connect_hello() -> Result<(Tx, Rx)> {
             tofu_pin(server_fingerprint.as_deref(), &target);
             Ok((tx, rx))
         }
-        other => Err(CoreError::Provider(format!(
-            "expected welcome, got {other:?}"
-        ))),
+        other => Err(CoreError::Message(hello_failure_message(other.as_ref()))),
+    }
+}
+
+/// A human-readable reason a Hello handshake did not yield a `Welcome`. Never a
+/// Debug dump of the internal frame. Pure. An `unauthenticated` rejection is the
+/// common "not paired yet" case and gets actionable guidance.
+fn hello_failure_message(reply: Option<&ServerMsg>) -> String {
+    match reply {
+        Some(ServerMsg::Error { error }) if is_auth_rejection(&error.kind) => {
+            "not paired with this server — run `fleety pair <code>` (mint a code with \
+             `fleety pair-code` on the server host)"
+                .to_string()
+        }
+        Some(ServerMsg::Error { error }) => {
+            format!("the server rejected the connection: {}", error.message)
+        }
+        Some(other) => format!("unexpected reply from server ({})", server_msg_kind(other)),
+        None => "the connection closed before the server replied".to_string(),
     }
 }
 
@@ -1568,9 +1575,7 @@ pub(crate) async fn connect_hello_for_auth() -> Result<(Tx, Rx, u32, connection:
             tofu_pin(server_fingerprint.as_deref(), &target);
             Ok((tx, rx, config_protocol, target))
         }
-        other => Err(CoreError::Provider(format!(
-            "expected welcome, got {other:?}"
-        ))),
+        other => Err(CoreError::Message(hello_failure_message(other.as_ref()))),
     }
 }
 
@@ -1924,11 +1929,7 @@ pub(crate) async fn open_panel() -> Result<((Tx, Rx), u32)> {
         Some(ServerMsg::Welcome {
             config_protocol, ..
         }) => config_protocol,
-        other => {
-            return Err(CoreError::Provider(format!(
-                "expected welcome, got {other:?}"
-            )))
-        }
+        other => return Err(CoreError::Message(hello_failure_message(other.as_ref()))),
     };
     Ok(((tx, rx), config_protocol))
 }
@@ -2054,6 +2055,34 @@ mod tests {
         assert!(!is_auth_rejection("invalid"));
         assert!(!is_auth_rejection("io"));
         assert!(!is_auth_rejection(""));
+    }
+
+    #[test]
+    fn hello_failure_messages_are_readable_never_debug() {
+        let err = |kind: &str, msg: &str| {
+            Some(ServerMsg::Error {
+                error: fleety_protocol::WireError {
+                    kind: kind.into(),
+                    message: msg.into(),
+                    remediation: None,
+                },
+            })
+        };
+        // Unauthenticated → not-paired guidance mentioning pair / pair-code.
+        let m = hello_failure_message(err("unauthenticated", "nope").as_ref());
+        assert!(m.contains("not paired") && m.contains("fleety pair"));
+        assert!(m.contains("pair-code"));
+        // Other server error → surfaces the server message, not a Debug dump.
+        let m = hello_failure_message(err("io", "disk full").as_ref());
+        assert!(m.contains("disk full") && !m.contains("Error {"));
+        // Closed connection.
+        assert!(hello_failure_message(None).contains("closed"));
+        // Any other frame → readable tag, not a `{variant:?}` dump.
+        let other = Some(ServerMsg::Done {
+            conversation_id: "c1".into(),
+        });
+        let m = hello_failure_message(other.as_ref());
+        assert!(m.contains("unexpected reply") && !m.contains("conversation_id"));
     }
 
     #[test]

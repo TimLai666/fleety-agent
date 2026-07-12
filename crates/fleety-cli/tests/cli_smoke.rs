@@ -535,7 +535,13 @@ fn init_pair_and_ask_report_unexpected_server_frames() {
     let (url, rx) = start_ws_server(vec![vec![server_error]]);
     let (output, _) = run_against_server(&["ask", "hi"], &url, &home, rx);
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("expected welcome"));
+    // The handshake failure is reported readably (the server's message surfaced),
+    // never a Debug dump of the internal frame.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("wrong frame") && !stderr.contains("Error {"),
+        "{stderr}"
+    );
 
     let (url, rx) = start_ws_server(vec![vec![welcome(None)]]);
     let (output, _) = run_against_server(&["pair", "PAIR-2"], &url, &home, rx);
