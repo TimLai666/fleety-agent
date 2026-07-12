@@ -8,12 +8,27 @@ TBD - created by archiving change 'codex-oauth'. Update Purpose after archive.
 
 ### Requirement: ChatGPT login uses a PKCE authorization-code flow
 
-The CLI SHALL provide a `login` command that authenticates against ChatGPT using an OAuth 2.0 authorization-code flow with PKCE (S256). It SHALL generate a high-entropy code verifier and its S256 challenge, open the authorization endpoint in a browser with the client id, a loopback redirect URI, a state value, and the code challenge, and capture the returned authorization code on a temporary local loopback listener. It SHALL verify the returned state before exchanging the code, and SHALL exchange the code plus verifier at the token endpoint for an access token and a refresh token. When no browser is available, the command SHALL be able to print the authorization URL instead of opening a browser. The exchanged tokens SHALL be delivered over the authenticated connection to the currently connected server for storage; the CLI SHALL NOT persist them to a local token file. Before starting the browser flow, login SHALL verify the connected server advertises credential support (config protocol 2 or newer) and fail up front with an update-the-server error otherwise. A delivery failure (unreachable, unpaired, or refusing server) SHALL fail the login with a remediation message and SHALL NOT fall back to local storage. On successful delivery, the CLI SHALL name the server (profile and URL) the credential now lives on, and SHALL delete a leftover legacy local token file when one exists.
+The CLI SHALL provide a `login <provider>` command that authenticates a named `oauth:codex` provider against ChatGPT using an OAuth 2.0 authorization-code flow with PKCE (S256). The command SHALL require a provider argument that names an existing `oauth:codex` provider in the connected server's provider config, and SHALL fail with a usage error (naming an example) when the argument is missing, and with a by-name error when the provider does not exist or is not an `oauth:codex` type. It SHALL generate a high-entropy code verifier and its S256 challenge, open the authorization endpoint in a browser with the client id, a loopback redirect URI, a state value, and the code challenge, and capture the returned authorization code on a temporary local loopback listener. It SHALL verify the returned state before exchanging the code, and SHALL exchange the code plus verifier at the token endpoint for an access token and a refresh token. When no browser is available, the command SHALL be able to print the authorization URL instead of opening a browser. The exchanged tokens SHALL be delivered over the authenticated connection to the currently connected server for storage **tagged with the provider name**; the CLI SHALL NOT persist them to a local token file. Before starting the browser flow, login SHALL verify the connected server advertises per-provider credential support (config protocol 3 or newer) and fail up front with an update-the-server error otherwise, opening no browser. A delivery failure (unreachable, unpaired, or refusing server) SHALL fail the login with a remediation message and SHALL NOT fall back to local storage. Re-running login for a provider that already has a stored credential SHALL replace it, switching that provider's account. On successful delivery, the CLI SHALL name the server (profile and URL) and the provider the credential now lives on, and SHALL delete a leftover legacy local token file when one exists.
 
-#### Scenario: successful login delivers tokens to the connected server
+#### Scenario: login binds tokens to the named provider
 
-- **WHEN** a user runs the login command and completes authorization in the browser
-- **THEN** the CLI captures the code on the loopback listener, exchanges it with the code verifier, delivers the resulting tokens to the connected server over the authenticated connection, and no token file is written on the CLI host
+- **WHEN** a user runs login for an `oauth:codex` provider and completes authorization in the browser
+- **THEN** the CLI captures the code on the loopback listener, exchanges it with the code verifier, delivers the resulting tokens to the connected server tagged with that provider name, and no token file is written on the CLI host
+
+#### Scenario: two providers hold two accounts
+
+- **WHEN** a user logs in provider `a` with one account and provider `b` with a different account
+- **THEN** each provider's stored credential is that account's, independent of the other
+
+#### Scenario: re-login switches a provider's account
+
+- **WHEN** a user runs login again for a provider that already has a stored credential, authorizing a different account
+- **THEN** that provider's stored credential is replaced with the new account's tokens
+
+#### Scenario: missing or wrong provider argument is actionable
+
+- **WHEN** login is run with no provider argument, or with a name that is not an existing `oauth:codex` provider
+- **THEN** the CLI fails with a usage or by-name error and opens no browser
 
 #### Scenario: state mismatch aborts
 
@@ -27,7 +42,7 @@ The CLI SHALL provide a `login` command that authenticates against ChatGPT using
 
 #### Scenario: old server is rejected before the browser opens
 
-- **WHEN** login runs while connected to a server that does not advertise credential support
+- **WHEN** login runs while connected to a server that does not advertise per-provider credential support (config protocol below 3)
 - **THEN** the CLI fails before opening the browser, telling the user to update the server first
 
 #### Scenario: delivery failure does not store locally
@@ -38,63 +53,85 @@ The CLI SHALL provide a `login` command that authenticates against ChatGPT using
 #### Scenario: leftover legacy local file is cleaned up
 
 - **WHEN** login succeeds on a CLI host that still has a legacy local token file from an earlier version
-- **THEN** the CLI deletes the legacy file and tells the user credentials now live on the server
+- **THEN** the CLI deletes that stale local file
 
 
 <!-- @trace
-source: codex-oauth-server-side
-updated: 2026-07-11
+source: per-provider-codex-oauth
+updated: 2026-07-12
 code:
-  - crates/fleety-protocol/src/lib.rs
   - docs/env.md
+  - crates/fleety-cli/src/provider_tui.rs
+  - crates/fleety-cli/src/config.rs
+  - crates/fleety-cli/src/config_panel.rs
+  - docs/design-cli-config.md
   - README.md
-  - crates/fleety-cli/src/auth.rs
+  - crates/fleety-server/src/main.rs
+  - crates/fleety-tools/src/oauth.rs
   - crates/fleety-server/src/conn.rs
-  - crates/fleety-cli/src/main.rs
+  - crates/fleety-protocol/src/lib.rs
+  - crates/fleety-server/src/providers.rs
+  - crates/fleety-cli/src/auth.rs
 -->
 
 ---
 ### Requirement: OAuth tokens are stored protected and refreshed automatically
 
-The server SHALL persist the access token, refresh token, and expiry in its own token store file with restricted permissions (mode 0600 on Unix), never in the general config or providers file, and never on the CLI host. Before a model call that uses OAuth, the server SHALL return a valid bearer, refreshing the access token via the refresh token when it is at or near expiry and persisting the refreshed token to the same store. A refresh failure SHALL return an actionable error asking the user to log in again, and SHALL NOT crash. Credential storage and removal SHALL be recorded in the audit log.
+The server SHALL persist each provider's access token, refresh token, and expiry in a **per-provider** token store file keyed by the provider name (mode 0600 on Unix), never in the general config or providers file, and never on the CLI host. On startup the server SHALL delete its legacy global token file if one exists (no migration; each provider re-logs in fresh). Before a model call that uses OAuth for a given provider, the server SHALL return a valid bearer for **that provider**, refreshing its access token via its refresh token when it is at or near expiry and persisting the refreshed token to the same per-provider store. A refresh failure SHALL return an actionable error asking the user to log in again for that provider, and SHALL NOT crash. Credential storage and removal SHALL be recorded in the audit log with the provider named.
+
+#### Scenario: each provider's token is stored separately
+
+- **WHEN** two `oauth:codex` providers each have a credential put
+- **THEN** the server writes two distinct per-provider token store files, and neither read nor refresh of one touches the other
 
 #### Scenario: expired token is refreshed before use
 
-- **WHEN** a model call needs an OAuth bearer and the stored access token is at or past its expiry
-- **THEN** the server refreshes it with the refresh token, persists the new token, and uses it for the call
+- **WHEN** a model call needs an OAuth bearer for a provider and that provider's stored access token is at or past its expiry
+- **THEN** the server refreshes it with that provider's refresh token, persists the new token, and uses it for the call
+
+#### Scenario: legacy global token is cleared on upgrade
+
+- **WHEN** the upgraded server starts and a legacy global token file exists
+- **THEN** the server deletes it and no provider inherits it (each must log in again)
 
 #### Scenario: refresh failure is actionable
 
-- **WHEN** the refresh token is no longer valid and a refresh is attempted
-- **THEN** the call returns an actionable error telling the user to log in again, without crashing
+- **WHEN** a provider's refresh token is no longer valid and a refresh is attempted
+- **THEN** the call returns an actionable error telling the user to log in again for that provider, without crashing
 
 #### Scenario: tokens are not world-readable
 
 - **WHEN** tokens are persisted on a Unix server host
-- **THEN** the token store file is created with owner-only permissions and is not written into the config or providers file
+- **THEN** each per-provider token store file is created with owner-only permissions and is not written into the config or providers file
 
 
 <!-- @trace
-source: codex-oauth-server-side
-updated: 2026-07-11
+source: per-provider-codex-oauth
+updated: 2026-07-12
 code:
-  - crates/fleety-protocol/src/lib.rs
   - docs/env.md
+  - crates/fleety-cli/src/provider_tui.rs
+  - crates/fleety-cli/src/config.rs
+  - crates/fleety-cli/src/config_panel.rs
+  - docs/design-cli-config.md
   - README.md
-  - crates/fleety-cli/src/auth.rs
+  - crates/fleety-server/src/main.rs
+  - crates/fleety-tools/src/oauth.rs
   - crates/fleety-server/src/conn.rs
-  - crates/fleety-cli/src/main.rs
+  - crates/fleety-protocol/src/lib.rs
+  - crates/fleety-server/src/providers.rs
+  - crates/fleety-cli/src/auth.rs
 -->
 
 ---
 ### Requirement: A provider can authenticate with the OAuth token
 
-A provider SHALL support an authentication mode that sources its bearer from the OAuth token store instead of a static key, selected by configuration and defaulting to the static-key mode. When the OAuth mode is selected, the provider SHALL obtain a valid bearer (refreshing if needed) before each call and use the existing OpenAI-compatible request path against the configured backend base URL. When no authentication mode is configured, existing behavior SHALL be unchanged.
+A provider SHALL support an authentication mode that sources its bearer from **its own** provider-named OAuth token store instead of a static key, selected by configuration and defaulting to the static-key mode. When the OAuth mode is selected, the provider SHALL obtain a valid bearer for its own provider name (refreshing if needed) before each call and use the existing OpenAI-compatible request path against the configured backend base URL. When no authentication mode is configured, existing behavior SHALL be unchanged.
 
-#### Scenario: an OAuth provider uses the logged-in account
+#### Scenario: an OAuth provider uses its own account
 
-- **WHEN** a provider's authentication mode is set to the Codex OAuth mode and the user is logged in
-- **THEN** model calls use the OAuth account's bearer token and require no static API key
+- **WHEN** an `oauth:codex` provider's model is called and that provider is logged in
+- **THEN** model calls use that provider's own OAuth account bearer, not another provider's, and require no static API key
 
 #### Scenario: default mode is unchanged
 
@@ -103,55 +140,47 @@ A provider SHALL support an authentication mode that sources its bearer from the
 
 #### Scenario: using an OAuth provider while logged out is actionable
 
-- **WHEN** a provider is set to the OAuth mode but no valid tokens are stored
-- **THEN** a model call returns an actionable error instructing the user to log in, without crashing
+- **WHEN** an `oauth:codex` provider is called but that provider has no valid stored tokens
+- **THEN** a model call returns an actionable error instructing the user to log in for that provider, without crashing
 
 
 <!-- @trace
-source: codex-oauth
-updated: 2026-07-03
+source: per-provider-codex-oauth
+updated: 2026-07-12
 code:
-  - crates/fleety-server/src/providers.rs
   - docs/env.md
-  - crates/fleety-cli/src/auth.rs
-  - prompts/memory.md
-  - crates/fleety-tools/src/lib.rs
-  - crates/fleety-protocol/src/lib.rs
-  - crates/fleety-server/src/main.rs
   - crates/fleety-cli/src/provider_tui.rs
-  - crates/fleety-cli/Cargo.toml
-  - crates/fleety-server/src/gc.rs
-  - crates/fleety-server/src/conn.rs
-  - docs/tools.md
-  - crates/fleety-daemon/src/main.rs
+  - crates/fleety-cli/src/config.rs
+  - crates/fleety-cli/src/config_panel.rs
+  - docs/design-cli-config.md
   - README.md
-  - crates/fleety-cli/src/main.rs
-  - crates/agent-core/src/lib.rs
-  - crates/agent-core/src/openai.rs
-  - crates/fleety-server/src/storage.rs
-  - crates/fleety-server/src/sites.rs
+  - crates/fleety-server/src/main.rs
   - crates/fleety-tools/src/oauth.rs
-  - crates/fleety-daemon/src/colocation.rs
-  - crates/fleety-server/src/presence.rs
-  - crates/fleety-tools/src/config.rs
-  - crates/fleety-server/src/scheduler.rs
-  - crates/fleety-tools/src/providers_config.rs
+  - crates/fleety-server/src/conn.rs
+  - crates/fleety-protocol/src/lib.rs
+  - crates/fleety-server/src/providers.rs
+  - crates/fleety-cli/src/auth.rs
 -->
 
 ---
 ### Requirement: Login status and logout do not leak tokens
 
-The CLI SHALL provide a status command that reports whether the connected server holds a credential and when it expires without printing the token values, and a logout command that removes the credential stored on the connected server. When a legacy local token file exists on the CLI host, status SHALL note that it is no longer used by any flow. The endpoints, client id, and backend base URL SHALL be overridable by configuration with known public defaults.
+The CLI SHALL provide a `status [<provider>]` command and a `logout <provider>` command. `status <provider>` SHALL report whether the connected server holds that provider's credential and when it expires without printing the token values; `status` with no provider SHALL enumerate the `oauth:codex` providers in the connected server's provider config and report each one's signed-in state and expiry on its own line. `logout <provider>` SHALL remove that provider's credential stored on the connected server. When a legacy local token file exists on the CLI host, status SHALL note that it is no longer used by any flow. The endpoints, client id, and backend base URL SHALL be overridable by configuration with known public defaults.
 
-#### Scenario: status reports the server-side state without token values
+#### Scenario: status reports one provider's state without token values
 
-- **WHEN** a user runs the status command while the connected server holds a credential
-- **THEN** it reports the signed-in state and expiry of the server-side credential without printing the access or refresh token
+- **WHEN** a user runs status for a provider while the connected server holds that provider's credential
+- **THEN** it reports the signed-in state and expiry of that provider's server-side credential without printing the access or refresh token
 
-#### Scenario: logout removes the server-side credential
+#### Scenario: status with no provider lists every oauth provider
 
-- **WHEN** a user runs the logout command
-- **THEN** the token store on the connected server is removed and subsequent OAuth calls report a logged-out state
+- **WHEN** a user runs status with no provider argument
+- **THEN** the CLI lists each `oauth:codex` provider with its signed-in state and expiry, one per line
+
+#### Scenario: logout removes one provider's credential
+
+- **WHEN** a user runs logout for a provider
+- **THEN** that provider's token store on the connected server is removed and subsequent OAuth calls for that provider report a logged-out state, while other providers' credentials are untouched
 
 #### Scenario: leftover local file is flagged
 
@@ -165,15 +194,21 @@ The CLI SHALL provide a status command that reports whether the connected server
 
 
 <!-- @trace
-source: codex-oauth-server-side
-updated: 2026-07-11
+source: per-provider-codex-oauth
+updated: 2026-07-12
 code:
-  - crates/fleety-protocol/src/lib.rs
   - docs/env.md
+  - crates/fleety-cli/src/provider_tui.rs
+  - crates/fleety-cli/src/config.rs
+  - crates/fleety-cli/src/config_panel.rs
+  - docs/design-cli-config.md
   - README.md
-  - crates/fleety-cli/src/auth.rs
+  - crates/fleety-server/src/main.rs
+  - crates/fleety-tools/src/oauth.rs
   - crates/fleety-server/src/conn.rs
-  - crates/fleety-cli/src/main.rs
+  - crates/fleety-protocol/src/lib.rs
+  - crates/fleety-server/src/providers.rs
+  - crates/fleety-cli/src/auth.rs
 -->
 
 ---
