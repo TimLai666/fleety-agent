@@ -398,6 +398,12 @@ async fn run_tui() -> Result<()> {
     let token = target.token.clone();
     send(&mut tx, &hello(token.clone(), None)).await?;
 
+    // Converge to a newer server before entering the UI. The Welcome frame is
+    // the greeting; the TUI does not otherwise consume it.
+    if let Ok(Some(ServerMsg::Welcome { server_version, .. })) = recv(&mut rx).await {
+        maybe_converge_cli(&server_version).await;
+    }
+
     // Blocking key reads happen on a thread and arrive over a channel.
     let (key_tx, mut key_rx) = tokio::sync::mpsc::unbounded_channel();
     std::thread::spawn(move || loop {
@@ -1283,7 +1289,9 @@ async fn ask(text: String, attachments: Vec<WireAttachment>) -> Result<()> {
 
     send(&mut tx, &hello(target.token.clone(), None)).await?;
     match recv(&mut rx).await? {
-        Some(ServerMsg::Welcome { .. }) => {}
+        Some(ServerMsg::Welcome { server_version, .. }) => {
+            maybe_converge_cli(&server_version).await;
+        }
         other => return Err(CoreError::Message(hello_failure_message(other.as_ref()))),
     }
 
@@ -1402,10 +1410,14 @@ async fn voice_chat() -> Result<()> {
     send(&mut tx, &hello(target.token.clone(), None)).await?;
     let (conversation, audio_input) = match recv(&mut rx).await? {
         Some(ServerMsg::Welcome {
+            server_version,
             conversation_id,
             audio_input,
             ..
-        }) => (conversation_id, audio_input),
+        }) => {
+            maybe_converge_cli(&server_version).await;
+            (conversation_id, audio_input)
+        }
         other => return Err(CoreError::Message(hello_failure_message(other.as_ref()))),
     };
     // Decide once: send audio to an audio-capable model, else transcribe locally.
@@ -1520,7 +1532,9 @@ async fn resume(conversation_id: String, after_seq: u64) -> Result<()> {
 
     send(&mut tx, &hello(target.token.clone(), None)).await?;
     match recv(&mut rx).await? {
-        Some(ServerMsg::Welcome { .. }) => {}
+        Some(ServerMsg::Welcome { server_version, .. }) => {
+            maybe_converge_cli(&server_version).await;
+        }
         other => return Err(CoreError::Message(hello_failure_message(other.as_ref()))),
     }
 
@@ -1551,13 +1565,99 @@ async fn resume(conversation_id: String, after_seq: u64) -> Result<()> {
 
 /// Open a connection, send Hello, await Welcome, return the streams. Common
 /// preamble for audit/rollback commands.
+/// Whether the CLI auto-converges to a newer server on connect
+/// (`FLEETY_CLI_AUTO_UPDATE`, default on). Only an explicit `0`/`off`/`false`
+/// disables it.
+fn cli_auto_update_enabled() -> bool {
+    match std::env::var("FLEETY_CLI_AUTO_UPDATE") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "off" | "false"
+        ),
+        Err(_) => true,
+    }
+}
+
+/// Pure decision: should the CLI converge to `server_version`? Only when enabled,
+/// not already converged this run, the server reported a version, and it is
+/// strictly newer than `me` (forward-only — never downgrade or re-run on equal).
+fn should_converge(server_version: &str, me: &str, enabled: bool, already_converged: bool) -> bool {
+    enabled
+        && !already_converged
+        && !server_version.is_empty()
+        && fleety_tools::update::is_newer(server_version, me)
+}
+
+/// Forward-only convergence for the interactive CLI: when the connected server is
+/// newer, update this binary to the server's exact version and re-exec the
+/// current command on it. No-op when up to date, disabled, or already converged
+/// once this run; a failed self-update warns and lets the command proceed on the
+/// current version (never blocks). Mirrors the daemon's `converge_to_server_version`.
+async fn maybe_converge_cli(server_version: &str) {
+    let me = agent_core::VERSION;
+    let already = std::env::var("FLEETY_CONVERGED").is_ok();
+    if !should_converge(server_version, me, cli_auto_update_enabled(), already) {
+        return;
+    }
+    eprintln!("updating fleety {me} → {server_version} to match the server…");
+    match fleety_tools::update::converge_self_to_version(server_version).await {
+        Ok(true) => reexec_current(), // replaces the process on success
+        Ok(false) => eprintln!(
+            "note: no matching build to converge to the server's {server_version} yet — \
+             continuing on {me}"
+        ),
+        Err(e) => eprintln!(
+            "note: could not self-update to match the server ({server_version}): {} — \
+             continuing on {me}",
+            e.report().message
+        ),
+    }
+}
+
+/// Re-run the current command with the same arguments after a convergence
+/// self-update. Sets `FLEETY_CONVERGED` first so the fresh process converges at
+/// most once (no loop). Unix replaces the process image; other platforms spawn +
+/// wait + exit with the child's code. Returns only on failure, so the caller
+/// proceeds on the current binary.
+fn reexec_current() {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("note: cannot locate the updated binary to re-run ({e}); continuing");
+            return;
+        }
+    };
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    std::env::set_var("FLEETY_CONVERGED", "1");
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let err = std::process::Command::new(&exe).args(&args).exec();
+        eprintln!("note: could not re-run the updated binary ({err}); continuing on the old one");
+    }
+    #[cfg(not(unix))]
+    {
+        match std::process::Command::new(&exe).args(&args).status() {
+            Ok(status) => std::process::exit(status.code().unwrap_or(0)),
+            Err(e) => {
+                eprintln!(
+                    "note: could not re-run the updated binary ({e}); continuing on the old one"
+                );
+            }
+        }
+    }
+}
+
 async fn connect_hello() -> Result<(Tx, Rx)> {
     let (mut tx, mut rx, target) = open().await?;
     send(&mut tx, &hello(target.token.clone(), None)).await?;
     match recv(&mut rx).await? {
         Some(ServerMsg::Welcome {
-            server_fingerprint, ..
+            server_version,
+            server_fingerprint,
+            ..
         }) => {
+            maybe_converge_cli(&server_version).await;
             tofu_pin(server_fingerprint.as_deref(), &target);
             Ok((tx, rx))
         }
@@ -1611,10 +1711,12 @@ pub(crate) async fn connect_hello_for_auth() -> Result<(Tx, Rx, u32, connection:
     send(&mut tx, &hello(target.token.clone(), None)).await?;
     match recv(&mut rx).await? {
         Some(ServerMsg::Welcome {
+            server_version,
             config_protocol,
             server_fingerprint,
             ..
         }) => {
+            maybe_converge_cli(&server_version).await;
             tofu_pin(server_fingerprint.as_deref(), &target);
             Ok((tx, rx, config_protocol, target))
         }
@@ -1970,8 +2072,13 @@ pub(crate) async fn open_panel() -> Result<((Tx, Rx), u32)> {
     send(&mut tx, &hello(target.token.clone(), None)).await?;
     let config_protocol = match recv(&mut rx).await? {
         Some(ServerMsg::Welcome {
-            config_protocol, ..
-        }) => config_protocol,
+            server_version,
+            config_protocol,
+            ..
+        }) => {
+            maybe_converge_cli(&server_version).await;
+            config_protocol
+        }
         other => return Err(CoreError::Message(hello_failure_message(other.as_ref()))),
     };
     Ok(((tx, rx), config_protocol))
@@ -2155,6 +2262,21 @@ mod tests {
         // Neither → None, so resolution proceeds to the localhost default.
         let r = prefer_loopback_discovery(|| None, || None);
         assert!(r.is_none());
+    }
+
+    #[test]
+    fn should_converge_truth_table() {
+        // Server strictly newer, enabled, not yet converged → converge.
+        assert!(should_converge("0.2.0", "0.1.0", true, false));
+        // Forward-only: equal or older server → never.
+        assert!(!should_converge("0.1.0", "0.1.0", true, false));
+        assert!(!should_converge("0.1.0", "0.2.0", true, false));
+        // Disabled → never.
+        assert!(!should_converge("0.2.0", "0.1.0", false, false));
+        // Loop guard: already converged this run → never.
+        assert!(!should_converge("0.2.0", "0.1.0", true, true));
+        // Old server reports no version → never.
+        assert!(!should_converge("", "0.1.0", true, false));
     }
 
     struct EnvGuard {

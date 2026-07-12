@@ -697,6 +697,7 @@ to run it; `fleetyd update` (one-shot) restarts the installed service the same w
 | `FLEETY_UPDATE_MANIFEST` | built-in (this project's GitHub releases) | URL of the JSON update manifest (flat or multi-target form). `{bin}` substitutes the binary name; `{version}` substitutes the exact version when pinning and the literal `latest` otherwise. **Unset → a built-in default (`…/fleety-agent/releases/latest/download/{bin}-manifest.json`) so a stock `fleety update` works with no configuration; set this to override for a fork/mirror.** The daemon's *unattended* auto-update poll still requires this to be set explicitly (opt-in). |
 | `FLEETY_UPDATE_POLL_SECS` | `86400` (24 h) | How often to check. Floor 60 s. |
 | `FLEETY_AUTO_UPDATE` | `apply` | Each tick that finds a newer version runs the full host-wide update (fleetyd + sidecar + the host sibling binaries). Set `notify` (or `0`) for log-only. |
+| `FLEETY_CLI_AUTO_UPDATE` | `on` | When the **CLI** connects to a server whose version (from `Welcome`) is newer, self-update the CLI to that exact version (forward-only) and re-run the command on it. `0`/`off` disables. A failed self-update warns and the command continues on the current version. Mirrors the daemon's convergence, for interactive `fleety` commands. |
 
 ## Sidecar binaries (`fleetyd` + tools)
 

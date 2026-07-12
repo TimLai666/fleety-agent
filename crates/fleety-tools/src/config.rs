@@ -207,6 +207,14 @@ pub fn registry() -> &'static [Setting] {
             validator: Some(v_voice_audio),
         },
         Setting {
+            key: "FLEETY_CLI_AUTO_UPDATE",
+            scope: Cli,
+            default: "on",
+            description: "When the CLI connects to a NEWER server, self-update to the server's version (forward-only) and re-run the command (on/off).",
+            secret: false,
+            validator: Some(v_onoff),
+        },
+        Setting {
             key: "FLEETY_VOICE_AUDIO_MAX_KB",
             scope: Cli,
             default: "2048",
@@ -660,6 +668,7 @@ pub fn setting_choices(key: &str) -> Vec<&'static str> {
         "FLEETY_PRESENCE" => vec!["on", "off"],
         "FLEETY_AUTO_EFFORT" => vec!["on", "off"],
         "FLEETY_VIDEO_WHISPER" => vec!["on", "off"],
+        "FLEETY_CLI_AUTO_UPDATE" => vec!["on", "off"],
         "FLEETY_MODEL_EFFORT" | "FLEETY_CHEAP_MODEL_EFFORT" => vec!["low", "medium", "high"],
         "FLEETY_REQUIRE_AUTH"
         | "FLEETY_AUTO_INSTALL_DEPS"
