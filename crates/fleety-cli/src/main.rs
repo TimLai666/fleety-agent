@@ -249,8 +249,9 @@ async fn main() -> std::process::ExitCode {
             // this host's own files. `--target <device-id>` is sent to the server
             // (which reports it as a follow-up for now).
             let (target, rest) = config::split_target(&args[2..]);
-            // Bare `fleety config` on a TTY → the three-region interactive panel
-            // (connection / this device / server); no `--target` needed.
+            // Bare `fleety config` on a TTY → the guided menu (Providers /
+            // Models / Settings; Settings is the three-region panel); no
+            // `--target` needed.
             let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
             let res = if rest.is_empty() && is_tty {
                 config_panel::run().await
