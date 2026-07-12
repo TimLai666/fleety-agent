@@ -203,10 +203,15 @@ pub fn run_verb(spec: &ServiceSpec, verb: Verb) -> Result<()> {
         let Some((program, args)) = argv.split_first() else {
             continue;
         };
-        // macOS Install runs `[bootout, bootstrap]`; the leading bootout is
-        // best-effort (it fails when nothing is loaded yet) and its "not loaded"
-        // stderr must not leak, so only the bootstrap has to succeed.
-        let best_effort = os == Os::Macos && verb == Verb::Install && i == 0;
+        // Some leading commands in a sequence are best-effort:
+        // - macOS Install runs `[bootout, bootstrap]`; the leading bootout fails
+        //   when nothing is loaded yet, and its "not loaded" stderr must not leak,
+        //   so only the bootstrap has to succeed.
+        // - Windows Restart runs `[sc stop, sc start]`; `sc stop` fails (1062)
+        //   when the service is already stopped, but the restart should still
+        //   start it — tolerate the stop and let the start be the one that matters.
+        let win_restart_stop = os == Os::Windows && verb == Verb::Restart && i == 0;
+        let best_effort = (os == Os::Macos && verb == Verb::Install && i == 0) || win_restart_stop;
         let mut cmd = Command::new(program);
         cmd.args(args);
         if best_effort {
@@ -225,6 +230,17 @@ pub fn run_verb(spec: &ServiceSpec, verb: Verb) -> Result<()> {
                 argv.join(" "),
                 admin_hint(os, verb)
             )));
+        }
+        // `sc stop` returns at STOP_PENDING; wait for the old process to actually
+        // exit before the following `sc start`, or the SCM rejects the start with
+        // "an instance is already running". Best-effort: on timeout we start
+        // anyway and let that error surface.
+        if win_restart_stop {
+            wait_until_stopped_at(
+                &pidfile_path(&spec.name),
+                STOP_SETTLE_WAIT,
+                STOP_SETTLE_POLL,
+            );
         }
     }
     if verb == Verb::Uninstall {
@@ -471,6 +487,39 @@ fn wait_until_running_at(
         }
         if Instant::now() >= deadline {
             return None;
+        }
+        std::thread::sleep(poll);
+    }
+}
+
+/// How long a Windows `restart` waits for the service to reach STOPPED (its
+/// pidfile owner gone) after `sc stop` before issuing `sc start`. `sc stop`
+/// returns at STOP_PENDING, so starting immediately races the SCM ("an instance
+/// is already running"); waiting for the old process to exit avoids it.
+const STOP_SETTLE_WAIT: Duration = Duration::from_secs(15);
+/// Poll granularity while waiting for the old process to exit.
+const STOP_SETTLE_POLL: Duration = Duration::from_millis(300);
+
+/// True when the pidfile has no live owner — the service has fully stopped
+/// (either the guard removed the file, or its pid is dead). Pure.
+pub fn sample_is_stopped(current: Option<u32>, alive: bool) -> bool {
+    !matches!(current, Some(pid) if alive && pid != 0)
+}
+
+/// Block until the `name` service's pidfile has no live owner, or `timeout`
+/// elapses. Returns `true` once stopped, `false` on timeout. Used between a
+/// Windows `sc stop` and `sc start` so the start doesn't race a still-stopping
+/// service. Blocking.
+fn wait_until_stopped_at(path: &Path, timeout: Duration, poll: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let current = read_pid(path);
+        let alive = current.map(pid_alive).unwrap_or(false);
+        if sample_is_stopped(current, alive) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
         }
         std::thread::sleep(poll);
     }
@@ -783,6 +832,48 @@ mod tests {
             ),
             None
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sample_is_stopped_means_no_live_owner() {
+        assert!(sample_is_stopped(None, false)); // no pidfile → stopped
+        assert!(sample_is_stopped(Some(42), false)); // dead owner → stopped
+        assert!(sample_is_stopped(Some(0), true)); // pid 0 is never a real owner
+        assert!(!sample_is_stopped(Some(42), true)); // live owner → not stopped
+    }
+
+    #[test]
+    fn wait_until_stopped_returns_fast_when_gone_and_times_out_when_live() {
+        let dir = std::env::temp_dir().join(format!("fleety-stoptest-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+
+        // Missing pidfile → already stopped.
+        let missing = dir.join("missing.pid");
+        assert!(wait_until_stopped_at(
+            &missing,
+            Duration::from_millis(40),
+            Duration::from_millis(5)
+        ));
+
+        // A dead owner → stopped.
+        let dead = dir.join("dead.pid");
+        std::fs::write(&dead, "4294967294").unwrap();
+        assert!(wait_until_stopped_at(
+            &dead,
+            Duration::from_millis(40),
+            Duration::from_millis(5)
+        ));
+
+        // Our own (live) pid → never stops within the window → times out (false).
+        let live = dir.join("live.pid");
+        std::fs::write(&live, std::process::id().to_string()).unwrap();
+        assert!(!wait_until_stopped_at(
+            &live,
+            Duration::from_millis(40),
+            Duration::from_millis(5)
+        ));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
