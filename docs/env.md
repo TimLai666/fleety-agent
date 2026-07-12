@@ -226,21 +226,22 @@ operations entirely (enable auth and pair first). Login uses a **fixed loopback
 redirect** (`http://localhost:1455/auth/callback`) because the client id is
 registered with it — port 1455 must be free on the CLI host during login.
 
-The defaults work out of the box; override only for a non-default install.
+The Codex **client id and endpoints are fixed constants** in the code
+(`fleety_tools::oauth::CODEX_CLIENT_ID` / `CODEX_AUTHORIZE_URL` /
+`CODEX_TOKEN_URL` / `CODEX_BACKEND_URL` — OpenAI's public values, like the
+loopback port). They are **not** env vars or config keys and don't appear in
+`fleety config`. The few remaining knobs below are for tests / non-default
+installs only.
 
 | Var | Default | Meaning |
 |---|---|---|
-| `FLEETY_CODEX_CLIENT_ID` | `app_EMoamEEZ73f0CkXaXp7hrann` | Codex OAuth public client id. |
-| `FLEETY_CODEX_AUTHORIZE_URL` | `https://auth.openai.com/oauth/authorize` | Authorization endpoint. |
-| `FLEETY_CODEX_TOKEN_URL` | `https://auth.openai.com/oauth/token` | Token endpoint. |
-| `FLEETY_CODEX_BACKEND_URL` | `https://chatgpt.com/backend-api/codex` | Codex backend base; the provider calls `<base>/responses`. |
 | `FLEETY_CODEX_ORIGINATOR` | `codex_cli_rs` | Originator sent on the Responses call (`fleety` is used on the authorize request). |
 | `FLEETY_CODEX_TOKENS` | per-provider `~/.fleety/codex-oauth/<provider>.json` | Override the token-store path to a single explicit file **on the server host** (tests / non-default installs). Unset → the per-provider default. |
 | `FLEETY_CODEX_AUDIT` | `~/.fleety/` (auth audit file) | Override the auth-audit log path (login/logout events, never token values). |
 | `FLEETY_MODEL_AUTH` / `FLEETY_CHEAP_MODEL_AUTH` | unset | Bootstrap-seed twin of a provider's `type`: set `oauth:codex` to route the env-seeded main / economy tier through the Codex Responses backend without a providers.toml. |
 
 Setting a provider's `type = "oauth:codex"` builds a **Codex Responses provider**:
-it calls `<FLEETY_CODEX_BACKEND_URL>/responses` (the OpenAI Responses API, not
+it calls the fixed Codex backend's `/responses` (the OpenAI Responses API, not
 `/chat/completions`) with the account's OAuth bearer, the `chatgpt-account-id`
 header (decoded from the login `id_token`), and the Codex beta/originator/session
 headers, streaming the reply and driving tool calls. The configured

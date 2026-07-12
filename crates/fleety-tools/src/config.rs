@@ -388,41 +388,11 @@ pub fn registry() -> &'static [Setting] {
             secret: false,
             validator: Some(v_uint),
         },
-        Setting {
-            key: "FLEETY_CODEX_CLIENT_ID",
-            scope: Shared,
-            // The Codex CLI public client id (same value the upstream Codex CLI and
-            // other clients use). Overridable, but this default lets login work
-            // out of the box.
-            default: "app_EMoamEEZ73f0CkXaXp7hrann",
-            description: "Codex ChatGPT OAuth public client id.",
-            secret: false,
-            validator: None,
-        },
-        Setting {
-            key: "FLEETY_CODEX_AUTHORIZE_URL",
-            scope: Shared,
-            default: "https://auth.openai.com/oauth/authorize",
-            description: "Codex OAuth authorization endpoint.",
-            secret: false,
-            validator: Some(v_url),
-        },
-        Setting {
-            key: "FLEETY_CODEX_TOKEN_URL",
-            scope: Shared,
-            default: "https://auth.openai.com/oauth/token",
-            description: "Codex OAuth token endpoint.",
-            secret: false,
-            validator: Some(v_url),
-        },
-        Setting {
-            key: "FLEETY_CODEX_BACKEND_URL",
-            scope: Shared,
-            default: "https://chatgpt.com/backend-api/codex",
-            description: "Codex OAuth backend base URL for model calls.",
-            secret: false,
-            validator: Some(v_url),
-        },
+        // The Codex OAuth client id and endpoints are NOT config knobs — they are
+        // OpenAI's fixed public values, hardcoded in `fleety_tools::oauth`
+        // (`CODEX_CLIENT_ID`/`CODEX_AUTHORIZE_URL`/`CODEX_TOKEN_URL`/
+        // `CODEX_BACKEND_URL`), like the loopback port. So they are intentionally
+        // absent from the registry (not shown/editable in `fleety config`).
     ]
 }
 
@@ -1560,14 +1530,19 @@ mod tests {
     }
 
     #[test]
-    fn codex_oauth_settings_registered_with_defaults() {
-        let cid = find("FLEETY_CODEX_CLIENT_ID").expect("client id registered");
-        assert!(cid.default.starts_with("app_")); // the Codex public client id
-        assert!(!cid.secret); // not a secret (it's a public client id)
-        let auth_url = find("FLEETY_CODEX_AUTHORIZE_URL").expect("authorize url");
-        assert!(auth_url.default.starts_with("https://"));
-        assert!(find("FLEETY_CODEX_TOKEN_URL").is_some());
-        assert!(find("FLEETY_CODEX_BACKEND_URL").is_some());
+    fn codex_oauth_endpoints_are_hardcoded_not_config_keys() {
+        // The Codex client id and endpoints are fixed constants (OpenAI's public
+        // values), not config keys — they must NOT be in the registry, so
+        // `fleety config` never shows or edits them.
+        assert!(find("FLEETY_CODEX_CLIENT_ID").is_none());
+        assert!(find("FLEETY_CODEX_AUTHORIZE_URL").is_none());
+        assert!(find("FLEETY_CODEX_TOKEN_URL").is_none());
+        assert!(find("FLEETY_CODEX_BACKEND_URL").is_none());
+        // The values live as constants in `oauth`.
+        assert!(crate::oauth::CODEX_CLIENT_ID.starts_with("app_"));
+        assert!(crate::oauth::CODEX_AUTHORIZE_URL.starts_with("https://"));
+        assert!(crate::oauth::CODEX_TOKEN_URL.starts_with("https://"));
+        assert!(crate::oauth::CODEX_BACKEND_URL.starts_with("https://"));
     }
 
     #[test]
@@ -2116,9 +2091,6 @@ mod tests {
             ("FLEETY_PRESENCE_INTERVAL_SECS", "300", "5m"),
             ("FLEETY_VOICE_AUDIO_MAX_KB", "2048", "big"),
             ("FLEETY_MODEL_BASE_URL", "https://api.x/v1", "notaurl"),
-            ("FLEETY_CODEX_AUTHORIZE_URL", "https://auth/x", "ftp://x"),
-            ("FLEETY_CODEX_TOKEN_URL", "http://auth/x", "auth/x"),
-            ("FLEETY_CODEX_BACKEND_URL", "https://b/x", "b"),
         ];
         for &(key, good, bad) in cases {
             let s = find(key).unwrap_or_else(|| panic!("{key} registered"));

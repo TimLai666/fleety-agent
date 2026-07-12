@@ -165,7 +165,7 @@ code:
 ---
 ### Requirement: Login status and logout do not leak tokens
 
-The CLI SHALL provide a `status [<provider>]` command and a `logout <provider>` command. `status <provider>` SHALL report whether the connected server holds that provider's credential and when it expires without printing the token values; `status` with no provider SHALL enumerate the `oauth:codex` providers in the connected server's provider config and report each one's signed-in state and expiry on its own line. `logout <provider>` SHALL remove that provider's credential stored on the connected server. When a legacy local token file exists on the CLI host, status SHALL note that it is no longer used by any flow. The endpoints, client id, and backend base URL SHALL be overridable by configuration with known public defaults.
+The CLI SHALL provide a `status [<provider>]` command and a `logout <provider>` command. `status <provider>` SHALL report whether the connected server holds that provider's credential and when it expires without printing the token values; `status` with no provider SHALL enumerate the `oauth:codex` providers in the connected server's provider config and report each one's signed-in state and expiry on its own line. `logout <provider>` SHALL remove that provider's credential stored on the connected server. When a legacy local token file exists on the CLI host, status SHALL note that it is no longer used by any flow. The authorization/token endpoints, client id, and backend base URL SHALL be fixed constants in the code (OpenAI's public values, like the loopback port) — they SHALL NOT be configuration keys or environment variables and SHALL NOT appear in `fleety config`.
 
 #### Scenario: status reports one provider's state without token values
 
@@ -187,10 +187,10 @@ The CLI SHALL provide a `status [<provider>]` command and a `logout <provider>` 
 - **WHEN** status runs on a CLI host that still has a legacy local token file
 - **THEN** the output notes the file is no longer read by any flow and suggests re-running login
 
-#### Scenario: endpoints are overridable
+#### Scenario: endpoints are fixed, not configurable
 
-- **WHEN** the authorization endpoint, token endpoint, client id, or backend base URL is set in configuration
-- **THEN** the login flow and provider use the configured values instead of the defaults
+- **WHEN** a user inspects or edits configuration (env, `config.toml`, or `fleety config`)
+- **THEN** the Codex client id and endpoints are not present as settings — the login flow and provider always use the hardcoded constants
 
 
 <!-- @trace

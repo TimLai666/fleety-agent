@@ -259,31 +259,23 @@ pub struct OAuthConfig {
     pub backend_base_url: String,
 }
 
-/// Resolve one OAuth setting via the shared config precedence (env → config.toml
-/// → the registry default). The endpoints have stable defaults in the registry;
-/// the client id defaults to empty (login then errors actionably if unset). The
-/// endpoint/client-id values MUST match the current Codex CLI — see the change's
-/// Open Questions; they are overridable without a rebuild.
-fn config_value(key: &str) -> String {
-    if let Ok(v) = std::env::var(key) {
-        if !v.is_empty() {
-            return v;
-        }
-    }
-    let map = crate::config::load(&crate::config::config_path());
-    crate::config::resolve(key, &map)
-        .map(|r| r.value)
-        .filter(|v| !v.is_empty())
-        .unwrap_or_default()
-}
+/// The fixed Codex OAuth client id and endpoints — OpenAI's public, stable
+/// values. Like [`CODEX_LOOPBACK_PORT`]/[`CODEX_CALLBACK_PATH`] and the OAuth
+/// query params, these are hardcoded rather than config knobs: a normal user
+/// never changes them, and the redirect + flow params are already fixed to match
+/// them. (If OpenAI ever rotates them, bump these constants and cut a release.)
+pub const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+pub const CODEX_AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
+pub const CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+pub const CODEX_BACKEND_URL: &str = "https://chatgpt.com/backend-api/codex";
 
-/// Resolve the OAuth configuration from env/config/registry defaults.
+/// The fixed OAuth configuration. No env/config override — these are constants.
 pub fn oauth_config() -> OAuthConfig {
     OAuthConfig {
-        client_id: config_value("FLEETY_CODEX_CLIENT_ID"),
-        authorize_endpoint: config_value("FLEETY_CODEX_AUTHORIZE_URL"),
-        token_endpoint: config_value("FLEETY_CODEX_TOKEN_URL"),
-        backend_base_url: config_value("FLEETY_CODEX_BACKEND_URL"),
+        client_id: CODEX_CLIENT_ID.to_string(),
+        authorize_endpoint: CODEX_AUTHORIZE_URL.to_string(),
+        token_endpoint: CODEX_TOKEN_URL.to_string(),
+        backend_base_url: CODEX_BACKEND_URL.to_string(),
     }
 }
 

@@ -56,13 +56,7 @@ impl Region {
 fn is_sensitive(key: &str) -> bool {
     matches!(
         key,
-        "FLEETY_MODEL_KEY"
-            | "FLEETY_MODEL_BASE_URL"
-            | "FLEETY_BACKUP_REPO"
-            | "FLEETY_BACKUP_TOKEN"
-            | "FLEETY_CODEX_AUTHORIZE_URL"
-            | "FLEETY_CODEX_TOKEN_URL"
-            | "FLEETY_CODEX_BACKEND_URL"
+        "FLEETY_MODEL_KEY" | "FLEETY_MODEL_BASE_URL" | "FLEETY_BACKUP_REPO" | "FLEETY_BACKUP_TOKEN"
     )
 }
 
@@ -149,7 +143,9 @@ impl Panel {
             revision,
             staged: BTreeMap::new(),
             apply_now: false,
-            status: "Tab: region · ↑/↓: move · Enter: edit · a: apply server · q: quit".to_string(),
+            // The key hints live on their own persistent footer line now; the
+            // status line starts empty so it doesn't duplicate them.
+            status: String::new(),
             quit: false,
         }
     }
@@ -515,7 +511,13 @@ fn render(f: &mut Frame, p: &Panel) {
                     Some(fleety_protocol::Effect::NextConnection) => "next connection",
                     None => "-",
                 };
-                format!("{}  (effect: {eff})  · {}", p.status, e.description)
+                // Show the selected key's effect + description; prefix the action
+                // status only when there is one (so an empty status leaves no gap).
+                if p.status.is_empty() {
+                    format!("(effect: {eff})  · {}", e.description)
+                } else {
+                    format!("{}  ·  (effect: {eff})  · {}", p.status, e.description)
+                }
             }
             None => p.status.clone(),
         }
