@@ -294,10 +294,10 @@ verbs register/run it as a background service:
 
 | Command | What it does |
 |---|---|
-| `fleety-server up` | install + enable + start (one shot, `docker compose up -d` style). |
+| `fleety-server up` | install + enable + start (one shot, `docker compose up -d` style). **Waits until the server is actually running** and errors if it never comes up (so a failed launch isn't reported as success). |
 | `fleety-server down` | stop the running service. |
 | `fleety-server install` / `uninstall` | register / remove the OS service (install also enables boot autostart). |
-| `fleety-server start` / `stop` / `restart` | run now / stop now / restart. A non-forced `restart` **defers until the server is idle** (no in-flight turn) instead of interrupting a turn; `restart --force` restarts immediately. A forced (or past-deadline, ~300 s) restart interrupts the in-flight turn, which is then recovered from the journal, not lost. |
+| `fleety-server start` / `stop` / `restart` | run now / stop now / restart. `start`/`restart` **wait for the process to actually come up** (reporting the new pid, or erroring if it doesn't) rather than returning as soon as the request is sent. A non-forced `restart` **defers until the server is idle** (no in-flight turn) instead of interrupting a turn, then waits for that deferred restart to complete (up to ~330 s); `restart --force` restarts immediately. A forced (or past-deadline, ~300 s) restart interrupts the in-flight turn, which is then recovered from the journal, not lost. |
 | `fleety-server enable` / `disable` | turn boot autostart on / off. |
 | `fleety-server status` | running? autostart on? |
 | `fleety-server config <list\|get\|set\|unset\|edit>` | Inspect/edit **this host's** settings (e.g. `set FLEETY_MODEL …`, `set FLEETY_TOKEN …`); also `config provider\|model …` for providers + model roles. Same surface as `fleety config`, applied where the server boots. |
@@ -313,7 +313,7 @@ server, plus self-update:
 | Command | What it does |
 |---|---|
 | `fleetyd install` / `uninstall` | register / remove the daemon service (install leaves autostart off until `enable`). |
-| `fleetyd start` / `stop` / `restart` / `enable` / `disable` / `status` | as above. A manual restart is immediate; only the *self-update* path defers its restart until the daemon is idle (no running on-device tool). |
+| `fleetyd start` / `stop` / `restart` / `enable` / `disable` / `status` | as above; `start`/`restart` **wait for the daemon to actually come up** (report the new pid, or error). A manual restart is immediate; only the *self-update* path defers its restart until the daemon is idle (no running on-device tool). |
 | `fleetyd config <list\|get\|set\|unset\|edit>` | Inspect/edit **this host's** settings (incl. `config provider\|model …`); same surface as `fleety config`. |
 | `fleetyd update` | host-wide update: fleetyd + the `fleety-insyra` sidecar + the sibling `fleety`/`fleety-server` on this host. `fleety-server update` is the server-only-host equivalent. |
 | `fleetyd run-service` | internal service entry point. |

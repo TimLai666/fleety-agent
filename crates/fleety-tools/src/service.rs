@@ -14,6 +14,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use agent_core::{CoreError, Result};
 
@@ -421,6 +422,60 @@ pub fn pid_alive(pid: u32) -> bool {
     }
 }
 
+/// Whether a freshly sampled pidfile owner means "the (re)started service is up":
+/// the pidfile holds a pid, it is `alive`, and — for a restart that must cycle
+/// the process — it is not the `replacing` pid we are moving away from. Returns
+/// the confirmed pid, or `None` if this sample doesn't qualify. Pure.
+pub fn sample_is_up(current: Option<u32>, alive: bool, replacing: Option<u32>) -> Option<u32> {
+    match current {
+        Some(pid) if alive && replacing != Some(pid) => Some(pid),
+        _ => None,
+    }
+}
+
+/// Block until the `name` service's pidfile has a confirmed live owner, or
+/// `timeout` elapses. "Confirmed" means the same qualifying pid is seen on two
+/// consecutive polls, so a process that writes the pidfile then immediately dies
+/// (e.g. a bad binary that crashes on boot) is not mistaken for a healthy start.
+/// `replacing` (the pid a restart is cycling away from) makes the wait ignore the
+/// still-present old process until the new one takes over. Returns the confirmed
+/// pid, or `None` on timeout. Blocking (sleeps between polls); callers run it from
+/// a one-shot CLI command.
+pub fn wait_until_running(
+    name: &str,
+    replacing: Option<u32>,
+    timeout: Duration,
+    poll: Duration,
+) -> Option<u32> {
+    wait_until_running_at(&pidfile_path(name), replacing, timeout, poll)
+}
+
+/// Path-based core of [`wait_until_running`] (tests point it at an explicit
+/// pidfile instead of resolving one from `$HOME`).
+fn wait_until_running_at(
+    path: &Path,
+    replacing: Option<u32>,
+    timeout: Duration,
+    poll: Duration,
+) -> Option<u32> {
+    let deadline = Instant::now() + timeout;
+    let mut confirmed_once: Option<u32> = None;
+    loop {
+        let current = read_pid(path);
+        let alive = current.map(pid_alive).unwrap_or(false);
+        match sample_is_up(current, alive, replacing) {
+            // The same live owner twice running → settled; report it up.
+            Some(pid) if confirmed_once == Some(pid) => return Some(pid),
+            Some(pid) => confirmed_once = Some(pid),
+            None => confirmed_once = None,
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(poll);
+    }
+}
+
 /// Outcome of trying to claim the single-instance pidfile.
 #[derive(Debug)]
 pub enum Acquire {
@@ -670,6 +725,64 @@ mod tests {
         let dead = dir.join("dead.pid");
         std::fs::write(&dead, "4294967294").unwrap(); // u32::MAX-1, not a real pid
         assert!(matches!(acquire_at(&dead).unwrap(), Acquire::Started(_)));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sample_is_up_needs_live_and_changed() {
+        // Live owner, nothing to replace → up.
+        assert_eq!(sample_is_up(Some(42), true, None), Some(42));
+        // Live owner that differs from the one we're replacing → up (new process).
+        assert_eq!(sample_is_up(Some(43), true, Some(42)), Some(43));
+        // The still-present old process (== replacing) is not "up" yet.
+        assert_eq!(sample_is_up(Some(42), true, Some(42)), None);
+        // A dead owner, or an empty pidfile, is never up.
+        assert_eq!(sample_is_up(Some(42), false, None), None);
+        assert_eq!(sample_is_up(None, false, None), None);
+    }
+
+    #[test]
+    fn wait_until_running_confirms_a_live_owner_and_times_out_on_dead() {
+        let dir = std::env::temp_dir().join(format!("fleety-waittest-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+
+        // Our own pid is live → confirmed within the timeout.
+        let live = dir.join("live.pid");
+        std::fs::write(&live, std::process::id().to_string()).unwrap();
+        assert_eq!(
+            wait_until_running_at(
+                &live,
+                None,
+                Duration::from_secs(2),
+                Duration::from_millis(5)
+            ),
+            Some(std::process::id())
+        );
+
+        // Requiring a change away from our own (live) pid never settles → times out.
+        assert_eq!(
+            wait_until_running_at(
+                &live,
+                Some(std::process::id()),
+                Duration::from_millis(40),
+                Duration::from_millis(5)
+            ),
+            None
+        );
+
+        // A dead owner → times out (never confirmed).
+        let dead = dir.join("dead.pid");
+        std::fs::write(&dead, "4294967294").unwrap(); // u32::MAX-1, not a real pid
+        assert_eq!(
+            wait_until_running_at(
+                &dead,
+                None,
+                Duration::from_millis(40),
+                Duration::from_millis(5)
+            ),
+            None
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

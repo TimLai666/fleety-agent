@@ -10,8 +10,23 @@
 //! The high-level action → low-level verb mapping ([`plan`]) is pure and
 //! unit-tested; the executor shells out via the shared module.
 
+use std::time::Duration;
+
 use agent_core::{CoreError, Result};
+use fleety_tools::restart::DEFERRAL_CAP;
 use fleety_tools::service::{self, ServiceSpec, Verb};
+
+/// How long `start`/`up` waits for the server process to actually come up before
+/// declaring the launch failed. A healthy start writes its pidfile within a
+/// second or two; the ceiling just covers a slow boot.
+const STARTUP_WAIT: Duration = Duration::from_secs(20);
+/// How long a forced/immediate `restart` waits for the new process to take over.
+const RESTART_WAIT: Duration = Duration::from_secs(20);
+/// Extra time a *deferred* restart is allowed beyond the idle-deferral cap, for
+/// the new process to come up once the running server finally cycles.
+const RESTART_GRACE: Duration = Duration::from_secs(30);
+/// Poll granularity while waiting for the pidfile owner to settle.
+const WAIT_POLL: Duration = Duration::from_millis(400);
 
 /// High-level server lifecycle actions exposed on the CLI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +93,28 @@ pub fn run(action: Action) -> Result<()> {
     for verb in verbs {
         service::run_verb(&spec, verb)?;
     }
+    // `start`/`up` only *issued* the manager verb; confirm the process actually
+    // came up. A manager "start" reports success even when the binary fails to
+    // launch (e.g. it lost its executable bit on a self-update) — so without this
+    // the command would claim the server is up while nothing runs. Error instead.
+    if matches!(action, Action::Start | Action::Up) {
+        match service::wait_until_running(&spec.name, None, STARTUP_WAIT, WAIT_POLL) {
+            Some(pid) => {
+                if action == Action::Start {
+                    println!("fleety-server started (pid {pid}).");
+                }
+            }
+            None => {
+                return Err(CoreError::Message(format!(
+                    "fleety-server did not come up within {}s — the service was told to start but \
+                     no running process claimed the pidfile. It likely failed to launch (e.g. the \
+                     binary is not executable after an update) or crashed on boot; check \
+                     `fleety-server status` and the service logs.",
+                    STARTUP_WAIT.as_secs()
+                )));
+            }
+        }
+    }
     match action {
         Action::Install => println!(
             "fleety-server installed and set to autostart at boot. Use `fleety-server start` to \
@@ -123,30 +160,56 @@ pub fn restart(force: bool) -> Result<()> {
     let spec = spec()?;
     let pid = service::read_pid(&service::pidfile_path(&spec.name));
     let server_alive = pid.map(service::pid_alive).unwrap_or(false);
+    // The pid we are cycling away from (only when a live server owns it), so the
+    // wait ignores the old process and reports success only once the *new* one is up.
+    let replacing = if server_alive { pid } else { None };
     match restart_mode(force, server_alive) {
         RestartMode::Immediate => {
             // A forced/immediate restart drives the SCM directly (sc stop + start),
             // so pre-flight the same elevation guard the other state-changing verbs
             // use — abort before touching the SCM when not elevated on Windows.
             service::ensure_elevated_for(Verb::Restart)?;
-            service::run_verb(&spec, Verb::Restart)
+            service::run_verb(&spec, Verb::Restart)?;
+            confirm_restarted(&spec.name, replacing, RESTART_WAIT)
         }
         RestartMode::RequestDeferred => match crate::restart_watch::request_restart(&spec.name) {
             Ok(()) => {
+                let budget = DEFERRAL_CAP + RESTART_GRACE;
                 println!(
-                    "restart requested; the running server will restart once it is idle (no \
-                     in-flight turn), or after the deferral deadline. Pass --force to restart now."
+                    "restart requested; waiting for the server to finish any in-flight turn and \
+                     restart (up to ~{}s — pass --force to restart now without waiting)…",
+                    budget.as_secs()
                 );
-                Ok(())
+                confirm_restarted(&spec.name, replacing, budget)
             }
             Err(e) => {
                 eprintln!(
                     "could not record a deferred restart request ({}); restarting now instead.",
                     e.report().message
                 );
-                service::run_verb(&spec, Verb::Restart)
+                service::run_verb(&spec, Verb::Restart)?;
+                confirm_restarted(&spec.name, replacing, RESTART_WAIT)
             }
         },
+    }
+}
+
+/// Wait for a restart to actually complete — a new live pid taking over the
+/// pidfile — within `budget`, reporting the new pid or an actionable timeout so
+/// the command only "succeeds" once the server is genuinely back up.
+fn confirm_restarted(name: &str, replacing: Option<u32>, budget: Duration) -> Result<()> {
+    match service::wait_until_running(name, replacing, budget, WAIT_POLL) {
+        Some(pid) => {
+            println!("fleety-server restarted (pid {pid}).");
+            Ok(())
+        }
+        None => Err(CoreError::Message(format!(
+            "restart did not complete within {}s — the server did not come back up. It may have \
+             failed to relaunch (check the binary and `fleety-server status`) or, for a deferred \
+             restart, still be finishing a long-running turn; `fleety-server restart --force` \
+             restarts immediately.",
+            budget.as_secs()
+        ))),
     }
 }
 

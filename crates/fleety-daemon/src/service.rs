@@ -6,8 +6,17 @@
 //! builds fleetyd's [`ServiceSpec`] and wires each verb; the command/file
 //! mapping and its tests live in the shared module.
 
+use std::time::Duration;
+
 use agent_core::{CoreError, Result};
 use fleety_tools::service::{self, ServiceSpec, Verb};
+
+/// How long `start`/`restart` waits for the daemon process to actually come up
+/// before reporting the launch failed (a healthy start writes its pidfile within
+/// a second or two; the ceiling covers a slow boot).
+const STARTUP_WAIT: Duration = Duration::from_secs(20);
+/// Poll granularity while waiting for the pidfile owner to settle.
+const WAIT_POLL: Duration = Duration::from_millis(400);
 
 /// fleetyd's service definition, pointing at the current executable run in
 /// service mode (`run-service`).
@@ -41,8 +50,12 @@ pub fn uninstall() -> Result<()> {
 }
 
 pub fn start() -> Result<()> {
+    let spec = spec()?;
     service::ensure_elevated_for(Verb::Start)?;
-    service::run_verb(&spec()?, Verb::Start)
+    service::run_verb(&spec, Verb::Start)?;
+    // Confirm the process actually came up — a manager "start" succeeds even when
+    // the binary fails to launch, so don't report success on a dead start.
+    confirm_up(&spec.name, None, "start")
 }
 
 pub fn stop() -> Result<()> {
@@ -51,8 +64,32 @@ pub fn stop() -> Result<()> {
 }
 
 pub fn restart() -> Result<()> {
+    let spec = spec()?;
     service::ensure_elevated_for(Verb::Restart)?;
-    service::run_verb(&spec()?, Verb::Restart)
+    // The live pid we're cycling away from, so we wait for the *new* one to take over.
+    let replacing =
+        service::read_pid(&service::pidfile_path(&spec.name)).filter(|&p| service::pid_alive(p));
+    service::run_verb(&spec, Verb::Restart)?;
+    confirm_up(&spec.name, replacing, "restart")
+}
+
+/// Wait for a `start`/`restart` to complete — a live pid taking over the pidfile
+/// (distinct from `replacing`, for a restart) — within [`STARTUP_WAIT`], and turn
+/// a timeout into an actionable error so the command only "succeeds" once fleetyd
+/// is genuinely up.
+fn confirm_up(name: &str, replacing: Option<u32>, verb: &str) -> Result<()> {
+    match service::wait_until_running(name, replacing, STARTUP_WAIT, WAIT_POLL) {
+        Some(pid) => {
+            println!("fleetyd {verb} complete (pid {pid}).");
+            Ok(())
+        }
+        None => Err(CoreError::Message(format!(
+            "fleetyd {verb} did not complete within {}s — no running process claimed the pidfile. \
+             It likely failed to launch (e.g. a non-executable binary after an update) or crashed \
+             on boot; check `fleetyd status` and the service logs.",
+            STARTUP_WAIT.as_secs()
+        ))),
+    }
 }
 
 pub fn enable() -> Result<()> {
