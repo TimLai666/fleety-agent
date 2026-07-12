@@ -49,6 +49,7 @@ pub fn build(prefix: &str) -> Option<Arc<dyn ModelProvider>> {
         modalities,
         effort,
         auth,
+        provider_name: None, // env bootstrap has no named provider
         label: prefix.to_string(),
     }))
 }
@@ -76,6 +77,11 @@ pub struct ProviderBuild {
     /// Auth mode: `None`/`"static"` uses `key`; `"oauth:codex"` sources the
     /// bearer from the Codex OAuth token store.
     pub auth: Option<String>,
+    /// The `providers.toml` provider name, used to source the **per-provider**
+    /// Codex token store for `oauth:codex`. `None` for the env bootstrap path
+    /// (which has no named provider) — such a build falls back to the legacy
+    /// global path, which is cleared on boot, so it reports logged-out.
+    pub provider_name: Option<String>,
     /// Used only for log lines (the env prefix or the provider name).
     pub label: String,
 }
@@ -94,6 +100,7 @@ pub fn build_provider(cfg: ProviderBuild) -> Arc<dyn ModelProvider> {
         modalities,
         effort,
         auth,
+        provider_name,
         label,
     } = cfg;
     let modalities = modalities.as_deref();
@@ -123,7 +130,7 @@ pub fn build_provider(cfg: ProviderBuild) -> Arc<dyn ModelProvider> {
     // Codex OAuth mode talks to the ChatGPT backend over the Responses API — a
     // different provider entirely, ignoring base_url/key.
     if auth_is_oauth(auth) {
-        return build_codex_responses(model, caps, default_effort, label);
+        return build_codex_responses(model, caps, default_effort, label, provider_name.as_deref());
     }
     if agent_core::gemini::looks_like_gemini_model(&model) {
         tracing::info!(%base_url, %model, stream, %label, "using native Gemini provider");
@@ -144,6 +151,17 @@ pub fn build_provider(cfg: ProviderBuild) -> Arc<dyn ModelProvider> {
     }
 }
 
+/// The Codex token store an `oauth:codex` provider reads: its OWN per-provider
+/// file (`codex-oauth/<name>.json`) when named in providers.toml, else the legacy
+/// global path for the env bootstrap path (cleared on boot, so it reads as
+/// logged-out until a per-provider login). Pure selection — unit-tested.
+fn codex_token_path(provider_name: Option<&str>) -> std::path::PathBuf {
+    match provider_name {
+        Some(name) => fleety_tools::oauth::token_path_for(name),
+        None => fleety_tools::oauth::default_token_path(),
+    }
+}
+
 /// Build the Codex Responses provider for the `oauth:codex` auth mode: it calls
 /// the ChatGPT backend over the Responses API with the account's OAuth token
 /// (refreshed on demand). The configured `base_url`/`key` are ignored — Codex has
@@ -153,12 +171,12 @@ fn build_codex_responses(
     caps: agent_core::model::ModelCapabilities,
     default_effort: Option<agent_core::model::Effort>,
     label: &str,
+    provider_name: Option<&str>,
 ) -> Arc<dyn ModelProvider> {
     let cfg = fleety_tools::oauth::oauth_config();
     let endpoint = format!("{}/responses", cfg.backend_base_url.trim_end_matches('/'));
-    tracing::info!(%endpoint, %model, %label, "using Codex Responses provider (oauth:codex)");
-    let auth_src =
-        fleety_tools::oauth::OAuthCodexAuth::new(fleety_tools::oauth::default_token_path(), &cfg);
+    tracing::info!(%endpoint, %model, %label, provider = provider_name.unwrap_or("(env)"), "using Codex Responses provider (oauth:codex)");
+    let auth_src = fleety_tools::oauth::OAuthCodexAuth::new(codex_token_path(provider_name), &cfg);
     Arc::new(
         CodexResponses::new(endpoint, model, Arc::new(auth_src))
             .with_capabilities(caps)
@@ -193,6 +211,7 @@ fn build_member(
         modalities: m.modalities.clone(),
         effort: m.effort.clone(),
         auth,
+        provider_name: Some(m.provider.clone()),
         label: format!("{}/{}", m.provider, m.model),
     }))
 }
@@ -450,6 +469,28 @@ mod tests {
         assert!(!auth_is_oauth(None)); // default → static
         assert!(!auth_is_oauth(Some("static")));
         assert!(!auth_is_oauth(Some("oauth:other")));
+    }
+
+    #[test]
+    fn codex_token_path_uses_the_providers_own_name() {
+        // A named provider reads its OWN per-provider token file; the env path
+        // (no name) falls back to the legacy global path. (Assumes FLEETY_CODEX_TOKENS
+        // is unset — no test sets it.)
+        let named = codex_token_path(Some("tingzhen-codex"));
+        assert!(named
+            .to_string_lossy()
+            .replace('\\', "/")
+            .ends_with("codex-oauth/tingzhen-codex.json"));
+        let other = codex_token_path(Some("work-codex"));
+        assert_ne!(
+            named, other,
+            "different providers get different token files"
+        );
+        let env = codex_token_path(None);
+        assert!(env
+            .to_string_lossy()
+            .replace('\\', "/")
+            .ends_with(".fleety/codex-oauth.json"));
     }
 
     #[test]

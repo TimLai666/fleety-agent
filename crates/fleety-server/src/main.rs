@@ -497,6 +497,9 @@ async fn run_server(shutdown: Option<tokio::sync::watch::Receiver<bool>>) {
     }
     // Stamp the start time once so uptime reflects boot, not first status query.
     let _ = server_start();
+    // Codex credentials are per-provider now: drop any pre-per-provider global
+    // token file on boot (no migration — each provider signs in fresh).
+    fleety_tools::oauth::clear_legacy_global(&fleety_tools::oauth::default_token_path());
     // Default to all interfaces so a bare-metal server is reachable across
     // devices out of the box (auth is required by default). Set FLEETY_ADDR=
     // 127.0.0.1:8787 for loopback-only.

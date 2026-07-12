@@ -15,8 +15,10 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// (`0` = only the legacy `ConfigExec`). A client compares this to decide
 /// which remote-config surfaces it can use. `1` adds `ConfigSnapshot`/
 /// `ConfigApply`; `2` adds the credential frames (`CredentialPut`/`Status`/
-/// `Delete`). Additive — an older server omits it and the client sees `0`.
-pub const CONFIG_PROTOCOL_VERSION: u32 = 2;
+/// `Delete`); `3` makes those credential frames per-provider (they carry a
+/// `provider`, and a `codex-oauth` frame without one is rejected). Additive —
+/// an older server omits it and the client sees `0`.
+pub const CONFIG_PROTOCOL_VERSION: u32 = 3;
 
 /// Wire form of an actionable error (mirrors `agent_core::ErrorReport`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -286,14 +288,30 @@ pub enum ClientMsg {
     /// discriminates the credential (first kind: `codex-oauth`, whose
     /// `payload_json` is the serde shape of the OAuth `Tokens`). Requires an
     /// authenticated connection; accepted writes are audited (never with token
-    /// values). Reply: `CredentialResult`. Advertised by `config_protocol >= 2`.
-    CredentialPut { kind: String, payload_json: String },
-    /// Query whether the server holds a credential of `kind`. Reply:
+    /// values). Reply: `CredentialResult`. Advertised by `config_protocol >= 2`;
+    /// the per-provider `provider` key requires `config_protocol >= 3`.
+    /// `provider` names the provider the credential belongs to (required for
+    /// `codex-oauth`; a `None` from an older client is rejected server-side).
+    CredentialPut {
+        kind: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+        payload_json: String,
+    },
+    /// Query whether the server holds a credential of `kind` for `provider`. Reply:
     /// `CredentialStatusResult` — presence and expiry only, never token values.
-    CredentialStatus { kind: String },
-    /// Remove the server-side credential of `kind`. Requires an authenticated
-    /// connection; audited. Reply: `CredentialResult`.
-    CredentialDelete { kind: String },
+    CredentialStatus {
+        kind: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+    },
+    /// Remove the server-side credential of `kind` for `provider`. Requires an
+    /// authenticated connection; audited. Reply: `CredentialResult`.
+    CredentialDelete {
+        kind: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+    },
     /// Ask the connected server to mint a short-lived pairing code (for enrolling
     /// another device). Only reaches the server past Hello auth / loopback trust.
     /// Reply: `PairingCode`.
@@ -541,7 +559,7 @@ mod tests {
         let json = serde_json::to_string(&w).expect("ser");
         assert!(json.contains("\"server_version\":\"0.3.0\""));
         assert!(json.contains("\"audio_input\":true"));
-        assert!(json.contains("\"config_protocol\":2"));
+        assert!(json.contains("\"config_protocol\":3"));
         assert!(json.contains("\"server_fingerprint\":\"srv-fp-1\""));
         // An old server's frame (no server_version / audio_input / config_protocol)
         // still parses → defaults ("" / false / 0 → legacy ConfigExec + local STT).
@@ -652,9 +670,10 @@ mod tests {
 
     #[test]
     fn credential_frames_roundtrip_and_status_never_carries_tokens() {
-        // Put / status / delete round-trip.
+        // Put / status / delete round-trip, carrying the per-provider key.
         let put = ClientMsg::CredentialPut {
             kind: "codex-oauth".into(),
+            provider: Some("tingzhen-codex".into()),
             payload_json: r#"{"access_token":"a","refresh_token":"r","expires_at_secs":1}"#.into(),
         };
         assert_eq!(
@@ -664,6 +683,7 @@ mod tests {
         );
         let status = ClientMsg::CredentialStatus {
             kind: "codex-oauth".into(),
+            provider: Some("tingzhen-codex".into()),
         };
         assert_eq!(
             serde_json::from_str::<ClientMsg>(&serde_json::to_string(&status).expect("ser"))
@@ -672,12 +692,21 @@ mod tests {
         );
         let del = ClientMsg::CredentialDelete {
             kind: "codex-oauth".into(),
+            provider: Some("tingzhen-codex".into()),
         };
         assert_eq!(
             serde_json::from_str::<ClientMsg>(&serde_json::to_string(&del).expect("ser"))
                 .expect("de"),
             del
         );
+
+        // An older client's frame omits `provider` entirely → it parses as `None`
+        // (the server rejects a codex-oauth `None`, but the wire stays parseable).
+        let legacy = r#"{"type":"credential_put","kind":"codex-oauth","payload_json":"{}"}"#;
+        match serde_json::from_str::<ClientMsg>(legacy).expect("de legacy") {
+            ClientMsg::CredentialPut { provider, .. } => assert!(provider.is_none()),
+            _ => panic!("not a credential put"),
+        }
 
         let ok = ServerMsg::CredentialResult {
             ok: true,

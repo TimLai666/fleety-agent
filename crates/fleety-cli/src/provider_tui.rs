@@ -69,6 +69,27 @@ impl ProviderEditor {
         Ok(())
     }
 
+    /// Upsert a provider: replace an existing entry (edit) or add a new one. No
+    /// duplicate guard (unlike [`add_provider`](Self::add_provider)) — this is the
+    /// edit path, where the name already exists. Field-shape rules (api needs
+    /// base_url; oauth carries none) are enforced at [`save`].
+    pub fn set_provider(
+        &mut self,
+        name: String,
+        kind: String,
+        base_url: Option<String>,
+        key: Option<String>,
+    ) {
+        self.cfg.providers.insert(
+            name,
+            Provider {
+                kind,
+                base_url,
+                key,
+            },
+        );
+    }
+
     /// Remove a provider; rejected if a model role member still references it
     /// (the error names the role).
     pub fn remove_provider(&mut self, name: &str) -> Result<()> {
@@ -188,6 +209,99 @@ enum Mode {
     /// one of that provider's fetched models (or type an id when the fetch is
     /// unavailable). Replaces the old comma-separated `role, members, strategy`.
     SetModel(ModelWizard),
+    /// Edit an existing **api** provider: change its base_url (prefilled) and api
+    /// key (blank keeps the current one). The name and type stay fixed.
+    EditProvider(EditWizard),
+    /// The OAuth action menu for an existing **oauth:codex** provider: sign in,
+    /// sign out, or switch account. The chosen action is carried out after the
+    /// editor exits (the browser flow can't run under the full-screen UI).
+    OauthActions(OauthMenu),
+}
+
+/// The two editable fields of an api provider, in order.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EditStep {
+    BaseUrl,
+    Key,
+}
+
+/// Accumulating state for editing an existing api provider. `base_url` starts
+/// prefilled; `key` starts empty and, left blank, keeps the current key.
+struct EditWizard {
+    name: String,
+    kind: String,
+    /// The provider's current key, preserved when the user leaves the key blank.
+    existing_key: Option<String>,
+    step: EditStep,
+    base_url: String,
+    buffer: LineEditor,
+}
+
+impl EditWizard {
+    fn new(name: String, kind: String, base_url: Option<String>, key: Option<String>) -> Self {
+        let mut buffer = LineEditor::default();
+        buffer.set_text(base_url.clone().unwrap_or_default());
+        Self {
+            name,
+            kind,
+            existing_key: key,
+            step: EditStep::BaseUrl,
+            base_url: base_url.unwrap_or_default(),
+            buffer,
+        }
+    }
+
+    /// Store the current field and advance. Returns `Some((base_url, key))` when
+    /// the edit is complete (the caller upserts it). A blank key keeps the
+    /// existing one; a non-blank key replaces it.
+    fn advance(&mut self, text: String) -> Option<(Option<String>, Option<String>)> {
+        match self.step {
+            EditStep::BaseUrl => {
+                self.base_url = text.trim().to_string();
+                self.step = EditStep::Key;
+                self.buffer = LineEditor::default();
+                None
+            }
+            EditStep::Key => {
+                let entered = text.trim().to_string();
+                let key = if entered.is_empty() {
+                    self.existing_key.clone()
+                } else {
+                    Some(entered)
+                };
+                let base_url = (!self.base_url.is_empty()).then(|| self.base_url.clone());
+                Some((base_url, key))
+            }
+        }
+    }
+}
+
+/// The OAuth actions offered for an `oauth:codex` provider.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AuthAction {
+    Login,
+    Logout,
+    Switch,
+}
+
+const AUTH_ACTIONS: &[(&str, AuthAction)] = &[
+    ("Sign in", AuthAction::Login),
+    ("Sign out", AuthAction::Logout),
+    ("Switch account (sign out, then in)", AuthAction::Switch),
+];
+
+/// The OAuth action menu for one `oauth:codex` provider.
+struct OauthMenu {
+    provider: String,
+    sel: usize,
+}
+
+/// What the editor asks the caller to do after it exits: run an OAuth action for
+/// a provider (the browser flow needs the plain terminal, so it can't run under
+/// the full-screen UI).
+pub struct AuthRequest {
+    pub action: AuthAction,
+    pub provider: String,
 }
 
 /// One step of the add-provider wizard.
@@ -371,6 +485,10 @@ struct App {
     /// the blocking `/models` fetch (I/O belongs there, not in `on_key`) and
     /// feeds the result back via [`ModelWizard::apply_fetch`].
     fetch_models_now: bool,
+    /// Set when the user picks an OAuth action for a provider: the editor saves
+    /// and quits, and the caller runs the action (browser flow) after the
+    /// full-screen UI is torn down.
+    auth_request: Option<AuthRequest>,
     quit: bool,
 }
 
@@ -380,11 +498,12 @@ impl App {
             ed: ProviderEditor::new(cfg),
             sel: 0,
             mode: Mode::Browse,
-            status:
-                "a add-provider · d del-provider · m set-model · u unset-model · s save · q quit"
-                    .to_string(),
+            // The key hints live on their own persistent footer line (see
+            // `hints_for`); the status line starts empty and shows action results.
+            status: "editing providers.toml".to_string(),
             save_now: false,
             fetch_models_now: false,
+            auth_request: None,
             quit: false,
         }
     }
@@ -693,6 +812,102 @@ fn on_key_model_wizard(app: &mut App, code: KeyCode) {
     }
 }
 
+/// Drive the edit-existing-api-provider wizard (base_url then api key). Completing
+/// upserts the provider via [`ProviderEditor::set_provider`].
+fn on_key_edit_wizard(app: &mut App, code: KeyCode) {
+    enum EdAction {
+        Stay,
+        Cancel,
+        Complete {
+            name: String,
+            kind: String,
+            base_url: Option<String>,
+            key: Option<String>,
+        },
+    }
+    let action = {
+        let Mode::EditProvider(w) = &mut app.mode else {
+            return;
+        };
+        match code {
+            KeyCode::Char(c) => {
+                w.buffer.insert(c);
+                EdAction::Stay
+            }
+            KeyCode::Backspace => {
+                w.buffer.backspace();
+                EdAction::Stay
+            }
+            KeyCode::Left => {
+                w.buffer.left();
+                EdAction::Stay
+            }
+            KeyCode::Right => {
+                w.buffer.right();
+                EdAction::Stay
+            }
+            KeyCode::Esc => EdAction::Cancel,
+            KeyCode::Enter => {
+                let text = w.buffer.take();
+                match w.advance(text) {
+                    Some((base_url, key)) => EdAction::Complete {
+                        name: w.name.clone(),
+                        kind: w.kind.clone(),
+                        base_url,
+                        key,
+                    },
+                    None => EdAction::Stay,
+                }
+            }
+            _ => EdAction::Stay,
+        }
+    };
+    match action {
+        EdAction::Stay => {}
+        EdAction::Cancel => {
+            app.mode = Mode::Browse;
+            app.status = "cancelled".to_string();
+        }
+        EdAction::Complete {
+            name,
+            kind,
+            base_url,
+            key,
+        } => {
+            app.ed.set_provider(name.clone(), kind, base_url, key);
+            app.mode = Mode::Browse;
+            app.status = format!("edited provider '{name}' (s to save)");
+        }
+    }
+}
+
+/// Drive the OAuth action menu for an `oauth:codex` provider. Enter records the
+/// chosen action, saves, and quits so the caller runs it after the full-screen UI
+/// is torn down (the browser flow can't run under ratatui).
+fn on_key_oauth_menu(app: &mut App, code: KeyCode) {
+    let Mode::OauthActions(m) = &mut app.mode else {
+        return;
+    };
+    match code {
+        KeyCode::Up => m.sel = m.sel.saturating_sub(1),
+        KeyCode::Down => m.sel = (m.sel + 1).min(AUTH_ACTIONS.len() - 1),
+        KeyCode::Esc => {
+            app.mode = Mode::Browse;
+            app.status = "cancelled".to_string();
+        }
+        KeyCode::Enter => {
+            let action = AUTH_ACTIONS[m.sel].1;
+            let provider = m.provider.clone();
+            // Save first (so the provider entry exists on the server the login
+            // pushes to), then leave the editor to run the action.
+            app.auth_request = Some(AuthRequest { action, provider });
+            app.save_now = true;
+            app.quit = true;
+        }
+        _ => {}
+    }
+}
+
 fn on_key(app: &mut App, code: KeyCode) {
     if matches!(app.mode, Mode::AddProvider(_)) {
         on_key_add_wizard(app, code);
@@ -702,8 +917,19 @@ fn on_key(app: &mut App, code: KeyCode) {
         on_key_model_wizard(app, code);
         return;
     }
+    if matches!(app.mode, Mode::EditProvider(_)) {
+        on_key_edit_wizard(app, code);
+        return;
+    }
+    if matches!(app.mode, Mode::OauthActions(_)) {
+        on_key_oauth_menu(app, code);
+        return;
+    }
     match &mut app.mode {
-        Mode::AddProvider(_) | Mode::SetModel(_) => {} // handled above
+        Mode::AddProvider(_)
+        | Mode::SetModel(_)
+        | Mode::EditProvider(_)
+        | Mode::OauthActions(_) => {} // handled above
         Mode::Input { buffer, .. } => match code {
             KeyCode::Char(c) => buffer.insert(c),
             KeyCode::Backspace => buffer.backspace(),
@@ -746,6 +972,27 @@ fn on_key(app: &mut App, code: KeyCode) {
                 }
                 None => app.status = "nothing selected".to_string(),
             },
+            KeyCode::Char('e') => match app.ed.provider_names().get(app.sel).cloned() {
+                Some(name) => match app.ed.cfg.provider(&name) {
+                    // oauth:codex → the sign-in/out/switch menu; api → field edit.
+                    Some(p) if p.kind.eq_ignore_ascii_case("oauth:codex") => {
+                        app.mode = Mode::OauthActions(OauthMenu {
+                            provider: name,
+                            sel: 0,
+                        });
+                    }
+                    Some(p) => {
+                        app.mode = Mode::EditProvider(EditWizard::new(
+                            name,
+                            p.kind.clone(),
+                            p.base_url.clone(),
+                            p.key.clone(),
+                        ));
+                    }
+                    None => app.status = "nothing selected".to_string(),
+                },
+                None => app.status = "nothing selected".to_string(),
+            },
             KeyCode::Char('m') => {
                 let names = app.ed.provider_names();
                 if names.is_empty() {
@@ -769,7 +1016,7 @@ fn on_key(app: &mut App, code: KeyCode) {
 fn render(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(3)])
+        .constraints([Constraint::Min(3), Constraint::Length(4)])
         .split(f.area());
 
     let mut lines: Vec<Line> = Vec::new();
@@ -809,11 +1056,14 @@ fn render(f: &mut Frame, app: &App) {
         chunks[0],
     );
 
-    match &app.mode {
-        Mode::Browse => f.render_widget(
-            Paragraph::new(app.status.clone()).block(Block::bordered()),
-            chunks[1],
-        ),
+    // The footer is two lines inside one box: line 1 is the mode's content
+    // (status / input / picker), line 2 is the persistent key hints. Because the
+    // hints live on their own line, an action's status output (e.g. "added
+    // provider 'X'") can never overwrite them.
+    let max_w = chunks[1].width.saturating_sub(2) as usize;
+    let cursor_col = |x: u16| -> u16 { (2 + x as usize).min(max_w) as u16 };
+    let (title, body, cursor_x): (String, String, Option<u16>) = match &app.mode {
+        Mode::Browse => ("providers.toml".to_string(), app.status.clone(), None),
         Mode::AddProvider(wiz) => match wiz.step {
             AddStep::PickType => {
                 let sel = pc::provider_types()
@@ -828,13 +1078,7 @@ fn render(f: &mut Frame, app: &App) {
                     })
                     .collect::<Vec<_>>()
                     .join("   ");
-                f.render_widget(
-                    Paragraph::new(format!("type: {sel}")).block(
-                        Block::bordered()
-                            .title("add provider — ↑↓ pick type · Enter next · Esc cancel"),
-                    ),
-                    chunks[1],
-                );
+                ("add provider".to_string(), format!("type: {sel}"), None)
             }
             AddStep::Name | AddStep::BaseUrl | AddStep::Key => {
                 let (label, masked) = match wiz.step {
@@ -842,26 +1086,17 @@ fn render(f: &mut Frame, app: &App) {
                     AddStep::Key => ("api key", true),
                     _ => ("name", false),
                 };
-                let max_w = chunks[1].width.saturating_sub(2) as usize;
                 let (view, x) = wiz.buffer.display_window(max_w.saturating_sub(2));
                 let shown = if masked {
                     "*".repeat(view.chars().count())
                 } else {
                     view.to_string()
                 };
-                f.render_widget(
-                    Paragraph::new(format!("> {shown}")).block(Block::bordered().title(format!(
-                        "add {} provider — {label} · Enter next · Esc cancel",
-                        wiz.kind
-                    ))),
-                    chunks[1],
-                );
-                if !masked {
-                    f.set_cursor_position((
-                        chunks[1].x + 1 + (2 + x as usize).min(max_w) as u16,
-                        chunks[1].y + 1,
-                    ));
-                }
+                (
+                    format!("add {} provider — {label}", wiz.kind),
+                    format!("> {shown}"),
+                    (!masked).then(|| cursor_col(x)),
+                )
             }
         },
         Mode::SetModel(w) => match w.step {
@@ -878,13 +1113,7 @@ fn render(f: &mut Frame, app: &App) {
                     })
                     .collect::<Vec<_>>()
                     .join("   ");
-                f.render_widget(
-                    Paragraph::new(format!("role: {sel}")).block(
-                        Block::bordered()
-                            .title("set model — ↑↓ pick role · Enter next · Esc cancel"),
-                    ),
-                    chunks[1],
-                );
+                ("set model".to_string(), format!("role: {sel}"), None)
             }
             ModelStep::PickProvider => {
                 let n = w.prov_names.len();
@@ -893,40 +1122,25 @@ fn render(f: &mut Frame, app: &App) {
                     .get(w.prov_sel)
                     .map(String::as_str)
                     .unwrap_or("");
-                f.render_widget(
-                    Paragraph::new(format!("provider [{}/{n}]: {name}", w.prov_sel + 1)).block(
-                        Block::bordered().title(format!(
-                            "set model [{}] — ↑↓ provider · Enter fetch models · Esc back",
-                            w.role
-                        )),
-                    ),
-                    chunks[1],
-                );
+                (
+                    format!("set model [{}]", w.role),
+                    format!("provider [{}/{n}]: {name}", w.prov_sel + 1),
+                    None,
+                )
             }
-            ModelStep::Fetching => {
-                f.render_widget(
-                    Paragraph::new(format!("fetching {}/models …", w.provider))
-                        .block(Block::bordered().title(format!("set model [{}]", w.role))),
-                    chunks[1],
-                );
-            }
+            ModelStep::Fetching => (
+                format!("set model [{}]", w.role),
+                format!("fetching {}/models …", w.provider),
+                None,
+            ),
             ModelStep::PickModel => {
                 if w.manual {
-                    let max_w = chunks[1].width.saturating_sub(2) as usize;
                     let (view, x) = w.filter.display_window(max_w.saturating_sub(2));
-                    f.render_widget(
-                        Paragraph::new(format!("> {view}")).block(Block::bordered().title(
-                            format!(
-                                "set model [{}] {} — {} · Enter save · Esc back",
-                                w.role, w.provider, w.note
-                            ),
-                        )),
-                        chunks[1],
-                    );
-                    f.set_cursor_position((
-                        chunks[1].x + 1 + (2 + x as usize).min(max_w) as u16,
-                        chunks[1].y + 1,
-                    ));
+                    (
+                        format!("set model [{}] {} — {}", w.role, w.provider, w.note),
+                        format!("> {view}"),
+                        Some(cursor_col(x)),
+                    )
                 } else {
                     let filt = w.filtered();
                     let n = filt.len();
@@ -941,52 +1155,111 @@ fn render(f: &mut Frame, app: &App) {
                     } else {
                         format!("   filter: {ftext}")
                     };
-                    f.render_widget(
-                        Paragraph::new(format!("[{idx}/{n}] {highlighted}{filt_hint}")).block(
-                            Block::bordered().title(format!(
-                                "set model [{}] {} — ↑↓ pick · type filter · Enter save · Esc back",
-                                w.role, w.provider
-                            )),
-                        ),
-                        chunks[1],
-                    );
+                    (
+                        format!("set model [{}] {}", w.role, w.provider),
+                        format!("[{idx}/{n}] {highlighted}{filt_hint}"),
+                        None,
+                    )
                 }
             }
         },
-        Mode::Input { prompt, buffer, .. } => {
-            let max_w = chunks[1].width.saturating_sub(2) as usize;
-            let (view, x) = buffer.display_window(max_w.saturating_sub(2));
-            f.render_widget(
-                Paragraph::new(format!("> {view}"))
-                    .block(Block::bordered().title(format!("{prompt} · Enter save · Esc cancel"))),
-                chunks[1],
-            );
-            f.set_cursor_position((
-                chunks[1].x + 1 + (2 + x as usize).min(max_w) as u16,
-                chunks[1].y + 1,
-            ));
+        Mode::EditProvider(w) => {
+            let (label, masked) = match w.step {
+                EditStep::BaseUrl => ("base_url", false),
+                EditStep::Key => ("api key (blank keeps current)", true),
+            };
+            let (view, x) = w.buffer.display_window(max_w.saturating_sub(2));
+            let shown = if masked {
+                "*".repeat(view.chars().count())
+            } else {
+                view.to_string()
+            };
+            (
+                format!("edit {} provider '{}' — {label}", w.kind, w.name),
+                format!("> {shown}"),
+                (!masked).then(|| cursor_col(x)),
+            )
         }
+        Mode::OauthActions(m) => {
+            let sel = AUTH_ACTIONS
+                .iter()
+                .enumerate()
+                .map(|(i, (label, _))| {
+                    if i == m.sel {
+                        format!("▶{label}")
+                    } else {
+                        format!(" {label}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("   ");
+            (format!("Codex sign-in — '{}'", m.provider), sel, None)
+        }
+        Mode::Input { prompt, buffer, .. } => {
+            let (view, x) = buffer.display_window(max_w.saturating_sub(2));
+            (prompt.to_string(), format!("> {view}"), Some(cursor_col(x)))
+        }
+    };
+    f.render_widget(
+        Paragraph::new(vec![Line::from(body), Line::from(hints_for(&app.mode))])
+            .block(Block::bordered().title(title)),
+        chunks[1],
+    );
+    if let Some(cx) = cursor_x {
+        f.set_cursor_position((chunks[1].x + 1 + cx, chunks[1].y + 1));
     }
 }
 
+/// The persistent key-hint line for the current screen. Rendered on its own
+/// footer line so an action's status output never hides it (spec: the key hints
+/// stay visible). Pure — a non-empty hint exists for every screen.
+fn hints_for(mode: &Mode) -> &'static str {
+    match mode {
+        Mode::Browse => "a: add · e: edit · d: del · m: set-model · u: unset · s: save · q: quit",
+        Mode::AddProvider(w) => match w.step {
+            AddStep::PickType => "↑↓: pick type · Enter: next · Esc: cancel",
+            _ => "type the value · Enter: next · Esc: cancel",
+        },
+        Mode::SetModel(w) => match w.step {
+            ModelStep::PickRole => "↑↓: pick role · Enter: next · Esc: cancel",
+            ModelStep::PickProvider => "↑↓: provider · Enter: fetch models · Esc: back",
+            ModelStep::Fetching => "fetching the provider's models…",
+            ModelStep::PickModel => "↑↓: pick · type: filter · Enter: set · Esc: back",
+        },
+        Mode::EditProvider(_) => "type the value · Enter: next · Esc: cancel",
+        Mode::OauthActions(_) => "↑↓: action · Enter: run · Esc: back",
+        Mode::Input { .. } => "Enter: save · Esc: cancel",
+    }
+}
+
+/// Why the editor exited (beyond a normal quit): a concurrent-edit conflict the
+/// caller should reload from, and/or an OAuth action to run once the full-screen
+/// UI is torn down (then reopen the editor).
+pub struct EditorOutcome {
+    pub conflict: Option<String>,
+    pub auth_request: Option<AuthRequest>,
+}
+
 /// Open the interactive providers editor over `path` (this host's own file).
-pub fn run(path: &Path) -> Result<()> {
+/// Returns an OAuth action the caller must run after the terminal is restored
+/// (then reopen), or `None` on a normal quit. A local file write never conflicts.
+pub fn run(path: &Path) -> Result<Option<AuthRequest>> {
     let cfg = pc::load_or_default(path)?;
     run_with_saver(cfg, |edited| {
         pc::write_providers(path, edited).map(|()| SaveOutcome::Saved)
     })
-    .map(|_| ())
+    .map(|outcome| outcome.auth_request)
 }
 
 /// Open the interactive providers editor over an in-memory configuration; every
 /// save goes through `save` (local file write or remote apply — the editor does
-/// not care). Returns the conflict message when the editor exited because a
-/// save hit a concurrent-edit conflict (the caller reloads and reopens), `None`
-/// on a normal quit.
+/// not care). Returns an [`EditorOutcome`]: a conflict message when a save hit a
+/// concurrent edit (the caller reloads and reopens), and/or a requested OAuth
+/// action (the caller runs it after the UI is torn down, then reopens).
 pub fn run_with_saver(
     cfg: ProvidersConfig,
     mut save: impl FnMut(&ProvidersConfig) -> Result<SaveOutcome>,
-) -> Result<Option<String>> {
+) -> Result<EditorOutcome> {
     use ratatui::crossterm::event::{self, Event, KeyEventKind};
     let mut app = App::new(cfg);
     let mut conflict: Option<String> = None;
@@ -1033,7 +1306,11 @@ pub fn run_with_saver(
         Ok(())
     })();
     ratatui::restore();
-    result.map(|()| conflict)
+    let auth_request = app.auth_request.take();
+    result.map(|()| EditorOutcome {
+        conflict,
+        auth_request,
+    })
 }
 
 #[cfg(test)]
@@ -1255,6 +1532,76 @@ mod tests {
     }
 
     #[test]
+    fn set_provider_upserts_existing_fields() {
+        let mut ed = ProviderEditor::new(ProvidersConfig::default());
+        ed.add_provider(
+            "p1".into(),
+            "api".into(),
+            Some("https://old/v1".into()),
+            Some("k1".into()),
+        )
+        .unwrap();
+        // Upsert replaces the fields without the add-time duplicate guard.
+        ed.set_provider(
+            "p1".into(),
+            "api".into(),
+            Some("https://new/v1".into()),
+            Some("k2".into()),
+        );
+        let p = ed.cfg.provider("p1").unwrap();
+        assert_eq!(p.base_url.as_deref(), Some("https://new/v1"));
+        assert_eq!(p.key.as_deref(), Some("k2"));
+        assert_eq!(ed.provider_names(), vec!["p1".to_string()]);
+    }
+
+    #[test]
+    fn edit_wizard_updates_base_url_and_keeps_blank_key() {
+        let mut app = App::new(ProvidersConfig::default());
+        app.ed
+            .add_provider(
+                "p1".into(),
+                "api".into(),
+                Some("https://old/v1".into()),
+                Some("orig".into()),
+            )
+            .unwrap();
+        on_key(&mut app, KeyCode::Char('e')); // api → EditProvider, base_url prefilled
+        assert!(matches!(app.mode, Mode::EditProvider(_)));
+        // Replace the base_url, then leave the key blank to keep the current one.
+        if let Mode::EditProvider(w) = &mut app.mode {
+            w.buffer = LineEditor::default();
+        }
+        type_str(&mut app, "https://new/v1");
+        on_key(&mut app, KeyCode::Enter); // → key step
+        on_key(&mut app, KeyCode::Enter); // blank key → complete
+        let p = app.ed.cfg.provider("p1").unwrap();
+        assert_eq!(p.base_url.as_deref(), Some("https://new/v1"));
+        assert_eq!(
+            p.key.as_deref(),
+            Some("orig"),
+            "blank key keeps the current one"
+        );
+    }
+
+    #[test]
+    fn oauth_provider_edit_opens_menu_and_records_request() {
+        let mut app = App::new(ProvidersConfig::default());
+        app.ed
+            .add_provider("codex1".into(), "oauth:codex".into(), None, None)
+            .unwrap();
+        on_key(&mut app, KeyCode::Char('e')); // oauth:codex → OauthActions menu
+        assert!(matches!(app.mode, Mode::OauthActions(_)));
+        on_key(&mut app, KeyCode::Down); // Sign in → Sign out
+        on_key(&mut app, KeyCode::Down); // → Switch account
+        on_key(&mut app, KeyCode::Enter);
+        let req = app.auth_request.as_ref().expect("auth request recorded");
+        assert_eq!(req.action, AuthAction::Switch);
+        assert_eq!(req.provider, "codex1");
+        assert!(app.save_now, "saves before running the action");
+        assert!(app.quit, "leaves the editor to run the action");
+    }
+
+    #[test]
     fn wizard_shows_the_typed_buffer() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
@@ -1279,6 +1626,65 @@ mod tests {
         assert!(
             content.contains("add api provider"),
             "wizard prompt visible in title"
+        );
+    }
+
+    #[test]
+    fn hints_for_is_nonempty_on_every_screen() {
+        // Browse, both add-wizard step kinds, every set-model step, and the input
+        // line each expose a non-empty key-hint line.
+        assert!(!hints_for(&Mode::Browse).is_empty());
+        assert!(!hints_for(&Mode::AddProvider(AddWizard::new())).is_empty()); // PickType
+        let mut add = AddWizard::new();
+        add.step = AddStep::Name;
+        assert!(!hints_for(&Mode::AddProvider(add)).is_empty()); // text step
+        for step in [
+            ModelStep::PickRole,
+            ModelStep::PickProvider,
+            ModelStep::Fetching,
+            ModelStep::PickModel,
+        ] {
+            let mut w = ModelWizard::new(vec!["p".to_string()]);
+            w.step = step;
+            assert!(!hints_for(&Mode::SetModel(w)).is_empty(), "{step:?}");
+        }
+        assert!(!hints_for(&Mode::Input {
+            action: Action::UnsetModel,
+            prompt: "x",
+            buffer: LineEditor::default(),
+        })
+        .is_empty());
+    }
+
+    #[test]
+    fn browse_hints_survive_a_status_message() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        // Add a provider through the wizard (sets status "added provider 'X'"),
+        // then render: the status AND the key hints must both be visible.
+        let mut app = App::new(ProvidersConfig::default());
+        on_key(&mut app, KeyCode::Char('a'));
+        on_key(&mut app, KeyCode::Enter); // api → name
+        type_str(&mut app, "openai1");
+        on_key(&mut app, KeyCode::Enter); // → base_url
+        type_str(&mut app, "https://u/v1");
+        on_key(&mut app, KeyCode::Enter); // → key
+        type_str(&mut app, "sk");
+        on_key(&mut app, KeyCode::Enter); // done → Browse, status set
+        assert!(matches!(app.mode, Mode::Browse));
+        let mut terminal = Terminal::new(TestBackend::new(90, 12)).expect("term");
+        terminal.draw(|f| render(f, &app)).expect("draw");
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(content.contains("added provider"), "status result visible");
+        assert!(
+            content.contains("a: add") && content.contains("q: quit"),
+            "key hints stay visible alongside the status"
         );
     }
 }

@@ -9,7 +9,9 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 
 use agent_core::{CoreError, Result};
-use fleety_protocol::{ClientMsg, ServerMsg};
+use fleety_protocol::{ClientMsg, ConfigTarget, ServerMsg};
+use fleety_tools::providers_config::ProvidersConfig;
+use fleety_tools::transport::{Receiver as Rx, Sender as Tx};
 use fleety_tools::{connection, oauth};
 
 use crate::{connect_hello_for_auth, recv, send};
@@ -24,28 +26,114 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Dispatch `fleety auth <sub>`.
+/// Dispatch `fleety auth <sub>`. Codex credentials are per provider, so `login`
+/// and `logout` take the provider name; `status` takes an optional one (no name
+/// lists every `oauth:codex` provider).
 pub async fn run(args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
-        Some("login") => login(args.iter().any(|a| a == "--no-browser")).await,
-        Some("status") => status().await,
-        Some("logout") => logout().await,
+        Some("login") => {
+            let no_browser = args.iter().any(|a| a == "--no-browser");
+            match first_positional(&args[1..]) {
+                Some(provider) => login(&provider, no_browser).await,
+                None => Err(usage_error("login")),
+            }
+        }
+        Some("logout") => match first_positional(&args[1..]) {
+            Some(provider) => logout(&provider).await,
+            None => Err(usage_error("logout")),
+        },
+        Some("status") => status(first_positional(&args[1..])).await,
         _ => {
-            println!("usage: fleety auth <login|status|logout> [--no-browser]");
+            println!(
+                "usage: fleety auth <login <provider> | logout <provider> | status [<provider>]> \
+                 [--no-browser]"
+            );
             Ok(())
         }
     }
 }
 
-/// The version gate: a server that does not advertise credential support
-/// (config protocol 2) cannot store the login — refuse up front, before any
-/// browser opens, with the fix spelled out.
+/// The first positional (non-flag) argument — the provider name after the
+/// subcommand. Flags start with `--`. Pure.
+fn first_positional(args: &[String]) -> Option<String> {
+    args.iter().find(|a| !a.starts_with("--")).cloned()
+}
+
+/// A missing-provider usage error naming an example. Pure.
+fn usage_error(sub: &str) -> CoreError {
+    CoreError::Message(format!(
+        "`fleety auth {sub}` needs a provider name (an oauth:codex provider), e.g. \
+         `fleety auth {sub} my-codex`. List them with `fleety auth status`."
+    ))
+}
+
+/// Validate that `provider` names an `oauth:codex` provider in the connected
+/// server's config, erroring by name otherwise. Pure.
+fn validate_codex_provider(cfg: &ProvidersConfig, provider: &str) -> Result<()> {
+    match cfg.providers.get(provider) {
+        Some(p) if p.kind.eq_ignore_ascii_case("oauth:codex") => Ok(()),
+        Some(p) => Err(CoreError::Message(format!(
+            "provider '{provider}' is type '{}', not oauth:codex — `fleety auth` signs in only \
+             Codex providers",
+            p.kind
+        ))),
+        None => Err(CoreError::Message(format!(
+            "no such provider '{provider}' on the server — add it first with `fleety config` \
+             (Providers, type oauth:codex)"
+        ))),
+    }
+}
+
+/// The `oauth:codex` provider names in the config, in display order. Pure.
+fn codex_provider_names(cfg: &ProvidersConfig) -> Vec<String> {
+    cfg.providers
+        .iter()
+        .filter(|(_, p)| p.kind.eq_ignore_ascii_case("oauth:codex"))
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// Pull the connected server's provider config (to validate a provider name and
+/// enumerate the `oauth:codex` ones). Reuses the same `ConfigSnapshot` the config
+/// panel uses.
+async fn fetch_providers(tx: &mut Tx, rx: &mut Rx) -> Result<ProvidersConfig> {
+    send(
+        tx,
+        &ClientMsg::ConfigSnapshot {
+            target: ConfigTarget::Server,
+        },
+    )
+    .await?;
+    let providers_json = match recv(rx).await? {
+        Some(ServerMsg::ConfigSnapshotResult { providers_json, .. }) => providers_json,
+        Some(ServerMsg::ConfigResult { error: Some(e), .. }) => {
+            return Err(CoreError::Message(match e.remediation {
+                Some(r) => format!("{} — {r}", e.message),
+                None => e.message,
+            }))
+        }
+        other => {
+            return Err(CoreError::Provider(format!(
+                "expected a config snapshot, got {other:?}"
+            )))
+        }
+    };
+    serde_json::from_str(&providers_json).map_err(|e| {
+        CoreError::Message(format!(
+            "the server returned an unreadable provider snapshot: {e}"
+        ))
+    })
+}
+
+/// The version gate: a server that does not advertise **per-provider** credential
+/// support (config protocol 3) cannot store a per-provider login — refuse up
+/// front, before any browser opens, with the fix spelled out.
 fn credential_support_err(config_protocol: u32) -> Option<CoreError> {
-    (config_protocol < 2).then(|| {
+    (config_protocol < 3).then(|| {
         CoreError::Message(
-            "the connected server is too old to store credentials remotely — update it first \
-             (run `fleety update` on the server host, or let fleet convergence catch it up), \
-             then re-run `fleety auth login`"
+            "the connected server is too old to store per-provider Codex credentials — update it \
+             first (run `fleety update` on the server host, or let fleet convergence catch it up), \
+             then re-run `fleety auth login <provider>`"
                 .to_string(),
         )
     })
@@ -132,7 +220,7 @@ fn credential_result(reply: Option<ServerMsg>) -> Result<()> {
 /// Run the PKCE authorization-code login: open the browser, capture the code on
 /// a loopback listener, exchange it, and deliver the tokens to the connected
 /// server for storage (nothing is persisted on this host).
-pub async fn login(no_browser: bool) -> Result<()> {
+pub async fn login(provider: &str, no_browser: bool) -> Result<()> {
     let config = oauth::oauth_config();
     if config.client_id.is_empty() {
         return Err(CoreError::Message(
@@ -148,17 +236,22 @@ pub async fn login(no_browser: bool) -> Result<()> {
     // This probe connection is then dropped — the authorization can take minutes
     // and an idle link would trip the keepalive; delivery reconnects afresh.
     {
-        let (_tx, _rx, config_protocol, _target) = connect_hello_for_auth().await.map_err(|e| {
-            CoreError::Message(format!(
-                "could not reach the server that would store this login: {} — check the \
+        let (mut tx, mut rx, config_protocol, _target) =
+            connect_hello_for_auth().await.map_err(|e| {
+                CoreError::Message(format!(
+                    "could not reach the server that would store this login: {} — check the \
                      connection (`fleety status`), pair this device first (`fleety pair <code>`), \
                      or set the server URL with `fleety init <ws-url>`",
-                e.report().message
-            ))
-        })?;
+                    e.report().message
+                ))
+            })?;
         if let Some(err) = credential_support_err(config_protocol) {
             return Err(err);
         }
+        // Validate the provider before the browser opens: it must be an
+        // oauth:codex provider on this server.
+        let providers = fetch_providers(&mut tx, &mut rx).await?;
+        validate_codex_provider(&providers, provider)?;
     }
 
     let verifier = oauth::generate_verifier();
@@ -216,6 +309,7 @@ pub async fn login(no_browser: bool) -> Result<()> {
         &mut tx,
         &ClientMsg::CredentialPut {
             kind: CREDENTIAL_KIND.to_string(),
+            provider: Some(provider.to_string()),
             payload_json,
         },
     )
@@ -226,7 +320,7 @@ pub async fn login(no_browser: bool) -> Result<()> {
         tracing::warn!(report = ?e.report(), "could not record auth audit");
     }
     println!(
-        "Signed in. Credentials delivered to server {}.",
+        "Signed in provider '{provider}'. Credentials delivered to server {}.",
         server_label(&target)
     );
     if let Some(note) = cleanup_legacy_local_file(&oauth::default_token_path()) {
@@ -235,47 +329,63 @@ pub async fn login(no_browser: bool) -> Result<()> {
     Ok(())
 }
 
-/// Report whether the connected server holds a credential and when it expires —
-/// never the token values (the status frame carries none by shape).
-pub async fn status() -> Result<()> {
+/// Report sign-in state and expiry per provider — never token values (the status
+/// frame carries none by shape). With a provider name, reports just that one;
+/// with none, lists every `oauth:codex` provider on the server.
+pub async fn status(provider: Option<String>) -> Result<()> {
     let (mut tx, mut rx, config_protocol, target) = connect_hello_for_auth().await?;
     if let Some(err) = credential_support_err(config_protocol) {
         return Err(err);
     }
-    send(
-        &mut tx,
-        &ClientMsg::CredentialStatus {
-            kind: CREDENTIAL_KIND.to_string(),
-        },
-    )
-    .await?;
-    match recv(&mut rx).await? {
-        Some(ServerMsg::CredentialStatusResult { error: Some(e), .. }) => {
-            return Err(CoreError::Message(match e.remediation {
-                Some(r) => format!("{} — {r}", e.message),
-                None => e.message,
-            }))
+    let label = server_label(&target);
+    let names = match provider {
+        Some(p) => vec![p],
+        None => {
+            let cfg = fetch_providers(&mut tx, &mut rx).await?;
+            let names = codex_provider_names(&cfg);
+            if names.is_empty() {
+                println!(
+                    "No oauth:codex providers configured on server {label}. Add one with \
+                     `fleety config` (Providers, type oauth:codex), then \
+                     `fleety auth login <provider>`."
+                );
+                return Ok(());
+            }
+            names
         }
-        Some(ServerMsg::CredentialStatusResult {
-            present,
-            expires_at_secs,
-            detail,
-            ..
-        }) => {
-            println!(
-                "{}",
-                remote_status_line(
-                    present,
-                    expires_at_secs,
-                    detail.as_deref(),
-                    &server_label(&target)
-                )
-            );
-        }
-        other => {
-            return Err(CoreError::Provider(format!(
-                "expected a credential status reply, got {other:?}"
-            )))
+    };
+    for name in &names {
+        send(
+            &mut tx,
+            &ClientMsg::CredentialStatus {
+                kind: CREDENTIAL_KIND.to_string(),
+                provider: Some(name.clone()),
+            },
+        )
+        .await?;
+        match recv(&mut rx).await? {
+            Some(ServerMsg::CredentialStatusResult { error: Some(e), .. }) => {
+                return Err(CoreError::Message(match e.remediation {
+                    Some(r) => format!("{} — {r}", e.message),
+                    None => e.message,
+                }))
+            }
+            Some(ServerMsg::CredentialStatusResult {
+                present,
+                expires_at_secs,
+                detail,
+                ..
+            }) => {
+                println!(
+                    "{name}: {}",
+                    remote_status_line(present, expires_at_secs, detail.as_deref(), &label)
+                );
+            }
+            other => {
+                return Err(CoreError::Provider(format!(
+                    "expected a credential status reply, got {other:?}"
+                )))
+            }
         }
     }
     if let Some(note) = legacy_local_note(&oauth::default_token_path()) {
@@ -284,16 +394,20 @@ pub async fn status() -> Result<()> {
     Ok(())
 }
 
-/// Remove the credential stored on the connected server.
-pub async fn logout() -> Result<()> {
+/// Remove a provider's credential stored on the connected server.
+pub async fn logout(provider: &str) -> Result<()> {
     let (mut tx, mut rx, config_protocol, target) = connect_hello_for_auth().await?;
     if let Some(err) = credential_support_err(config_protocol) {
         return Err(err);
     }
+    // Validate the provider so a typo doesn't "succeed" as a no-op delete.
+    let cfg = fetch_providers(&mut tx, &mut rx).await?;
+    validate_codex_provider(&cfg, provider)?;
     send(
         &mut tx,
         &ClientMsg::CredentialDelete {
             kind: CREDENTIAL_KIND.to_string(),
+            provider: Some(provider.to_string()),
         },
     )
     .await?;
@@ -301,7 +415,10 @@ pub async fn logout() -> Result<()> {
     if let Err(e) = oauth::append_auth_audit("logout", now_secs()) {
         tracing::warn!(report = ?e.report(), "could not record auth audit");
     }
-    println!("Signed out on server {}.", server_label(&target));
+    println!(
+        "Signed out provider '{provider}' on server {}.",
+        server_label(&target)
+    );
     Ok(())
 }
 
@@ -410,6 +527,67 @@ fn wait_for_code(listener: &TcpListener, expected_state: &str) -> Result<String>
 mod tests {
     use super::*;
 
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn first_positional_skips_flags() {
+        // The provider is the first non-flag arg; flags anywhere are skipped.
+        assert_eq!(
+            first_positional(&s(&["my-codex", "--no-browser"])),
+            Some("my-codex".to_string())
+        );
+        assert_eq!(
+            first_positional(&s(&["--no-browser", "my-codex"])),
+            Some("my-codex".to_string())
+        );
+        // No provider (only flags, or empty) → None → the caller raises a usage error.
+        assert_eq!(first_positional(&s(&["--no-browser"])), None);
+        assert_eq!(first_positional(&s(&[])), None);
+    }
+
+    #[test]
+    fn usage_error_names_the_subcommand_and_an_example() {
+        let e = usage_error("login").to_string();
+        assert!(e.contains("login") && e.contains("provider"));
+    }
+
+    #[test]
+    fn validate_codex_provider_checks_existence_and_type() {
+        let mut cfg = ProvidersConfig::default();
+        cfg.providers.insert(
+            "codex1".into(),
+            fleety_tools::providers_config::Provider {
+                kind: "oauth:codex".into(),
+                base_url: None,
+                key: None,
+            },
+        );
+        cfg.providers.insert(
+            "openai1".into(),
+            fleety_tools::providers_config::Provider {
+                kind: "api".into(),
+                base_url: Some("https://u/v1".into()),
+                key: None,
+            },
+        );
+        // An oauth:codex provider validates.
+        assert!(validate_codex_provider(&cfg, "codex1").is_ok());
+        // A non-oauth provider errors by name and type.
+        let e = validate_codex_provider(&cfg, "openai1")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("openai1") && e.contains("oauth:codex"));
+        // A missing provider errors by name.
+        let e = validate_codex_provider(&cfg, "ghost")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("ghost"));
+        // Enumeration lists only the codex providers.
+        assert_eq!(codex_provider_names(&cfg), vec!["codex1".to_string()]);
+    }
+
     #[test]
     fn parse_callback_extracts_code_and_checks_state() {
         let line = "GET /callback?code=abc123&state=st-1 HTTP/1.1";
@@ -423,13 +601,19 @@ mod tests {
 
     #[test]
     fn version_gate_refuses_old_servers_before_any_flow() {
-        // config protocol < 2 → refuse with the fix; 2+ → proceed.
+        // Per-provider Codex needs config protocol 3: < 3 → refuse with the fix.
         let err = credential_support_err(1).expect("old server refused");
         let msg = err.to_string();
         assert!(msg.contains("update"), "gate names the remedy: {msg}");
         assert!(credential_support_err(0).is_some());
-        assert!(credential_support_err(2).is_none());
-        assert!(credential_support_err(3).is_none(), "future versions pass");
+        assert!(
+            credential_support_err(2).is_some(),
+            "protocol 2 lacks per-provider"
+        );
+        assert!(
+            credential_support_err(3).is_none(),
+            "protocol 3 supports per-provider"
+        );
     }
 
     #[test]

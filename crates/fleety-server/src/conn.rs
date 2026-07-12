@@ -1583,14 +1583,20 @@ async fn serve(
                 };
                 emit(out, &reply)?;
             }
-            ClientMsg::CredentialPut { kind, payload_json } => {
+            ClientMsg::CredentialPut {
+                kind,
+                provider,
+                payload_json,
+            } => {
                 // Deliver-and-store: the CLI ran the OAuth flow, this server owns
-                // the credential from here (its own protected token store, same
-                // path the provider reads). Audited without token values; a
-                // failed write is audited too so a broken store is visible.
+                // the credential from here (its own protected per-provider token
+                // store, the same path that provider reads). Audited without token
+                // values, with the provider named; a failed write is audited too so
+                // a broken store is visible.
                 let reply = credential_put(
-                    &fleety_tools::oauth::default_token_path(),
+                    &credential_token_path(provider.as_deref()),
                     &kind,
+                    provider.as_deref(),
                     &payload_json,
                     auth.required(),
                 );
@@ -1604,27 +1610,34 @@ async fn serve(
                     _ => None,
                 };
                 if let Some(op) = op {
-                    let _ = storage.append_history(device_id, &credential_audit_event(op, &kind));
+                    let _ = storage.append_history(
+                        device_id,
+                        &credential_audit_event(op, &kind, provider.as_deref()),
+                    );
                 }
                 emit(out, &reply)?;
             }
-            ClientMsg::CredentialStatus { kind } => {
+            ClientMsg::CredentialStatus { kind, provider } => {
                 let reply = credential_status(
-                    &fleety_tools::oauth::default_token_path(),
+                    &credential_token_path(provider.as_deref()),
                     &kind,
+                    provider.as_deref(),
                     auth.required(),
                 );
                 emit(out, &reply)?;
             }
-            ClientMsg::CredentialDelete { kind } => {
+            ClientMsg::CredentialDelete { kind, provider } => {
                 let reply = credential_delete(
-                    &fleety_tools::oauth::default_token_path(),
+                    &credential_token_path(provider.as_deref()),
                     &kind,
+                    provider.as_deref(),
                     auth.required(),
                 );
                 if matches!(&reply, ServerMsg::CredentialResult { ok: true, .. }) {
-                    let _ =
-                        storage.append_history(device_id, &credential_audit_event("delete", &kind));
+                    let _ = storage.append_history(
+                        device_id,
+                        &credential_audit_event("delete", &kind, provider.as_deref()),
+                    );
                 }
                 emit(out, &reply)?;
             }
@@ -1726,9 +1739,16 @@ fn remote_mutation_denied(args: &[String], require_auth: bool) -> bool {
 const CREDENTIAL_KIND_CODEX_OAUTH: &str = "codex-oauth";
 
 /// The gate every credential frame passes first: auth must be on (a wide-open
-/// server takes any connection, and credentials are the crown jewels), and the
-/// kind must be known. `None` means the request may proceed. Pure.
-fn credential_gate(kind: &str, auth_required: bool) -> Option<fleety_protocol::WireError> {
+/// server takes any connection, and credentials are the crown jewels), the kind
+/// must be known, and a `codex-oauth` credential MUST name the provider it
+/// belongs to (the store is per-provider). `None` means the request may proceed.
+/// Pure. A `provider` that is absent or blank is treated the same — rejected — so
+/// an empty name can never map to a stray `codex-oauth/.json`.
+fn credential_gate(
+    kind: &str,
+    provider: Option<&str>,
+    auth_required: bool,
+) -> Option<fleety_protocol::WireError> {
     if !auth_required {
         return Some(fleety_protocol::WireError {
             kind: "unauthenticated".to_string(),
@@ -1751,7 +1771,32 @@ fn credential_gate(kind: &str, auth_required: bool) -> Option<fleety_protocol::W
             remediation: Some("update the server, or use a matching client version".to_string()),
         });
     }
+    // codex-oauth credentials are stored per provider: an old client that omits
+    // the provider (or sends a blank one) is rejected with an update-your-CLI
+    // message rather than falling back to a global write.
+    if provider.map(str::trim).unwrap_or("").is_empty() {
+        return Some(fleety_protocol::WireError {
+            kind: "invalid".to_string(),
+            message: "this server stores Codex credentials per provider — update fleety and \
+                      sign in per provider with `fleety auth login <provider>`"
+                .to_string(),
+            remediation: Some(
+                "update the fleety CLI, then run `fleety auth login <provider>`".to_string(),
+            ),
+        });
+    }
     None
+}
+
+/// The per-provider token store path for a credential frame. `provider` is
+/// guaranteed present past [`credential_gate`]; the `None` arm is an unreachable
+/// placeholder (the gate rejects a codex-oauth frame without a provider before any
+/// path is read) that keeps the caller total.
+fn credential_token_path(provider: Option<&str>) -> std::path::PathBuf {
+    match provider {
+        Some(p) if !p.trim().is_empty() => fleety_tools::oauth::token_path_for(p),
+        _ => fleety_tools::oauth::default_token_path(),
+    }
 }
 
 /// Handle `CredentialPut`: validate the payload shape for `kind` and persist it
@@ -1760,10 +1805,11 @@ fn credential_gate(kind: &str, auth_required: bool) -> Option<fleety_protocol::W
 fn credential_put(
     token_path: &std::path::Path,
     kind: &str,
+    provider: Option<&str>,
     payload_json: &str,
     auth_required: bool,
 ) -> ServerMsg {
-    if let Some(error) = credential_gate(kind, auth_required) {
+    if let Some(error) = credential_gate(kind, provider, auth_required) {
         return ServerMsg::CredentialResult {
             ok: false,
             error: Some(error),
@@ -1802,8 +1848,13 @@ fn credential_put(
 
 /// Handle `CredentialStatus`: presence and expiry only — token values never
 /// enter the reply.
-fn credential_status(token_path: &std::path::Path, kind: &str, auth_required: bool) -> ServerMsg {
-    if let Some(error) = credential_gate(kind, auth_required) {
+fn credential_status(
+    token_path: &std::path::Path,
+    kind: &str,
+    provider: Option<&str>,
+    auth_required: bool,
+) -> ServerMsg {
+    if let Some(error) = credential_gate(kind, provider, auth_required) {
         return ServerMsg::CredentialStatusResult {
             present: false,
             expires_at_secs: None,
@@ -1829,8 +1880,13 @@ fn credential_status(token_path: &std::path::Path, kind: &str, auth_required: bo
 
 /// Handle `CredentialDelete`: remove the stored credential (idempotent — a
 /// missing file is a successful logout).
-fn credential_delete(token_path: &std::path::Path, kind: &str, auth_required: bool) -> ServerMsg {
-    if let Some(error) = credential_gate(kind, auth_required) {
+fn credential_delete(
+    token_path: &std::path::Path,
+    kind: &str,
+    provider: Option<&str>,
+    auth_required: bool,
+) -> ServerMsg {
+    if let Some(error) = credential_gate(kind, provider, auth_required) {
         return ServerMsg::CredentialResult {
             ok: false,
             error: Some(error),
@@ -1889,10 +1945,12 @@ fn mint_pairing_code(auth: &AuthStore) -> ServerMsg {
 
 /// The audit event for an accepted (or failed) credential operation. Carries
 /// the operation and kind only — token values never reach the audit log.
-fn credential_audit_event(op: &str, kind: &str) -> agent_core::Event {
+fn credential_audit_event(op: &str, kind: &str, provider: Option<&str>) -> agent_core::Event {
     agent_core::Event::ToolResult {
         id: "credential".to_string(),
-        result: serde_json::json!({ "credential": { "op": op, "kind": kind } }),
+        result: serde_json::json!({
+            "credential": { "op": op, "kind": kind, "provider": provider }
+        }),
     }
 }
 
@@ -3485,7 +3543,7 @@ mod tests {
         let valid = r#"{"access_token":"at-1","refresh_token":"rt-1","expires_at_secs":123,"account_id":"acc-1"}"#;
 
         // Auth-off server refuses every credential operation and stores nothing.
-        match credential_put(&path, "codex-oauth", valid, false) {
+        match credential_put(&path, "codex-oauth", Some("codex-a"), valid, false) {
             ServerMsg::CredentialResult { ok, error } => {
                 assert!(!ok);
                 let e = error.expect("gate error");
@@ -3495,7 +3553,7 @@ mod tests {
             other => panic!("unexpected reply {other:?}"),
         }
         assert!(!path.exists());
-        match credential_status(&path, "codex-oauth", false) {
+        match credential_status(&path, "codex-oauth", Some("codex-a"), false) {
             ServerMsg::CredentialStatusResult { present, error, .. } => {
                 assert!(!present);
                 assert!(error.is_some(), "status is refused on an auth-off server");
@@ -3504,7 +3562,7 @@ mod tests {
         }
 
         // Unknown kind is rejected by name; nothing is stored.
-        match credential_put(&path, "something-else", valid, true) {
+        match credential_put(&path, "something-else", Some("codex-a"), valid, true) {
             ServerMsg::CredentialResult { ok, error } => {
                 assert!(!ok);
                 let e = error.expect("kind error");
@@ -3515,9 +3573,27 @@ mod tests {
         }
         assert!(!path.exists());
 
+        // A codex-oauth frame with no provider is rejected (per-provider store).
+        match credential_put(&path, "codex-oauth", None, valid, true) {
+            ServerMsg::CredentialResult { ok, error } => {
+                assert!(!ok);
+                let e = error.expect("provider error");
+                assert_eq!(e.kind, "invalid");
+                assert!(e.message.contains("per provider"));
+            }
+            other => panic!("unexpected reply {other:?}"),
+        }
+        assert!(!path.exists());
+
         // A payload missing a required field is rejected naming the field, and
         // has no side effects.
-        match credential_put(&path, "codex-oauth", r#"{"access_token":"a"}"#, true) {
+        match credential_put(
+            &path,
+            "codex-oauth",
+            Some("codex-a"),
+            r#"{"access_token":"a"}"#,
+            true,
+        ) {
             ServerMsg::CredentialResult { ok, error } => {
                 assert!(!ok);
                 assert!(error
@@ -3530,7 +3606,7 @@ mod tests {
         assert!(!path.exists());
 
         // A valid put persists exactly the delivered tokens.
-        match credential_put(&path, "codex-oauth", valid, true) {
+        match credential_put(&path, "codex-oauth", Some("codex-a"), valid, true) {
             ServerMsg::CredentialResult { ok, error } => {
                 assert!(ok, "valid put succeeds: {error:?}");
             }
@@ -3544,7 +3620,7 @@ mod tests {
 
         // Status reports presence + expiry and, by serialized shape, carries no
         // token material.
-        let status = credential_status(&path, "codex-oauth", true);
+        let status = credential_status(&path, "codex-oauth", Some("codex-a"), true);
         match &status {
             ServerMsg::CredentialStatusResult {
                 present,
@@ -3562,23 +3638,75 @@ mod tests {
         assert!(!json.contains("at-1") && !json.contains("rt-1"));
 
         // Delete removes the file and is idempotent.
-        match credential_delete(&path, "codex-oauth", true) {
+        match credential_delete(&path, "codex-oauth", Some("codex-a"), true) {
             ServerMsg::CredentialResult { ok, .. } => assert!(ok),
             other => panic!("unexpected reply {other:?}"),
         }
         assert!(!path.exists());
-        match credential_delete(&path, "codex-oauth", true) {
+        match credential_delete(&path, "codex-oauth", Some("codex-a"), true) {
             ServerMsg::CredentialResult { ok, .. } => assert!(ok, "idempotent delete"),
             other => panic!("unexpected reply {other:?}"),
         }
 
-        // The audit event names the operation and kind, never token values.
-        let ev = credential_audit_event("put", "codex-oauth");
+        // The audit event names the operation, kind, and provider, never tokens.
+        let ev = credential_audit_event("put", "codex-oauth", Some("codex-a"));
         let ev_json = serde_json::to_string(&ev).expect("ser");
         assert!(ev_json.contains("credential"));
         assert!(ev_json.contains("put") && ev_json.contains("codex-oauth"));
+        assert!(ev_json.contains("codex-a"), "audit names the provider");
         assert!(!ev_json.contains("at-1") && !ev_json.contains("access_token"));
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn credentials_are_isolated_per_provider() {
+        // Two providers, two token files: a put/delete on one never touches the
+        // other (verified through the path-injected helpers with distinct paths).
+        let dir = std::env::temp_dir().join(format!("fleety-cred2-{}", uuid::Uuid::new_v4()));
+        let path_a = dir.join("codex-oauth").join("a.json");
+        let path_b = dir.join("codex-oauth").join("b.json");
+        let toks = |acc: &str| {
+            format!(
+                r#"{{"access_token":"at-{acc}","refresh_token":"rt-{acc}","expires_at_secs":9,"account_id":"{acc}"}}"#
+            )
+        };
+
+        assert!(matches!(
+            credential_put(&path_a, "codex-oauth", Some("a"), &toks("acct-a"), true),
+            ServerMsg::CredentialResult { ok: true, .. }
+        ));
+        assert!(matches!(
+            credential_put(&path_b, "codex-oauth", Some("b"), &toks("acct-b"), true),
+            ServerMsg::CredentialResult { ok: true, .. }
+        ));
+        // Each file holds its own account.
+        assert_eq!(
+            fleety_tools::oauth::load_tokens(&path_a)
+                .unwrap()
+                .account_id
+                .as_deref(),
+            Some("acct-a")
+        );
+        assert_eq!(
+            fleety_tools::oauth::load_tokens(&path_b)
+                .unwrap()
+                .account_id
+                .as_deref(),
+            Some("acct-b")
+        );
+        // Deleting a leaves b present.
+        assert!(matches!(
+            credential_delete(&path_a, "codex-oauth", Some("a"), true),
+            ServerMsg::CredentialResult { ok: true, .. }
+        ));
+        assert!(!path_a.exists());
+        match credential_status(&path_b, "codex-oauth", Some("b"), true) {
+            ServerMsg::CredentialStatusResult { present, .. } => {
+                assert!(present, "b's credential survives a's deletion")
+            }
+            other => panic!("unexpected reply {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

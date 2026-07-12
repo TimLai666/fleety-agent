@@ -198,19 +198,25 @@ Three ways, in increasing power:
 
 Use a ChatGPT subscription rather than a static key:
 
-1. `fleety auth login` — opens the browser (or `fleety auth login --no-browser`
-   prints the URL), captures the redirect on the fixed loopback port
-   `http://localhost:1455/auth/callback` (must be free during login), and
-   **delivers the tokens to the connected server**, which stores them at its
-   `~/.fleety/codex-oauth.json` (0600 on Unix; refreshed automatically, never
-   printed — nothing is persisted on the CLI host). Requires a paired,
-   up-to-date server; `fleety auth status` / `logout` act on the same server.
-   The public Codex client id is the default — no setup needed.
-2. Point a provider at it with `type = "oauth:codex"` in `providers.toml` (or
-   `FLEETY_MODEL_AUTH=oauth:codex`). Fleety then calls the ChatGPT/Codex backend
-   over the **Responses API** with your account's token (auto-refreshed) — no key.
+1. Add an `oauth:codex` provider (name it, e.g. `codex1`) in `providers.toml`,
+   then `fleety auth login codex1` — opens the browser (or
+   `fleety auth login codex1 --no-browser` prints the URL), captures the redirect
+   on the fixed loopback port `http://localhost:1455/auth/callback` (must be free
+   during login), and **delivers the tokens to the connected server**, which
+   stores them **per provider** at its `~/.fleety/codex-oauth/<provider>.json`
+   (0600 on Unix; refreshed automatically, never printed — nothing is persisted
+   on the CLI host). Requires a paired, up-to-date server. Each `oauth:codex`
+   provider holds its **own** account, so different providers can sign in to
+   different accounts, and re-running `login` on one switches its account. The
+   public Codex client id is the default — no setup needed.
+2. That provider (`type = "oauth:codex"`) then calls the ChatGPT/Codex backend
+   over the **Responses API** with its own account's token (auto-refreshed) — no key.
 
-`fleety auth status` shows whether you're signed in; `fleety auth logout` clears the tokens.
+`fleety auth status` lists each `oauth:codex` provider's sign-in state (or
+`fleety auth status <provider>` for one); `fleety auth logout <provider>` clears
+that provider's credential. You can also do all of this from `fleety config`
+(Providers → select the codex provider → `e` → sign in / out / switch account).
+Upgrading to per-provider Codex clears any old global login — sign in again per provider.
 
 > **Note:** end-to-end behavior against the live Codex backend is network-gated
 > and unverified from CI (the request/SSE shapes follow the documented Codex CLI

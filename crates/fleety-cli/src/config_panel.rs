@@ -581,7 +581,7 @@ pub async fn run() -> Result<()> {
             Some(MenuChoice::Settings) => run_settings().await?,
             // Providers + Models share the interactive providers editor for now
             // (it does both add-provider and set-model).
-            Some(MenuChoice::Providers) | Some(MenuChoice::Models) => run_providers()?,
+            Some(MenuChoice::Providers) | Some(MenuChoice::Models) => run_providers().await?,
             Some(MenuChoice::Quit) | None => return Ok(()),
         }
     }
@@ -648,10 +648,41 @@ fn render_menu(f: &mut Frame, sel: usize) {
 }
 
 /// Launch the interactive providers/models editor over this host's providers.toml
-/// (from the "Providers"/"Models" menu items).
-fn run_providers() -> Result<()> {
+/// (from the "Providers"/"Models" menu items). When the editor asks for an OAuth
+/// action (sign in / out / switch on an `oauth:codex` provider), run it after the
+/// full-screen UI is torn down — the browser flow needs the plain terminal — then
+/// reopen the editor.
+pub async fn run_providers() -> Result<()> {
     let path = fleety_tools::providers_config::providers_path();
-    crate::provider_tui::run(&path)
+    loop {
+        match crate::provider_tui::run(&path)? {
+            None => return Ok(()), // normal quit
+            Some(req) => run_auth_action(&req).await,
+        }
+    }
+}
+
+/// Run a provider's requested OAuth action (the editor exited to let us), print
+/// the outcome, and wait for Enter so the user can read it before the editor
+/// reopens. Switch = sign out then in.
+async fn run_auth_action(req: &crate::provider_tui::AuthRequest) {
+    use crate::provider_tui::AuthAction;
+    let result = match req.action {
+        AuthAction::Login => crate::auth::login(&req.provider, false).await,
+        AuthAction::Logout => crate::auth::logout(&req.provider).await,
+        AuthAction::Switch => match crate::auth::logout(&req.provider).await {
+            Ok(()) => crate::auth::login(&req.provider, false).await,
+            other => other,
+        },
+    };
+    if let Err(e) = result {
+        eprintln!("auth for '{}': {}", req.provider, e.report().message);
+    }
+    print!("\nPress Enter to return to the editor… ");
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let mut buf = String::new();
+    let _ = std::io::stdin().read_line(&mut buf);
 }
 
 /// The three-region settings editor (Connection / This device / Server),

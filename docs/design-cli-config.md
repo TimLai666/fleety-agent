@@ -254,9 +254,12 @@ fleety server use <name>          # 同時設定 CLI 與本機 daemon(一台一�
 └──────────────────────────────────────────────────────┘
 ```
 
-- **(3) Server 區的編輯經連線遠端套用**(Phase 2 的 protocol)。編輯 provider
-  依 `type` 顯示不同欄位(api 要 base_url+key;codex 不要,改顯示「登入狀態」+ 觸發
-  `auth login`)。門鎖 key 標示「需認證已開」;敏感 key 覆寫前二次確認 + 告警。
+- **(3) Server 區的編輯經連線遠端套用**(Phase 2 的 protocol)。編輯 provider(`e`)
+  依 `type` 顯示不同欄位:api 型預填 base_url+key(空 key 保留原值);`oauth:codex` 型
+  不填欄位,改進**登入/登出/換帳號子選單**——因為登入是 async+開瀏覽器+搶終端,
+  做法是存檔→離開全螢幕→對該 provider 跑 `auth login/logout`(換帳號=登出再登入)→
+  重開編輯器。憑證 per-provider(每個 codex provider 各自帳號)。門鎖 key 標示「需認證
+  已開」;敏感 key 覆寫前二次確認 + 告警。
 - secret 顯示遮罩,編輯 secret 只上送新值(write-only,tri-state:keep/set/clear,
   遮罩值一律不回寫,見 M3)。
 - 生效時機(下次連線 / 需重啟)在 detail pane 明示。

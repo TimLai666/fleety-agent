@@ -95,6 +95,50 @@ pub fn default_token_path() -> PathBuf {
     PathBuf::from(home).join(".fleety").join("codex-oauth.json")
 }
 
+/// The `~/.fleety` runtime directory the token stores live under.
+fn fleety_dir() -> PathBuf {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(".fleety")
+}
+
+/// Pure path builder: the per-provider token file under `fleety_dir`
+/// (`<fleety_dir>/codex-oauth/<provider>.json`). Split out so it is unit-testable
+/// without touching `$HOME` or `FLEETY_CODEX_TOKENS`.
+fn token_path_in(fleety_dir: &Path, provider: &str) -> PathBuf {
+    fleety_dir
+        .join("codex-oauth")
+        .join(format!("{provider}.json"))
+}
+
+/// The **per-provider** token store path: `~/.fleety/codex-oauth/<provider>.json`,
+/// or `FLEETY_CODEX_TOKENS` (a single explicit file) when set — the override keeps
+/// the single-provider test flow working. Each `oauth:codex` provider stores its
+/// own account here, keyed by the provider name. Never the config/providers file.
+pub fn token_path_for(provider: &str) -> PathBuf {
+    if let Ok(p) = std::env::var("FLEETY_CODEX_TOKENS") {
+        return PathBuf::from(p);
+    }
+    token_path_in(&fleety_dir(), provider)
+}
+
+/// One-time cleanup of the pre-per-provider **global** token file at `path`.
+/// Best-effort: a missing file is fine; any other error is logged, not fatal. No
+/// credential is migrated — after this each provider signs in fresh under its own
+/// per-provider path.
+pub fn clear_legacy_global(path: &Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => {
+            tracing::info!(
+                "cleared legacy global Codex token store (credentials are per-provider now)"
+            )
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => tracing::warn!(%e, "could not clear legacy global Codex token store"),
+    }
+}
+
 /// Load tokens from `path`. A missing or corrupt file reads as "logged out"
 /// (`None`) rather than an error, so a bad file never wedges the agent.
 pub fn load_tokens(path: &Path) -> Option<Tokens> {
@@ -553,6 +597,38 @@ mod tests {
         std::env::temp_dir()
             .join(format!("fleety-oauth-{}", uuid::Uuid::new_v4()))
             .join("codex-oauth.json")
+    }
+
+    #[test]
+    fn token_path_in_is_per_provider_under_codex_oauth_dir() {
+        let root = PathBuf::from("/home/u/.fleety");
+        let a = token_path_in(&root, "tingzhen-codex");
+        let b = token_path_in(&root, "work-codex");
+        // Distinct per provider, both under the codex-oauth subdirectory.
+        assert_ne!(a, b);
+        assert!(a
+            .to_string_lossy()
+            .replace('\\', "/")
+            .ends_with(".fleety/codex-oauth/tingzhen-codex.json"));
+        assert!(b
+            .to_string_lossy()
+            .replace('\\', "/")
+            .ends_with(".fleety/codex-oauth/work-codex.json"));
+    }
+
+    #[test]
+    fn clear_legacy_global_is_idempotent() {
+        let p = temp_token_path();
+        // Missing file → no-op (best-effort, never panics).
+        clear_legacy_global(&p);
+        // Present file → removed.
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, "{}").unwrap();
+        assert!(p.exists());
+        clear_legacy_global(&p);
+        assert!(!p.exists());
+        // Removing again is still a no-op.
+        clear_legacy_global(&p);
     }
 
     #[test]

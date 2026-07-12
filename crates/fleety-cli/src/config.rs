@@ -185,7 +185,10 @@ pub async fn provider_edit_remote() -> Result<()> {
                 })
             })
         })?;
-        match conflict {
+        // The remote provider-edit path ignores an OAuth action request (Codex
+        // sign-in is a local flow, out of scope for the remote editor here); only
+        // a concurrent-edit conflict reopens.
+        match conflict.conflict {
             None => return Ok(()),
             Some(msg) => {
                 println!("{msg} — reloading the current server configuration…");
@@ -214,7 +217,12 @@ pub fn run(args: &[String]) -> Result<()> {
         args.get(1).map(String::as_str),
     );
     if head == (Some("provider"), Some("edit")) && std::io::stdout().is_terminal() {
-        return crate::provider_tui::run(&fleety_tools::providers_config::providers_path());
+        // Same local editor as the `fleety config` menu, including the OAuth
+        // sign-in/out/switch loop. `config::run` is sync but runs on the
+        // multi-threaded runtime, so bridge to the async editor loop here.
+        return tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(crate::config_panel::run_providers())
+        });
     }
     if matches!(config::parse(args), config::Command::Edit) && std::io::stdout().is_terminal() {
         run_tui_edit(&config::config_path())
