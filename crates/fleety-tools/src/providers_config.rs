@@ -226,13 +226,33 @@ pub fn load_or_default(path: &Path) -> Result<ProvidersConfig> {
     }
 }
 
+/// Whether `name` is a safe provider name: non-empty and made only of
+/// `[A-Za-z0-9._-]`, and not `.`/`..`. Provider names are used verbatim as the
+/// per-provider Codex token filename (`codex-oauth/<name>.json`), so a name with
+/// a path separator or traversal could escape that directory — this rejects such
+/// names at their source. Pure.
+pub fn valid_provider_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
 /// Validate the two-tier config. Pure. Enforces provider `type` field rules (api
 /// needs a `base_url` and no oauth-only shape; oauth types carry no
-/// `base_url`/`key`), and role referential integrity (every member names a
-/// defined provider; a present role has ≥1 member; `single` has exactly one).
-/// Each error names the offending item.
+/// `base_url`/`key`), safe provider names, and role referential integrity (every
+/// member names a defined provider; a present role has ≥1 member; `single` has
+/// exactly one). Each error names the offending item.
 pub fn validate(cfg: &ProvidersConfig) -> Result<()> {
     for (name, p) in &cfg.providers {
+        if !valid_provider_name(name) {
+            return Err(CoreError::Message(format!(
+                "provider name '{name}' is invalid — use only letters, digits, '.', '_' or '-' \
+                 (no path separators)"
+            )));
+        }
         let Some(t) = provider_type(&p.kind) else {
             return Err(CoreError::Message(format!(
                 "provider '{name}' has unknown type '{}' (known types: {})",
@@ -610,6 +630,32 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("must not set base_url"));
+    }
+
+    #[test]
+    fn valid_provider_name_blocks_traversal_and_separators() {
+        // Normal names pass.
+        assert!(valid_provider_name("tingzhen-codex"));
+        assert!(valid_provider_name("openai1"));
+        assert!(valid_provider_name("a.b_c-1"));
+        // Empty, dot-dirs, separators, traversal, and odd chars are rejected —
+        // these are what could escape the codex-oauth/<name>.json directory.
+        assert!(!valid_provider_name(""));
+        assert!(!valid_provider_name("."));
+        assert!(!valid_provider_name(".."));
+        assert!(!valid_provider_name("../agent/auth"));
+        assert!(!valid_provider_name("a/b"));
+        assert!(!valid_provider_name("a\\b"));
+        assert!(!valid_provider_name("a b"));
+    }
+
+    #[test]
+    fn validate_rejects_a_provider_with_an_unsafe_name() {
+        let cfg = cfg_with(&[("../evil", api("https://x/v1"))], &[]);
+        assert!(validate(&cfg)
+            .unwrap_err()
+            .to_string()
+            .contains("is invalid"));
     }
 
     #[test]

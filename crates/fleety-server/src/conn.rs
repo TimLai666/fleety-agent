@@ -1774,7 +1774,8 @@ fn credential_gate(
     // codex-oauth credentials are stored per provider: an old client that omits
     // the provider (or sends a blank one) is rejected with an update-your-CLI
     // message rather than falling back to a global write.
-    if provider.map(str::trim).unwrap_or("").is_empty() {
+    let name = provider.map(str::trim).unwrap_or("");
+    if name.is_empty() {
         return Some(fleety_protocol::WireError {
             kind: "invalid".to_string(),
             message: "this server stores Codex credentials per provider — update fleety and \
@@ -1785,6 +1786,19 @@ fn credential_gate(
             ),
         });
     }
+    // The provider name becomes the per-provider token filename, so a name with a
+    // path separator or traversal could escape the token directory (e.g.
+    // `../agent/auth` clobbering the connection-auth store). Reject anything that
+    // isn't a plain provider name — the wire value is untrusted.
+    if !fleety_tools::providers_config::valid_provider_name(name) {
+        return Some(fleety_protocol::WireError {
+            kind: "invalid".to_string(),
+            message: format!(
+                "invalid provider name '{name}' — use only letters, digits, '.', '_' or '-'"
+            ),
+            remediation: Some("check the provider name and try again".to_string()),
+        });
+    }
     None
 }
 
@@ -1793,8 +1807,10 @@ fn credential_gate(
 /// placeholder (the gate rejects a codex-oauth frame without a provider before any
 /// path is read) that keeps the caller total.
 fn credential_token_path(provider: Option<&str>) -> std::path::PathBuf {
-    match provider {
-        Some(p) if !p.trim().is_empty() => fleety_tools::oauth::token_path_for(p),
+    match provider.map(str::trim) {
+        // Use the trimmed name the gate validated, so the write path matches the
+        // read side (`token_path_for`) exactly — no `codex-oauth/ name .json` skew.
+        Some(p) if !p.is_empty() => fleety_tools::oauth::token_path_for(p),
         _ => fleety_tools::oauth::default_token_path(),
     }
 }
@@ -3580,6 +3596,19 @@ mod tests {
                 let e = error.expect("provider error");
                 assert_eq!(e.kind, "invalid");
                 assert!(e.message.contains("per provider"));
+            }
+            other => panic!("unexpected reply {other:?}"),
+        }
+        assert!(!path.exists());
+
+        // A path-traversal provider name is rejected before any write — it must
+        // never escape the codex-oauth/ directory (e.g. clobber the auth store).
+        match credential_put(&path, "codex-oauth", Some("../agent/auth"), valid, true) {
+            ServerMsg::CredentialResult { ok, error } => {
+                assert!(!ok);
+                let e = error.expect("provider error");
+                assert_eq!(e.kind, "invalid");
+                assert!(e.message.contains("invalid provider name"));
             }
             other => panic!("unexpected reply {other:?}"),
         }
