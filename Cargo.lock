@@ -10,7 +10,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agent-core"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -33,7 +33,7 @@ dependencies = [
 
 [[package]]
 name = "agent-workflow"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "agent-core",
  "async-trait",
@@ -1708,7 +1708,7 @@ dependencies = [
 
 [[package]]
 name = "fleety-cli"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "agent-core",
  "arboard",
@@ -1732,7 +1732,7 @@ dependencies = [
 
 [[package]]
 name = "fleety-daemon"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "agent-core",
  "fleety-protocol",
@@ -1750,7 +1750,7 @@ dependencies = [
 
 [[package]]
 name = "fleety-eval"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "agent-core",
  "async-trait",
@@ -1765,7 +1765,7 @@ dependencies = [
 
 [[package]]
 name = "fleety-protocol"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "serde",
  "serde_json",
@@ -1773,7 +1773,7 @@ dependencies = [
 
 [[package]]
 name = "fleety-server"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "agent-core",
  "agent-workflow",
@@ -1810,7 +1810,7 @@ dependencies = [
 
 [[package]]
 name = "fleety-tools"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "agent-core",
  "async-trait",
@@ -1841,7 +1841,7 @@ dependencies = [
 
 [[package]]
 name = "fleety-vec"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "rusqlite",
  "sqlite-vec",
