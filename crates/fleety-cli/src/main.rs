@@ -13,6 +13,7 @@ mod config;
 mod config_panel;
 mod input;
 mod markdown;
+mod model_picker;
 mod provider_tui;
 mod server;
 mod tui;

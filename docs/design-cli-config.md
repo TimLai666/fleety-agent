@@ -223,6 +223,11 @@ fleety server use <name>          # 同時設定 CLI 與本機 daemon(一台一�
 
 一個 ratatui 面板,Tab 三區,**不用打 `--target`**。這是「一個入口設定任何東西」。
 
+> 現行實作:裸 `fleety config` 先開**頂層選單**(Providers / Models / Settings),
+> 用選的再往下鑽 —— Providers/Models 進 provider 編輯器(選 type 逐欄新增 provider、
+> 選 provider 再從其 `/models` 挑 model),Settings 進下方這個三區面板。提示列常駐;
+> Esc 回選單、q 離開。下方 mockup 即 Settings 那一層。
+
 ```
 ┌─ fleety config ─────────────────────────────────────┐
 │  [1] Connection   [2] This device   [3] Server       │  ← ←→ / Tab 切區

@@ -66,6 +66,37 @@ fn is_sensitive(key: &str) -> bool {
     )
 }
 
+/// The first, always-offered pick in the timezone list: clear `FLEETY_TZ` so the
+/// runtime follows the host device's own zone (then UTC). Selecting it commits an
+/// empty value through the normal path.
+const TZ_DEVICE_LABEL: &str = "(device — follow this machine)";
+
+/// Candidate timezones matching `needle` (case-insensitive substring over the
+/// IANA `TZ_VARIANTS`), with the device-default option first when it matches.
+/// Pure — unit-tested; the picker renders and commits from this list.
+fn tz_candidates(needle: &str) -> Vec<&'static str> {
+    let n = needle.trim().to_ascii_lowercase();
+    let mut out: Vec<&'static str> = Vec::new();
+    if n.is_empty() || "device".contains(n.as_str()) {
+        out.push(TZ_DEVICE_LABEL);
+    }
+    for tz in chrono_tz::TZ_VARIANTS {
+        let name = tz.name();
+        if n.is_empty() || name.to_ascii_lowercase().contains(n.as_str()) {
+            out.push(name);
+        }
+    }
+    out
+}
+
+/// Searchable IANA-timezone picker shown when editing `FLEETY_TZ`, so the user
+/// selects a zone instead of free-typing one. Commits through the same
+/// [`Panel::commit_edit`] path as any other value (device option → empty).
+struct TzPicker {
+    filter: LineEditor,
+    sel: usize,
+}
+
 /// The panel state. `on_key` is pure (no I/O) so it is unit-testable; the run
 /// loop owns the terminal + the connection.
 struct Panel {
@@ -74,6 +105,9 @@ struct Panel {
     /// `Some(editor)` while editing the selected row's value; the bool marks a
     /// pending sensitive-key confirmation before the edit is applied.
     edit: Option<LineEditor>,
+    /// `Some` while the `FLEETY_TZ` timezone picker is open (mutually exclusive
+    /// with `edit`).
+    tz_pick: Option<TzPicker>,
     confirm_sensitive: Option<String>,
     // Connection region.
     conns: Connections,
@@ -105,6 +139,7 @@ impl Panel {
             region: Region::Connection,
             sel: 0,
             edit: None,
+            tz_pick: None,
             confirm_sensitive: None,
             conns,
             local,
@@ -131,6 +166,16 @@ impl Panel {
     /// The connection profile names in display order.
     fn profile_names(&self) -> Vec<String> {
         self.conns.profiles.keys().cloned().collect()
+    }
+
+    /// The setting key of the selected row in an editable region (Local/Server),
+    /// used to route `FLEETY_TZ` to the timezone picker. `None` for Connection.
+    fn selected_key(&self) -> Option<String> {
+        match self.region {
+            Region::Local => self.local.get(self.sel).map(|r| r.0.clone()),
+            Region::Server => self.entries.get(self.sel).map(|e| e.key.clone()),
+            Region::Connection => None,
+        }
     }
 
     /// Begin editing the selected server entry (staging its current value),
@@ -220,9 +265,57 @@ impl Panel {
     }
 }
 
+/// Handle a key while the `FLEETY_TZ` timezone picker is open. Commits through
+/// [`Panel::commit_edit`] (device option → empty value; a highlighted zone → its
+/// name; no candidates → the typed text), so validation + persistence match
+/// every other edit. Returns `true` when a local file must be persisted. Pure.
+fn on_key_tz_pick(p: &mut Panel, code: KeyCode) -> bool {
+    let Some(pick) = p.tz_pick.as_mut() else {
+        return false;
+    };
+    match code {
+        KeyCode::Char(c) => {
+            pick.filter.insert(c);
+            pick.sel = 0;
+        }
+        KeyCode::Backspace => {
+            pick.filter.backspace();
+            pick.sel = 0;
+        }
+        KeyCode::Left => pick.filter.left(),
+        KeyCode::Right => pick.filter.right(),
+        KeyCode::Up => pick.sel = pick.sel.saturating_sub(1),
+        KeyCode::Down => {
+            let max = tz_candidates(pick.filter.text()).len().saturating_sub(1);
+            pick.sel = (pick.sel + 1).min(max);
+        }
+        KeyCode::Esc => {
+            p.tz_pick = None;
+            p.status = "edit cancelled".to_string();
+        }
+        KeyCode::Enter => {
+            let cands = tz_candidates(pick.filter.text());
+            let picked = cands.get(pick.sel).copied();
+            let raw = pick.filter.text().trim().to_string();
+            p.tz_pick = None;
+            let value = match picked {
+                Some(name) if name == TZ_DEVICE_LABEL => String::new(),
+                Some(name) => name.to_string(),
+                None => raw,
+            };
+            return p.commit_edit(value);
+        }
+        _ => {}
+    }
+    false
+}
+
 /// One key event. Returns `true` when the connection/local file should be
 /// persisted by the run loop. Pure (no I/O).
 fn on_key(p: &mut Panel, code: KeyCode) -> bool {
+    if p.tz_pick.is_some() {
+        return on_key_tz_pick(p, code);
+    }
     if let Some(ed) = p.edit.as_mut() {
         match code {
             KeyCode::Char(c) => ed.insert(c),
@@ -276,6 +369,13 @@ fn on_key(p: &mut Panel, code: KeyCode) -> bool {
             } else {
                 p.status = "nothing staged".to_string();
             }
+        }
+        KeyCode::Enter if p.selected_key().as_deref() == Some("FLEETY_TZ") => {
+            // Guided timezone choice instead of free-typing an IANA name.
+            p.tz_pick = Some(TzPicker {
+                filter: LineEditor::default(),
+                sel: 0,
+            });
         }
         KeyCode::Enter => match p.region {
             Region::Server => p.begin_server_edit(),
@@ -395,7 +495,16 @@ fn render(f: &mut Frame, p: &Panel) {
     // Footer: a PERSISTENT key-hint line (so an action's output never hides how
     // to move / apply / leave), then the transient edit buffer or status below.
     let hints = "Tab: region · ↑↓: move · Enter: edit · a: apply server · Esc/q: menu";
-    let status_line = if let Some(ed) = &p.edit {
+    let status_line = if let Some(pick) = &p.tz_pick {
+        let cands = tz_candidates(pick.filter.text());
+        let n = cands.len();
+        let hl = cands.get(pick.sel).copied().unwrap_or("(type a zone name)");
+        let idx = if n == 0 { 0 } else { pick.sel + 1 };
+        format!(
+            "tz> {}   [{idx}/{n}] {hl}   (↑↓ pick · Enter set · Esc cancel)",
+            pick.filter.text()
+        )
+    } else if let Some(ed) = &p.edit {
         let (view, _) = ed.display_window(60);
         format!("> {view}   (Enter save · Esc cancel)")
     } else if p.region == Region::Server {
@@ -837,6 +946,74 @@ mod tests {
         p.edit = Some(LineEditor::default()); // empty
         on_key(&mut p, KeyCode::Enter);
         assert_eq!(p.staged.get("FLEETY_POLICY").unwrap().op, ChangeOp::Clear);
+    }
+
+    #[test]
+    fn tz_candidates_offers_device_and_filters() {
+        let all = tz_candidates("");
+        assert_eq!(all.first().copied(), Some(TZ_DEVICE_LABEL));
+        assert!(all.contains(&"Asia/Taipei"));
+        assert!(all.contains(&"UTC"));
+        // Substring filter is case-insensitive and drops the device option.
+        assert_eq!(tz_candidates("TAIPEI"), vec!["Asia/Taipei"]);
+        // "device" narrows to just the device option (no zone contains it).
+        assert_eq!(tz_candidates("device"), vec![TZ_DEVICE_LABEL]);
+        // No match → empty (picker then commits the typed text).
+        assert!(tz_candidates("zzz-nowhere").is_empty());
+    }
+
+    #[test]
+    fn fleety_tz_edit_opens_picker_and_commits_zone() {
+        let mut p = Panel::new(
+            Connections::default(),
+            fleety_tools::config::ConfigMap::new(),
+            false,
+            vec![],
+            String::new(),
+        );
+        p.region = Region::Local;
+        p.sel = p
+            .local
+            .iter()
+            .position(|r| r.0 == "FLEETY_TZ")
+            .expect("FLEETY_TZ row present by default");
+        // Enter opens the timezone picker, not a free-text editor.
+        assert!(!on_key(&mut p, KeyCode::Enter));
+        assert!(p.tz_pick.is_some());
+        assert!(p.edit.is_none());
+        for c in "taipei".chars() {
+            on_key(&mut p, KeyCode::Char(c));
+        }
+        // Enter commits the single match and signals a local-file write.
+        assert!(on_key(&mut p, KeyCode::Enter));
+        assert!(p.tz_pick.is_none());
+        assert_eq!(
+            p.local_map
+                .get(&(fleety_tools::config::Scope::Shared, "FLEETY_TZ".to_string()))
+                .map(String::as_str),
+            Some("Asia/Taipei")
+        );
+    }
+
+    #[test]
+    fn fleety_tz_device_option_clears_to_follow_the_machine() {
+        let mut map = fleety_tools::config::ConfigMap::new();
+        map.insert(
+            (fleety_tools::config::Scope::Shared, "FLEETY_TZ".to_string()),
+            "Asia/Taipei".to_string(),
+        );
+        let mut p = Panel::new(Connections::default(), map, false, vec![], String::new());
+        p.region = Region::Local;
+        p.sel = p
+            .local
+            .iter()
+            .position(|r| r.0 == "FLEETY_TZ")
+            .expect("FLEETY_TZ row");
+        on_key(&mut p, KeyCode::Enter); // open picker (empty filter → device at index 0)
+        assert!(on_key(&mut p, KeyCode::Enter)); // choose device → clears the value
+        assert!(!p
+            .local_map
+            .contains_key(&(fleety_tools::config::Scope::Shared, "FLEETY_TZ".to_string())));
     }
 
     #[test]

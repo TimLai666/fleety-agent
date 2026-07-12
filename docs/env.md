@@ -2,7 +2,9 @@
 
 > **Config file.** The most-used `FLEETY_*` settings are also **config keys** you
 > can set without exporting env: `fleety config list` / `get` / `set <KEY>
-> <VALUE>` / `unset`, or `fleety config edit` interactively. Values persist to
+> <VALUE>` / `unset`, or bare **`fleety config`** (on a TTY) for a guided menu —
+> pick Providers / Models / Settings and drill in (add a provider by type, pick a
+> model from its `/models` list, choose a timezone). Values persist to
 > `~/.fleety/config.toml` (override with `FLEETY_CONFIG`), sectioned by scope
 > (`[server]` / `[daemon]` / `[cli]` / `[shared]`). **Read precedence is env →
 > config → default**: an explicit environment variable always wins, so config
@@ -579,7 +581,8 @@ presents timestamps, in the **acting user's** timezone. Resolution precedence:
 
 1. the acting user's configured IANA zone (`users/<id>/timezone`),
 2. else the global `FLEETY_TZ` (an IANA name like `Asia/Taipei`),
-3. else UTC.
+3. else the **host device's** local timezone (detected via the OS),
+4. else UTC.
 
 An invalid zone string falls through to the next source (never errors). The
 per-user zone is set by the **`set_timezone`** tool (the agent calls it when the
@@ -588,7 +591,7 @@ unavailable to a guest).
 
 | Var | Default | Meaning |
 |---|---|---|
-| `FLEETY_TZ` | (unset → UTC) | Fallback IANA timezone for rendering when a user has no configured zone. Storage stays UTC regardless. |
+| `FLEETY_TZ` | (unset → host device zone, then UTC) | Fallback IANA timezone for rendering when a user has no configured zone. Unset follows the host device's local timezone; `fleety config` offers a searchable zone picker. Storage stays UTC regardless. |
 
 ## Startup dependencies (auto-install on boot)
 

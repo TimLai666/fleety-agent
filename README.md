@@ -241,11 +241,16 @@ If the server can't be reached, the CLI says so and suggests `--target local`.
 
 On a TTY:
 
-- **`fleety config`** (no args) — the three-region interactive panel
-  (Connection / This device / Server). The Server region edits the connected
-  server's settings — including providers/models — live **over the connection**
-  (optimistic-locked; secrets stay write-only), so remote editing no longer needs
-  shell access to the server host.
+- **`fleety config`** (no args) — a guided **menu**: pick Providers, Models, or
+  Settings and drill in. Providers/Models open the provider editor (add a
+  provider by type with per-field prompts; set a model role by picking a provider
+  then choosing from its `/models` list, or typing an id if the fetch is
+  unavailable). Settings is the three-region panel (Connection / This device /
+  Server). The Server region edits the connected server's settings — including
+  providers/models — live **over the connection** (optimistic-locked; secrets
+  stay write-only), so remote editing no longer needs shell access to the server
+  host. Editing `FLEETY_TZ` opens a searchable IANA timezone picker (or follow
+  the host device). The key hints stay visible; Esc steps back, q quits.
 - `fleety config edit` — edit just the flat `FLEETY_*` settings (ratatui list;
   secrets masked; line-based fallback when not a TTY).
 - `fleety config provider edit` — the provider-only editor for `providers.toml`:
@@ -273,7 +278,7 @@ launchd / Windows SCM).
 | `fleety voice` | Voice conversation (speech-to-text in, spoken reply out). |
 | `fleety status` | Server health: version, uptime, connected devices. |
 | `fleety config <list\|get\|set\|unset\|edit>` | Inspect/edit settings; secrets masked. Targets the connected **server** by default; `--target local` edits this host's `~/.fleety/config.toml`. `edit` is local + interactive (ratatui on a TTY, line-based otherwise). |
-| `fleety config provider\|model <…>` | Manage providers + model roles (`providers.toml`): `provider add\|set\|remove\|list`, `model set\|show\|unset\|list`. Same `--target` rule (default server). Bare `fleety config` on a TTY opens the three-region panel; `config provider edit` is the provider-only interactive editor. |
+| `fleety config provider\|model <…>` | Manage providers + model roles (`providers.toml`): `provider add\|set\|remove\|list`, `model set\|show\|unset\|list`. Same `--target` rule (default server). Bare `fleety config` on a TTY opens a guided menu (Providers / Models / Settings); `config provider edit` is the provider-only interactive editor. |
 | `fleety audit list [<limit>]` / `fleety audit show <index>` | List this device's audit-log entries (tool calls/results/replies) / show one in full. |
 | `fleety rollback list` / `fleety rollback apply <backup_id>` | List backups / restore a file from a backup. |
 | `fleety pair-code` | Mint a short-lived pairing code on the connected server (loopback-trusted on the server host, else token-authed) and print the `fleety pair <code>` to run on the new device. |
