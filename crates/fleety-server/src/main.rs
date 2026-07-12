@@ -675,7 +675,12 @@ async fn run_server(shutdown: Option<tokio::sync::watch::Receiver<bool>>) {
     };
     let app = http::router(state);
     tokio::select! {
-        r = axum::serve(listener, app.into_make_service()) => {
+        // ConnectInfo carries each connection's peer socket address so the
+        // handlers can grant same-host loopback trust (see conn::authenticate).
+        r = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        ) => {
             if let Err(e) = r {
                 tracing::error!(%e, "http server error");
             }

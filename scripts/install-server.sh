@@ -61,6 +61,22 @@ mv "$tmp/$BIN" "$dir/$BIN"
 
 echo "$BIN: installed to $dir/$BIN"
 
+# Best-effort: also install the `fleety` CLI next to the server, so this host
+# can drive its own server (`fleety init` finds the local one and needs no
+# pairing — see loopback trust). Same target/archive as the server. Non-fatal:
+# a failure just prints how to install the CLI by hand.
+cli_asset="fleety-${target}.tar.gz"
+cli_url="https://github.com/${REPO}/releases/latest/download/${cli_asset}"
+if curl -fsSL "$cli_url" -o "$tmp/$cli_asset" 2>/dev/null \
+  && tar -C "$tmp" -xzf "$tmp/$cli_asset" 2>/dev/null; then
+  chmod 755 "$tmp/fleety"
+  mv "$tmp/fleety" "$dir/fleety"
+  echo "fleety: installed CLI to $dir/fleety"
+else
+  echo "fleety: could not install the CLI automatically; get it with" >&2
+  echo "        curl -fsSL https://raw.githubusercontent.com/${REPO}/main/scripts/install.sh | sh" >&2
+fi
+
 # Best-effort: also install the fleety-insyra data-analysis sidecar next to the
 # server so the `insyra_exec` tool works out of the box. It ships as a raw
 # per-target binary. Non-fatal if the asset isn't published yet — insyra_exec
@@ -131,6 +147,9 @@ echo "launchd on macOS; one step = install + enable + start):"
 echo "  $BIN up"
 echo
 echo "Prefer loopback-only? Persist it first:  $BIN config set FLEETY_ADDR 127.0.0.1:8787"
+echo
+echo "Drive it from this host with the CLI (no pairing — the local server is trusted"
+echo "on loopback):  fleety init   (picks the local server), then  fleety tui"
 echo
 echo "Update later with:  $BIN update   (self-update + sidecar refresh; restarts when idle)"
 case ":$PATH:" in

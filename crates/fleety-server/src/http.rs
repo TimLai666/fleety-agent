@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use agent_core::{CoreError, ModelProvider, Policy, Result};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Query, State};
+use axum::extract::{ConnectInfo, Query, State};
 use axum::http::header::AUTHORIZATION;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -107,12 +107,19 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// Upgrade a `GET /` request to WebSocket and drive the connection.
-async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
-    ws.on_upgrade(move |socket| serve_ws(socket, state))
+/// Upgrade a `GET /` request to WebSocket and drive the connection. The peer
+/// socket address (from the accept layer, not a header) decides same-host
+/// loopback trust.
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    State(state): State<AppState>,
+) -> Response {
+    let loopback = crate::conn::peer_is_loopback(Some(peer));
+    ws.on_upgrade(move |socket| serve_ws(socket, state, loopback))
 }
 
-async fn serve_ws(socket: WebSocket, state: AppState) {
+async fn serve_ws(socket: WebSocket, state: AppState, peer_is_loopback: bool) {
     // The socket-owner task is the only holder of the WebSocket; the connection
     // logic talks to it through channels — the same shape as the SSE adapters.
     let (out_tx, out_rx) = mpsc::unbounded_channel::<String>();
@@ -132,6 +139,7 @@ async fn serve_ws(socket: WebSocket, state: AppState) {
         state.handles,
         state.auth,
         state.device_tools,
+        peer_is_loopback,
     )
     .await
     {
@@ -263,8 +271,10 @@ impl FrameWriter for WsChannelWriter {
 async fn sse_handler(
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     State(state): State<AppState>,
 ) -> Response {
+    let peer_is_loopback = crate::conn::peer_is_loopback(Some(peer));
     let Some(session) = params.get("session").filter(|s| !s.is_empty()).cloned() else {
         return (StatusCode::BAD_REQUEST, "missing ?session=<id>").into_response();
     };
@@ -308,6 +318,7 @@ async fn sse_handler(
             conn_state.handles,
             conn_state.auth,
             conn_state.device_tools,
+            peer_is_loopback,
         )
         .await
         {
@@ -466,7 +477,13 @@ mod tests {
         let addr = listener.local_addr().expect("addr");
         let app = router(state);
         tokio::spawn(async move {
-            let _ = axum::serve(listener, app.into_make_service()).await;
+            // ConnectInfo is required now that the handlers read the peer address
+            // for loopback trust (the production serve uses the same).
+            let _ = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await;
         });
         format!("http://{addr}")
     }

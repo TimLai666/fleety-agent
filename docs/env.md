@@ -37,6 +37,7 @@ server keeps the fallback root and records the originating device on the binding
 | `FLEETY_FS_SCOPE` | (unset → `full`) | `full` (default): the structured file tools may read/write anywhere on the device (absolute paths allowed; still audited + rollback-backed; a sensitive-path guard refuses SSH keys/`/etc/shadow`/`/dev`/Windows system dirs/etc.). `workspace`: re-confine every path to the workspace/device root (`..`/absolute/symlink-tight sandbox). Set on `fleetyd` too for its `FLEETY_DEVICE_ROOT`. |
 | `FLEETY_POLICY` | `full_access` | `require_approval` gates every non-read tool through the approval flow. Limitation: under `require_approval` the server does not read frames mid-turn (the approval gate owns the inbound stream), so a `CancelTurn` sent during a gated turn has no effect — cancel works under the default full-access policy. |
 | `FLEETY_REQUIRE_AUTH` | `1` | Require a valid token / pairing code on every `Hello`. **On by default** — set `0` to disable. A fresh auth-required server (no `FLEETY_TOKEN`, no paired device) prints a short-lived first-run pairing code at startup. |
+| `FLEETY_TRUST_LOOPBACK` | `1` | Trust same-host connections: a client whose transport peer is a loopback address (`127.0.0.0/8` / `::1`, taken from the connection socket — never a header) is accepted without a token even when auth is required, because a same-host process can already read the server's token and config files. Set `0` to require auth even on loopback (multi-tenant hosts, or a reverse proxy that forwards remote connections over loopback — otherwise it would falsely trust them). LAN/remote connections are always authenticated regardless. |
 | `FLEETY_TOKEN` | (unset) | Bootstrap admin token. Use it once to pair the first device. |
 | `FLEETY_SCHED_TICK` | `60` | Seconds between scheduler fire-loop ticks. |
 | `FLEETY_SYSTEM_PROMPT` | (unset → full) | `minimal` drops the embedded behavioural docs (protocol/rules/memory/policy) from the system message, leaving only core memory (ME/USER/TODO) — for token-lean / debugging runs. |
@@ -309,12 +310,18 @@ reversible, then prints a restart prompt. It never runs automatically at boot.
 
 Server announces `_fleety._tcp.local.`; CLI / fleetyd browse for it as the
 last fallback when no URL is configured. Bare `fleety init` on a TTY uses the
-same discovery interactively: it scans for a few seconds, lists **every**
-announced server by name (the instance name minus the `fleety-` prefix; saved
-ones are marked), lets you pick one, saves it as the current profile, and
-prompts for a pairing code in the same flow. With mDNS disabled, no TTY, or
-nothing found, it falls back to the explicit `fleety init ws://host:8787`
-guidance.
+same discovery interactively: it first probes the **local** server on loopback
+(a same-host server needs no pairing — see `FLEETY_TRUST_LOOPBACK`) and lists it
+first as the default pick, then scans the LAN for a few seconds and lists
+**every** announced server by name (the instance name minus the `fleety-`
+prefix; saved ones are marked), lets you pick one (Enter takes the default),
+saves it as the current profile, and — for a non-local pick — prompts for a
+pairing code in the same flow. Switch servers later with `fleety server use
+<name>` (config and every command land on whichever profile is current). With
+mDNS disabled, no TTY, or nothing found, it falls back to the explicit
+`fleety init ws://host:8787` guidance. The server install script installs the
+`fleety` CLI alongside `fleety-server`, so a server host can drive its own
+server this way out of the box.
 
 **Server identity + sticky healing.** Each server mints a persistent identity
 fingerprint on first start (stored at `<agent home>/server-id`, stable across

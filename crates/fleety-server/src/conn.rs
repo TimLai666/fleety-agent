@@ -458,6 +458,9 @@ pub async fn handle_conn(
         handles,
         auth,
         device_tools,
+        // The harness models a REMOTE client (peer not loopback) so the auth
+        // tests stay meaningful; loopback trust is unit-tested on `authenticate`.
+        false,
     )
     .await
 }
@@ -479,9 +482,10 @@ pub(crate) async fn run_connection(
     handles: Handles,
     auth: Arc<AuthStore>,
     device_tools: DeviceTools,
+    peer_is_loopback: bool,
 ) -> Result<()> {
     // The first frame must be Hello; enforce auth if the server requires it.
-    let (device_id, minted_token) = match inbound.next_client().await? {
+    let (device_id, minted_token, loopback_trusted) = match inbound.next_client().await? {
         Some(ClientMsg::Hello {
             device_id,
             protocol,
@@ -497,7 +501,21 @@ pub(crate) async fn run_connection(
                     "protocol version mismatch; proceeding (only v0 exists)"
                 );
             }
-            match authenticate(&auth, &device_id, token.as_deref(), pairing_code.as_deref()) {
+            // Trusted-loopback = accepted on same-host trust with no credential
+            // (a valid token still authenticates normally). Recorded so Welcome
+            // can tell the client it needn't pair.
+            let loopback_trusted = auth.required()
+                && token.is_none()
+                && pairing_code.is_none()
+                && peer_is_loopback
+                && trust_loopback_enabled();
+            match authenticate(
+                &auth,
+                &device_id,
+                token.as_deref(),
+                pairing_code.as_deref(),
+                peer_is_loopback,
+            ) {
                 Ok(minted) => {
                     // Resolve the authoritative device id (token-bound when
                     // authenticated) and migrate any legacy hostname/bound-id data
@@ -529,7 +547,7 @@ pub(crate) async fn run_connection(
                             }
                         }
                     }
-                    (device_id, minted)
+                    (device_id, minted, loopback_trusted)
                 }
                 Err(message) => {
                     tracing::warn!(%device_id, "rejected unauthenticated connection");
@@ -590,6 +608,7 @@ pub(crate) async fn run_connection(
         &device_tools,
         minted_token,
         &device_id,
+        loopback_trusted,
     )
     .await;
 
@@ -617,6 +636,7 @@ async fn serve(
     device_tools: &DeviceTools,
     minted_token: Option<String>,
     device_id: &str,
+    loopback_trusted: bool,
 ) -> Result<()> {
     let session_id = uuid::Uuid::new_v4().to_string();
     let default_conversation = uuid::Uuid::new_v4().to_string();
@@ -634,6 +654,7 @@ async fn serve(
                 let fp = crate::server_fingerprint();
                 (!fp.is_empty()).then(|| fp.to_string())
             },
+            loopback_trusted,
             token: minted_token,
         },
     )?;
@@ -2114,15 +2135,36 @@ fn config_apply(target: fleety_protocol::ConfigTarget, args: &[String]) -> Serve
     }
 }
 
+/// Whether same-host loopback connections are trusted (bypass auth). On unless
+/// `FLEETY_TRUST_LOOPBACK=0` — a loopback peer already has filesystem access to
+/// the server's token/config, so requiring a token is friction, not security.
+fn trust_loopback_enabled() -> bool {
+    std::env::var("FLEETY_TRUST_LOOPBACK").as_deref() != Ok("0")
+}
+
+/// Whether a connection's transport peer is a loopback address. Taken from the
+/// connection socket, never a client-supplied field. Pure.
+pub(crate) fn peer_is_loopback(peer: Option<std::net::SocketAddr>) -> bool {
+    peer.map(|a| a.ip().is_loopback()).unwrap_or(false)
+}
+
 /// Authenticate a Hello. `Ok(Some(token))` = pairing minted a token to return;
-/// `Ok(None)` = already authenticated or auth disabled; `Err(msg)` = rejected.
+/// `Ok(None)` = already authenticated, auth disabled, or accepted on loopback
+/// trust; `Err(msg)` = rejected. `loopback` is whether the transport peer is on
+/// the same host (from the connection socket).
 fn authenticate(
     auth: &AuthStore,
     device_id: &str,
     token: Option<&str>,
     pairing_code: Option<&str>,
+    loopback: bool,
 ) -> std::result::Result<Option<String>, String> {
     if !auth.required() {
+        return Ok(None);
+    }
+    // A valid token still wins even on loopback (so an enrolled device keeps its
+    // bound identity); a token-less same-host client is trusted when enabled.
+    if token.is_none() && pairing_code.is_none() && loopback && trust_loopback_enabled() {
         return Ok(None);
     }
     // A valid token wins — authenticate with it and leave any (possibly
@@ -3559,7 +3601,7 @@ mod tests {
         let code = auth.create_pairing().expect("mint code");
 
         // First connect: the code enrolls the device and mints a token.
-        let token = match authenticate(&auth, "dev", None, Some(&code)) {
+        let token = match authenticate(&auth, "dev", None, Some(&code), false) {
             Ok(Some(t)) => t,
             other => panic!("expected a minted token, got {other:?}"),
         };
@@ -3567,14 +3609,43 @@ mod tests {
         // Reconnect: the same (now-used) code is resent alongside the valid token.
         assert!(
             matches!(
-                authenticate(&auth, "dev", Some(&token), Some(&code)),
+                authenticate(&auth, "dev", Some(&token), Some(&code), false),
                 Ok(None)
             ),
             "a valid token must authenticate even when the spent pairing code is resent"
         );
 
         // Sanity: a bad token with no code is still rejected.
-        assert!(authenticate(&auth, "dev", Some("bogus"), None).is_err());
+        assert!(authenticate(&auth, "dev", Some("bogus"), None, false).is_err());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn loopback_peer_is_trusted_only_when_enabled() {
+        assert!(peer_is_loopback(Some("127.0.0.1:5".parse().unwrap())));
+        assert!(peer_is_loopback(Some("127.0.5.9:5".parse().unwrap())));
+        assert!(peer_is_loopback(Some("[::1]:5".parse().unwrap())));
+        assert!(!peer_is_loopback(Some("192.168.1.10:5".parse().unwrap())));
+        assert!(!peer_is_loopback(None));
+
+        let path = std::env::temp_dir().join(format!("fleety-lb-{}.json", uuid::Uuid::new_v4()));
+        let auth = AuthStore::load(path, None, true); // auth required
+
+        std::env::remove_var("FLEETY_TRUST_LOOPBACK"); // default: trust on
+        assert!(trust_loopback_enabled());
+        // A token-less loopback client is accepted (Ok(None)) when trust is on.
+        assert!(matches!(
+            authenticate(&auth, "dev", None, None, true),
+            Ok(None)
+        ));
+        // A non-loopback token-less client is still rejected.
+        assert!(authenticate(&auth, "dev", None, None, false).is_err());
+
+        std::env::set_var("FLEETY_TRUST_LOOPBACK", "0");
+        assert!(!trust_loopback_enabled());
+        // With trust off, even a loopback token-less client is rejected.
+        assert!(authenticate(&auth, "dev", None, None, true).is_err());
+        std::env::remove_var("FLEETY_TRUST_LOOPBACK");
     }
 
     #[test]

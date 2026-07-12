@@ -43,6 +43,7 @@ fn welcome(token: Option<&str>) -> ServerMsg {
         audio_input: false,
         config_protocol: 0,
         server_fingerprint: None,
+        loopback_trusted: false,
         token: token.map(String::from),
     }
 }

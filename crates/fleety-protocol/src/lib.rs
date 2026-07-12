@@ -333,6 +333,11 @@ pub enum ServerMsg {
         /// server after an address change. Additive; absent on older servers.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         server_fingerprint: Option<String>,
+        /// True when the server accepted this connection on same-host loopback
+        /// trust (no token needed). The CLI uses it to skip pairing prompts for
+        /// a local server. Additive; `false` on older servers.
+        #[serde(default)]
+        loopback_trusted: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         token: Option<String>,
     },
@@ -518,6 +523,7 @@ mod tests {
             audio_input: true,
             config_protocol: CONFIG_PROTOCOL_VERSION,
             server_fingerprint: Some("srv-fp-1".into()),
+            loopback_trusted: false,
             token: None,
         };
         let json = serde_json::to_string(&w).expect("ser");

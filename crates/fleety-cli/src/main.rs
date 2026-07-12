@@ -822,15 +822,61 @@ fn parse_selection(input: &str, n: usize) -> Selection {
     }
 }
 
-/// One numbered picker line; servers whose URL is already in a saved profile
-/// are flagged so a re-run is recognizable. Pure.
-fn render_pick_line(idx: usize, s: &DiscoveredServer, saved_urls: &[String]) -> String {
-    let saved = if saved_urls.iter().any(|u| u == &s.url) {
-        "  (saved)"
-    } else {
-        ""
-    };
-    format!("  {}. {}  {}{}", idx + 1, s.name, s.url, saved)
+/// One numbered picker line; the local server is flagged "no pairing" and any
+/// server already in a saved profile is flagged "saved". Pure.
+fn render_pick_line(
+    idx: usize,
+    s: &DiscoveredServer,
+    saved_urls: &[String],
+    local_url: Option<&str>,
+) -> String {
+    let mut tag = String::new();
+    if local_url == Some(s.url.as_str()) {
+        tag.push_str("  (local, no pairing)");
+    }
+    if saved_urls.iter().any(|u| u == &s.url) {
+        tag.push_str("  (saved)");
+    }
+    format!("  {}. {}  {}{}", idx + 1, s.name, s.url, tag)
+}
+
+/// The local server's WebSocket URL: `ws://127.0.0.1:<port>`, port taken from
+/// `FLEETY_ADDR` (`host:port`) or the default. Pure.
+fn local_server_url() -> String {
+    let port = std::env::var("FLEETY_ADDR")
+        .ok()
+        .and_then(|a| a.rsplit(':').next().map(String::from))
+        .and_then(|p| p.trim().parse::<u16>().ok())
+        .unwrap_or(8787);
+    format!("ws://127.0.0.1:{port}")
+}
+
+/// Probe the local server: connect on loopback with a short timeout and read a
+/// `Welcome`. Returns it as a discovery entry named `local` (carrying any
+/// advertised fingerprint) when it answers, else `None` — a host with no local
+/// server is not delayed beyond the timeout, and the probe never errors init.
+async fn probe_local_server(url: &str, timeout: std::time::Duration) -> Option<DiscoveredServer> {
+    let ws = tokio::time::timeout(timeout, transport::connect(url, None))
+        .await
+        .ok()?
+        .ok()?;
+    let (mut tx, mut rx) = ws.split();
+    send(&mut tx, &hello(None, None)).await.ok()?;
+    let reply = tokio::time::timeout(timeout, recv(&mut rx))
+        .await
+        .ok()?
+        .ok()??;
+    let _ = tx.close().await;
+    match reply {
+        ServerMsg::Welcome {
+            server_fingerprint, ..
+        } => Some(DiscoveredServer {
+            name: "local".to_string(),
+            url: url.to_string(),
+            fingerprint: server_fingerprint,
+        }),
+        _ => None,
+    }
 }
 
 /// Read one line from stdin (the picker / pairing prompts); EOF reads as empty.
@@ -844,10 +890,22 @@ fn read_prompt_line() -> String {
 /// server from a numbered list, save it as the current profile, and offer to
 /// pair right away. Falls back to the usage guidance when nothing is found.
 async fn init_interactive(name_override: Option<String>) -> Result<()> {
+    // Probe the local server first (loopback, short timeout): a same-host server
+    // needs no pairing and should be the default pick.
+    let local_url = local_server_url();
+    let local = probe_local_server(&local_url, std::time::Duration::from_secs(1)).await;
+    if local.is_some() {
+        println!("Found a local server at {local_url}.");
+    }
     println!("Scanning the LAN for Fleety servers… (3s)");
-    let found = discover_all_via_mdns(std::time::Duration::from_secs(3));
+    let mut found = discover_all_via_mdns(std::time::Duration::from_secs(3));
+    // The local server leads the list (default pick); drop any mDNS duplicate of it.
+    if let Some(local) = local {
+        found.retain(|d| d.url != local.url);
+        found.insert(0, local);
+    }
     if found.is_empty() {
-        println!("No Fleety server found on this network.");
+        println!("No Fleety server found (no local server, none on the LAN).");
         println!("Point the CLI at one explicitly: fleety init ws://host:8787 [--name <name>]");
         println!(
             "(the server announces itself on the LAN only when it is running and mDNS is enabled)"
@@ -859,25 +917,29 @@ async fn init_interactive(name_override: Option<String>) -> Result<()> {
         .unwrap_or_default();
     println!("Found {} server(s):", found.len());
     for (i, s) in found.iter().enumerate() {
-        println!("{}", render_pick_line(i, s, &saved_urls));
+        println!("{}", render_pick_line(i, s, &saved_urls, Some(&local_url)));
     }
     let picked = loop {
-        eprint!("Pick a server [1-{}] (Enter to cancel): ", found.len());
+        // Default (empty input) picks #1 — the local server when present.
+        eprint!("Pick a server [1-{}] (Enter for 1): ", found.len());
         match parse_selection(&read_prompt_line(), found.len()) {
             Selection::Pick(i) => break i,
-            Selection::Cancel => {
-                println!("Cancelled. Connect later with: fleety init ws://host:8787");
-                return Ok(());
-            }
+            Selection::Cancel => break 0,
             Selection::Invalid => continue,
         }
     };
     let chosen = found[picked].clone();
+    let is_local = chosen.url == local_url;
     let profile = name_override.unwrap_or_else(|| chosen.name.clone());
     // Upsert keeps an existing profile's token, so re-running init on an
     // already-paired server never loses the enrollment.
     upsert_profile_and_use(&profile, &chosen.url)?;
     println!("Using '{profile}' ({}) as the current server.", chosen.url);
+    // The local server is loopback-trusted — no pairing code needed.
+    if is_local {
+        println!("It's your local server — no pairing needed. Try: fleety tui");
+        return Ok(());
+    }
     eprint!(
         "Pairing code — printed on the server's first run, or minted by `pair_create` on an \
          already-paired device (Enter to skip): "
@@ -1912,7 +1974,7 @@ mod tests {
             fingerprint: Some("fp-1".into()),
         };
         let saved = vec!["ws://10.0.0.2:8787".to_string()];
-        let line = render_pick_line(0, &s, &saved);
+        let line = render_pick_line(0, &s, &saved, None);
         assert!(line.starts_with("  1."));
         assert!(line.contains("mini") && line.contains("ws://10.0.0.2:8787"));
         assert!(line.contains("(saved)"));
@@ -1921,7 +1983,27 @@ mod tests {
             url: "ws://10.0.0.3:8787".into(),
             fingerprint: None,
         };
-        assert!(!render_pick_line(1, &other, &saved).contains("(saved)"));
+        assert!(!render_pick_line(1, &other, &saved, None).contains("(saved)"));
+        // The local server is flagged as needing no pairing.
+        let local = DiscoveredServer {
+            name: "local".into(),
+            url: "ws://127.0.0.1:8787".into(),
+            fingerprint: None,
+        };
+        let line = render_pick_line(0, &local, &[], Some("ws://127.0.0.1:8787"));
+        assert!(line.contains("(local, no pairing)"));
+    }
+
+    #[test]
+    fn local_server_url_takes_the_addr_port() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("FLEETY_ADDR");
+        assert_eq!(local_server_url(), "ws://127.0.0.1:8787");
+        std::env::set_var("FLEETY_ADDR", "0.0.0.0:9000");
+        assert_eq!(local_server_url(), "ws://127.0.0.1:9000");
+        std::env::set_var("FLEETY_ADDR", "garbage");
+        assert_eq!(local_server_url(), "ws://127.0.0.1:8787");
+        std::env::remove_var("FLEETY_ADDR");
     }
 
     struct EnvGuard {
