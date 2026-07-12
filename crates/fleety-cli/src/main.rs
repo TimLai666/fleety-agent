@@ -708,14 +708,17 @@ fn resolve_target() -> Result<connection::Resolved> {
     let over = OVERRIDE.get().cloned().unwrap_or(Target::Current);
     let env_url = std::env::var("FLEETY_AGENT_URL").ok();
     let env_token = std::env::var("FLEETY_TOKEN").ok();
+    // Discovery step (only reached with no override/env/sticky profile): prefer
+    // a local server on loopback over an mDNS advertisement. On the server host,
+    // mDNS returns this box's own LAN IP, and a same-host connection to that LAN
+    // IP is NOT loopback-trusted (it would demand pairing); 127.0.0.1 is. Plain
+    // mDNS advertises no server fingerprint yet, so a discovered server never
+    // inherits a pinned profile's token (the guard stays closed).
     let r = connection::resolve(&conns, &over, env_url, env_token, || {
-        discover_via_mdns(std::time::Duration::from_secs(2)).map(|url| connection::Discovered {
-            url,
-            // Plain mDNS advertises no server fingerprint yet, so a discovered
-            // server never inherits a pinned profile's token (the guard stays
-            // closed). Fingerprinted discovery is a later enhancement.
-            fingerprint: None,
-        })
+        prefer_loopback_discovery(
+            || loopback_server_up(std::time::Duration::from_millis(300)),
+            || discover_via_mdns(std::time::Duration::from_secs(2)),
+        )
     })?;
     match &r.source {
         connection::Source::Env => {
@@ -724,6 +727,10 @@ fn resolve_target() -> Result<connection::Resolved> {
                 r.url
             )
         }
+        connection::Source::Mdns if r.url == local_server_url() => eprintln!(
+            "using this host's local server ({}) — same-host trusted, no pairing needed",
+            r.url
+        ),
         connection::Source::Mdns => eprintln!("discovered agent on the LAN: {}", r.url),
         connection::Source::Default => eprintln!(
             "no server configured and none found on the LAN — trying the local default \
@@ -868,6 +875,42 @@ pub(crate) fn local_server_url() -> String {
         .and_then(|p| p.trim().parse::<u16>().ok())
         .unwrap_or(8787);
     format!("ws://127.0.0.1:{port}")
+}
+
+/// Whether a local server is listening on loopback right now: a quick blocking
+/// TCP connect to `127.0.0.1:<port>` (no WS handshake — the real connect
+/// follows). Sync so it slots into the resolution discovery closure. A host with
+/// no local server returns fast (connection refused is immediate, not the full
+/// timeout). Returns the loopback URL when up, else `None`.
+fn loopback_server_up(timeout: std::time::Duration) -> Option<String> {
+    use std::net::ToSocketAddrs;
+    let url = local_server_url();
+    let addr = url.strip_prefix("ws://")?.to_socket_addrs().ok()?.next()?;
+    std::net::TcpStream::connect_timeout(&addr, timeout).ok()?;
+    Some(url)
+}
+
+/// Co-located discovery preference: a local server on loopback wins over an mDNS
+/// advertisement. The same host connecting to its own LAN IP — what mDNS returns
+/// — is NOT loopback-trusted and would have to pair, whereas `127.0.0.1` is
+/// same-host trusted (no pairing). Pure over the two injected probes so the
+/// precedence is unit-testable; the loopback probe runs first and mDNS only when
+/// it finds nothing.
+fn prefer_loopback_discovery(
+    loopback: impl FnOnce() -> Option<String>,
+    mdns: impl FnOnce() -> Option<String>,
+) -> Option<connection::Discovered> {
+    if let Some(url) = loopback() {
+        // Loopback is same-host trusted, so it never carries/needs a token.
+        return Some(connection::Discovered {
+            url,
+            fingerprint: None,
+        });
+    }
+    mdns().map(|url| connection::Discovered {
+        url,
+        fingerprint: None,
+    })
 }
 
 /// Probe the local server: connect on loopback with a short timeout and read a
@@ -2095,6 +2138,23 @@ mod tests {
         std::env::set_var("FLEETY_ADDR", "garbage");
         assert_eq!(local_server_url(), "ws://127.0.0.1:8787");
         std::env::remove_var("FLEETY_ADDR");
+    }
+
+    #[test]
+    fn loopback_wins_over_mdns_in_discovery() {
+        let lb = "ws://127.0.0.1:8787".to_string();
+        let lan = "ws://192.168.1.109:8787".to_string();
+        // A local server on loopback is preferred even when mDNS also finds a
+        // LAN advertiser (the same-host box's own outward IP) — loopback is
+        // trusted, the LAN IP would demand pairing.
+        let r = prefer_loopback_discovery(|| Some(lb.clone()), || Some(lan.clone()));
+        assert_eq!(r.unwrap().url, lb);
+        // No local server → fall through to the mDNS advertiser.
+        let r = prefer_loopback_discovery(|| None, || Some(lan.clone()));
+        assert_eq!(r.unwrap().url, lan);
+        // Neither → None, so resolution proceeds to the localhost default.
+        let r = prefer_loopback_discovery(|| None, || None);
+        assert!(r.is_none());
     }
 
     struct EnvGuard {
