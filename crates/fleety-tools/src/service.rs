@@ -198,6 +198,11 @@ pub fn run_verb(spec: &ServiceSpec, verb: Verb) -> Result<()> {
                 .map_err(|e| CoreError::Message(format!("cannot write service file: {e}")))?;
         }
     }
+    // A Windows restart of the service *we ourselves are* (an in-process
+    // self-restart) must not wait for the old process to stop between `sc stop`
+    // and `sc start` — that old process is us, and we can't wait for ourselves.
+    // External restarts (a separate CLI process) own no such pidfile and wait.
+    let self_restart = os == Os::Windows && verb == Verb::Restart && is_self_service(&spec.name);
     let domain = launchd_domain();
     for (i, argv) in verb_argv(os, spec, verb, &domain).into_iter().enumerate() {
         let Some((program, args)) = argv.split_first() else {
@@ -234,8 +239,9 @@ pub fn run_verb(spec: &ServiceSpec, verb: Verb) -> Result<()> {
         // `sc stop` returns at STOP_PENDING; wait for the old process to actually
         // exit before the following `sc start`, or the SCM rejects the start with
         // "an instance is already running". Best-effort: on timeout we start
-        // anyway and let that error surface.
-        if win_restart_stop {
+        // anyway and let that error surface. Skipped for a self-restart (we are
+        // the process being stopped — see `self_restart`).
+        if win_restart_stop && !self_restart {
             wait_until_stopped_at(
                 &pidfile_path(&spec.name),
                 STOP_SETTLE_WAIT,
@@ -504,6 +510,16 @@ const STOP_SETTLE_POLL: Duration = Duration::from_millis(300);
 /// (either the guard removed the file, or its pid is dead). Pure.
 pub fn sample_is_stopped(current: Option<u32>, alive: bool) -> bool {
     !matches!(current, Some(pid) if alive && pid != 0)
+}
+
+/// True when *this* process owns `name`'s pidfile — a "restart" of `name` is then
+/// this process restarting **itself** (e.g. the running server applying its own
+/// auto-update). Such a caller must not wait for the (re)start to complete: it is
+/// the process being replaced, so waiting for itself to stop / a new pid to appear
+/// would just self-deadlock. External restarts (a separate CLI process) own no
+/// such pidfile, so they wait normally.
+pub fn is_self_service(name: &str) -> bool {
+    read_pid(&pidfile_path(name)) == Some(std::process::id())
 }
 
 /// Block until the `name` service's pidfile has no live owner, or `timeout`
@@ -834,6 +850,16 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_self_service_false_without_our_own_pidfile() {
+        // A service whose pidfile we don't own is not a self-restart (no marker,
+        // or someone else's pid). We never write a pidfile for this bogus name, so
+        // it must read as "not self" — the guard then lets the restart wait.
+        assert!(!is_self_service(
+            "definitely-not-a-real-fleety-service-name-xyz"
+        ));
     }
 
     #[test]

@@ -158,6 +158,14 @@ pub fn restart_mode(force: bool, server_alive: bool) -> RestartMode {
 /// silently skip the restart).
 pub fn restart(force: bool) -> Result<()> {
     let spec = spec()?;
+    // Defensive: a self-restart must not wait for itself. The server's own
+    // deferred restart goes through the watcher's `run_verb` (never here), so this
+    // should not trigger — but if it ever does, fire the manager restart and let
+    // this process be replaced rather than self-deadlocking in the confirm wait.
+    if service::is_self_service(&spec.name) {
+        service::ensure_elevated_for(Verb::Restart)?;
+        return service::run_verb(&spec, Verb::Restart);
+    }
     let pid = service::read_pid(&service::pidfile_path(&spec.name));
     let server_alive = pid.map(service::pid_alive).unwrap_or(false);
     // The pid we are cycling away from (only when a live server owns it), so the

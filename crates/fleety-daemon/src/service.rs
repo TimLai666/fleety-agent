@@ -66,6 +66,12 @@ pub fn stop() -> Result<()> {
 pub fn restart() -> Result<()> {
     let spec = spec()?;
     service::ensure_elevated_for(Verb::Restart)?;
+    // A self-restart (the running daemon restarting itself to apply an auto-update)
+    // must not wait — we are the process being replaced. Fire the manager restart
+    // and return; only an external `fleetyd restart` waits for the new process.
+    if service::is_self_service(&spec.name) {
+        return service::run_verb(&spec, Verb::Restart);
+    }
     // The live pid we're cycling away from, so we wait for the *new* one to take over.
     let replacing =
         service::read_pid(&service::pidfile_path(&spec.name)).filter(|&p| service::pid_alive(p));
