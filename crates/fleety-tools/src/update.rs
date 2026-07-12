@@ -205,6 +205,19 @@ fn swap_exe(exe_path: &Path, bytes: &[u8]) -> Result<()> {
     let staged = exe_path.with_extension("new");
     std::fs::write(&staged, bytes)
         .map_err(|e| CoreError::Message(format!("cannot write staged binary: {e}")))?;
+    // `std::fs::write` creates the staged file 0644; without the execute bit the
+    // swapped-in binary is "permission denied" on Unix. Make it 0755 (as the
+    // installers and the sidecar download do) before it takes the exe's place.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)) {
+            let _ = std::fs::remove_file(&staged);
+            return Err(CoreError::Message(format!(
+                "cannot make the staged binary executable: {e}"
+            )));
+        }
+    }
     let backup = exe_path.with_extension("old");
     let _ = std::fs::remove_file(&backup);
     std::fs::rename(exe_path, &backup)
@@ -767,5 +780,27 @@ mod tests {
             manifest_url_for("fleety-server").unwrap(),
             "https://github.com/TimLai666/fleety-agent/releases/latest/download/fleety-server-manifest.json"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn swap_exe_leaves_the_binary_executable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("fleety-swap-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("mk dir");
+        let exe = dir.join("fleety");
+        std::fs::write(&exe, b"old").expect("seed");
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        swap_exe(&exe, b"new-binary-bytes").expect("swap");
+
+        let mode = std::fs::metadata(&exe).expect("stat").permissions().mode();
+        assert_eq!(
+            mode & 0o111,
+            0o111,
+            "swapped-in binary must stay executable, got {mode:o}"
+        );
+        assert_eq!(std::fs::read(&exe).expect("read"), b"new-binary-bytes");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
