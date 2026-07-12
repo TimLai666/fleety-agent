@@ -242,7 +242,8 @@ fn on_key(p: &mut Panel, code: KeyCode) -> bool {
         return false;
     }
     match code {
-        KeyCode::Char('q') => p.quit = true,
+        // q or Esc (when not editing) leaves the settings editor back to the menu.
+        KeyCode::Char('q') | KeyCode::Esc => p.quit = true,
         KeyCode::Tab => {
             p.region = p.region.next();
             p.sel = 0;
@@ -305,7 +306,7 @@ fn render(f: &mut Frame, p: &Panel) {
         .constraints([
             Constraint::Length(1),
             Constraint::Min(3),
-            Constraint::Length(3),
+            Constraint::Length(4),
         ])
         .split(f.area());
 
@@ -391,9 +392,10 @@ fn render(f: &mut Frame, p: &Panel) {
         chunks[1],
     );
 
-    // Footer: the edit buffer, or the status + (for the selected server entry)
-    // its effect/description.
-    let footer = if let Some(ed) = &p.edit {
+    // Footer: a PERSISTENT key-hint line (so an action's output never hides how
+    // to move / apply / leave), then the transient edit buffer or status below.
+    let hints = "Tab: region · ↑↓: move · Enter: edit · a: apply server · Esc/q: menu";
+    let status_line = if let Some(ed) = &p.edit {
         let (view, _) = ed.display_window(60);
         format!("> {view}   (Enter save · Esc cancel)")
     } else if p.region == Region::Server {
@@ -411,6 +413,7 @@ fn render(f: &mut Frame, p: &Panel) {
     } else {
         p.status.clone()
     };
+    let footer = vec![Line::from(hints), Line::from(status_line)];
     f.render_widget(Paragraph::new(footer).block(Block::bordered()), chunks[2]);
 }
 
@@ -424,7 +427,127 @@ fn has_local_profile(conns: &Connections, local_url: &str) -> bool {
     conns.profiles.values().any(|p| p.url == local_url)
 }
 
+/// Top-level `fleety config` menu items.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MenuChoice {
+    Providers,
+    Models,
+    Settings,
+    Quit,
+}
+
+const MENU_ITEMS: &[(&str, MenuChoice)] = &[
+    (
+        "Providers   — add / edit model providers",
+        MenuChoice::Providers,
+    ),
+    (
+        "Models      — set the main / cheap model roles",
+        MenuChoice::Models,
+    ),
+    (
+        "Settings    — FLEETY_* values (connection, this device, server)",
+        MenuChoice::Settings,
+    ),
+    ("Quit", MenuChoice::Quit),
+];
+
+/// Pure menu navigation: the new selected index, and `Some(idx)` when Enter chose
+/// an item. Unit-testable without a terminal.
+fn menu_step(len: usize, idx: usize, key: KeyCode) -> (usize, Option<usize>) {
+    match key {
+        KeyCode::Up => (idx.saturating_sub(1), None),
+        KeyCode::Down => ((idx + 1).min(len.saturating_sub(1)), None),
+        KeyCode::Enter => (idx, Some(idx)),
+        _ => (idx, None),
+    }
+}
+
+/// `fleety config` (bare, on a TTY): a top-level menu — pick what to configure
+/// (Providers / Models / Settings) and drill into it; Esc/q leaves. Each item
+/// runs its own screen and returns here.
 pub async fn run() -> Result<()> {
+    loop {
+        match run_menu().await? {
+            Some(MenuChoice::Settings) => run_settings().await?,
+            // Providers + Models share the interactive providers editor for now
+            // (it does both add-provider and set-model).
+            Some(MenuChoice::Providers) | Some(MenuChoice::Models) => run_providers()?,
+            Some(MenuChoice::Quit) | None => return Ok(()),
+        }
+    }
+}
+
+/// Draw the top-level menu and return the chosen item (None when the user quit).
+async fn run_menu() -> Result<Option<MenuChoice>> {
+    let (key_tx, mut key_rx) = tokio::sync::mpsc::unbounded_channel();
+    std::thread::spawn(move || loop {
+        match ratatui::crossterm::event::read() {
+            Ok(Event::Key(k)) if k.kind != KeyEventKind::Release => {
+                if key_tx.send(k.code).is_err() {
+                    break;
+                }
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    });
+    let mut sel = 0usize;
+    let mut terminal = ratatui::init();
+    let result: Result<Option<MenuChoice>> = loop {
+        if let Err(e) = terminal.draw(|f| render_menu(f, sel)) {
+            break Err(CoreError::Message(format!("draw failed: {e}")));
+        }
+        let Some(code) = key_rx.recv().await else {
+            break Ok(None);
+        };
+        if matches!(code, KeyCode::Char('q') | KeyCode::Esc) {
+            break Ok(None);
+        }
+        let (new_sel, chosen) = menu_step(MENU_ITEMS.len(), sel, code);
+        sel = new_sel;
+        if let Some(i) = chosen {
+            break Ok(Some(MENU_ITEMS[i].1));
+        }
+    };
+    ratatui::restore();
+    result
+}
+
+fn render_menu(f: &mut Frame, sel: usize) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(3)])
+        .split(f.area());
+    let lines: Vec<Line> = MENU_ITEMS
+        .iter()
+        .enumerate()
+        .map(|(i, (label, _))| {
+            let marker = if i == sel { "▶ " } else { "  " };
+            Line::from(format!("{marker}{label}"))
+        })
+        .collect();
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(Block::bordered().title("fleety config — choose what to configure")),
+        chunks[0],
+    );
+    f.render_widget(
+        Paragraph::new("↑↓: move · Enter: open · Esc/q: quit").block(Block::bordered()),
+        chunks[1],
+    );
+}
+
+/// Launch the interactive providers/models editor over this host's providers.toml
+/// (from the "Providers"/"Models" menu items).
+fn run_providers() -> Result<()> {
+    let path = fleety_tools::providers_config::providers_path();
+    crate::provider_tui::run(&path)
+}
+
+/// The three-region settings editor (Connection / This device / Server),
+/// launched from the top-level menu's "Settings" item.
+async fn run_settings() -> Result<()> {
     // Resolve + connect, capturing the Welcome so we know the server's config
     // protocol. On any connection failure, the panel still opens for the local
     // + connection regions; the server region reports it is unavailable.
@@ -663,6 +786,21 @@ mod tests {
             effect: Some(fleety_protocol::Effect::Restart),
             choices: vec![],
         }
+    }
+
+    #[test]
+    fn menu_step_navigates_and_selects() {
+        let n = MENU_ITEMS.len();
+        // Down moves, clamped at the end.
+        assert_eq!(menu_step(n, 0, KeyCode::Down), (1, None));
+        assert_eq!(menu_step(n, n - 1, KeyCode::Down), (n - 1, None));
+        // Up moves, clamped at 0.
+        assert_eq!(menu_step(n, 1, KeyCode::Up), (0, None));
+        assert_eq!(menu_step(n, 0, KeyCode::Up), (0, None));
+        // Enter chooses the current index.
+        assert_eq!(menu_step(n, 2, KeyCode::Enter), (2, Some(2)));
+        // Other keys are no-ops.
+        assert_eq!(menu_step(n, 1, KeyCode::Tab), (1, None));
     }
 
     #[test]
