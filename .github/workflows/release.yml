@@ -69,14 +69,31 @@ jobs:
           # Anonymous api.github.com calls from shared runner IPs hit the
           # 60/hr rate limit (403) — authenticate with the workflow token.
           GITHUB_TOKEN: ${{ github.token }}
+          # Pipe (not comma) so `go` falls back to the origin on ANY error,
+          # including a proxy timeout — a comma would only fall back on 404/410,
+          # which is why a proxy.golang.org zip timeout (e.g. the thrift dep) used
+          # to hard-fail the whole release.
+          GOPROXY: "https://proxy.golang.org|direct"
         run: |
           cd sidecars/fleety-insyra
+          # proxy.golang.org occasionally times out fetching a module zip. Retry
+          # the network-bound `go` commands with backoff; GOPROXY's pipe fallback
+          # handles a persistently-slow proxy per-fetch. A real breaking change
+          # still fails: `go test` is not retried, and exhausted retries fail loud.
+          retry() {
+            local n=1 max=5 delay=10
+            until "$@"; do
+              [ "$n" -ge "$max" ] && { echo "FAILED after $max attempts: $*" >&2; return 1; }
+              echo "attempt $n/$max failed: $* — retrying in ${delay}s" >&2
+              sleep "$delay"; n=$((n + 1)); delay=$((delay * 2))
+            done
+          }
           # Bump Insyra and every sidecar dependency to its latest version. CI
           # uses the latest stable Go (setup-go: stable), and `go mod tidy` raises
           # the go.mod `go` directive if a dependency needs a newer language version.
-          go get -u github.com/HazelnutParadise/insyra@latest
-          go get -u ./...
-          go mod tidy
+          retry go get -u github.com/HazelnutParadise/insyra@latest
+          retry go get -u ./...
+          retry go mod tidy
           go test ./...
           # tr -d '\r': on the Windows runner `go list` output carries a CR
           # that would silently corrupt the URLs built from $v (curl exit 3).
@@ -190,6 +207,12 @@ jobs:
   manifests:
     name: build update manifests
     needs: build
+    # Run even if a build target failed (but not if the run was cancelled): a
+    # missing target then makes THIS job fail loudly at the missing-binary check
+    # below, instead of `needs: build` silently SKIPPING manifests — which once
+    # shipped a release with binaries but no manifests, quietly breaking
+    # self-update. `gh run rerun --failed` re-runs the failed build + this job.
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -228,7 +251,7 @@ jobs:
             for t in $targets; do
               f="raw/$bin-$t"
               [ -f "$f" ] || f="raw/$bin-$t.exe"
-              [ -f "$f" ] || { echo "missing raw binary for $bin ($t)" >&2; exit 1; }
+              [ -f "$f" ] || { echo "missing raw binary for $bin ($t) — its build job failed (likely a transient toolchain/download error); re-run it with 'gh run rerun --failed' before this release is usable" >&2; exit 1; }
               sha=$(sha256sum "$f" | cut -d' ' -f1)
               json=$(jq --arg t "$t" --arg url "$base/$tag/$(basename "$f")" --arg sha "$sha" \
                 '.targets[$t] = {url: $url, sha256: $sha}' <<<"$json")
@@ -281,11 +304,24 @@ jobs:
       # skills mirroring isn't repeated here — this job runs no cargo build, so
       # nothing embeds them.
       - name: Update Insyra to latest release
+        shell: bash
+        env:
+          # See the main build job: pipe fallback goes direct on any proxy error
+          # (including a timeout), not just 404/410.
+          GOPROXY: "https://proxy.golang.org|direct"
         run: |
           cd sidecars/fleety-insyra
-          go get -u github.com/HazelnutParadise/insyra@latest
-          go get -u ./...
-          go mod tidy
+          retry() {
+            local n=1 max=5 delay=10
+            until "$@"; do
+              [ "$n" -ge "$max" ] && { echo "FAILED after $max attempts: $*" >&2; return 1; }
+              echo "attempt $n/$max failed: $* — retrying in ${delay}s" >&2
+              sleep "$delay"; n=$((n + 1)); delay=$((delay * 2))
+            done
+          }
+          retry go get -u github.com/HazelnutParadise/insyra@latest
+          retry go get -u ./...
+          retry go mod tidy
           go test ./...
       - name: Cross-build insyra sidecar
         env:
