@@ -4,7 +4,9 @@
 > can set without exporting env: `fleety config list` / `get` / `set <KEY>
 > <VALUE>` / `unset`, or bare **`fleety config`** (on a TTY) for a guided menu —
 > pick Providers / Models / Settings and drill in (add a provider by type, pick a
-> model from its `/models` list, choose a timezone). Values persist to
+> model from its API `/models` list or the connected server's authenticated Codex
+> catalog, choose a timezone). OAuth rows show whether the server is signed in,
+> signed out, or unavailable. Values persist to
 > `~/.fleety/config.toml` (override with `FLEETY_CONFIG`), sectioned by scope
 > (`[server]` / `[daemon]` / `[cli]` / `[shared]`). **Read precedence is env →
 > config → default**: an explicit environment variable always wins, so config

@@ -165,7 +165,7 @@ code:
 ---
 ### Requirement: Login status and logout do not leak tokens
 
-The CLI SHALL provide a `status [<provider>]` command and a `logout <provider>` command. `status <provider>` SHALL report whether the connected server holds that provider's credential and when it expires without printing the token values; `status` with no provider SHALL enumerate the `oauth:codex` providers in the connected server's provider config and report each one's signed-in state and expiry on its own line. `logout <provider>` SHALL remove that provider's credential stored on the connected server. When a legacy local token file exists on the CLI host, status SHALL note that it is no longer used by any flow. The authorization/token endpoints, client id, and backend base URL SHALL be fixed constants in the code (OpenAI's public values, like the loopback port) — they SHALL NOT be configuration keys or environment variables and SHALL NOT appear in `fleety config`.
+The CLI SHALL provide a `status [<provider>]` command and a `logout <provider>` command. `status <provider>` SHALL report whether the connected server holds that provider's credential and when it expires without printing the token values; `status` with no provider SHALL enumerate the `oauth:codex` providers in the connected server's provider config and report each one's signed-in state and expiry on its own line. The remote interactive provider editor SHALL reuse the same server-side credential status authority and SHALL show each `oauth:codex` provider as `signed in`, `not signed in`, or `unavailable` without printing token values. `logout <provider>` SHALL remove that provider's credential stored on the connected server. When a legacy local token file exists on the CLI host, status SHALL note that it is no longer used by any flow. The authorization/token endpoints, client id, and backend base URL SHALL be fixed constants in the code (OpenAI's public values, like the loopback port) ? they SHALL NOT be configuration keys or environment variables and SHALL NOT appear in `fleety config`.
 
 #### Scenario: status reports one provider's state without token values
 
@@ -176,6 +176,11 @@ The CLI SHALL provide a `status [<provider>]` command and a `logout <provider>` 
 
 - **WHEN** a user runs status with no provider argument
 - **THEN** the CLI lists each `oauth:codex` provider with its signed-in state and expiry, one per line
+
+#### Scenario: the remote editor reports provider auth state
+
+- **WHEN** the remote interactive provider editor receives credential status for an `oauth:codex` provider
+- **THEN** its provider row reports `signed in` or `not signed in` according to the server response, and reports `unavailable` when the status query cannot be completed
 
 #### Scenario: logout removes one provider's credential
 
@@ -189,26 +194,24 @@ The CLI SHALL provide a `status [<provider>]` command and a `logout <provider>` 
 
 #### Scenario: endpoints are fixed, not configurable
 
-- **WHEN** a user inspects or edits configuration (env, `config.toml`, or `fleety config`)
-- **THEN** the Codex client id and endpoints are not present as settings — the login flow and provider always use the hardcoded constants
+- **WHEN** a user inspects or edits configuration (env, config.toml, or fleety config)
+- **THEN** the Codex client id and endpoints are not present as settings; the login flow and provider always use the hardcoded constants
 
 
 <!-- @trace
-source: per-provider-codex-oauth
-updated: 2026-07-12
+source: oauth-provider-status-and-model-discovery
+updated: 2026-07-13
 code:
-  - docs/env.md
-  - crates/fleety-cli/src/provider_tui.rs
-  - crates/fleety-cli/src/config.rs
-  - crates/fleety-cli/src/config_panel.rs
-  - docs/design-cli-config.md
-  - README.md
-  - crates/fleety-server/src/main.rs
-  - crates/fleety-tools/src/oauth.rs
   - crates/fleety-server/src/conn.rs
-  - crates/fleety-protocol/src/lib.rs
   - crates/fleety-server/src/providers.rs
-  - crates/fleety-cli/src/auth.rs
+  - crates/fleety-cli/src/config.rs
+  - docs/env.md
+  - README.md
+  - crates/fleety-protocol/src/lib.rs
+  - crates/fleety-tools/src/oauth.rs
+  - crates/fleety-cli/src/provider_tui.rs
+  - crates/fleety-cli/src/main.rs
+  - docs/design-cli-config.md
 -->
 
 ---

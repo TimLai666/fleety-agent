@@ -260,8 +260,11 @@ fleety server use <name>          # 同時設定 CLI 與本機 daemon(一台一�
   依 `type` 顯示不同欄位:api 型預填 base_url+key(空 key 保留原值);`oauth:codex` 型
   不填欄位,改進**登入/登出/換帳號子選單**——因為登入是 async+開瀏覽器+搶終端,
   做法是存檔→離開全螢幕→對該 provider 跑 `auth login/logout`(換帳號=登出再登入)→
-  重開編輯器。憑證 per-provider(每個 codex provider 各自帳號)。門鎖 key 標示「需認證
-  已開」;敏感 key 覆寫前二次確認 + 告警。
+  重開編輯器。憑證 per-provider(每個 codex provider 各自帳號)。OAuth row 同時查詢
+  server-side credential status，明確標示「已登入／未登入／無法取得狀態」，不把未知誤報
+  成未登入。設定 model 時，API provider 查自己的 `/models`，`oauth:codex` 由 server
+  用該 provider 的 OAuth credential 查 Codex catalog，查不到就保留手動輸入。門鎖 key
+  標示「需認證已開」;敏感 key 覆寫前二次確認 + 告警。
 - secret 顯示遮罩,編輯 secret 只上送新值(write-only,tri-state:keep/set/clear,
   遮罩值一律不回寫,見 M3)。
 - 生效時機(下次連線 / 需重啟)在 detail pane 明示。

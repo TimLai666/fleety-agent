@@ -3,9 +3,10 @@
 //! (`~/.fleety/codex-oauth.json`, 0600 on Unix), never in the config or providers
 //! file. Endpoints and the client id are overridable via config; see `config.rs`.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use agent_core::{CoreError, Result};
+use agent_core::{CodexAuth, CoreError, Result};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -277,6 +278,88 @@ pub fn oauth_config() -> OAuthConfig {
         token_endpoint: CODEX_TOKEN_URL.to_string(),
         backend_base_url: CODEX_BACKEND_URL.to_string(),
     }
+}
+
+/// Parse the Codex backend's model catalog into stable, unique model IDs.
+/// Codex names catalog entries with `slug`; `id` is accepted for compatibility
+/// with API-shaped responses. Malformed or empty catalogs return no IDs so the
+/// caller can fall back to manual model entry.
+pub fn parse_codex_model_ids(body: &Value) -> Vec<String> {
+    let Some(models) = body.get("models").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut seen = HashSet::new();
+    let mut ids = Vec::new();
+    for model in models {
+        let value = model
+            .get("slug")
+            .or_else(|| model.get("id"))
+            .and_then(Value::as_str)
+            .or_else(|| model.as_str());
+        let Some(id) = value.map(str::trim).filter(|id| !id.is_empty()) else {
+            continue;
+        };
+        if seen.insert(id.to_string()) {
+            ids.push(id.to_string());
+        }
+    }
+    ids
+}
+
+/// Fetch the authenticated Codex model catalog for a named provider. OAuth
+/// credentials are loaded and refreshed on the server; only model IDs leave
+/// this function.
+pub async fn fetch_codex_models(provider_name: &str) -> Result<Vec<String>> {
+    let config = oauth_config();
+    let auth = OAuthCodexAuth::new(token_path_for(provider_name), &config);
+    let creds = auth.credentials().await.map_err(|e| {
+        CoreError::Provider(format!(
+            "provider '{provider_name}' is not signed in: {}",
+            e.report().message
+        ))
+    })?;
+    fetch_codex_models_at(&reqwest::Client::new(), &config.backend_base_url, &creds).await
+}
+
+async fn fetch_codex_models_at(
+    client: &reqwest::Client,
+    backend_base_url: &str,
+    creds: &agent_core::CodexCreds,
+) -> Result<Vec<String>> {
+    let endpoint = format!("{}/models", backend_base_url.trim_end_matches('/'));
+    let mut request = client
+        .get(&endpoint)
+        .query(&[("client_version", agent_core::VERSION)])
+        .bearer_auth(&creds.bearer)
+        .header("originator", originator())
+        .header(
+            "User-Agent",
+            "Mozilla/5.0 (compatible; Fleety/1.0; +https://github.com/) Codex",
+        );
+    if let Some(account_id) = &creds.account_id {
+        request = request.header("chatgpt-account-id", account_id);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|e| CoreError::Provider(format!("Codex model catalog request failed: {e}")))?;
+    if !response.status().is_success() {
+        return Err(CoreError::Provider(format!(
+            "Codex model catalog returned HTTP {}",
+            response.status()
+        )));
+    }
+    let body: Value = response
+        .json()
+        .await
+        .map_err(|e| CoreError::Provider(format!("Codex model catalog returned non-JSON: {e}")))?;
+    let ids = parse_codex_model_ids(&body);
+    if ids.is_empty() {
+        return Err(CoreError::Provider(
+            "Codex model catalog returned no model IDs".into(),
+        ));
+    }
+    Ok(ids)
 }
 
 /// The fixed loopback port the Codex OAuth client id is registered with. The
@@ -576,6 +659,34 @@ mod tests {
     use std::time::Duration;
 
     #[test]
+    fn codex_model_catalog_parser_keeps_slug_order_and_deduplicates() {
+        let body = json!({
+            "models": [
+                {"slug": "gpt-5"},
+                {"slug": ""},
+                {"slug": "gpt-5-mini"},
+                {"slug": "gpt-5"},
+                {"id": "fallback-id"}
+            ]
+        });
+        assert_eq!(
+            parse_codex_model_ids(&body),
+            vec![
+                "gpt-5".to_string(),
+                "gpt-5-mini".to_string(),
+                "fallback-id".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_model_catalog_parser_rejects_missing_or_empty_catalog() {
+        assert!(parse_codex_model_ids(&json!({})).is_empty());
+        assert!(parse_codex_model_ids(&json!({"models": []})).is_empty());
+        assert!(parse_codex_model_ids(&json!({"models": [{"slug": "  "}]})).is_empty());
+    }
+
+    #[test]
     fn pkce_matches_rfc7636_test_vector() {
         // RFC 7636 Appendix B.
         let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
@@ -763,6 +874,24 @@ mod tests {
             }
         });
         (format!("http://{addr}"), rx)
+    }
+
+    #[tokio::test]
+    async fn codex_model_catalog_request_uses_version_and_account_headers() {
+        let (base, rx) = serve_once_json("200 OK", r#"{"models":[{"slug":"gpt-5"}]}"#.to_string());
+        let creds = agent_core::CodexCreds {
+            bearer: "secret-access-token".into(),
+            account_id: Some("account-1".into()),
+        };
+        let ids = fetch_codex_models_at(&reqwest::Client::new(), &base, &creds)
+            .await
+            .expect("model catalog");
+        assert_eq!(ids, vec!["gpt-5"]);
+        let request = rx.recv_timeout(Duration::from_secs(5)).expect("request");
+        assert!(request.contains("GET /models?client_version="));
+        assert!(request.contains("authorization: Bearer secret-access-token"));
+        assert!(request.contains("chatgpt-account-id: account-1"));
+        assert!(!request.contains("refresh_token"));
     }
 
     #[tokio::test]

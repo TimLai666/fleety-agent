@@ -13,6 +13,7 @@
 //! in-place provider editing from the old single-tier UI are dropped; use
 //! remove+add, or the non-interactive commands, for those.)
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use agent_core::{CoreError, Result};
@@ -185,6 +186,60 @@ fn fetch_provider_models(
         handle.block_on(crate::model_picker::fetch_models(&base, key.as_deref()))
     })
     .map_err(|e| e.to_string())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ModelFetchTarget {
+    Api {
+        base_url: String,
+        key: Option<String>,
+    },
+    Server {
+        provider: String,
+    },
+}
+
+/// Select the discovery authority before touching a provider endpoint. OAuth
+/// providers have no `base_url`; remote editors use the server authority.
+fn model_fetch_target(
+    provider_name: &str,
+    provider: &Provider,
+    server_discovery: bool,
+) -> std::result::Result<ModelFetchTarget, String> {
+    if provider.kind == "oauth:codex" {
+        return if server_discovery {
+            Ok(ModelFetchTarget::Server {
+                provider: provider_name.to_string(),
+            })
+        } else {
+            Err("OAuth model discovery requires a connected server".to_string())
+        };
+    }
+    let base_url = provider
+        .base_url
+        .clone()
+        .ok_or_else(|| "provider has no base_url".to_string())?;
+    Ok(ModelFetchTarget::Api {
+        base_url,
+        key: provider.key.clone(),
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderAuthState {
+    SignedIn,
+    NotSignedIn,
+    Unavailable,
+}
+
+pub type ProviderAuthStates = BTreeMap<String, ProviderAuthState>;
+
+fn auth_state_label(state: ProviderAuthState) -> &'static str {
+    match state {
+        ProviderAuthState::SignedIn => "signed in",
+        ProviderAuthState::NotSignedIn => "not signed in",
+        ProviderAuthState::Unavailable => "unavailable",
+    }
 }
 
 // ---- interactive screen ----
@@ -480,6 +535,7 @@ struct App {
     sel: usize,
     mode: Mode,
     status: String,
+    auth_states: ProviderAuthStates,
     save_now: bool,
     /// Set by the set-model wizard when it enters `Fetching`; the run loop does
     /// the blocking `/models` fetch (I/O belongs there, not in `on_key`) and
@@ -493,7 +549,12 @@ struct App {
 }
 
 impl App {
+    #[cfg(test)]
     fn new(cfg: ProvidersConfig) -> Self {
+        Self::with_auth_states(cfg, ProviderAuthStates::new())
+    }
+
+    fn with_auth_states(cfg: ProvidersConfig, auth_states: ProviderAuthStates) -> Self {
         Self {
             ed: ProviderEditor::new(cfg),
             sel: 0,
@@ -501,31 +562,12 @@ impl App {
             // The key hints live on their own persistent footer line (see
             // `hints_for`); the status line starts empty and shows action results.
             status: "editing providers.toml".to_string(),
+            auth_states,
             save_now: false,
             fetch_models_now: false,
             auth_request: None,
             quit: false,
         }
-    }
-
-    /// Fetch the selected provider's model list for the in-progress set-model
-    /// wizard. Reads the provider's `base_url`/`key` from the edited config; a
-    /// provider without a `base_url` (e.g. oauth) or any fetch error is returned
-    /// as `Err` so the wizard falls back to manual entry.
-    fn fetch_selected_provider_models(&self) -> std::result::Result<Vec<String>, String> {
-        let Mode::SetModel(w) = &self.mode else {
-            return Err("not in set-model".to_string());
-        };
-        let p = self
-            .ed
-            .cfg
-            .provider(&w.provider)
-            .ok_or_else(|| format!("no provider '{}'", w.provider))?;
-        let base = p
-            .base_url
-            .clone()
-            .ok_or_else(|| "provider has no base_url".to_string())?;
-        fetch_provider_models(&base, p.key.clone())
     }
 
     /// Apply the submitted input buffer for the active single-line action.
@@ -1040,12 +1082,26 @@ fn render(f: &mut Frame, app: &App) {
     for (i, (name, p)) in app.ed.cfg.providers.iter().enumerate() {
         let marker = if i == app.sel { "▶" } else { " " };
         let endpoint = p.base_url.as_deref().unwrap_or("(oauth login)");
+        let auth = if p.kind == "oauth:codex" {
+            format!(
+                " auth={}",
+                auth_state_label(
+                    app.auth_states
+                        .get(name)
+                        .copied()
+                        .unwrap_or(ProviderAuthState::Unavailable)
+                )
+            )
+        } else {
+            String::new()
+        };
         lines.push(Line::from(format!(
-            "{marker} {:<14} [{}] {} key={}",
+            "{marker} {:<14} [{}] {} key={}{}",
             name,
             p.kind,
             endpoint,
-            masked_key(&p.key)
+            masked_key(&p.key),
+            auth,
         )));
     }
     lines.push(Line::from(""));
@@ -1274,10 +1330,33 @@ pub fn run(path: &Path) -> Result<Option<AuthRequest>> {
 /// action (the caller runs it after the UI is torn down, then reopens).
 pub fn run_with_saver(
     cfg: ProvidersConfig,
+    save: impl FnMut(&ProvidersConfig) -> Result<SaveOutcome>,
+) -> Result<EditorOutcome> {
+    run_with_saver_and_fetcher(
+        cfg,
+        save,
+        |provider_name, provider| match model_fetch_target(provider_name, provider, false)? {
+            ModelFetchTarget::Api { base_url, key } => fetch_provider_models(&base_url, key),
+            ModelFetchTarget::Server { .. } => {
+                Err("OAuth model discovery requires a connected server".to_string())
+            }
+        },
+        ProviderAuthStates::new(),
+    )
+}
+
+/// Open the editor with caller-owned model discovery and credential-status
+/// providers. The remote config editor uses this to keep both operations on its
+/// existing authenticated connection; the local wrapper above retains the API
+/// endpoint behavior.
+pub fn run_with_saver_and_fetcher(
+    cfg: ProvidersConfig,
     mut save: impl FnMut(&ProvidersConfig) -> Result<SaveOutcome>,
+    mut fetch_models: impl FnMut(&str, &Provider) -> std::result::Result<Vec<String>, String>,
+    auth_states: ProviderAuthStates,
 ) -> Result<EditorOutcome> {
     use ratatui::crossterm::event::{self, Event, KeyEventKind};
-    let mut app = App::new(cfg);
+    let mut app = App::with_auth_states(cfg, auth_states);
     let mut conflict: Option<String> = None;
     let mut terminal = ratatui::init();
     let result = (|| -> Result<()> {
@@ -1308,10 +1387,18 @@ pub fn run_with_saver(
                     }
                     if app.fetch_models_now {
                         // The set-model wizard asked to fetch the provider's
-                        // models: do the blocking `/models` request here (I/O
-                        // belongs in the loop) and feed the result back.
+                        // models. The caller supplies the authority, so remote
+                        // OAuth discovery never needs a local base_url/token.
                         app.fetch_models_now = false;
-                        let result = app.fetch_selected_provider_models();
+                        let result = match &app.mode {
+                            Mode::SetModel(w) => app
+                                .ed
+                                .cfg
+                                .provider(&w.provider)
+                                .ok_or_else(|| format!("no provider '{}'", w.provider))
+                                .and_then(|provider| fetch_models(&w.provider, provider)),
+                            _ => Err("not in set-model".to_string()),
+                        };
                         if let Mode::SetModel(w) = &mut app.mode {
                             w.apply_fetch(result);
                         }
@@ -1332,6 +1419,69 @@ pub fn run_with_saver(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oauth_model_target_uses_remote_discovery_without_base_url() {
+        let provider = pc::Provider {
+            kind: "oauth:codex".into(),
+            base_url: None,
+            key: None,
+        };
+        assert_eq!(
+            model_fetch_target("tingzhen-codex", &provider, true),
+            Ok(ModelFetchTarget::Server {
+                provider: "tingzhen-codex".into()
+            })
+        );
+    }
+
+    #[test]
+    fn oauth_provider_rows_render_signed_in_signed_out_and_unavailable_states() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut cfg = ProvidersConfig::default();
+        cfg.providers.insert(
+            "signed".into(),
+            pc::Provider {
+                kind: "oauth:codex".into(),
+                base_url: None,
+                key: None,
+            },
+        );
+        cfg.providers.insert(
+            "signed-out".into(),
+            pc::Provider {
+                kind: "oauth:codex".into(),
+                base_url: None,
+                key: None,
+            },
+        );
+        cfg.providers.insert(
+            "unknown".into(),
+            pc::Provider {
+                kind: "oauth:codex".into(),
+                base_url: None,
+                key: None,
+            },
+        );
+        let mut states = ProviderAuthStates::new();
+        states.insert("signed".into(), ProviderAuthState::SignedIn);
+        states.insert("signed-out".into(), ProviderAuthState::NotSignedIn);
+        let app = App::with_auth_states(cfg, states);
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).expect("term");
+        terminal.draw(|f| render(f, &app)).expect("draw");
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(content.contains("signed in"));
+        assert!(content.contains("not signed in"));
+        assert!(content.contains("auth=unavailable"));
+    }
 
     fn api(base: &str) -> (String, Option<String>, Option<String>) {
         ("api".to_string(), Some(base.to_string()), None)

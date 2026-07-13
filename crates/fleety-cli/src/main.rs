@@ -1351,6 +1351,7 @@ async fn ask(text: String, attachments: Vec<WireAttachment>) -> Result<()> {
             // request/reply exchanges; in the ask loop they are stray noise.
             Some(ServerMsg::CredentialResult { .. })
             | Some(ServerMsg::CredentialStatusResult { .. })
+            | Some(ServerMsg::ProviderModelListResult { .. })
             | Some(ServerMsg::PairingCode { .. }) => {}
             Some(ServerMsg::ApprovalRequested {
                 approval_id,

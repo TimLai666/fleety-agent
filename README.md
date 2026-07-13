@@ -253,13 +253,15 @@ On a TTY:
 - **`fleety config`** (no args) — a guided **menu**: pick Providers, Models, or
   Settings and drill in. Providers/Models open the provider editor (add a
   provider by type with per-field prompts; set a model role by picking a provider
-  then choosing from its `/models` list, or typing an id if the fetch is
-  unavailable). Settings is the three-region panel (Connection / This device /
-  Server). The Server region edits the connected server's settings — including
-  providers/models — live **over the connection** (optimistic-locked; secrets
-  stay write-only), so remote editing no longer needs shell access to the server
-  host. Editing `FLEETY_TZ` opens a searchable IANA timezone picker (or follow
-  the host device). The key hints stay visible; Esc steps back, q quits.
+  then choosing from its API `/models` list or the connected server's authenticated
+  Codex catalog, or typing an id if discovery is unavailable). OAuth provider rows
+  show `auth=signed in`, `auth=not signed in`, or `auth=unavailable`. Settings is
+  the three-region panel (Connection / This device / Server). The Server region
+  edits the connected server's settings — including providers/models — live **over
+  the connection** (optimistic-locked; secrets stay write-only), so remote editing
+  no longer needs shell access to the server host. Editing `FLEETY_TZ` opens a
+  searchable IANA timezone picker (or follow the host device). The key hints stay
+  visible; Esc steps back, q quits.
 - `fleety config edit` — edit just the flat `FLEETY_*` settings (ratatui list;
   secrets masked; line-based fallback when not a TTY).
 - `fleety config provider edit` — the provider-only editor for `providers.toml`:

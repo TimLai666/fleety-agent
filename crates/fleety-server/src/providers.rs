@@ -10,11 +10,93 @@
 //! role→name map. Subagents (and the main turn) select by tier/role name; an
 //! unknown selector falls back to `main`.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use agent_core::{CodexResponses, Gemini, ModelProvider, OpenAiCompat};
+use serde_json::Value;
 
 use crate::echo::EchoProvider;
+
+/// Parse common OpenAI-compatible model catalog shapes into ordered, unique IDs.
+/// Empty or malformed shapes return no IDs so callers can use manual entry.
+pub fn parse_api_model_ids(body: &Value) -> Vec<String> {
+    let values = body
+        .as_array()
+        .or_else(|| body.get("data").and_then(Value::as_array))
+        .or_else(|| body.get("models").and_then(Value::as_array));
+    let Some(values) = values else {
+        return Vec::new();
+    };
+    let mut seen = HashSet::new();
+    let mut ids = Vec::new();
+    for value in values {
+        let id = value
+            .get("id")
+            .or_else(|| value.get("slug"))
+            .and_then(Value::as_str)
+            .or_else(|| value.as_str())
+            .map(str::trim)
+            .filter(|id| !id.is_empty());
+        let Some(id) = id else {
+            continue;
+        };
+        if seen.insert(id.to_string()) {
+            ids.push(id.to_string());
+        }
+    }
+    ids
+}
+
+/// Discover model IDs for a named provider while keeping all credentials on the
+/// server. API providers use their configured endpoint; Codex OAuth providers
+/// use the server-side OAuth catalog path.
+pub async fn discover_provider_models(
+    provider_name: &str,
+    provider: &fleety_tools::providers_config::Provider,
+) -> agent_core::Result<Vec<String>> {
+    match provider.kind.as_str() {
+        "api" => fetch_api_models(provider).await,
+        "oauth:codex" => fleety_tools::oauth::fetch_codex_models(provider_name).await,
+        other => Err(agent_core::CoreError::Provider(format!(
+            "provider '{provider_name}' has unsupported model discovery type '{other}'"
+        ))),
+    }
+}
+
+async fn fetch_api_models(
+    provider: &fleety_tools::providers_config::Provider,
+) -> agent_core::Result<Vec<String>> {
+    let base_url = provider
+        .base_url
+        .as_deref()
+        .ok_or_else(|| agent_core::CoreError::Provider("API provider has no base_url".into()))?;
+    let endpoint = format!("{}/models", base_url.trim_end_matches('/'));
+    let client = reqwest::Client::new();
+    let mut request = client.get(&endpoint);
+    if let Some(key) = provider.key.as_deref().filter(|key| !key.is_empty()) {
+        request = request.bearer_auth(key);
+    }
+    let response = request.send().await.map_err(|e| {
+        agent_core::CoreError::Provider(format!("API model catalog request failed: {e}"))
+    })?;
+    if !response.status().is_success() {
+        return Err(agent_core::CoreError::Provider(format!(
+            "API model catalog returned HTTP {}",
+            response.status()
+        )));
+    }
+    let body: Value = response.json().await.map_err(|e| {
+        agent_core::CoreError::Provider(format!("API model catalog returned non-JSON: {e}"))
+    })?;
+    let ids = parse_api_model_ids(&body);
+    if ids.is_empty() {
+        return Err(agent_core::CoreError::Provider(
+            "API model catalog returned no model IDs".into(),
+        ));
+    }
+    Ok(ids)
+}
 
 /// Build a provider from environment variables under `prefix`. The model name
 /// is the bare `{prefix}` var; the base URL is `{prefix}_BASE_URL`, with
@@ -428,6 +510,25 @@ pub(crate) fn looks_multimodal(model: &str) -> bool {
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    #[test]
+    fn api_model_catalog_parser_accepts_common_shapes_and_deduplicates() {
+        let body = serde_json::json!({
+            "data": [
+                {"id": "gpt-4o"},
+                {"id": "gpt-4o"},
+                {"id": "gpt-4o-mini"}
+            ]
+        });
+        assert_eq!(
+            parse_api_model_ids(&body),
+            vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()]
+        );
+        assert_eq!(
+            parse_api_model_ids(&serde_json::json!(["one", "two"])),
+            vec!["one".to_string(), "two".to_string()]
+        );
+    }
 
     const KEYS: &[&str] = &[
         "FLEETY_MODEL_BASE_URL",

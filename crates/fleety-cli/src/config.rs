@@ -130,60 +130,148 @@ pub async fn provider_edit_remote() -> Result<()> {
                 ))
             })?;
 
-        // The editor loop is synchronous (crossterm events); each save runs the
-        // async apply on the runtime from inside it.
-        let handle = tokio::runtime::Handle::current();
-        let outcome = tokio::task::block_in_place(|| {
-            crate::provider_tui::run_with_saver(cfg, |edited| {
-                let json = serde_json::to_string(edited)
-                    .map_err(|e| CoreError::Message(format!("serialize providers: {e}")))?;
-                handle.block_on(async {
+        // Credential status is server-owned. A status failure is deliberately
+        // non-fatal so the editor never turns an unavailable query into a false
+        // "not signed in" claim or blocks unrelated config edits.
+        let mut auth_states = crate::provider_tui::ProviderAuthStates::new();
+        for (provider_name, provider) in &cfg.providers {
+            if provider.kind != "oauth:codex" {
+                continue;
+            }
+            let state = if config_protocol < 3 {
+                crate::provider_tui::ProviderAuthState::Unavailable
+            } else {
+                let query = async {
                     crate::send(
                         &mut tx,
-                        &ClientMsg::ConfigApply {
-                            target: ConfigTarget::Server,
-                            base_revision: revision.clone(),
-                            changes: vec![],
-                            providers_json: Some(json),
+                        &ClientMsg::CredentialStatus {
+                            kind: "codex-oauth".to_string(),
+                            provider: Some(provider_name.clone()),
                         },
                     )
                     .await?;
-                    match crate::recv(&mut rx).await? {
-                        Some(ServerMsg::ConfigResult { ok: true, .. }) => {
-                            // Our own write moved the server's revision; refresh
-                            // it so the next save in this session doesn't
-                            // conflict with our own edit.
+                    crate::recv(&mut rx).await
+                }
+                .await;
+                match query {
+                    Ok(Some(ServerMsg::CredentialStatusResult { present, error, .. }))
+                        if error.is_none() =>
+                    {
+                        if present {
+                            crate::provider_tui::ProviderAuthState::SignedIn
+                        } else {
+                            crate::provider_tui::ProviderAuthState::NotSignedIn
+                        }
+                    }
+                    _ => crate::provider_tui::ProviderAuthState::Unavailable,
+                }
+            };
+            auth_states.insert(provider_name.clone(), state);
+        }
+
+        // The editor loop is synchronous (crossterm events); each save runs the
+        // async apply on the runtime from inside it.
+        let handle = tokio::runtime::Handle::current();
+        let io = std::rc::Rc::new(tokio::sync::Mutex::new((&mut tx, &mut rx)));
+        let outcome = tokio::task::block_in_place(|| {
+            crate::provider_tui::run_with_saver_and_fetcher(
+                cfg,
+                |edited| {
+                    let json = serde_json::to_string(edited)
+                        .map_err(|e| CoreError::Message(format!("serialize providers: {e}")))?;
+                    handle.block_on(async {
+                        let mut io = io.lock().await;
+                        crate::send(
+                            io.0,
+                            &ClientMsg::ConfigApply {
+                                target: ConfigTarget::Server,
+                                base_revision: revision.clone(),
+                                changes: vec![],
+                                providers_json: Some(json),
+                            },
+                        )
+                        .await?;
+                        let reply = crate::recv(io.1).await?;
+                        match reply {
+                            Some(ServerMsg::ConfigResult { ok: true, .. }) => {
+                                // Our own write moved the server's revision; refresh
+                                // it so the next save in this session doesn't
+                                // conflict with our own edit.
+                                crate::send(
+                                    io.0,
+                                    &ClientMsg::ConfigSnapshot {
+                                        target: ConfigTarget::Server,
+                                    },
+                                )
+                                .await?;
+                                let snapshot = crate::recv(io.1).await?;
+                                if let Some(ServerMsg::ConfigSnapshotResult {
+                                    revision: r, ..
+                                }) = snapshot
+                                {
+                                    revision = r;
+                                }
+                                Ok(crate::provider_tui::SaveOutcome::Saved)
+                            }
+                            Some(ServerMsg::ConfigResult { error: Some(e), .. })
+                                if e.kind == "conflict" =>
+                            {
+                                Ok(crate::provider_tui::SaveOutcome::Conflict(e.message))
+                            }
+                            Some(ServerMsg::ConfigResult { error: Some(e), .. }) => {
+                                Err(CoreError::Message(match e.remediation {
+                                    Some(r) => format!("{} — {r}", e.message),
+                                    None => e.message,
+                                }))
+                            }
+                            other => Err(CoreError::Provider(format!(
+                                "expected a config result, got {other:?}"
+                            ))),
+                        }
+                    })
+                },
+                |provider_name, _provider| {
+                    if config_protocol < 4 {
+                        return Err(
+                            "server does not support provider model discovery (config protocol < 4)"
+                                .to_string(),
+                        );
+                    }
+                    handle
+                        .block_on(async {
+                            let mut io = io.lock().await;
                             crate::send(
-                                &mut tx,
-                                &ClientMsg::ConfigSnapshot {
-                                    target: ConfigTarget::Server,
+                                io.0,
+                                &ClientMsg::ProviderModelList {
+                                    provider: provider_name.to_string(),
                                 },
                             )
                             .await?;
-                            if let Some(ServerMsg::ConfigSnapshotResult { revision: r, .. }) =
-                                crate::recv(&mut rx).await?
-                            {
-                                revision = r;
+                            let reply = crate::recv(io.1).await?;
+                            match reply {
+                                Some(ServerMsg::ProviderModelListResult {
+                                    provider,
+                                    model_ids,
+                                    error,
+                                }) if provider == provider_name => match error {
+                                    None if !model_ids.is_empty() => Ok(model_ids),
+                                    Some(e) => Err(CoreError::Message(match e.remediation {
+                                        Some(r) => format!("{} — {r}", e.message),
+                                        None => e.message,
+                                    })),
+                                    None => Err(CoreError::Message(
+                                        "server returned no model IDs".to_string(),
+                                    )),
+                                },
+                                other => Err(CoreError::Provider(format!(
+                                    "expected provider model result, got {other:?}"
+                                ))),
                             }
-                            Ok(crate::provider_tui::SaveOutcome::Saved)
-                        }
-                        Some(ServerMsg::ConfigResult { error: Some(e), .. })
-                            if e.kind == "conflict" =>
-                        {
-                            Ok(crate::provider_tui::SaveOutcome::Conflict(e.message))
-                        }
-                        Some(ServerMsg::ConfigResult { error: Some(e), .. }) => {
-                            Err(CoreError::Message(match e.remediation {
-                                Some(r) => format!("{} — {r}", e.message),
-                                None => e.message,
-                            }))
-                        }
-                        other => Err(CoreError::Provider(format!(
-                            "expected a config result, got {other:?}"
-                        ))),
-                    }
-                })
-            })
+                        })
+                        .map_err(|e: CoreError| e.to_string())
+                },
+                auth_states,
+            )
         })?;
         // An OAuth action the editor asked for: the just-added/edited provider is
         // already applied to the server (the save above ran the ConfigApply), and

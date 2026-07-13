@@ -1626,6 +1626,10 @@ async fn serve(
                 );
                 emit(out, &reply)?;
             }
+            ClientMsg::ProviderModelList { provider } => {
+                let reply = provider_model_list(&provider).await;
+                emit(out, &reply)?;
+            }
             ClientMsg::CredentialDelete { kind, provider } => {
                 let reply = credential_delete(
                     &credential_token_path(provider.as_deref()),
@@ -1891,6 +1895,80 @@ fn credential_status(
             detail: None,
             error: None,
         },
+    }
+}
+
+/// Handle the structured provider-model discovery request. Credentials remain
+/// server-side: the reply contains only model IDs or a sanitized error.
+async fn provider_model_list(provider_name: &str) -> ServerMsg {
+    let provider_name = provider_name.trim();
+    if !fleety_tools::providers_config::valid_provider_name(provider_name) {
+        return model_list_error(
+            provider_name,
+            "invalid",
+            "the provider name is invalid",
+            "check the provider name and try again",
+        );
+    }
+    let Some(config) = fleety_tools::providers_config::load() else {
+        return model_list_error(
+            provider_name,
+            "config",
+            "the server has no usable providers.toml",
+            "configure the provider on the server, then retry",
+        );
+    };
+    let Some(provider) = config.provider(provider_name) else {
+        return model_list_error(
+            provider_name,
+            "not_found",
+            &format!("provider '{provider_name}' is not configured on the server"),
+            "select a configured provider and try again",
+        );
+    };
+    match crate::providers::discover_provider_models(provider_name, provider).await {
+        Ok(model_ids) if !model_ids.is_empty() => ServerMsg::ProviderModelListResult {
+            provider: provider_name.to_string(),
+            model_ids,
+            error: None,
+        },
+        Ok(_) => model_list_error(
+            provider_name,
+            "empty",
+            &format!("provider '{provider_name}' returned no model IDs"),
+            "enter a model ID manually or check the provider catalog",
+        ),
+        Err(error) => {
+            let detail = error.report().message.to_ascii_lowercase();
+            if detail.contains("not signed in") || detail.contains("auth login") {
+                model_list_error(
+                    provider_name,
+                    "not_authenticated",
+                    &format!("provider '{provider_name}' is not signed in"),
+                    &format!("run `fleety auth login {provider_name}`, then retry"),
+                )
+            } else {
+                tracing::warn!(provider = %provider_name, error = %error.report().message, "provider model discovery failed");
+                model_list_error(
+                    provider_name,
+                    "provider_model_list",
+                    &format!("could not fetch models for provider '{provider_name}'"),
+                    "enter a model ID manually or retry the catalog request",
+                )
+            }
+        }
+    }
+}
+
+fn model_list_error(provider: &str, kind: &str, message: &str, remediation: &str) -> ServerMsg {
+    ServerMsg::ProviderModelListResult {
+        provider: provider.to_string(),
+        model_ids: Vec::new(),
+        error: Some(WireError {
+            kind: kind.to_string(),
+            message: message.to_string(),
+            remediation: Some(remediation.to_string()),
+        }),
     }
 }
 

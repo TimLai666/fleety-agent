@@ -16,9 +16,10 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// which remote-config surfaces it can use. `1` adds `ConfigSnapshot`/
 /// `ConfigApply`; `2` adds the credential frames (`CredentialPut`/`Status`/
 /// `Delete`); `3` makes those credential frames per-provider (they carry a
-/// `provider`, and a `codex-oauth` frame without one is rejected). Additive —
-/// an older server omits it and the client sees `0`.
-pub const CONFIG_PROTOCOL_VERSION: u32 = 3;
+/// `provider`, and a `codex-oauth` frame without one is rejected); `4` adds
+/// provider-specific model discovery. Additive — an older server omits it and
+/// the client sees `0`.
+pub const CONFIG_PROTOCOL_VERSION: u32 = 4;
 
 /// Wire form of an actionable error (mirrors `agent_core::ErrorReport`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -305,6 +306,10 @@ pub enum ClientMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider: Option<String>,
     },
+    /// Ask the server to discover model IDs for a configured provider. The
+    /// server owns any API key or OAuth credential used by the request. Reply:
+    /// `ProviderModelListResult`; advertised by `config_protocol >= 4`.
+    ProviderModelList { provider: String },
     /// Remove the server-side credential of `kind` for `provider`. Requires an
     /// authenticated connection; audited. Reply: `CredentialResult`.
     CredentialDelete {
@@ -496,6 +501,13 @@ pub enum ServerMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<WireError>,
     },
+    /// Reply to `ProviderModelList`: model IDs only, never credential values.
+    ProviderModelListResult {
+        provider: String,
+        model_ids: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<WireError>,
+    },
     /// Reply to `MintPairingCode`: `code` is the minted short-lived pairing code
     /// on success; `error` explains why not (e.g. authentication is disabled).
     PairingCode {
@@ -559,7 +571,7 @@ mod tests {
         let json = serde_json::to_string(&w).expect("ser");
         assert!(json.contains("\"server_version\":\"0.3.0\""));
         assert!(json.contains("\"audio_input\":true"));
-        assert!(json.contains("\"config_protocol\":3"));
+        assert!(json.contains("\"config_protocol\":4"));
         assert!(json.contains("\"server_fingerprint\":\"srv-fp-1\""));
         // An old server's frame (no server_version / audio_input / config_protocol)
         // still parses → defaults ("" / false / 0 → legacy ConfigExec + local STT).
@@ -743,6 +755,32 @@ mod tests {
             }
             _ => panic!("not a credential status result"),
         }
+    }
+
+    #[test]
+    fn provider_model_frames_roundtrip_without_credentials() {
+        let request = ClientMsg::ProviderModelList {
+            provider: "tingzhen-codex".into(),
+        };
+        assert_eq!(
+            serde_json::from_str::<ClientMsg>(&serde_json::to_string(&request).expect("ser"))
+                .expect("de"),
+            request
+        );
+
+        let result = ServerMsg::ProviderModelListResult {
+            provider: "tingzhen-codex".into(),
+            model_ids: vec!["gpt-5".into(), "gpt-5-mini".into()],
+            error: None,
+        };
+        let json = serde_json::to_string(&result).expect("ser");
+        assert!(json.contains("gpt-5"));
+        assert!(!json.contains("access_token"));
+        assert!(!json.contains("refresh_token"));
+        assert_eq!(
+            serde_json::from_str::<ServerMsg>(&json).expect("de"),
+            result
+        );
     }
 
     #[test]
