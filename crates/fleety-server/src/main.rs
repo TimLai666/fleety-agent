@@ -114,7 +114,71 @@ fn policy_from_env() -> agent_core::Policy {
     }
 }
 
+const USAGE: &str = "Usage: fleety-server [COMMAND]\n\nCommands:\n  run-service     Run as the installed OS service\n  install         Install and enable the OS service\n  uninstall       Remove the OS service\n  start           Start the installed service\n  stop            Stop the installed service\n  restart [--force]\n                  Restart now or after in-flight work completes\n  enable          Enable service startup at boot\n  disable         Disable service startup at boot\n  status          Show service status\n  up              Install, enable, and start the service\n  down            Stop the service\n  update          Update fleety-server and its sidecar\n  backup <now|restore>\n                  Back up or restore server state\n  config ...      Inspect or edit server-owned settings\n  version         Print the version\n  help            Print this help\n\nWith no command, fleety-server runs in the foreground.";
+
+fn is_help(args: &[String]) -> bool {
+    matches!(args, [arg] if matches!(arg.as_str(), "help" | "--help" | "-h"))
+}
+
+fn validate_command_line(args: &[String]) -> std::result::Result<(), String> {
+    let Some(command) = args.first().map(String::as_str) else {
+        return Ok(());
+    };
+    if command == "config" {
+        return Ok(());
+    }
+    if command == "backup" {
+        return match args {
+            [_, action] if matches!(action.as_str(), "now" | "restore") => Ok(()),
+            _ => Err("backup requires exactly one action: now or restore".to_string()),
+        };
+    }
+    if command == "restart" {
+        return match args {
+            [_] => Ok(()),
+            [_, flag] if flag == "--force" => Ok(()),
+            _ => Err("restart accepts only the optional --force flag".to_string()),
+        };
+    }
+    let known = matches!(
+        command,
+        "run-service"
+            | "install"
+            | "uninstall"
+            | "start"
+            | "stop"
+            | "enable"
+            | "disable"
+            | "status"
+            | "up"
+            | "down"
+            | "update"
+            | "version"
+            | "--version"
+            | "-v"
+            | "-V"
+    );
+    if !known {
+        return Err(format!("unknown command '{command}'"));
+    }
+    if args.len() != 1 {
+        return Err(format!("command '{command}' does not accept arguments"));
+    }
+    Ok(())
+}
+
 fn main() -> std::process::ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if is_help(&args) {
+        println!("{USAGE}");
+        return std::process::ExitCode::SUCCESS;
+    }
+    if let Err(message) = validate_command_line(&args) {
+        eprintln!("error: {message}\n\n{USAGE}");
+        return std::process::ExitCode::FAILURE;
+    }
+    let cmd = args.first().cloned();
+
     obs::init();
     // Seed env from ~/.fleety/config.toml before anything reads env: an explicit
     // env var always wins (we only fill what's unset), so existing deployments
@@ -122,13 +186,10 @@ fn main() -> std::process::ExitCode {
     fleety_tools::config::seed_env_from_config(&fleety_tools::config::load(
         &fleety_tools::config::config_path(),
     ));
-    let cmd = std::env::args().nth(1);
-
     // `config ...` inspects/edits this host's settings (model, addr, token, …),
     // then exits — no runtime needed. Same command surface as `fleety config`.
     if cmd.as_deref() == Some("config") {
-        let args: Vec<String> = std::env::args().skip(2).collect();
-        if let Err(e) = fleety_tools::config::run(&args) {
+        if let Err(e) = fleety_tools::config::run(&args[1..]) {
             let report = e.report();
             eprintln!("error: {}", report.message);
             if let Some(hint) = report.remediation {
@@ -164,7 +225,7 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
-    rt.block_on(async_main(cmd))
+    rt.block_on(async_main(cmd, args))
 }
 
 /// Report a one-shot lifecycle verb: quiet on success (the verb itself prints),
@@ -256,7 +317,7 @@ fn load_or_mint_server_id(path: &std::path::Path) -> String {
     id
 }
 
-async fn async_main(cmd: Option<String>) -> std::process::ExitCode {
+async fn async_main(cmd: Option<String>, args: Vec<String>) -> std::process::ExitCode {
     // Print the version and exit — before anything else, so `-v` never falls
     // through to accidentally starting the server (which then fails to bind).
     if matches!(
@@ -273,7 +334,7 @@ async fn async_main(cmd: Option<String>) -> std::process::ExitCode {
         // a running server is asked to restart once idle (deferred). Other verbs
         // ignore extra args.
         if action == service::Action::Restart {
-            let force = std::env::args().skip(2).any(|a| a == "--force");
+            let force = args.get(1).is_some_and(|arg| arg == "--force");
             return log_action("restart", service::restart(force));
         }
         let name = cmd.as_deref().unwrap_or("?");
@@ -338,7 +399,7 @@ async fn async_main(cmd: Option<String>) -> std::process::ExitCode {
     // and exit (runtime needed for git/network). Restore is meant to be run with
     // the server stopped.
     if cmd.as_deref() == Some("backup") {
-        return run_backup_command(std::env::args().nth(2)).await;
+        return run_backup_command(args.get(1).cloned()).await;
     }
 
     // Service mode (non-Windows run-service) claims the single-instance pidfile;

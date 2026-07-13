@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -107,6 +107,59 @@ fn wait_until(mut predicate: impl FnMut() -> bool) {
             "timed out waiting for daemon state"
         );
         thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn run_command(args: &[&str]) -> Output {
+    let home = TempDir::new("command-contract");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_fleetyd"))
+        .args(args)
+        .env("HOME", &home.0)
+        .env("USERPROFILE", &home.0)
+        .env("FLEETY_AGENT_URL", "ws://127.0.0.1:9")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run fleetyd command");
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        if child.try_wait().expect("poll fleetyd").is_some() {
+            return child.wait_with_output().expect("collect fleetyd output");
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("fleetyd {args:?} started the daemon instead of exiting");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn help_exits_zero_without_starting_daemon() {
+    for arg in ["--help", "-h"] {
+        let output = run_command(&[arg]);
+        assert!(output.status.success(), "fleetyd {arg} should succeed");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("Usage: fleetyd"),
+            "fleetyd {arg} should print usage"
+        );
+    }
+}
+
+#[test]
+fn unknown_and_extra_arguments_fail_without_starting_daemon() {
+    for args in [
+        &["statuz"][..],
+        &["version", "unexpected"][..],
+        &["run-service", "unexpected"][..],
+    ] {
+        let output = run_command(args);
+        assert!(!output.status.success(), "fleetyd {args:?} should fail");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("Usage: fleetyd"),
+            "fleetyd {args:?} should explain the valid syntax"
+        );
     }
 }
 

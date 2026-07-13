@@ -353,6 +353,23 @@ pub async fn route_run_tool_via(
     }
 }
 
+/// Route a reserved server operation to the daemon that owns `device` without
+/// exposing the operation through the public device tool registry.
+pub async fn route_run_tool_to_device(
+    hub: &Hub,
+    pending: &Pending,
+    device: &str,
+    tool: &str,
+    args: Value,
+) -> Result<Value> {
+    let sender = hub.lock().await.get(device).cloned().ok_or_else(|| {
+        CoreError::Message(format!(
+            "device daemon '{device}' is not connected; no local config fallback is permitted"
+        ))
+    })?;
+    route_run_tool_via(&sender, pending, tool, args).await
+}
+
 /// Register the `transfer_file` relay tool. Needs the server's own workspace
 /// root + backups for the `server` endpoint, and the hub/pending to dispatch to
 /// device endpoints.

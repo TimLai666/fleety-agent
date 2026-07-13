@@ -251,11 +251,15 @@ pub fn refresh_installed(server: Option<&str>) {
         return; // not configured here
     };
     if let Some(merged) = refresh_zed_settings(&existing, &current_exe_str(), server) {
-        if std::fs::write(&path, merged).is_ok() {
-            println!(
+        match atomic_replace(&path, merged.as_bytes()) {
+            Ok(()) => println!(
                 "Refreshed the Fleety ACP agent in Zed ({}).",
                 path.display()
-            );
+            ),
+            Err(e) => eprintln!(
+                "Could not refresh the Fleety ACP agent in Zed ({}): {e}",
+                path.display()
+            ),
         }
     }
 }
@@ -265,16 +269,64 @@ pub fn refresh_installed(server: Option<&str>) {
 /// `None` when Fleety isn't installed, the file is unparseable (JSONC), or nothing
 /// would change — so a refresh never newly-installs or rewrites needlessly.
 pub fn refresh_zed_settings(existing: &str, command: &str, server: Option<&str>) -> Option<String> {
-    let has_fleety = serde_json::from_str::<Value>(existing)
-        .ok()?
-        .get("agent_servers")
-        .and_then(|s| s.get("Fleety"))
-        .is_some();
-    if !has_fleety {
+    let mut root = serde_json::from_str::<Value>(existing).ok()?;
+    let entry = root
+        .get_mut("agent_servers")?
+        .get_mut("Fleety")?
+        .as_object_mut()?;
+    let mut changed = entry.get("command").and_then(Value::as_str) != Some(command);
+    if changed {
+        entry.insert("command".to_string(), json!(command));
+    }
+    if let Some(server) = server {
+        let env = entry
+            .entry("env")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()?;
+        if env.get("FLEETY_AGENT_URL").and_then(Value::as_str) != Some(server) {
+            env.insert("FLEETY_AGENT_URL".to_string(), json!(server));
+            changed = true;
+        }
+    }
+    if !changed {
         return None;
     }
-    let (merged, _) = merge_zed_settings(existing, command, server).ok()?;
-    (merged != existing).then_some(merged)
+    serde_json::to_string_pretty(&root).ok()
+}
+
+/// Replace a settings file through a uniquely named temporary file in the same
+/// directory. Keeping the temporary file beside the destination makes the
+/// rename a single-filesystem operation; failures before that point leave the
+/// existing settings untouched.
+fn atomic_replace(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    atomic_replace_with(path, contents, |_| Ok(()))
+}
+
+fn atomic_replace_with(
+    path: &std::path::Path,
+    contents: &[u8],
+    before_replace: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let tmp = parent.join(format!(".fleety-zed-{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        before_replace(&tmp)?;
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// This binary's path, for launching it as an ACP agent.
@@ -345,7 +397,7 @@ pub fn install_zed(server: Option<String>) -> agent_core::Result<()> {
             if !existing.trim().is_empty() {
                 let _ = std::fs::write(path.with_extension("json.bak"), &existing);
             }
-            std::fs::write(&path, merged)
+            atomic_replace(&path, merged.as_bytes())
                 .map_err(|e| CoreError::Message(format!("cannot write {}: {e}", path.display())))?;
             let verb = if updated { "Updated" } else { "Configured" };
             println!(
@@ -680,9 +732,10 @@ async fn read_frame_async<R: tokio::io::AsyncBufRead + Unpin>(
     }
 }
 
-/// Run the ACP agent over stdio, bridging to the fleety-server. Only JSON-RPC is
-/// written to stdout; logs go to stderr (configured by the caller).
-pub async fn run(agent_url: String) -> agent_core::Result<()> {
+/// Run ACP against one immutable connection resolution. Callers that resolve a
+/// named/current profile must pass the complete snapshot so its URL and paired
+/// token stay bound together for every bridge connection.
+pub async fn run_resolved(target: fleety_tools::connection::Resolved) -> agent_core::Result<()> {
     // The stdin reader is shared: the main loop reads requests from it, and during
     // a prompt the bridge borrows it — to read the editor's responses to the
     // agent's fs/terminal calls, and to watch for a mid-turn `session/cancel`
@@ -691,7 +744,7 @@ pub async fn run(agent_url: String) -> agent_core::Result<()> {
     let reader: SharedReader = std::sync::Arc::new(tokio::sync::Mutex::new(
         tokio::io::BufReader::new(tokio::io::stdin()),
     ));
-    let bridge = WsBridge::new(agent_url, std::sync::Arc::clone(&reader));
+    let bridge = WsBridge::new(target, std::sync::Arc::clone(&reader));
     loop {
         let frame = {
             let mut r = reader.lock().await;
@@ -729,11 +782,11 @@ pub async fn run(agent_url: String) -> agent_core::Result<()> {
 type SharedReader = std::sync::Arc<tokio::sync::Mutex<tokio::io::BufReader<tokio::io::Stdin>>>;
 
 /// The Hello frame that opens any adapter→server connection.
-fn hello_json(local_tools_json: Option<String>) -> serde_json::Result<String> {
+fn hello_json(token: Option<&str>, local_tools_json: Option<String>) -> serde_json::Result<String> {
     serde_json::to_string(&fleety_protocol::ClientMsg::Hello {
         device_id: crate::device_id(),
         protocol: fleety_protocol::PROTOCOL_VERSION,
-        token: std::env::var("FLEETY_TOKEN").ok().filter(|s| !s.is_empty()),
+        token: token.filter(|s| !s.is_empty()).map(str::to_string),
         pairing_code: None,
         local_tools_json,
         hostname: fleety_tools::device::hostname(),
@@ -748,7 +801,7 @@ fn hello_json(local_tools_json: Option<String>) -> serde_json::Result<String> {
 /// Generic over the editor-input reader (stdin in production, in-memory in
 /// tests).
 struct WsBridge<R> {
-    agent_url: String,
+    target: fleety_tools::connection::Resolved,
     cwds: tokio::sync::Mutex<std::collections::HashMap<String, Option<String>>>,
     /// Sessions whose current turn the editor cancelled (`session/cancel`).
     /// Set when a cancel is seen, consumed by `take_cancelled`, reset when a
@@ -765,9 +818,12 @@ struct WsBridge<R> {
 }
 
 impl<R: tokio::io::AsyncBufRead + Unpin + Send> WsBridge<R> {
-    fn new(agent_url: String, reader: std::sync::Arc<tokio::sync::Mutex<R>>) -> Self {
+    fn new(
+        target: fleety_tools::connection::Resolved,
+        reader: std::sync::Arc<tokio::sync::Mutex<R>>,
+    ) -> Self {
         Self {
-            agent_url,
+            target,
             cwds: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             cancelled: std::sync::Mutex::new(std::collections::HashSet::new()),
             caps: std::sync::Mutex::new(EditorCapabilities::default()),
@@ -939,10 +995,10 @@ impl<R: tokio::io::AsyncBufRead + Unpin + Send> WsBridge<R> {
             c.remove(conversation);
         }
 
-        let (ws, _) = tokio_tungstenite::connect_async(&self.agent_url)
+        let (ws, _) = tokio_tungstenite::connect_async(&self.target.url)
             .await
             .map_err(|e| {
-                CoreError::Provider(format!("cannot connect to {}: {e}", self.agent_url))
+                CoreError::Provider(format!("cannot connect to {}: {e}", self.target.url))
             })?;
         let (mut tx, mut rx) = ws.split();
         // Advertise the editor-backed tools gated by what the editor supports, so
@@ -957,7 +1013,7 @@ impl<R: tokio::io::AsyncBufRead + Unpin + Send> WsBridge<R> {
         } else {
             serde_json::to_string(&editor_specs).ok()
         };
-        let hello = hello_json(local_tools_json)
+        let hello = hello_json(self.target.token.as_deref(), local_tools_json)
             .map_err(|e| CoreError::Message(format!("serialize hello: {e}")))?;
         tx.send(WsMessage::Text(hello))
             .await
@@ -1166,14 +1222,14 @@ impl<R: tokio::io::AsyncBufRead + Unpin + Send> AcpBridge for WsBridge<R> {
         // there is no live turn connection here: best-effort send CancelTurn
         // on a short-lived one — an idle server ignores it silently, by
         // design. A cancel never fails the adapter.
-        let Ok((ws, _)) = tokio_tungstenite::connect_async(&self.agent_url).await else {
-            tracing::warn!(url = %self.agent_url, "acp: cancel: server unreachable; nothing to cancel");
+        let Ok((ws, _)) = tokio_tungstenite::connect_async(&self.target.url).await else {
+            tracing::warn!(url = %self.target.url, "acp: cancel: server unreachable; nothing to cancel");
             return;
         };
         let (mut tx, _rx) = ws.split();
         let conversation_id = (!session_id.is_empty()).then(|| session_id.to_string());
         if let (Ok(hello), Ok(cancel)) = (
-            hello_json(None),
+            hello_json(self.target.token.as_deref(), None),
             serde_json::to_string(&fleety_protocol::ClientMsg::CancelTurn { conversation_id }),
         ) {
             let _ = tx.send(WsMessage::Text(hello)).await;
@@ -1476,6 +1532,20 @@ mod tests {
     }
 
     #[test]
+    fn hello_uses_the_resolved_profile_token() {
+        let hello = hello_json(Some("paired-profile-token"), None).expect("serialize hello");
+        let msg: fleety_protocol::ClientMsg =
+            serde_json::from_str(&hello).expect("deserialize hello");
+        assert!(matches!(
+            msg,
+            fleety_protocol::ClientMsg::Hello {
+                token: Some(token),
+                ..
+            } if token == "paired-profile-token"
+        ));
+    }
+
+    #[test]
     fn refresh_only_repoints_when_already_installed() {
         // Not installed → no refresh (never newly installs).
         assert_eq!(
@@ -1494,6 +1564,77 @@ mod tests {
 
         // Already pointing at the current binary → nothing changes → no rewrite.
         assert_eq!(refresh_zed_settings(&refreshed, "/new/fleety", None), None);
+
+        // A path-only refresh preserves the complete installed entry except
+        // for `command`, including its server binding and editor-specific env.
+        let bound = r#"{"agent_servers":{"Fleety":{"type":"custom","command":"/old/fleety","args":["acp","--editor-mode"],"env":{"FLEETY_AGENT_URL":"wss://paired.example/ws","EDITOR_FLAG":"keep"},"extra":"keep"}}}"#;
+        let refreshed = refresh_zed_settings(bound, "/new/fleety", None).expect("refresh");
+        let before: Value = serde_json::from_str(bound).unwrap();
+        let after: Value = serde_json::from_str(&refreshed).unwrap();
+        assert_eq!(
+            after["agent_servers"]["Fleety"]["env"],
+            before["agent_servers"]["Fleety"]["env"]
+        );
+        assert_eq!(
+            after["agent_servers"]["Fleety"]["args"],
+            before["agent_servers"]["Fleety"]["args"]
+        );
+        assert_eq!(after["agent_servers"]["Fleety"]["extra"], "keep");
+        assert_eq!(after["agent_servers"]["Fleety"]["command"], "/new/fleety");
+
+        // An explicit replacement changes only the server binding while
+        // retaining unrelated editor env values.
+        let rebound = refresh_zed_settings(&refreshed, "/new/fleety", Some("wss://new/ws"))
+            .expect("explicit server replacement");
+        let rebound: Value = serde_json::from_str(&rebound).unwrap();
+        assert_eq!(
+            rebound["agent_servers"]["Fleety"]["env"]["FLEETY_AGENT_URL"],
+            "wss://new/ws"
+        );
+        assert_eq!(
+            rebound["agent_servers"]["Fleety"]["env"]["EDITOR_FLAG"],
+            "keep"
+        );
+    }
+
+    #[test]
+    fn zed_replace_atomically_replaces_an_existing_file() {
+        let dir = std::env::temp_dir().join(format!("fleety-acp-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, b"old").unwrap();
+
+        atomic_replace(&path, b"new").expect("replace existing settings");
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            1,
+            "temporary file must not remain after success"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_zed_replace_keeps_the_existing_file() {
+        let dir = std::env::temp_dir().join(format!("fleety-acp-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        let original = br#"{"agent_servers":{"Fleety":{"command":"old"}}}"#;
+        std::fs::write(&path, original).unwrap();
+
+        let result = atomic_replace_with(&path, b"replacement", |_| {
+            Err(std::io::Error::other("injected before replace"))
+        });
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            1,
+            "temporary file must be cleaned up"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -1645,6 +1786,43 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn bridge_hello_uses_the_resolved_profile_token() {
+        let (url, server_rx) = scripted_server(vec![vec![
+            vec![],
+            vec![ServerMsg::Done {
+                conversation_id: "c-token".to_string(),
+            }],
+        ]]);
+        let (editor_in, _editor_out) = tokio::io::duplex(1024);
+        let bridge = WsBridge::new(
+            fleety_tools::connection::Resolved {
+                url,
+                token: Some("paired-profile-token".to_string()),
+                source: fleety_tools::connection::Source::Profile("paired".to_string()),
+            },
+            std::sync::Arc::new(tokio::sync::Mutex::new(tokio::io::BufReader::new(
+                editor_in,
+            ))),
+        );
+
+        bridge
+            .run_turn("c-token", "hello", None, false)
+            .await
+            .expect("turn completes");
+
+        let received = server_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("server frames");
+        assert!(matches!(
+            received.first(),
+            Some(ClientMsg::Hello {
+                token: Some(token),
+                ..
+            }) if token == "paired-profile-token"
+        ));
+    }
+
     /// A real WsBridge whose editor input is an in-memory duplex; returns the
     /// write half the test uses to play the editor.
     fn duplex_bridge(
@@ -1655,7 +1833,11 @@ mod tests {
     ) {
         let (editor_in, editor_out) = tokio::io::duplex(1024);
         let bridge = WsBridge::new(
-            url.to_string(),
+            fleety_tools::connection::Resolved {
+                url: url.to_string(),
+                token: None,
+                source: fleety_tools::connection::Source::Override,
+            },
             std::sync::Arc::new(tokio::sync::Mutex::new(tokio::io::BufReader::new(
                 editor_in,
             ))),

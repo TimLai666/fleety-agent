@@ -36,7 +36,7 @@
 - **connection-profiles** — `~/.fleety/connections.toml` + CLI/daemon 共用 resolver(單一優先序、mDNS sticky + fingerprint guard)+ `fleety server` 命令群 + `init`/`pair` sugar + config.json/fleetyd.token 一次性冪等遷移(O_EXCL 閂);`FLEETY_AGENT_URL` 移出 registry,消除三處優先序陷阱。
 - **provider-model-two-tier** — providers.toml 改兩層:type-tagged provider(api / oauth:codex,可擴展註冊)+ main/cheap member pool(stream/modalities/effort 下沉 member);混族 pool 能力取聯集;參照完整性寫前 validate;providers.toml 去重遷移;`FLEETY_MODEL_*` 降為 bootstrap seed、壞結構化設定硬啟動錯誤。
 - **auth-default-on** — `FLEETY_REQUIRE_AUTH` 預設開(顯式 `0` 才關)+ 首啟配對引導 + 遠端寫入⇒認證必開(auth 關閉時拒 mutating config frame)。
-- **local-config-scope** — `fleety config --target local` 只顯示/編輯 Cli/Shared;server/daemon key 導向正確主機。
+- **owner-routed-config** — `fleety config` 依 key owner 路由。CLI 只寫 Cli scope，Daemon/Shared 經 fleetyd，Server/provider/model 經 fleety-server，無直接改檔 fallback。
 
 **Phase 2(remote-config-panel,2026-07-10 出貨)** — 動 wire、交付 G2(一個面板設定任何東西):`ConfigSnapshot`/`ConfigApply` frame + revision 樂觀鎖 + 真原子存檔(config.toml tmp+rename+mutex)+ 能力協商(`Welcome.config_protocol`)+ 未知 frame 容忍(`ClientMsg::Unknown` → unsupported、不斷線)+ secret tri-state(keep/set/clear)+ 遠端寫入認證閘 + 敏感 key 稽核;`PROTOCOL_VERSION` 0→1。裸 `fleety config`(TTY)開三區互動面板(連線 / 本機 / server),server 區經結構化通道遠端 edit、舊 server 退回 ConfigExec。**已知缺口**(minimal-viable,列後續):server 區為單值 edit,provider/model 的完整互動編輯待補;傳輸 wss 硬要求未做;敏感 key 面板告警為二次確認,更完整的分級稽核待強化。
 

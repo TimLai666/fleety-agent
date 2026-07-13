@@ -173,33 +173,35 @@ config model set cheap --member openai1/gpt-4o-mini    # one member → strategy
 config model show [main|cheap]  |  config model unset main  |  config model list
 ```
 
-On a TTY, bare `fleety config` opens the interactive **three-region panel**
-(Connection / This device / Server) — the Server region edits providers/models
-and settings over the connection. `fleety config provider edit` (CLI only) opens
+On a TTY, bare `fleety config` opens the interactive **four-region panel**
+(Connection / CLI / Daemon / Server). Daemon and Server changes are sent to
+their owning runtimes. `fleety config provider edit` (CLI only) opens
 the provider-only editor, and like the subcommands it acts on the **connected
 server's** providers by default (snapshot → edit → apply under an optimistic
-lock; a concurrent edit reloads instead of overwriting). Use
-`fleety config --target local provider edit` to edit this host's own file. A
+lock; a concurrent edit reloads instead of overwriting). There is no local
+provider-file editing path. A
 server older than config protocol 2 is refused up front (it would silently
 ignore the write-back) — update it first. Without a TTY, the subcommands above
 are used.
 
 #### Remote vs local (`--target`)
 
-`fleety config …` manages the **connected server's** config by default (over the
-authenticated connection — no shell access to the server host needed). Pick the
-host with `--target`:
+`fleety config …` automatically routes a key to its owner. Use `--target` to
+assert the owner or select a device:
 
-- `--target server` (default) — the connected server. The result reports when the
+- `--target server` — the connected server. The result reports when the
   change takes effect: a provider/model change on the next connection; a flat
   `set`/`unset` after a server restart (flat settings are env-seeded at boot, and
   the environment takes precedence). A mutating change is **refused when the
   server runs with auth disabled** (enable auth first).
-- `--target local` — this CLI host's own `~/.fleety` files (no connection), scoped
-  to **this device's own settings** (Cli/Shared). A Server-scoped key is redirected
-  to the server (edit it via the default `fleety config`).
-- `--target <device-id>` — a follow-up; the server reports it as not-yet-supported.
-  Configure a device on its own host with `fleetyd config` for now.
+- `--target daemon` — the current device's daemon. Daemon and Shared keys are
+  applied by `fleetyd` through the server.
+- `--target cli` (alias `local`) — only the CLI scope in this host's
+  `config.toml`; it cannot select provider/model, Shared, Daemon, or Server keys.
+- `--target <device-id>` — that device's daemon through the server.
+
+An unavailable owner is a hard error. The CLI never falls back to editing the
+daemon's or server's files.
 
 `fleety-server config` (run on the server host) stays available as a bootstrap
 path before the CLI can connect. Remote config travels only over the

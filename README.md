@@ -228,35 +228,36 @@ login — sign in again per provider.
 
 ### Where config commands apply (`--target`)
 
-By default `fleety config …` manages the **connected server's** config over the
-connection — set the server's model from your laptop without shell access to the
-server host. Use `--target` to choose:
+`fleety config …` routes each key to its **owning runtime**. Server settings go
+to the connected server, daemon/shared settings go through that device's
+`fleetyd`, and CLI settings are the only settings written by the CLI process.
+Use `--target` to make the owner explicit:
 
-- `--target server` (default) — the connected server. Requires an authenticated
+- `--target server` — the connected server. Requires an authenticated
   connection; the result says when it takes effect (a provider/model change on the
   next connection; a flat `FLEETY_*` setting after a server restart). A mutating
   change is refused when the server runs with auth disabled.
-- `--target local` — this CLI host's own `~/.fleety` files (no connection), scoped
-  to this device's own settings (Cli/Shared); a Server-scoped key is redirected to
-  the server.
-- `--target <device-id>` — a specific device. *Follow-up* — the server currently
-  reports this as not-yet-supported; configure the device on its own host with
-  `fleetyd config` for now.
+- `--target daemon` — the current device's daemon. `Shared` and `Daemon` keys are
+  changed by `fleetyd` through the server's device route.
+- `--target cli` (alias: `local`) — CLI-only settings on this host. It never
+  includes Shared, Daemon, Server, provider, or model settings.
+- `--target <device-id>` — that device's daemon through the server.
 
-If the server can't be reached, the CLI says so and suggests `--target local`.
+If an owner cannot be reached, the command fails and leaves files unchanged.
+There is no fallback that writes the owner's file directly.
 `fleety-server config …` (run on the server host) remains as a bootstrap path.
 
 ### Edit config interactively
 
 On a TTY:
 
-- **`fleety config`** (no args) — a guided **menu**: pick Providers, Models, or
+- **`fleety config`** (no args) — a guided **menu**: pick Providers & Models or
   Settings and drill in. Providers/Models open the provider editor (add a
   provider by type with per-field prompts; set a model role by picking a provider
   then choosing from its API `/models` list or the connected server's authenticated
   Codex catalog, or typing an id if discovery is unavailable). OAuth provider rows
   show `auth=signed in`, `auth=not signed in`, or `auth=unavailable`. Settings is
-  the three-region panel (Connection / This device / Server). The Server region
+  the four-region panel (Connection / CLI / Daemon / Server). The Server region
   edits the connected server's settings — including providers/models — live **over
   the connection** (optimistic-locked; secrets stay write-only), so remote editing
   no longer needs shell access to the server host. Editing `FLEETY_TZ` opens a
@@ -288,8 +289,8 @@ launchd / Windows SCM).
 | `fleety tui` | Interactive terminal UI (streaming chat). While a reply is generating, **Esc cancels** the turn (completed work is kept); when idle, Esc quits. Ctrl+C always quits. PgUp/PgDn scroll the history. |
 | `fleety voice` | Voice conversation (speech-to-text in, spoken reply out). |
 | `fleety status` | Server health: version, uptime, connected devices. |
-| `fleety config <list\|get\|set\|unset\|edit>` | Inspect/edit settings; secrets masked. Targets the connected **server** by default; `--target local` edits this host's `~/.fleety/config.toml`. `edit` is local + interactive (ratatui on a TTY, line-based otherwise). |
-| `fleety config provider\|model <…>` | Manage providers + model roles (`providers.toml`): `provider add\|set\|remove\|list`, `model set\|show\|unset\|list`. Same `--target` rule (default server). Bare `fleety config` on a TTY opens a guided menu (Providers / Models / Settings); `config provider edit` is the provider-only interactive editor. |
+| `fleety config <list\|get\|set\|unset\|edit>` | Inspect/edit settings; secrets masked. Auto-routes each key to server, daemon, or CLI ownership. `--target server\|daemon\|cli\|<device-id>` is an owner assertion, not a file selector. |
+| `fleety config provider\|model <…>` | Manage the connected server's providers + model roles: `provider add\|set\|remove\|list`, `model set\|show\|unset\|list`. The CLI never writes `providers.toml` directly. |
 | `fleety audit list [<limit>]` / `fleety audit show <index>` | List this device's audit-log entries (tool calls/results/replies) / show one in full. |
 | `fleety rollback list` / `fleety rollback apply <backup_id>` | List backups / restore a file from a backup. |
 | `fleety pair-code` | Mint a short-lived pairing code on the connected server (loopback-trusted on the server host, else token-authed) and print the `fleety pair <code>` to run on the new device. |

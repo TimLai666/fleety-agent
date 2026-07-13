@@ -111,50 +111,69 @@ tests:
 ---
 ### Requirement: An interactive screen manages providers on a TTY
 
-When stdout is a TTY, `config provider edit` SHALL open an interactive screen listing providers, groups, and roles, supporting add/edit/remove of a provider, setting a group's members and strategy, and binding a role. By default the screen SHALL edit the **connected server's** provider configuration: it is loaded from a structured config snapshot, edited in memory, and written back through a structured config apply under the snapshot's optimistic-lock revision — validation and the atomic write run on the server, with the same semantics as the local path. With an explicit `--target local`, the screen SHALL edit this host's own providers file exactly as before. Against a server that does not advertise credential-era protocol support (config protocol < 2), the remote screen SHALL refuse up front with an update-the-server error before opening — an older server would silently ignore the write-back. A validation failure SHALL be shown without writing; a concurrent-edit conflict SHALL be reported and the screen reloaded from a fresh snapshot rather than overwriting. Provider keys SHALL be masked in the display. When stdout is not a TTY, the system SHALL fall back to the subcommands.
+When stdout is a TTY, config provider edit SHALL open an interactive screen listing providers, groups, and roles, supporting add, edit, and remove of a provider, setting a group's members and strategy, and binding a role. The screen SHALL always edit the connected server's provider configuration: it is loaded from a structured config snapshot, edited in memory, and written back through structured config apply under the snapshot revision. Validation and atomic persistence SHALL run on the server. An explicit cli or local target SHALL be rejected before the editor opens. Against a server below config protocol 2, the screen SHALL fail before opening with an update instruction. A validation failure SHALL be shown without writing. A concurrent-edit conflict SHALL be reported and the screen SHALL reload from a fresh snapshot rather than overwrite. Provider keys SHALL be masked. Without a TTY, the system SHALL use provider subcommands, which also target the server.
 
-#### Scenario: editing on a TTY saves through validation
+#### Scenario: editing on a TTY saves through server validation
 
 - **WHEN** a provider is added in the interactive screen and saved
-- **THEN** the configuration is validated and written atomically on the target host, and the key is masked on screen
+- **THEN** the configuration is validated and written atomically by the connected server and the key is masked on screen
 
 #### Scenario: default target edits the connected server
 
-- **WHEN** `config provider edit` runs on a TTY with no explicit target while connected to a remote server
-- **THEN** the screen shows the server's providers, and saving updates the server's providers file — nothing is written on the CLI host
+- **WHEN** config provider edit runs on a TTY with no explicit target
+- **THEN** the screen shows the server providers, saving updates the server providers file, and nothing is written on the CLI host
 
-#### Scenario: explicit local target keeps the local file path
+#### Scenario: explicit local target is rejected
 
-- **WHEN** `config --target local provider edit` runs on a TTY
-- **THEN** the screen edits this host's own providers file with unchanged behavior
+- **WHEN** config --target local provider edit runs on a TTY
+- **THEN** the command fails before the editor opens and directs the user to the connected server flow
 
 #### Scenario: old server is refused before the screen opens
 
 - **WHEN** the remote screen is requested against a server advertising config protocol below 2
-- **THEN** the command fails up front telling the user to update the server, and no editor opens
+- **THEN** the command fails with an update instruction and no editor opens
 
 #### Scenario: concurrent edit surfaces as a conflict
 
-- **WHEN** the server's configuration changed while the screen was open and the user saves
-- **THEN** the save is rejected as a conflict and the screen reloads the current server state instead of overwriting
+- **WHEN** the server configuration changes while the screen is open and the user saves
+- **THEN** the save is rejected as a conflict and the screen reloads current server state instead of overwriting
 
-#### Scenario: non-TTY falls back
+#### Scenario: non-TTY uses server subcommands
 
-- **WHEN** `config provider edit` is invoked without a TTY
-- **THEN** the interactive screen does not open and the subcommand path is used
+- **WHEN** config provider edit is invoked without a TTY
+- **THEN** the interactive screen does not open and the server-targeted subcommand path is used
 
 
 <!-- @trace
-source: provider-edit-remote
-updated: 2026-07-11
+source: route-config-to-owning-runtime
+updated: 2026-07-14
 code:
+  - crates/fleety-server/src/main.rs
+  - crates/fleety-server/src/http.rs
+  - crates/fleety-tools/src/oauth.rs
   - crates/fleety-cli/src/config_panel.rs
-  - crates/fleety-cli/src/config.rs
   - crates/fleety-cli/src/provider_tui.rs
-  - crates/fleety-cli/src/main.rs
+  - docs/design-cli-config.md
+  - docs/roadmap.md
+  - README.md
+  - crates/fleety-cli/src/model_picker.rs
+  - crates/fleety-daemon/src/main.rs
   - crates/fleety-server/src/conn.rs
-  - crates/fleety-protocol/src/lib.rs
+  - crates/fleety-tools/src/connection.rs
+  - crates/fleety-cli/src/auth.rs
+  - crates/fleety-tools/src/config.rs
+  - crates/fleety-tools/src/providers_config.rs
+  - crates/fleety-cli/src/main.rs
+  - docs/STATUS.md
+  - crates/fleety-cli/src/config.rs
+  - crates/fleety-server/src/bridge.rs
+  - crates/fleety-cli/src/acp.rs
   - docs/env.md
+  - crates/fleety-cli/src/server.rs
+tests:
+  - crates/fleety-cli/tests/cli_smoke.rs
+  - crates/fleety-daemon/tests/fleetyd_smoke.rs
+  - crates/fleety-server/tests/server_smoke.rs
 -->
 
 ---

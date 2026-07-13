@@ -6,35 +6,51 @@ TBD - created by archiving change 'remote-config-panel'. Update Purpose after ar
 
 ## Requirements
 
-### Requirement: Bare fleety config opens a three-region interactive panel
+### Requirement: Bare fleety config opens a four-region interactive panel
 
-On a TTY, `fleety config` with no arguments SHALL open a single interactive panel with three regions — Connection, This device, and Server — switchable without any `--target` flag. The Connection region edits `connections.toml`, the This-device region edits the local Cli/Shared settings, and the Server region edits the connected server's settings and provider/model configuration. Without a TTY, `fleety config` SHALL fall back to the non-interactive text commands.
+On a TTY, fleety config with no arguments SHALL open a single interactive panel with four regions: Connection, CLI, Daemon, and Server. The Connection region manages connection profiles. The CLI region edits only Cli-scoped settings. The Daemon region loads and applies Daemon and Shared settings through fleetyd. The Server region loads and applies Server settings through fleety-server. Without a TTY, fleety config SHALL use the non-interactive text command path.
 
-#### Scenario: the panel exposes all three layers from one entry
+#### Scenario: the panel exposes all four owners from one entry
 
-- **WHEN** `fleety config` runs on a TTY
-- **THEN** a panel opens with Connection / This device / Server regions, and switching regions needs no `--target` flag
+- **WHEN** fleety config runs on a TTY
+- **THEN** a panel opens with Connection, CLI, Daemon, and Server regions and switching regions needs no target flag
 
-#### Scenario: no TTY falls back to text
+#### Scenario: no TTY uses text commands
 
-- **WHEN** `fleety config list` runs without a TTY
-- **THEN** it uses the non-interactive text command path, not the panel
+- **WHEN** fleety config list runs without a TTY
+- **THEN** it uses the non-interactive text command path
 
 
 <!-- @trace
-source: remote-config-panel
-updated: 2026-07-10
+source: route-config-to-owning-runtime
+updated: 2026-07-14
 code:
-  - docs/design-cli-config.md
+  - crates/fleety-server/src/main.rs
+  - crates/fleety-server/src/http.rs
+  - crates/fleety-tools/src/oauth.rs
   - crates/fleety-cli/src/config_panel.rs
-  - crates/fleety-cli/src/main.rs
-  - crates/fleety-protocol/src/lib.rs
-  - crates/fleety-tools/src/config.rs
-  - crates/fleety-server/src/conn.rs
+  - crates/fleety-cli/src/provider_tui.rs
+  - docs/design-cli-config.md
   - docs/roadmap.md
+  - README.md
+  - crates/fleety-cli/src/model_picker.rs
+  - crates/fleety-daemon/src/main.rs
+  - crates/fleety-server/src/conn.rs
+  - crates/fleety-tools/src/connection.rs
+  - crates/fleety-cli/src/auth.rs
+  - crates/fleety-tools/src/config.rs
+  - crates/fleety-tools/src/providers_config.rs
+  - crates/fleety-cli/src/main.rs
+  - docs/STATUS.md
+  - crates/fleety-cli/src/config.rs
+  - crates/fleety-server/src/bridge.rs
+  - crates/fleety-cli/src/acp.rs
+  - docs/env.md
+  - crates/fleety-cli/src/server.rs
 tests:
-  - crates/fleety-daemon/tests/fleetyd_smoke.rs
   - crates/fleety-cli/tests/cli_smoke.rs
+  - crates/fleety-daemon/tests/fleetyd_smoke.rs
+  - crates/fleety-server/tests/server_smoke.rs
 -->
 
 ---
@@ -231,4 +247,58 @@ code:
   - crates/fleety-protocol/src/lib.rs
   - crates/fleety-server/src/providers.rs
   - crates/fleety-cli/src/auth.rs
+-->
+
+---
+### Requirement: Daemon and server regions persist only through their owners
+
+The Daemon and Server panel regions SHALL keep independent availability, revision, snapshot entries, staged changes, and apply targets. A daemon edit SHALL be sent to fleetyd and a server edit SHALL be sent to fleety-server. If an owner is unavailable, its region SHALL display an unavailable state and SHALL NOT offer a direct-file fallback.
+
+#### Scenario: daemon unavailable leaves other regions usable
+
+- **GIVEN** the server connection works but fleetyd for the current device is not connected
+- **WHEN** the panel opens
+- **THEN** Connection, CLI, and Server remain usable while Daemon is marked unavailable
+
+#### Scenario: server unavailable does not convert remote edits to local writes
+
+- **GIVEN** the server cannot be reached
+- **WHEN** the panel opens
+- **THEN** Connection and CLI remain usable, Daemon and Server are marked unavailable, and no remote setting is written locally
+
+#### Scenario: staged changes remain separated
+
+- **WHEN** the user stages one daemon setting and one server setting
+- **THEN** applying in either region sends only that region's changes and revision to its owner
+
+<!-- @trace
+source: route-config-to-owning-runtime
+updated: 2026-07-14
+code:
+  - crates/fleety-server/src/main.rs
+  - crates/fleety-server/src/http.rs
+  - crates/fleety-tools/src/oauth.rs
+  - crates/fleety-cli/src/config_panel.rs
+  - crates/fleety-cli/src/provider_tui.rs
+  - docs/design-cli-config.md
+  - docs/roadmap.md
+  - README.md
+  - crates/fleety-cli/src/model_picker.rs
+  - crates/fleety-daemon/src/main.rs
+  - crates/fleety-server/src/conn.rs
+  - crates/fleety-tools/src/connection.rs
+  - crates/fleety-cli/src/auth.rs
+  - crates/fleety-tools/src/config.rs
+  - crates/fleety-tools/src/providers_config.rs
+  - crates/fleety-cli/src/main.rs
+  - docs/STATUS.md
+  - crates/fleety-cli/src/config.rs
+  - crates/fleety-server/src/bridge.rs
+  - crates/fleety-cli/src/acp.rs
+  - docs/env.md
+  - crates/fleety-cli/src/server.rs
+tests:
+  - crates/fleety-cli/tests/cli_smoke.rs
+  - crates/fleety-daemon/tests/fleetyd_smoke.rs
+  - crates/fleety-server/tests/server_smoke.rs
 -->

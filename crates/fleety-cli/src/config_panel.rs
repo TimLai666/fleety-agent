@@ -1,10 +1,8 @@
-//! `fleety config` (bare, on a TTY) — the three-region interactive panel.
+//! `fleety config` (bare, on a TTY) — the four-region interactive panel.
 //!
-//! One entry point, three Tab-switchable regions (design §7): **Connection**
-//! (edits `~/.fleety/connections.toml`), **This device** (edits the local
-//! Cli/Shared settings), and **Server** (edits the connected server's settings
-//! over the structured `ConfigSnapshot`/`ConfigApply` wire when the server
-//! supports it, per `Welcome.config_protocol`).
+//! One entry point, four Tab-switchable regions: **Connection**, **CLI**,
+//! **Daemon**, and **Server**. Only the CLI region persists locally. Daemon and
+//! Server changes always travel through their owning runtimes.
 //!
 //! This is the minimal-viable panel (design Risks note): each region does a
 //! single-value edit; the Connection region also switches the current server.
@@ -30,23 +28,26 @@ use crate::input::LineEditor;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Region {
     Connection,
-    Local,
+    Cli,
+    Daemon,
     Server,
 }
 
 impl Region {
     fn next(self) -> Self {
         match self {
-            Region::Connection => Region::Local,
-            Region::Local => Region::Server,
+            Region::Connection => Region::Cli,
+            Region::Cli => Region::Daemon,
+            Region::Daemon => Region::Server,
             Region::Server => Region::Connection,
         }
     }
     fn title(self) -> &'static str {
         match self {
             Region::Connection => "[1] Connection",
-            Region::Local => "[2] This device",
-            Region::Server => "[3] Server",
+            Region::Cli => "[2] CLI",
+            Region::Daemon => "[3] Daemon",
+            Region::Server => "[4] Server",
         }
     }
 }
@@ -105,9 +106,15 @@ struct Panel {
     confirm_sensitive: Option<String>,
     // Connection region.
     conns: Connections,
-    // Local region (Cli/Shared rows: key, scope, value, source).
+    // CLI region.
     local: Vec<(String, String, String, String)>,
     local_map: fleety_tools::config::ConfigMap,
+    // Daemon region.
+    daemon_supported: bool,
+    daemon_entries: Vec<ConfigEntry>,
+    daemon_revision: String,
+    daemon_staged: BTreeMap<String, ConfigChange>,
+    apply_daemon_now: bool,
     // Server region.
     server_supported: bool,
     entries: Vec<ConfigEntry>,
@@ -119,13 +126,28 @@ struct Panel {
     quit: bool,
 }
 
+struct RemoteRegionState {
+    supported: bool,
+    entries: Vec<ConfigEntry>,
+    revision: String,
+}
+
+impl RemoteRegionState {
+    fn new(supported: bool, entries: Vec<ConfigEntry>, revision: String) -> Self {
+        Self {
+            supported,
+            entries,
+            revision,
+        }
+    }
+}
+
 impl Panel {
     fn new(
         conns: Connections,
         local_map: fleety_tools::config::ConfigMap,
-        server_supported: bool,
-        entries: Vec<ConfigEntry>,
-        revision: String,
+        daemon: RemoteRegionState,
+        server: RemoteRegionState,
     ) -> Self {
         let local =
             fleety_tools::config::rows_in_scopes(&local_map, fleety_tools::config::LOCAL_SCOPES);
@@ -138,9 +160,14 @@ impl Panel {
             conns,
             local,
             local_map,
-            server_supported,
-            entries,
-            revision,
+            daemon_supported: daemon.supported,
+            daemon_entries: daemon.entries,
+            daemon_revision: daemon.revision,
+            daemon_staged: BTreeMap::new(),
+            apply_daemon_now: false,
+            server_supported: server.supported,
+            entries: server.entries,
+            revision: server.revision,
             staged: BTreeMap::new(),
             apply_now: false,
             // The key hints live on their own persistent footer line now; the
@@ -154,7 +181,8 @@ impl Panel {
     fn rows_len(&self) -> usize {
         match self.region {
             Region::Connection => self.conns.profiles.len(),
-            Region::Local => self.local.len(),
+            Region::Cli => self.local.len(),
+            Region::Daemon => self.daemon_entries.len(),
             Region::Server => self.entries.len(),
         }
     }
@@ -168,7 +196,8 @@ impl Panel {
     /// used to route `FLEETY_TZ` to the timezone picker. `None` for Connection.
     fn selected_key(&self) -> Option<String> {
         match self.region {
-            Region::Local => self.local.get(self.sel).map(|r| r.0.clone()),
+            Region::Cli => self.local.get(self.sel).map(|r| r.0.clone()),
+            Region::Daemon => self.daemon_entries.get(self.sel).map(|e| e.key.clone()),
             Region::Server => self.entries.get(self.sel).map(|e| e.key.clone()),
             Region::Connection => None,
         }
@@ -176,8 +205,13 @@ impl Panel {
 
     /// Begin editing the selected server entry (staging its current value),
     /// double-confirming a sensitive key first.
-    fn begin_server_edit(&mut self) {
-        let Some(entry) = self.entries.get(self.sel) else {
+    fn begin_remote_edit(&mut self) {
+        let entry = match self.region {
+            Region::Daemon => self.daemon_entries.get(self.sel),
+            Region::Server => self.entries.get(self.sel),
+            _ => None,
+        };
+        let Some(entry) = entry else {
             return;
         };
         if is_sensitive(&entry.key) && self.confirm_sensitive.as_deref() != Some(&entry.key) {
@@ -213,7 +247,7 @@ impl Panel {
                 }
                 false
             }
-            Region::Local => {
+            Region::Cli => {
                 if let Some((key, _, _, _)) = self.local.get(self.sel).cloned() {
                     if let Some(setting) = fleety_tools::config::find(&key) {
                         if let Err(e) = fleety_tools::config::validate(setting, &value) {
@@ -236,15 +270,25 @@ impl Panel {
                 }
                 false
             }
-            Region::Server => {
-                if let Some(entry) = self.entries.get(self.sel).cloned() {
+            Region::Daemon | Region::Server => {
+                let entry = match self.region {
+                    Region::Daemon => self.daemon_entries.get(self.sel).cloned(),
+                    Region::Server => self.entries.get(self.sel).cloned(),
+                    _ => None,
+                };
+                if let Some(entry) = entry {
                     // Tri-state: empty → clear, else set. (keep = untouched.)
                     let op = if value.is_empty() {
                         ChangeOp::Clear
                     } else {
                         ChangeOp::Set
                     };
-                    self.staged.insert(
+                    let staged = if self.region == Region::Daemon {
+                        &mut self.daemon_staged
+                    } else {
+                        &mut self.staged
+                    };
+                    staged.insert(
                         entry.key.clone(),
                         ConfigChange {
                             key: entry.key.clone(),
@@ -252,8 +296,15 @@ impl Panel {
                             value: if value.is_empty() { None } else { Some(value) },
                         },
                     );
-                    self.status =
-                        format!("staged '{}' — press a to apply to the server", entry.key);
+                    self.status = format!(
+                        "staged '{}' — press a to apply to the {}",
+                        entry.key,
+                        if self.region == Region::Daemon {
+                            "daemon"
+                        } else {
+                            "server"
+                        }
+                    );
                 }
                 false
             }
@@ -355,13 +406,27 @@ fn on_key(p: &mut Panel, code: KeyCode) -> bool {
             // status; the run loop checks and saves.
             p.status = "__save_conns__".to_string();
         }
-        KeyCode::Char('a') if p.region == Region::Server => {
-            if p.server_supported && !p.staged.is_empty() {
-                p.apply_now = true;
-            } else if !p.server_supported {
-                p.status =
-                    "this server does not support structured config; use `fleety config set …`"
-                        .to_string();
+        KeyCode::Char('a') if matches!(p.region, Region::Daemon | Region::Server) => {
+            let (supported, staged) = if p.region == Region::Daemon {
+                (p.daemon_supported, !p.daemon_staged.is_empty())
+            } else {
+                (p.server_supported, !p.staged.is_empty())
+            };
+            if supported && staged {
+                if p.region == Region::Daemon {
+                    p.apply_daemon_now = true;
+                } else {
+                    p.apply_now = true;
+                }
+            } else if !supported {
+                p.status = format!(
+                    "{} is unavailable; no local file fallback will be used",
+                    if p.region == Region::Daemon {
+                        "daemon"
+                    } else {
+                        "server"
+                    }
+                );
             } else {
                 p.status = "nothing staged".to_string();
             }
@@ -374,7 +439,7 @@ fn on_key(p: &mut Panel, code: KeyCode) -> bool {
             });
         }
         KeyCode::Enter => match p.region {
-            Region::Server => p.begin_server_edit(),
+            Region::Daemon | Region::Server => p.begin_remote_edit(),
             _ => {
                 let mut ed = LineEditor::default();
                 let prefill = match p.region {
@@ -384,8 +449,8 @@ fn on_key(p: &mut Panel, code: KeyCode) -> bool {
                         .and_then(|n| p.conns.profiles.get(n))
                         .map(|pr| pr.url.clone())
                         .unwrap_or_default(),
-                    Region::Local => p.local.get(p.sel).map(|r| r.2.clone()).unwrap_or_default(),
-                    Region::Server => String::new(),
+                    Region::Cli => p.local.get(p.sel).map(|r| r.2.clone()).unwrap_or_default(),
+                    Region::Daemon | Region::Server => String::new(),
                 };
                 ed.set_text(prefill);
                 p.edit = Some(ed);
@@ -407,17 +472,22 @@ fn render(f: &mut Frame, p: &Panel) {
         .split(f.area());
 
     // Region tab bar.
-    let tabs = [Region::Connection, Region::Local, Region::Server]
-        .iter()
-        .map(|r| {
-            if *r == p.region {
-                format!("▸{}", r.title())
-            } else {
-                format!(" {}", r.title())
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("   ");
+    let tabs = [
+        Region::Connection,
+        Region::Cli,
+        Region::Daemon,
+        Region::Server,
+    ]
+    .iter()
+    .map(|r| {
+        if *r == p.region {
+            format!("▸{}", r.title())
+        } else {
+            format!(" {}", r.title())
+        }
+    })
+    .collect::<Vec<_>>()
+    .join("   ");
     f.render_widget(Paragraph::new(tabs), chunks[0]);
 
     // Region body.
@@ -444,7 +514,7 @@ fn render(f: &mut Frame, p: &Panel) {
                 "(u: switch current · Enter: edit url · s: save · 'local' needs no pairing)",
             ));
         }
-        Region::Local => {
+        Region::Cli => {
             for (i, (key, scope, value, source)) in p.local.iter().enumerate() {
                 let marker = if i == p.sel { "▶" } else { " " };
                 lines.push(Line::from(format!(
@@ -452,14 +522,24 @@ fn render(f: &mut Frame, p: &Panel) {
                 )));
             }
         }
-        Region::Server => {
-            if !p.server_supported {
-                lines.push(Line::from(
-                    "This server does not support structured config (older version).",
-                ));
-                lines.push(Line::from("Use `fleety config set <KEY> <VALUE>` instead."));
+        Region::Daemon | Region::Server => {
+            let (supported, entries, staged, owner) = if p.region == Region::Daemon {
+                (
+                    p.daemon_supported,
+                    &p.daemon_entries,
+                    &p.daemon_staged,
+                    "daemon",
+                )
             } else {
-                for (i, e) in p.entries.iter().enumerate() {
+                (p.server_supported, &p.entries, &p.staged, "server")
+            };
+            if !supported {
+                lines.push(Line::from(format!(
+                    "The {owner} is unavailable for structured config."
+                )));
+                lines.push(Line::from("No local config file fallback will be used."));
+            } else {
+                for (i, e) in entries.iter().enumerate() {
                     let marker = if i == p.sel { "▶" } else { " " };
                     let shown = if e.secret {
                         if e.is_set {
@@ -470,7 +550,7 @@ fn render(f: &mut Frame, p: &Panel) {
                     } else {
                         &e.value
                     };
-                    let staged = if p.staged.contains_key(&e.key) {
+                    let staged = if staged.contains_key(&e.key) {
                         " *staged"
                     } else {
                         ""
@@ -490,7 +570,7 @@ fn render(f: &mut Frame, p: &Panel) {
 
     // Footer: a PERSISTENT key-hint line (so an action's output never hides how
     // to move / apply / leave), then the transient edit buffer or status below.
-    let hints = "Tab: region · ↑↓: move · Enter: edit · a: apply server · Esc/q: menu";
+    let hints = "Tab: region · ↑↓: move · Enter: edit · a: apply owner · Esc/q: menu";
     let status_line = if let Some(pick) = &p.tz_pick {
         let cands = tz_candidates(pick.filter.text());
         let n = cands.len();
@@ -503,8 +583,13 @@ fn render(f: &mut Frame, p: &Panel) {
     } else if let Some(ed) = &p.edit {
         let (view, _) = ed.display_window(60);
         format!("> {view}   (Enter save · Esc cancel)")
-    } else if p.region == Region::Server {
-        match p.entries.get(p.sel) {
+    } else if matches!(p.region, Region::Daemon | Region::Server) {
+        let entries = if p.region == Region::Daemon {
+            &p.daemon_entries
+        } else {
+            &p.entries
+        };
+        match entries.get(p.sel) {
             Some(e) => {
                 let eff = match e.effect {
                     Some(fleety_protocol::Effect::Restart) => "restart",
@@ -530,8 +615,8 @@ fn render(f: &mut Frame, p: &Panel) {
 
 /// Open the interactive config panel: resolve + connect to the current server,
 /// negotiate the structured-config capability, pull a snapshot if supported,
-/// then run the three-region editor. Connection/local edits persist to their
-/// files; server edits are staged and applied via `ConfigApply`.
+/// then run the four-region editor. Connection/CLI edits persist locally;
+/// daemon and server edits are staged and applied via their owning runtimes.
 /// Whether any saved profile already targets `local_url` (so the panel need not
 /// inject a `local` entry). Pure.
 fn has_local_profile(conns: &Connections, local_url: &str) -> bool {
@@ -541,20 +626,15 @@ fn has_local_profile(conns: &Connections, local_url: &str) -> bool {
 /// Top-level `fleety config` menu items.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MenuChoice {
-    Providers,
-    Models,
+    ProvidersAndModels,
     Settings,
     Quit,
 }
 
 const MENU_ITEMS: &[(&str, MenuChoice)] = &[
     (
-        "Providers   — add / edit model providers",
-        MenuChoice::Providers,
-    ),
-    (
-        "Models      — set the main / cheap model roles",
-        MenuChoice::Models,
+        "Providers & Models — configure the connected server",
+        MenuChoice::ProvidersAndModels,
     ),
     (
         "Settings    — FLEETY_* values (connection, this device, server)",
@@ -575,7 +655,7 @@ fn menu_step(len: usize, idx: usize, key: KeyCode) -> (usize, Option<usize>) {
 }
 
 /// `fleety config` (bare, on a TTY): a top-level menu — pick what to configure
-/// (Providers / Models / Settings) and drill into it; Esc/q leaves. Each item
+/// (Providers & Models / Settings) and drill into it; Esc/q leaves. Each item
 /// runs its own screen and returns here.
 pub async fn run() -> Result<()> {
     loop {
@@ -587,7 +667,7 @@ pub async fn run() -> Result<()> {
             // (Never a local file — providers live on the server.) A failure here
             // (e.g. server unreachable) returns to the menu rather than tearing
             // down the whole config session.
-            Some(MenuChoice::Providers) | Some(MenuChoice::Models) => {
+            Some(MenuChoice::ProvidersAndModels) => {
                 if let Err(e) = crate::config::provider_edit_remote().await {
                     eprintln!("\n{}", e.report().message);
                     eprint!("(press Enter to return to the menu) ");
@@ -662,23 +742,6 @@ fn render_menu(f: &mut Frame, sel: usize) {
     );
 }
 
-/// Launch the interactive providers/models editor over **this host's own**
-/// `providers.toml` — the explicit `fleety config --target local provider edit`
-/// escape hatch (editing a local file directly, e.g. on a server host). The
-/// menu and the default (server) `provider edit` go through
-/// [`crate::config::provider_edit_remote`] instead, which edits the connected
-/// server's providers over the wire. When the editor asks for an OAuth action,
-/// run it after the full-screen UI is torn down, then reopen.
-pub async fn run_providers() -> Result<()> {
-    let path = fleety_tools::providers_config::providers_path();
-    loop {
-        match crate::provider_tui::run(&path)? {
-            None => return Ok(()), // normal quit
-            Some(req) => run_auth_action(&req).await,
-        }
-    }
-}
-
 /// Run a provider's requested OAuth action (the editor exited to let us), print
 /// the outcome, and wait for Enter so the user can read it before the editor
 /// reopens. Switch = sign out then in. Shared by the local and remote editors.
@@ -705,12 +768,12 @@ pub(crate) async fn run_auth_action(req: &crate::provider_tui::AuthRequest) {
     let _ = std::io::stdin().read_line(&mut buf);
 }
 
-/// The three-region settings editor (Connection / This device / Server),
+/// The four-region settings editor (Connection / CLI / Daemon / Server),
 /// launched from the top-level menu's "Settings" item.
 async fn run_settings() -> Result<()> {
     // Resolve + connect, capturing the Welcome so we know the server's config
-    // protocol. On any connection failure, the panel still opens for the local
-    // + connection regions; the server region reports it is unavailable.
+    // protocol. On any connection failure, the panel still opens for the CLI
+    // + connection regions; the daemon and server regions report unavailable.
     let (mut conn, cp): (
         Option<(
             fleety_tools::transport::Sender,
@@ -721,8 +784,8 @@ async fn run_settings() -> Result<()> {
         Ok((streams, cp)) => (Some(streams), Some(cp)),
         Err(e) => {
             eprintln!(
-                "note: could not reach the server ({}) — the Server region is unavailable; \
-                     the Connection and This-device regions still work.",
+                "note: could not reach the server ({}) — the Daemon and Server regions are \
+                     unavailable; the Connection and CLI regions still work.",
                 e.report().message
             );
             (None, None)
@@ -731,10 +794,13 @@ async fn run_settings() -> Result<()> {
     let mut server_supported = false;
     let mut entries: Vec<ConfigEntry> = Vec::new();
     let mut revision = String::new();
+    let mut daemon_supported = false;
+    let mut daemon_entries: Vec<ConfigEntry> = Vec::new();
+    let mut daemon_revision = String::new();
     if let (Some((tx, rx)), Some(cp)) = (conn.as_mut(), cp) {
         server_supported = cp >= 1;
         if server_supported {
-            match pull_snapshot(tx, rx).await {
+            match pull_snapshot(tx, rx, ConfigTarget::Server).await {
                 Ok((rev, es)) => {
                     revision = rev;
                     entries = es;
@@ -743,6 +809,19 @@ async fn run_settings() -> Result<()> {
                     server_supported = false;
                     eprintln!(
                         "note: snapshot failed ({}); Server region read-only.",
+                        e.report().message
+                    );
+                }
+            }
+            match pull_snapshot(tx, rx, ConfigTarget::Device(crate::device_id())).await {
+                Ok((rev, es)) => {
+                    daemon_supported = true;
+                    daemon_revision = rev;
+                    daemon_entries = es;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "note: daemon config is unavailable ({}); no local fallback will be used.",
                         e.report().message
                     );
                 }
@@ -769,7 +848,12 @@ async fn run_settings() -> Result<()> {
             });
     }
     let local_map = fleety_tools::config::load(&fleety_tools::config::config_path());
-    let mut app = Panel::new(conns, local_map, server_supported, entries, revision);
+    let mut app = Panel::new(
+        conns,
+        local_map,
+        RemoteRegionState::new(daemon_supported, daemon_entries, daemon_revision),
+        RemoteRegionState::new(server_supported, entries, revision),
+    );
 
     // Key events arrive over a channel from a blocking reader thread.
     let (key_tx, mut key_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -786,50 +870,79 @@ async fn run_settings() -> Result<()> {
     });
 
     let mut terminal = ratatui::init();
-    let result: Result<()> = loop {
-        if let Err(e) = terminal.draw(|f| render(f, &app)) {
-            break Err(CoreError::Message(format!("draw failed: {e}")));
-        }
-        if app.quit {
-            break Ok(());
-        }
-        let Some(code) = key_rx.recv().await else {
-            break Ok(());
-        };
-        let persist = on_key(&mut app, code);
-        // Connection "save" is signalled via a status sentinel.
-        if app.status == "__save_conns__" {
-            app.status = match connection::save(&app.conns) {
-                Ok(()) => "saved connections".to_string(),
-                Err(e) => format!("save failed: {}", e.report().message),
-            };
-        }
-        if persist {
-            if let Err(e) =
-                fleety_tools::config::save(&fleety_tools::config::config_path(), &app.local_map)
-            {
-                app.status = format!("save failed: {}", e.report().message);
+    let result: Result<()> =
+        loop {
+            if let Err(e) = terminal.draw(|f| render(f, &app)) {
+                break Err(CoreError::Message(format!("draw failed: {e}")));
             }
-        }
-        if app.apply_now {
-            app.apply_now = false;
-            if let Some((tx, rx)) = conn.as_mut() {
-                let changes: Vec<ConfigChange> = app.staged.values().cloned().collect();
-                app.status = match apply_changes(tx, rx, &app.revision, changes).await {
-                    Ok(msg) => {
-                        app.staged.clear();
-                        // Re-pull so the revision + values reflect the applied state.
-                        if let Ok((rev, es)) = pull_snapshot(tx, rx).await {
-                            app.revision = rev;
-                            app.entries = es;
-                        }
-                        msg
-                    }
-                    Err(e) => format!("apply failed: {}", e.report().message),
+            if app.quit {
+                break Ok(());
+            }
+            let Some(code) = key_rx.recv().await else {
+                break Ok(());
+            };
+            let persist = on_key(&mut app, code);
+            // Connection "save" is signalled via a status sentinel.
+            if app.status == "__save_conns__" {
+                app.status = match connection::save(&app.conns) {
+                    Ok(()) => "saved connections".to_string(),
+                    Err(e) => format!("save failed: {}", e.report().message),
                 };
             }
-        }
-    };
+            if persist {
+                if let Err(e) = fleety_tools::config::replace_scopes_strict(
+                    &fleety_tools::config::config_path(),
+                    fleety_tools::config::CLI_SCOPES,
+                    &app.local_map,
+                ) {
+                    app.status = format!("save failed: {}", e.report().message);
+                }
+            }
+            if app.apply_now {
+                app.apply_now = false;
+                if let Some((tx, rx)) = conn.as_mut() {
+                    let changes: Vec<ConfigChange> = app.staged.values().cloned().collect();
+                    app.status =
+                        match apply_changes(tx, rx, ConfigTarget::Server, &app.revision, changes)
+                            .await
+                        {
+                            Ok(msg) => {
+                                app.staged.clear();
+                                // Re-pull so the revision + values reflect the applied state.
+                                if let Ok((rev, es)) =
+                                    pull_snapshot(tx, rx, ConfigTarget::Server).await
+                                {
+                                    app.revision = rev;
+                                    app.entries = es;
+                                }
+                                msg
+                            }
+                            Err(e) => format!("apply failed: {}", e.report().message),
+                        };
+                }
+            }
+            if app.apply_daemon_now {
+                app.apply_daemon_now = false;
+                if let Some((tx, rx)) = conn.as_mut() {
+                    let changes: Vec<ConfigChange> = app.daemon_staged.values().cloned().collect();
+                    let target = ConfigTarget::Device(crate::device_id());
+                    app.status =
+                        match apply_changes(tx, rx, target.clone(), &app.daemon_revision, changes)
+                            .await
+                        {
+                            Ok(msg) => {
+                                app.daemon_staged.clear();
+                                if let Ok((rev, es)) = pull_snapshot(tx, rx, target).await {
+                                    app.daemon_revision = rev;
+                                    app.daemon_entries = es;
+                                }
+                                msg
+                            }
+                            Err(e) => format!("daemon apply failed: {}", e.report().message),
+                        };
+                }
+            }
+        };
     ratatui::restore();
     if let Some((mut tx, _)) = conn {
         let _ = tx.close().await;
@@ -841,14 +954,9 @@ async fn run_settings() -> Result<()> {
 async fn pull_snapshot(
     tx: &mut fleety_tools::transport::Sender,
     rx: &mut fleety_tools::transport::Receiver,
+    target: ConfigTarget,
 ) -> Result<(String, Vec<ConfigEntry>)> {
-    crate::send(
-        tx,
-        &ClientMsg::ConfigSnapshot {
-            target: ConfigTarget::Server,
-        },
-    )
-    .await?;
+    crate::send(tx, &ClientMsg::ConfigSnapshot { target }).await?;
     match crate::recv(rx).await? {
         Some(ServerMsg::ConfigSnapshotResult {
             revision, entries, ..
@@ -864,13 +972,14 @@ async fn pull_snapshot(
 async fn apply_changes(
     tx: &mut fleety_tools::transport::Sender,
     rx: &mut fleety_tools::transport::Receiver,
+    target: ConfigTarget,
     base_revision: &str,
     changes: Vec<ConfigChange>,
 ) -> Result<String> {
     crate::send(
         tx,
         &ClientMsg::ConfigApply {
-            target: ConfigTarget::Server,
+            target,
             base_revision: base_revision.to_string(),
             changes,
             providers_json: None,
@@ -928,9 +1037,8 @@ mod tests {
         Panel::new(
             Connections::default(),
             fleety_tools::config::ConfigMap::new(),
-            true,
-            entries,
-            "rev-1".to_string(),
+            RemoteRegionState::new(false, vec![], String::new()),
+            RemoteRegionState::new(true, entries, "rev-1".to_string()),
         )
     }
 
@@ -964,11 +1072,13 @@ mod tests {
     }
 
     #[test]
-    fn tab_cycles_three_regions() {
+    fn tab_cycles_four_regions() {
         let mut p = panel_with_entries(vec![]);
         assert!(matches!(p.region, Region::Connection));
         on_key(&mut p, KeyCode::Tab);
-        assert!(matches!(p.region, Region::Local));
+        assert!(matches!(p.region, Region::Cli));
+        on_key(&mut p, KeyCode::Tab);
+        assert!(matches!(p.region, Region::Daemon));
         on_key(&mut p, KeyCode::Tab);
         assert!(matches!(p.region, Region::Server));
         on_key(&mut p, KeyCode::Tab);
@@ -1018,16 +1128,15 @@ mod tests {
         let mut p = Panel::new(
             Connections::default(),
             fleety_tools::config::ConfigMap::new(),
-            false,
-            vec![],
-            String::new(),
+            RemoteRegionState::new(
+                true,
+                vec![entry("FLEETY_TZ", "UTC", false)],
+                "daemon-rev".into(),
+            ),
+            RemoteRegionState::new(false, vec![], String::new()),
         );
-        p.region = Region::Local;
-        p.sel = p
-            .local
-            .iter()
-            .position(|r| r.0 == "FLEETY_TZ")
-            .expect("FLEETY_TZ row present by default");
+        p.region = Region::Daemon;
+        p.sel = 0;
         // Enter opens the timezone picker, not a free-text editor.
         assert!(!on_key(&mut p, KeyCode::Enter));
         assert!(p.tz_pick.is_some());
@@ -1035,36 +1144,37 @@ mod tests {
         for c in "taipei".chars() {
             on_key(&mut p, KeyCode::Char(c));
         }
-        // Enter commits the single match and signals a local-file write.
-        assert!(on_key(&mut p, KeyCode::Enter));
+        // Enter commits the single match into daemon staging, never a local file.
+        assert!(!on_key(&mut p, KeyCode::Enter));
         assert!(p.tz_pick.is_none());
         assert_eq!(
-            p.local_map
-                .get(&(fleety_tools::config::Scope::Shared, "FLEETY_TZ".to_string()))
-                .map(String::as_str),
+            p.daemon_staged
+                .get("FLEETY_TZ")
+                .and_then(|change| change.value.as_deref()),
             Some("Asia/Taipei")
         );
     }
 
     #[test]
     fn fleety_tz_device_option_clears_to_follow_the_machine() {
-        let mut map = fleety_tools::config::ConfigMap::new();
-        map.insert(
-            (fleety_tools::config::Scope::Shared, "FLEETY_TZ".to_string()),
-            "Asia/Taipei".to_string(),
+        let mut p = Panel::new(
+            Connections::default(),
+            fleety_tools::config::ConfigMap::new(),
+            RemoteRegionState::new(
+                true,
+                vec![entry("FLEETY_TZ", "Asia/Taipei", false)],
+                "daemon-rev".into(),
+            ),
+            RemoteRegionState::new(false, vec![], String::new()),
         );
-        let mut p = Panel::new(Connections::default(), map, false, vec![], String::new());
-        p.region = Region::Local;
-        p.sel = p
-            .local
-            .iter()
-            .position(|r| r.0 == "FLEETY_TZ")
-            .expect("FLEETY_TZ row");
+        p.region = Region::Daemon;
+        p.sel = 0;
         on_key(&mut p, KeyCode::Enter); // open picker (empty filter → device at index 0)
-        assert!(on_key(&mut p, KeyCode::Enter)); // choose device → clears the value
-        assert!(!p
-            .local_map
-            .contains_key(&(fleety_tools::config::Scope::Shared, "FLEETY_TZ".to_string())));
+        assert!(!on_key(&mut p, KeyCode::Enter)); // choose device → stages clear
+        assert_eq!(
+            p.daemon_staged.get("FLEETY_TZ").map(|change| change.op),
+            Some(ChangeOp::Clear)
+        );
     }
 
     #[test]

@@ -557,6 +557,59 @@ pub fn pin_current_fingerprint(seen: &str) -> Result<PinDecision> {
     Ok(decision)
 }
 
+/// Apply trust-on-first-use to one named profile. This is used by commands that
+/// resolved a non-current profile and must not drift to whichever profile is
+/// current when the handshake finishes.
+pub fn pin_profile_fingerprint(name: &str, seen: &str) -> Result<PinDecision> {
+    let mut conns = load()?;
+    let Some(profile) = conns.profiles.get_mut(name) else {
+        return Ok(PinDecision::AlreadyPinned);
+    };
+    let decision = tofu_pin_decision(profile.fingerprint.as_deref(), seen);
+    if decision == PinDecision::Pin {
+        profile.fingerprint = Some(seen.to_string());
+        save(&conns)?;
+    }
+    Ok(decision)
+}
+
+/// Persist pairing material only onto the named profile that supplied the
+/// connection. The URL must still match the resolved snapshot, and a changed
+/// fingerprint is rejected without writing either token or fingerprint.
+pub fn store_profile_pairing(
+    name: &str,
+    expected_url: &str,
+    token: &str,
+    fingerprint: Option<&str>,
+) -> Result<PinDecision> {
+    let mut conns = load()?;
+    let profile = conns.profiles.get_mut(name).ok_or_else(|| {
+        CoreError::Message(format!(
+            "server profile '{name}' disappeared during pairing; no credential was saved"
+        ))
+    })?;
+    if profile.url != expected_url {
+        return Err(CoreError::Message(format!(
+            "server profile '{name}' changed from '{expected_url}' to '{}' during pairing; no credential was saved",
+            profile.url
+        )));
+    }
+    let decision = fingerprint
+        .map(|seen| tofu_pin_decision(profile.fingerprint.as_deref(), seen))
+        .unwrap_or(PinDecision::AlreadyPinned);
+    if decision == PinDecision::IdentityChanged {
+        return Err(CoreError::Message(format!(
+            "server profile '{name}' has a different identity fingerprint; no credential was saved"
+        )));
+    }
+    profile.token = Some(token.to_string());
+    if decision == PinDecision::Pin {
+        profile.fingerprint = fingerprint.map(str::to_string);
+    }
+    save(&conns)?;
+    Ok(decision)
+}
+
 /// The sticky-heal candidate: among `found`, the advertiser whose fingerprint
 /// exactly equals `pinned` and whose URL differs from the failing one. Anything
 /// fingerprint-less or different is excluded — the stored token is never handed

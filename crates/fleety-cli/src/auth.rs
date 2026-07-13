@@ -14,7 +14,10 @@ use fleety_tools::providers_config::ProvidersConfig;
 use fleety_tools::transport::{Receiver as Rx, Sender as Tx};
 use fleety_tools::{connection, oauth};
 
-use crate::{connect_hello_for_auth, recv, send};
+use crate::{
+    connect_hello_for_auth, connect_hello_for_auth_target, connect_hello_for_auth_transaction,
+    recv, send,
+};
 
 /// The credential kind this command manages on the server.
 const CREDENTIAL_KIND: &str = "codex-oauth";
@@ -32,31 +35,44 @@ fn now_secs() -> u64 {
 pub async fn run(args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
         Some("login") => {
-            let no_browser = args.iter().any(|a| a == "--no-browser");
-            match first_positional(&args[1..]) {
-                Some(provider) => login(&provider, no_browser).await,
-                None => Err(usage_error("login")),
+            let mut provider = None;
+            let mut no_browser = false;
+            for arg in &args[1..] {
+                if arg == "--no-browser" && !no_browser {
+                    no_browser = true;
+                } else if arg.starts_with('-') || provider.is_some() {
+                    return Err(CoreError::Message(format!(
+                        "unexpected auth login argument '{arg}'. Usage: fleety auth login <provider> [--no-browser]"
+                    )));
+                } else {
+                    provider = Some(arg.clone());
+                }
             }
+            let provider = provider.ok_or_else(|| usage_error("login"))?;
+            login(&provider, no_browser).await
         }
-        Some("logout") => match first_positional(&args[1..]) {
-            Some(provider) => logout(&provider).await,
-            None => Err(usage_error("logout")),
-        },
-        Some("status") => status(first_positional(&args[1..])).await,
-        _ => {
+        Some("logout") if args.len() == 2 && !args[1].starts_with('-') => logout(&args[1]).await,
+        Some("logout") => Err(usage_error("logout")),
+        Some("status")
+            if args.len() <= 2 && args.get(1).map_or(true, |a| !a.starts_with('-')) =>
+        {
+            status(args.get(1).cloned()).await
+        }
+        Some("help" | "--help" | "-h") if args.len() == 1 => {
             println!(
                 "usage: fleety auth <login <provider> | logout <provider> | status [<provider>]> \
                  [--no-browser]"
             );
             Ok(())
         }
+        None => Err(CoreError::Message(
+            "usage: fleety auth <login <provider> | logout <provider> | status [<provider>]> [--no-browser]"
+                .to_string(),
+        )),
+        Some(other) => Err(CoreError::Message(format!(
+            "unknown auth command '{other}'. Usage: fleety auth <login|logout|status>"
+        ))),
     }
-}
-
-/// The first positional (non-flag) argument — the provider name after the
-/// subcommand. Flags start with `--`. Pure.
-fn first_positional(args: &[String]) -> Option<String> {
-    args.iter().find(|a| !a.starts_with("--")).cloned()
 }
 
 /// A missing-provider usage error naming an example. Pure.
@@ -243,9 +259,9 @@ pub async fn login(provider: &str, no_browser: bool) -> Result<()> {
     // too-old server must not cost the user a full authorization round-trip.
     // This probe connection is then dropped — the authorization can take minutes
     // and an idle link would trip the keepalive; delivery reconnects afresh.
-    {
-        let (mut tx, mut rx, config_protocol, _target) =
-            connect_hello_for_auth().await.map_err(|e| {
+    let (target, preflight_fingerprint) = {
+        let (mut tx, mut rx, config_protocol, target, fingerprint) =
+            connect_hello_for_auth_transaction().await.map_err(|e| {
                 CoreError::Message(format!(
                     "could not reach the server that would store this login: {} — check the \
                      connection (`fleety status`), pair this device first (`fleety pair <code>`), \
@@ -260,7 +276,14 @@ pub async fn login(provider: &str, no_browser: bool) -> Result<()> {
         // oauth:codex provider on this server.
         let providers = fetch_providers(&mut tx, &mut rx).await?;
         validate_codex_provider(&providers, provider)?;
-    }
+        let fingerprint = fingerprint.ok_or_else(|| {
+            CoreError::Message(
+                "the server does not advertise a stable identity fingerprint; update it before OAuth login so credentials cannot be delivered to a different server"
+                    .to_string(),
+            )
+        })?;
+        (target, fingerprint)
+    };
 
     let verifier = oauth::generate_verifier();
     let challenge = oauth::challenge_for(&verifier);
@@ -302,8 +325,8 @@ pub async fn login(provider: &str, no_browser: bool) -> Result<()> {
     // very split-brain this flow removes).
     let payload_json = serde_json::to_string(&tokens)
         .map_err(|e| CoreError::Message(format!("serialize tokens: {e}")))?;
-    let (mut tx, mut rx, config_protocol, target) =
-        connect_hello_for_auth().await.map_err(|e| {
+    let (mut tx, mut rx, config_protocol, delivery_fingerprint) =
+        connect_hello_for_auth_target(&target).await.map_err(|e| {
             CoreError::Message(format!(
                 "authorization succeeded, but the server could not be reached to store it: {} — \
              re-run `fleety auth login` once the connection is back",
@@ -312,6 +335,12 @@ pub async fn login(provider: &str, no_browser: bool) -> Result<()> {
         })?;
     if let Some(err) = credential_support_err(config_protocol) {
         return Err(err);
+    }
+    if delivery_fingerprint.as_deref() != Some(preflight_fingerprint.as_str()) {
+        return Err(CoreError::Message(
+            "the server identity changed during OAuth login; credential delivery was refused. Verify the selected server and re-run login"
+                .to_string(),
+        ));
     }
     send(
         &mut tx,
@@ -513,9 +542,38 @@ fn parse_callback(request_line: &str, expected_state: &str) -> Result<String> {
 /// Accept one loopback connection, parse the callback, verify state, and reply
 /// with a small close-the-window page. Returns the authorization code.
 fn wait_for_code(listener: &TcpListener, expected_state: &str) -> Result<String> {
-    let (mut stream, _) = listener
-        .accept()
-        .map_err(|e| CoreError::Message(format!("loopback accept failed: {e}")))?;
+    wait_for_code_with_timeout(
+        listener,
+        expected_state,
+        std::time::Duration::from_secs(180),
+    )
+}
+
+fn wait_for_code_with_timeout(
+    listener: &TcpListener,
+    expected_state: &str,
+    timeout: std::time::Duration,
+) -> Result<String> {
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| CoreError::Message(format!("could not configure OAuth callback: {e}")))?;
+    let deadline = std::time::Instant::now() + timeout;
+    let (mut stream, _) = loop {
+        match listener.accept() {
+            Ok(pair) => break pair,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(CoreError::Message(format!(
+                        "OAuth callback did not arrive within {} seconds. Close any stale browser tab and re-run `fleety auth login`",
+                        timeout.as_secs()
+                    )));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => return Err(CoreError::Message(format!("loopback accept failed: {e}"))),
+        }
+    };
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
     let mut buf = [0u8; 4096];
     let n = stream.read(&mut buf).unwrap_or(0);
     let request = String::from_utf8_lossy(&buf[..n]);
@@ -541,26 +599,6 @@ fn wait_for_code(listener: &TcpListener, expected_state: &str) -> Result<String>
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn s(v: &[&str]) -> Vec<String> {
-        v.iter().map(|x| x.to_string()).collect()
-    }
-
-    #[test]
-    fn first_positional_skips_flags() {
-        // The provider is the first non-flag arg; flags anywhere are skipped.
-        assert_eq!(
-            first_positional(&s(&["my-codex", "--no-browser"])),
-            Some("my-codex".to_string())
-        );
-        assert_eq!(
-            first_positional(&s(&["--no-browser", "my-codex"])),
-            Some("my-codex".to_string())
-        );
-        // No provider (only flags, or empty) → None → the caller raises a usage error.
-        assert_eq!(first_positional(&s(&["--no-browser"])), None);
-        assert_eq!(first_positional(&s(&[])), None);
-    }
 
     #[test]
     fn usage_error_names_the_subcommand_and_an_example() {
@@ -726,5 +764,16 @@ mod tests {
         let code = wait_for_code(&listener, "st-9").expect("code");
         assert_eq!(code, "the-code");
         h.join().expect("join");
+    }
+
+    #[test]
+    fn wait_for_code_has_a_finite_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let started = std::time::Instant::now();
+        let err =
+            wait_for_code_with_timeout(&listener, "never", std::time::Duration::from_millis(25))
+                .expect_err("missing callback must time out");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(err.to_string().contains("re-run"));
     }
 }

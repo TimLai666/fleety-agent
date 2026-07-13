@@ -4,6 +4,7 @@
 //! file. Endpoints and the client id are overridable via config; see `config.rs`.
 
 use std::collections::HashSet;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use agent_core::{CodexAuth, CoreError, Result};
@@ -150,17 +151,49 @@ pub fn load_tokens(path: &Path) -> Option<Tokens> {
 /// Persist tokens to `path`, creating the directory and restricting the file to
 /// owner-only (mode 0600) on Unix. Never written into the config/providers file.
 pub fn save_tokens(path: &Path, tokens: &Tokens) -> Result<()> {
+    save_tokens_with(path, tokens, |_| Ok(()))
+}
+
+fn save_tokens_with(
+    path: &Path,
+    tokens: &Tokens,
+    before_replace: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| CoreError::Message(format!("cannot create token dir: {e}")))?;
     }
     let json = serde_json::to_string_pretty(tokens)
         .map_err(|e| CoreError::Message(format!("serialize tokens: {e}")))?;
-    std::fs::write(path, json).map_err(|e| CoreError::Message(format!("write tokens: {e}")))?;
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let tmp = parent.join(format!(".fleety-oauth-{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| -> std::io::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        file.write_all(json.as_bytes())?;
+        file.sync_all()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        }
+        before_replace(&tmp)?;
+        std::fs::rename(&tmp, path)
+    })();
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(CoreError::Message(format!("write tokens: {e}")));
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| CoreError::Message(format!("protect token file: {e}")))?;
     }
     Ok(())
 }
@@ -767,6 +800,40 @@ mod tests {
         clear_tokens(&path).expect("clear again (missing ok)");
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn token_replace_failure_preserves_existing_bytes() {
+        let path = temp_token_path();
+        std::fs::create_dir_all(path.parent().expect("token parent")).expect("create token dir");
+        std::fs::write(&path, b"original-token-bytes").expect("seed token file");
+        let tokens = Tokens {
+            access_token: "new-at".into(),
+            refresh_token: "new-rt".into(),
+            expires_at_secs: 1_000,
+            token_type: "Bearer".into(),
+            account_id: None,
+        };
+        let result = save_tokens_with(&path, &tokens, |_| {
+            Err(std::io::Error::other("injected replace failure"))
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read(&path).expect("read original"),
+            b"original-token-bytes"
+        );
+        let leftovers = std::fs::read_dir(path.parent().expect("token parent"))
+            .expect("list token dir")
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".fleety-oauth-")
+            })
+            .count();
+        assert_eq!(leftovers, 0, "failed replace must clean its temporary file");
+        let _ = std::fs::remove_dir_all(path.parent().expect("token parent"));
     }
 
     fn fake_jwt(claims: serde_json::Value) -> String {

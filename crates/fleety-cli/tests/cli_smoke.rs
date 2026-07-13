@@ -119,8 +119,41 @@ fn run_against_server(
         .output()
         .expect("run fleety");
     let received = rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("server received frames");
+        .recv_timeout(Duration::from_secs(15))
+        .unwrap_or_else(|e| {
+            panic!(
+                "server received frames ({e:?}); stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+    (output, received)
+}
+
+fn run_against_profile(
+    args: &[&str],
+    home: &TempHome,
+    rx: mpsc::Receiver<Vec<ClientMsg>>,
+) -> (std::process::Output, Vec<ClientMsg>) {
+    let output = Command::new(env!("CARGO_BIN_EXE_fleety"))
+        .args(args)
+        .env("HOME", &home.0)
+        .env("USERPROFILE", &home.0)
+        .env("FLEETY_DEVICE_ID", "cli-smoke")
+        .env_remove("FLEETY_AGENT_URL")
+        .env_remove("FLEETY_TOKEN")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run fleety");
+    let received = rx
+        .recv_timeout(Duration::from_secs(15))
+        .unwrap_or_else(|e| {
+            panic!(
+                "profile server received frames ({e:?}); stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
     (output, received)
 }
 
@@ -145,6 +178,25 @@ fn no_args_prints_top_level_help() {
 }
 
 #[test]
+fn help_and_version_do_not_create_or_migrate_user_files() {
+    for arg in ["--help", "--version"] {
+        let home = TempHome::new(&format!("query-{}", arg.trim_start_matches('-')));
+        let output = Command::new(env!("CARGO_BIN_EXE_fleety"))
+            .arg(arg)
+            .env("HOME", &home.0)
+            .env("USERPROFILE", &home.0)
+            .env_remove("FLEETY_AGENT_URL")
+            .output()
+            .expect("run query");
+        assert!(output.status.success(), "{arg}");
+        assert!(
+            !home.0.join(".fleety").exists(),
+            "{arg} must be side-effect free"
+        );
+    }
+}
+
+#[test]
 fn unknown_command_errors_to_stderr_with_nonzero_exit() {
     let output = run(&["frobnicate"]);
     assert_eq!(output.status.code(), Some(2));
@@ -163,6 +215,12 @@ fn usage_errors_return_before_network_work() {
         &["rollback"][..],
         &["rollback", "apply"][..],
         &["pair"][..],
+        &["pair", "one", "extra"][..],
+        &["pair-code", "extra"][..],
+        &["status", "extra"][..],
+        &["voice", "extra"][..],
+        &["update", "extra"][..],
+        &["conversations", "not-a-number"][..],
     ] {
         let output = run(args);
         // Usage mistakes exit 2 so scripts can tell them from runtime failures.
@@ -170,6 +228,63 @@ fn usage_errors_return_before_network_work() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("usage:"), "{args:?}: {stderr}");
     }
+}
+
+#[test]
+fn config_owner_failures_never_fall_back_to_local_files() {
+    let home = TempHome::new("config-owner-boundary");
+    let fleety_dir = home.0.join(".fleety");
+    std::fs::create_dir_all(&fleety_dir).expect("create .fleety");
+    let config_path = fleety_dir.join("config.toml");
+    let providers_path = fleety_dir.join("providers.toml");
+    std::fs::write(&config_path, "[cli]\nFLEETY_VOICE_AUDIO = \"auto\"\n").expect("seed config");
+    std::fs::write(&providers_path, "# provider sentinel\n").expect("seed providers");
+    let config_before = std::fs::read(&config_path).expect("config bytes");
+    let providers_before = std::fs::read(&providers_path).expect("provider bytes");
+
+    let run_owner = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_fleety"))
+            .args(args)
+            .env("HOME", &home.0)
+            .env("USERPROFILE", &home.0)
+            .env("FLEETY_MDNS_DISABLED", "1")
+            .env_remove("FLEETY_AGENT_URL")
+            .output()
+            .expect("run config")
+    };
+
+    let local_provider = run_owner(&["config", "--target", "local", "provider", "edit"]);
+    assert!(!local_provider.status.success());
+    assert!(String::from_utf8_lossy(&local_provider.stderr).contains("owned by server"));
+
+    for args in [
+        &["config", "set", "FLEETY_TZ", "UTC"][..],
+        &["config", "set", "FLEETY_ADDR", "127.0.0.1:9999"][..],
+    ] {
+        let output = run_owner(args);
+        assert!(!output.status.success(), "{args:?}");
+    }
+    assert_eq!(
+        std::fs::read(&config_path).expect("config unchanged"),
+        config_before
+    );
+    assert_eq!(
+        std::fs::read(&providers_path).expect("providers unchanged"),
+        providers_before
+    );
+
+    let cli_write = run_owner(&["config", "set", "FLEETY_VOICE_AUDIO", "off"]);
+    assert!(
+        cli_write.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cli_write.stderr)
+    );
+    let config_after = std::fs::read_to_string(&config_path).expect("read CLI config");
+    assert!(config_after.contains("FLEETY_VOICE_AUDIO = \"off\""));
+    assert_eq!(
+        std::fs::read(&providers_path).expect("providers still unchanged"),
+        providers_before
+    );
 }
 
 #[test]
@@ -198,10 +313,18 @@ fn init_and_pair_write_the_connection_profile() {
         "made current: {conns}"
     );
 
-    // `fleety pair <code>` enrolls the current server and writes the minted token
-    // onto that profile (here the connect target is the env-override server).
+    // `fleety pair <code>` requires a named profile and writes only that
+    // profile. Point the verified profile at the pairing fixture first.
     let (pair_url, pair_rx) = start_ws_server(vec![vec![welcome(Some("pair-token"))]]);
-    let (output, received) = run_against_server(&["pair", "PAIR-1"], &pair_url, &home, pair_rx);
+    let set_url = Command::new(env!("CARGO_BIN_EXE_fleety"))
+        .args(["server", "set-url", "default", pair_url.as_str()])
+        .env("HOME", &home.0)
+        .env("USERPROFILE", &home.0)
+        .env_remove("FLEETY_AGENT_URL")
+        .output()
+        .expect("set profile URL");
+    assert!(set_url.status.success());
+    let (output, received) = run_against_profile(&["pair", "PAIR-1"], &home, pair_rx);
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("token saved"));
     assert!(matches!(
@@ -430,7 +553,7 @@ fn resume_audit_and_rollback_render_server_results() {
         }],
     ]);
     let (output, received) = run_against_server(&["rollback", "apply", "b1"], &url, &home, rx);
-    assert!(output.status.success());
+    assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("missing backup"));
     assert!(matches!(
         received.get(1),
@@ -480,7 +603,7 @@ fn commands_render_server_errors_without_panicking() {
 
     let (output, received) = run_against_server(&["audit", "list"], &url, &home, rx);
 
-    assert!(output.status.success());
+    assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("server said no"));
     assert_eq!(received.len(), 2);
 }
@@ -494,7 +617,6 @@ fn network_commands_report_connection_errors_without_panicking() {
         &["audit", "show", "1"][..],
         &["rollback", "list"][..],
         &["rollback", "apply", "b1"][..],
-        &["pair", "PAIR-1"][..],
     ] {
         let output = run_with_rejecting_agent(args);
         // Connection failures exit non-zero so `fleety … && next` behaves.
@@ -505,6 +627,14 @@ fn network_commands_report_connection_errors_without_panicking() {
             "{args:?}: {stderr}"
         );
     }
+
+    let output = run_with_rejecting_agent(&["pair", "PAIR-1"]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("named server profile"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let url = rejecting_ws_url();
     let output = run(&["init", &url]);
@@ -530,7 +660,11 @@ fn init_pair_and_ask_report_unexpected_server_frames() {
     let (url, rx) = start_ws_server(vec![vec![server_error.clone()]]);
     let (output, _) = run_against_server(&["init", &url], &url, &home, rx);
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("unexpected reply during init"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("server rejected init") && stderr.contains("wrong frame"),
+        "{stderr}"
+    );
 
     let (url, rx) = start_ws_server(vec![vec![server_error]]);
     let (output, _) = run_against_server(&["ask", "hi"], &url, &home, rx);
@@ -544,7 +678,15 @@ fn init_pair_and_ask_report_unexpected_server_frames() {
     );
 
     let (url, rx) = start_ws_server(vec![vec![welcome(None)]]);
-    let (output, _) = run_against_server(&["pair", "PAIR-2"], &url, &home, rx);
+    let add = Command::new(env!("CARGO_BIN_EXE_fleety"))
+        .args(["server", "add", "default", url.as_str(), "--use"])
+        .env("HOME", &home.0)
+        .env("USERPROFILE", &home.0)
+        .env_remove("FLEETY_AGENT_URL")
+        .output()
+        .expect("add pair profile");
+    assert!(add.status.success());
+    let (output, _) = run_against_profile(&["pair", "PAIR-2"], &home, rx);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("server returned no token"));
 }

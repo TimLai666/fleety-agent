@@ -22,7 +22,9 @@ mod winsvc;
 
 use agent_core::{obs, Result};
 
-use fleety_protocol::{ClientMsg, ServerMsg, WireError, PROTOCOL_VERSION};
+use fleety_protocol::{
+    ChangeOp, ClientMsg, ConfigChange, ConfigEntry, Effect, ServerMsg, WireError, PROTOCOL_VERSION,
+};
 use fleety_tools::connection::{self, Target};
 
 /// Persist a freshly-minted token onto the current profile in connections.toml
@@ -61,7 +63,57 @@ fn clear_current_token() -> Result<()> {
     Ok(())
 }
 
+const USAGE: &str = "Usage: fleetyd [COMMAND]\n\nCommands:\n  run-service  Run as the installed OS service\n  install      Install the OS service\n  uninstall    Remove the OS service\n  start        Start the installed service\n  stop         Stop the installed service\n  restart      Restart the installed service\n  enable       Enable service startup at boot\n  disable      Disable service startup at boot\n  status       Show service status\n  update       Update fleetyd and its host components\n  config ...   Inspect or edit daemon-owned settings\n  version      Print the version\n  help         Print this help\n\nWith no command, fleetyd runs in the foreground.";
+
+fn is_help(args: &[String]) -> bool {
+    matches!(args, [arg] if matches!(arg.as_str(), "help" | "--help" | "-h"))
+}
+
+fn validate_command_line(args: &[String]) -> std::result::Result<(), String> {
+    let Some(command) = args.first().map(String::as_str) else {
+        return Ok(());
+    };
+    if command == "config" {
+        return Ok(());
+    }
+    let known = matches!(
+        command,
+        "run-service"
+            | "install"
+            | "uninstall"
+            | "start"
+            | "stop"
+            | "restart"
+            | "enable"
+            | "disable"
+            | "status"
+            | "update"
+            | "version"
+            | "--version"
+            | "-v"
+            | "-V"
+    );
+    if !known {
+        return Err(format!("unknown command '{command}'"));
+    }
+    if args.len() != 1 {
+        return Err(format!("command '{command}' does not accept arguments"));
+    }
+    Ok(())
+}
+
 fn main() -> std::process::ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if is_help(&args) {
+        println!("{USAGE}");
+        return std::process::ExitCode::SUCCESS;
+    }
+    if let Err(message) = validate_command_line(&args) {
+        eprintln!("error: {message}\n\n{USAGE}");
+        return std::process::ExitCode::FAILURE;
+    }
+    let cmd = args.first().cloned();
+
     obs::init();
     // Seed env from ~/.fleety/config.toml before reading env (env still wins;
     // only unset keys are filled). Best-effort.
@@ -71,13 +123,10 @@ fn main() -> std::process::ExitCode {
     // One-time, idempotent migration of the legacy config.json / fleetyd.token
     // into connections.toml (best-effort; a fresh device has nothing to migrate).
     let _ = connection::migrate_from_config_json();
-    let cmd = std::env::args().nth(1);
-
     // `config ...` inspects/edits this host's settings, then exits — no runtime
     // needed. Same command surface as `fleety config`.
     if cmd.as_deref() == Some("config") {
-        let args: Vec<String> = std::env::args().skip(2).collect();
-        if let Err(e) = fleety_tools::config::run(&args) {
+        if let Err(e) = fleety_tools::config::run(&args[1..]) {
             let report = e.report();
             eprintln!("error: {}", report.message);
             if let Some(hint) = report.remediation {
@@ -431,6 +480,161 @@ fn device_id() -> String {
         .unwrap_or_else(|_| fleety_tools::device::device_id())
 }
 
+const INTERNAL_CONFIG_TOOL: &str = "__fleety_internal_config";
+
+fn config_failure(kind: &str, message: impl Into<String>) -> serde_json::Value {
+    serde_json::json!({ "ok": false, "kind": kind, "message": message.into() })
+}
+
+fn internal_config(tool: &str, args: &serde_json::Value) -> Option<Result<serde_json::Value>> {
+    if tool != INTERNAL_CONFIG_TOOL {
+        return None;
+    }
+    let result = (|| -> Result<serde_json::Value> {
+        let op = args
+            .get("op")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                agent_core::CoreError::Message("internal config request is missing op".to_string())
+            })?;
+        let path = fleety_tools::config::config_path();
+        match op {
+            "exec" => {
+                let command: Vec<String> = serde_json::from_value(
+                    args.get("args")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!([])),
+                )
+                .map_err(|e| {
+                    agent_core::CoreError::Message(format!("invalid config arguments: {e}"))
+                })?;
+                if matches!(
+                    command.first().map(String::as_str),
+                    Some("provider" | "model")
+                ) {
+                    return Ok(config_failure(
+                        "wrong_owner",
+                        "provider and model configuration is owned by fleety-server",
+                    ));
+                }
+                match fleety_tools::config::run_rendered_scoped(
+                    &command,
+                    Some(fleety_tools::config::DAEMON_SCOPES),
+                ) {
+                    Ok(output) => Ok(serde_json::json!({
+                        "ok": true,
+                        "output": output,
+                        "effect": fleety_tools::config::config_effect(&command).map(|_| Effect::Restart),
+                    })),
+                    Err(e) => Ok(config_failure("invalid", e.report().message)),
+                }
+            }
+            "snapshot" => match fleety_tools::config::load_strict(&path) {
+                Ok(map) => {
+                    let entries: Vec<ConfigEntry> = fleety_tools::config::snapshot_entries(
+                        &map,
+                        Some(fleety_tools::config::DAEMON_SCOPES),
+                    )
+                    .into_iter()
+                    .map(|entry| ConfigEntry {
+                        key: entry.key.to_string(),
+                        scope: entry.scope.as_str().to_string(),
+                        value: entry.value,
+                        default: entry.default.to_string(),
+                        description: entry.description.to_string(),
+                        secret: entry.secret,
+                        is_set: entry.is_set,
+                        effect: Some(Effect::Restart),
+                        choices: entry.choices.into_iter().map(str::to_string).collect(),
+                    })
+                    .collect();
+                    Ok(serde_json::json!({
+                        "ok": true,
+                        "revision": fleety_tools::config::revision(&path),
+                        "entries": entries,
+                    }))
+                }
+                Err(e) => Ok(config_failure("invalid_config", e.report().message)),
+            },
+            "apply" => {
+                let base_revision = args
+                    .get("base_revision")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        agent_core::CoreError::Message(
+                            "internal config apply is missing base_revision".to_string(),
+                        )
+                    })?;
+                let changes: Vec<ConfigChange> = serde_json::from_value(
+                    args.get("changes")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!([])),
+                )
+                .map_err(|e| {
+                    agent_core::CoreError::Message(format!("invalid config changes: {e}"))
+                })?;
+                let applied = changes
+                    .iter()
+                    .filter(|change| !matches!(change.op, ChangeOp::Keep))
+                    .count();
+                let mutation =
+                    fleety_tools::config::mutate_strict_at_revision(&path, base_revision, |map| {
+                        for change in &changes {
+                            fleety_tools::config::ensure_scope(
+                                &change.key,
+                                fleety_tools::config::DAEMON_SCOPES,
+                            )?;
+                            let setting =
+                                fleety_tools::config::find(&change.key).ok_or_else(|| {
+                                    agent_core::CoreError::Message(format!(
+                                        "unknown setting '{}'",
+                                        change.key
+                                    ))
+                                })?;
+                            match change.op {
+                                ChangeOp::Keep => {}
+                                ChangeOp::Set => {
+                                    let value = change.value.as_deref().ok_or_else(|| {
+                                        agent_core::CoreError::Message(format!(
+                                            "{} set operation is missing a value",
+                                            change.key
+                                        ))
+                                    })?;
+                                    fleety_tools::config::validate(setting, value)?;
+                                    map.insert(
+                                        (setting.scope, change.key.clone()),
+                                        value.to_string(),
+                                    );
+                                }
+                                ChangeOp::Clear => {
+                                    map.remove(&(setting.scope, change.key.clone()));
+                                }
+                            }
+                        }
+                        Ok(())
+                    });
+                match mutation {
+                    Ok(()) => Ok(serde_json::json!({ "ok": true, "applied": applied })),
+                    Err(e) => {
+                        let message = e.report().message;
+                        let kind = if message.contains("revision conflict") {
+                            "conflict"
+                        } else {
+                            "invalid"
+                        };
+                        Ok(config_failure(kind, message))
+                    }
+                }
+            }
+            other => Ok(config_failure(
+                "invalid",
+                format!("unknown internal config operation '{other}'"),
+            )),
+        }
+    })();
+    Some(result)
+}
+
 /// What ended one connected session.
 enum Outcome {
     /// A clean shutdown signal (Ctrl+C / service Stop) — exit the process.
@@ -708,7 +912,11 @@ async fn serve(
                 // timeout; the tool still completes here (side effects intact),
                 // the reply send below fails, and we reconnect via the normal
                 // backoff path.
-                let reply = match registry.call(&tool, args).await {
+                let outcome = match internal_config(&tool, &args) {
+                    Some(result) => result,
+                    None => registry.call(&tool, args).await,
+                };
+                let reply = match outcome {
                     Ok(value) => ClientMsg::ToolResult {
                         call_id,
                         result_json: value.to_string(),
@@ -765,6 +973,7 @@ mod tests {
                 "FLEETY_TOKEN",
                 "FLEETY_MDNS_DISABLED",
                 "FLEETY_CONNECTIONS",
+                "FLEETY_CONFIG",
                 "COMPUTERNAME",
                 "HOSTNAME",
             ];
@@ -785,6 +994,7 @@ mod tests {
                 "FLEETY_TOKEN",
                 "FLEETY_MDNS_DISABLED",
                 "FLEETY_CONNECTIONS",
+                "FLEETY_CONFIG",
                 "COMPUTERNAME",
                 "HOSTNAME",
             ] {
@@ -851,6 +1061,79 @@ mod tests {
         // An old env deployment still connects: FLEETY_AGENT_URL overrides.
         std::env::set_var("FLEETY_AGENT_URL", "ws://env:8787");
         assert_eq!(resolve_target().expect("resolve").url, "ws://env:8787");
+    }
+
+    #[test]
+    fn daemon_internal_config_is_owner_scoped_and_transactional() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let guard = EnvGuard::new("internal-config");
+        let path = guard.temp_home.join("config.toml");
+        std::env::set_var("FLEETY_CONFIG", &path);
+
+        let set = internal_config(
+            INTERNAL_CONFIG_TOOL,
+            &serde_json::json!({
+                "op": "exec",
+                "args": ["set", "FLEETY_PRESENCE", "off"]
+            }),
+        )
+        .expect("reserved tool")
+        .expect("reply");
+        assert_eq!(
+            set.get("ok").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+
+        let foreign = internal_config(
+            INTERNAL_CONFIG_TOOL,
+            &serde_json::json!({
+                "op": "exec",
+                "args": ["set", "FLEETY_ADDR", "127.0.0.1:8787"]
+            }),
+        )
+        .expect("reserved tool")
+        .expect("reply");
+        assert_eq!(
+            foreign.get("ok").and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert!(fleety_tools::config::load_strict(&path)
+            .unwrap()
+            .contains_key(&(
+                fleety_tools::config::Scope::Daemon,
+                "FLEETY_PRESENCE".to_string()
+            )));
+
+        let snapshot = internal_config(
+            INTERNAL_CONFIG_TOOL,
+            &serde_json::json!({ "op": "snapshot" }),
+        )
+        .expect("reserved tool")
+        .expect("snapshot");
+        let entries: Vec<ConfigEntry> =
+            serde_json::from_value(snapshot["entries"].clone()).expect("entries");
+        assert!(entries
+            .iter()
+            .all(|entry| matches!(entry.scope.as_str(), "daemon" | "shared")));
+        assert!(!entries.iter().any(|entry| entry.key == "FLEETY_ADDR"));
+
+        let stale = internal_config(
+            INTERNAL_CONFIG_TOOL,
+            &serde_json::json!({
+                "op": "apply",
+                "base_revision": "stale",
+                "changes": [{"key":"FLEETY_TZ","op":"set","value":"UTC"}]
+            }),
+        )
+        .expect("reserved tool")
+        .expect("reply");
+        assert_eq!(
+            stale.get("kind").and_then(serde_json::Value::as_str),
+            Some("conflict")
+        );
+        assert!(!fleety_tools::config::load_strict(&path)
+            .unwrap()
+            .contains_key(&(fleety_tools::config::Scope::Shared, "FLEETY_TZ".to_string())));
     }
 
     #[test]

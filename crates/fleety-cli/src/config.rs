@@ -2,7 +2,7 @@
 //!
 //! Backed by the shared typed registry in `fleety_tools::config`. `list/get`
 //! show the resolved value and its source (env / config / default), secrets
-//! masked; `set/unset` edit `~/.fleety/config.toml` after validating the key;
+//! masked; CLI-owned `set/unset` edit `~/.fleety/config.toml` after validating the key;
 //! `edit` opens an interactive screen — a ratatui list when stdout is a TTY,
 //! else a line-based loop. Read precedence stays env → config → default, so an
 //! explicit env var always wins.
@@ -12,39 +12,123 @@ use std::path::Path;
 
 use agent_core::{CoreError, Result};
 use fleety_protocol::{ClientMsg, ConfigTarget, ServerMsg};
-use fleety_tools::config::{self, ConfigMap, Source};
+use fleety_tools::config::{self, ConfigMap, Owner, Source};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    Auto,
+    Server,
+    Daemon,
+    Cli,
+    Device(String),
+}
 
 /// Split a leading-or-embedded `--target <server|local|<device-id>>` out of the
 /// config args, returning the target (default `Server`) and the remaining args.
 /// Pure. `local` is handled by this CLI; `server`/`device` go over the wire.
-pub fn split_target(args: &[String]) -> (ConfigTarget, Vec<String>) {
-    let mut target = ConfigTarget::Server;
+pub fn split_target(args: &[String]) -> Result<(Target, Vec<String>)> {
+    let mut target = Target::Auto;
+    let mut seen = false;
     let mut rest = Vec::new();
     let mut i = 0;
     while i < args.len() {
         if args[i] == "--target" {
-            if let Some(v) = args.get(i + 1) {
-                target = match v.as_str() {
-                    "server" => ConfigTarget::Server,
-                    "local" => ConfigTarget::Local,
-                    other => ConfigTarget::Device(other.to_string()),
-                };
-                i += 2;
-                continue;
+            if seen {
+                return Err(CoreError::Message(
+                    "--target may be specified only once".to_string(),
+                ));
             }
+            let v = args.get(i + 1).ok_or_else(|| {
+                CoreError::Message(
+                    "--target needs server, daemon, cli, local, or a device id".to_string(),
+                )
+            })?;
+            target = match v.as_str() {
+                "server" => Target::Server,
+                "daemon" => Target::Daemon,
+                "cli" | "local" => Target::Cli,
+                other if other.starts_with('-') => {
+                    return Err(CoreError::Message(format!(
+                        "invalid config target '{other}'"
+                    )))
+                }
+                other => Target::Device(other.to_string()),
+            };
+            seen = true;
+            i += 2;
+            continue;
         }
         rest.push(args[i].clone());
         i += 1;
     }
-    (target, rest)
+    Ok((target, rest))
 }
 
-/// Whether `args` is an interactive edit (`edit` / `provider edit`). The plain
-/// settings editor is always local; `provider edit` is local only under an
-/// explicit `--target local` (the default target edits the connected server —
-/// see [`is_remote_provider_edit`]).
-pub fn is_interactive_edit(args: &[String]) -> bool {
-    matches!(args.first().map(String::as_str), Some("edit")) || is_provider_edit(args)
+fn command_owner(args: &[String]) -> Result<Option<Owner>> {
+    match args.first().map(String::as_str) {
+        Some("provider" | "model") => Ok(Some(Owner::Server)),
+        Some("get" | "set" | "unset") => {
+            let key = args.get(1).ok_or_else(|| {
+                CoreError::Message(format!(
+                    "config {} needs a setting key",
+                    args.first().map(String::as_str).unwrap_or_default()
+                ))
+            })?;
+            config::owner_for_key(key).map(Some)
+        }
+        Some("list") | None | Some("edit") => Ok(None),
+        Some(other) => Err(CoreError::Message(format!(
+            "unknown config command '{other}'"
+        ))),
+    }
+}
+
+/// Resolve automatic ownership and reject explicit target/owner mismatches
+/// before any file or network I/O.
+pub fn resolve_target(target: Target, args: &[String], device_id: &str) -> Result<Target> {
+    let owner = command_owner(args)?;
+    let resolved = match target {
+        Target::Auto => match owner {
+            Some(Owner::Server) => Target::Server,
+            Some(Owner::Daemon) => Target::Device(device_id.to_string()),
+            Some(Owner::Cli) => Target::Cli,
+            None => Target::Auto,
+        },
+        other => other,
+    };
+    if let Some(owner) = owner {
+        let matches = matches!(
+            (&resolved, owner),
+            (Target::Server, Owner::Server)
+                | (Target::Cli, Owner::Cli)
+                | (Target::Daemon | Target::Device(_), Owner::Daemon)
+        );
+        if !matches {
+            let owner_name = match owner {
+                Owner::Server => "server",
+                Owner::Daemon => "daemon",
+                Owner::Cli => "cli",
+            };
+            return Err(CoreError::Message(format!(
+                "this setting is owned by {owner_name}; choose --target {owner_name}"
+            )));
+        }
+    }
+    Ok(resolved)
+}
+
+pub fn wire_target(target: &Target) -> Result<ConfigTarget> {
+    match target {
+        Target::Server => Ok(ConfigTarget::Server),
+        Target::Daemon => Err(CoreError::Message(
+            "daemon target must be resolved to a device id".to_string(),
+        )),
+        Target::Device(id) => Ok(ConfigTarget::Device(id.clone())),
+        Target::Cli => Ok(ConfigTarget::Local),
+        Target::Auto => Err(CoreError::Message(
+            "config list/edit needs an explicit owner or the interactive panel".to_string(),
+        )),
+    }
 }
 
 /// Whether `args` is exactly the interactive provider editor invocation.
@@ -58,11 +142,9 @@ fn is_provider_edit(args: &[String]) -> bool {
     )
 }
 
-/// Pure routing: `provider edit` with the default (server) target belongs to
-/// the remote flow — the providers file it edits lives on the server. An
-/// explicit `--target local` keeps the local-file editor.
-pub fn is_remote_provider_edit(args: &[String], target: &ConfigTarget) -> bool {
-    is_provider_edit(args) && matches!(target, ConfigTarget::Server)
+/// Pure routing: `provider edit` is available only against its server owner.
+pub fn is_remote_provider_edit(args: &[String], target: &Target) -> bool {
+    is_provider_edit(args) && matches!(target, Target::Server)
 }
 
 /// The version gate for remote provider editing: the full-config write-back
@@ -72,8 +154,8 @@ fn provider_edit_support_err(config_protocol: u32) -> Option<CoreError> {
     (config_protocol < 2).then(|| {
         CoreError::Message(
             "the connected server is too old for remote provider editing — update it first \
-             (run `fleety update` on the server host), or edit this host's own file with \
-             `fleety config --target local provider edit`"
+             (run `fleety update` on the server host); provider configuration is server-owned \
+             and is never written directly by the CLI"
                 .to_string(),
         )
     })
@@ -89,9 +171,8 @@ pub async fn provider_edit_remote() -> Result<()> {
             crate::connect_hello_for_auth().await.map_err(|e| {
                 CoreError::Message(format!(
                     "could not reach the server whose providers this would edit: {} — pair this \
-                     device first (`fleety pair <code>`), set the server URL with `fleety init \
-                     <ws-url>`, or edit this host's own file with `fleety config --target local \
-                     provider edit`",
+                     device first (`fleety pair <code>`) or select the server with `fleety server \
+                     use <name>`; provider configuration is never written locally by the CLI",
                     e.report().message
                 ))
             })?;
@@ -305,19 +386,12 @@ use crate::input::LineEditor;
 /// `fleetyd` expose the same `config` command; the CLI only overrides `edit` to
 /// open the ratatui screen when stdout is a TTY.
 pub fn run(args: &[String]) -> Result<()> {
-    // `config provider edit` on a TTY opens the interactive providers screen;
-    // without a TTY it falls through to the shared subcommand dispatch.
-    let head = (
-        args.first().map(String::as_str),
-        args.get(1).map(String::as_str),
-    );
-    if head == (Some("provider"), Some("edit")) && std::io::stdout().is_terminal() {
-        // Same local editor as the `fleety config` menu, including the OAuth
-        // sign-in/out/switch loop. `config::run` is sync but runs on the
-        // multi-threaded runtime, so bridge to the async editor loop here.
-        return tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(crate::config_panel::run_providers())
-        });
+    if matches!(args.first().map(String::as_str), Some("provider" | "model")) {
+        return Err(CoreError::Message(
+            "provider and model configuration is owned by the server; use `fleety config \
+             --target server ...` (the CLI never edits providers.toml directly)"
+                .to_string(),
+        ));
     }
     if matches!(config::parse(args), config::Command::Edit) && std::io::stdout().is_terminal() {
         run_tui_edit(&config::config_path())
@@ -348,8 +422,8 @@ fn source_label(s: Source) -> &'static str {
 }
 
 fn build_rows(map: &ConfigMap) -> Vec<Row> {
-    // The local edit screen shows only this device's own settings (Cli/Shared);
-    // server/daemon settings are edited on their own hosts.
+    // The local edit screen shows only CLI-owned settings. Shared settings are
+    // daemon-owned and travel through fleetyd like other daemon settings.
     config::registry()
         .iter()
         .filter(|s| config::LOCAL_SCOPES.contains(&s.scope))
@@ -557,40 +631,36 @@ mod tests {
     #[test]
     fn split_target_extracts_and_defaults() {
         let s = |a: &[&str]| a.iter().map(|x| x.to_string()).collect::<Vec<_>>();
-        // Default is Server, args untouched.
-        let (t, rest) = split_target(&s(&["set", "FLEETY_MODEL", "gpt-5"]));
-        assert_eq!(t, ConfigTarget::Server);
+        // Default is automatic ownership, args untouched.
+        let (t, rest) = split_target(&s(&["set", "FLEETY_MODEL", "gpt-5"])).unwrap();
+        assert_eq!(t, Target::Auto);
         assert_eq!(rest, s(&["set", "FLEETY_MODEL", "gpt-5"]));
         // --target local is stripped.
-        let (t, rest) = split_target(&s(&["--target", "local", "list"]));
-        assert_eq!(t, ConfigTarget::Local);
+        let (t, rest) = split_target(&s(&["--target", "local", "list"])).unwrap();
+        assert_eq!(t, Target::Cli);
         assert_eq!(rest, s(&["list"]));
         // A non-server/local value is a device id; stripped from the middle.
-        let (t, rest) = split_target(&s(&["provider", "--target", "pi", "list"]));
-        assert_eq!(t, ConfigTarget::Device("pi".into()));
+        let (t, rest) = split_target(&s(&["provider", "--target", "pi", "list"])).unwrap();
+        assert_eq!(t, Target::Device("pi".into()));
         assert_eq!(rest, s(&["provider", "list"]));
-        // Edit detection.
-        assert!(is_interactive_edit(&s(&["edit"])));
-        assert!(is_interactive_edit(&s(&["provider", "edit"])));
-        assert!(!is_interactive_edit(&s(&["list"])));
     }
 
     #[test]
     fn provider_edit_routes_by_target_and_gates_by_version() {
         let s = |a: &[&str]| a.iter().map(|x| x.to_string()).collect::<Vec<_>>();
-        // Default (server) target → the remote flow; explicit local keeps the
-        // local file editor; other subcommands never route here.
+        // Server target uses the remote flow. CLI/local is not a provider owner,
+        // so other dispatch code rejects it before any file access.
         assert!(is_remote_provider_edit(
             &s(&["provider", "edit"]),
-            &ConfigTarget::Server
+            &Target::Server
         ));
         assert!(!is_remote_provider_edit(
             &s(&["provider", "edit"]),
-            &ConfigTarget::Local
+            &Target::Cli
         ));
         assert!(!is_remote_provider_edit(
             &s(&["provider", "list"]),
-            &ConfigTarget::Server
+            &Target::Server
         ));
 
         // Version gate: pre-credential-era servers silently drop the write-back
@@ -599,16 +669,38 @@ mod tests {
             .expect("old server refused")
             .to_string();
         assert!(msg.contains("update"), "gate names the remedy: {msg}");
-        assert!(
-            msg.contains("--target local"),
-            "gate offers the local escape hatch: {msg}"
-        );
+        assert!(msg.contains("server-owned"), "gate names ownership: {msg}");
         assert!(provider_edit_support_err(0).is_some());
         assert!(provider_edit_support_err(2).is_none());
         assert!(
             provider_edit_support_err(3).is_none(),
             "future versions pass"
         );
+    }
+
+    #[test]
+    fn owner_route_matrix_and_target_mismatches() {
+        let s = |a: &[&str]| a.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            resolve_target(Target::Auto, &s(&["set", "FLEETY_ADDR", "x"]), "dev").unwrap(),
+            Target::Server
+        );
+        assert_eq!(
+            resolve_target(Target::Auto, &s(&["set", "FLEETY_TZ", "UTC"]), "dev").unwrap(),
+            Target::Device("dev".into())
+        );
+        assert_eq!(
+            resolve_target(
+                Target::Auto,
+                &s(&["set", "FLEETY_VOICE_AUDIO", "auto"]),
+                "dev"
+            )
+            .unwrap(),
+            Target::Cli
+        );
+        assert!(resolve_target(Target::Server, &s(&["set", "FLEETY_TZ", "UTC"]), "dev").is_err());
+        assert!(resolve_target(Target::Cli, &s(&["provider", "edit"]), "dev").is_err());
+        assert!(split_target(&s(&["--target"])).is_err());
     }
 
     #[test]
@@ -622,14 +714,13 @@ mod tests {
         on_key(&mut app, KeyCode::Up);
         assert_eq!(app.sel, 0);
 
-        // Drive the edit assertions on a key with no validator so the committed
-        // value isn't rejected by write validation (that path has its own test
-        // below). `FLEETY_TZ` is a free-form (Shared-scope) timezone.
+        // Drive the edit assertions on a CLI-owned key. Shared keys such as
+        // FLEETY_TZ belong to fleetyd and intentionally do not appear here.
         app.sel = app
             .rows
             .iter()
-            .position(|r| r.key == "FLEETY_TZ")
-            .expect("FLEETY_TZ present");
+            .position(|r| r.key == "FLEETY_VOICE_AUDIO")
+            .expect("FLEETY_VOICE_AUDIO present");
         let key0 = app.rows[app.sel].key;
         let setting = config::find(key0).expect("known");
 
@@ -643,13 +734,15 @@ mod tests {
         // Edit then commit a value → saved + map updated.
         on_key(&mut app, KeyCode::Enter);
         app.edit = Some(LineEditor::default()); // clear the prefilled default for a clean assert
-        on_key(&mut app, KeyCode::Char('z'));
+        for c in "off".chars() {
+            on_key(&mut app, KeyCode::Char(c));
+        }
         assert!(on_key(&mut app, KeyCode::Enter));
         assert_eq!(
             app.map
                 .get(&(setting.scope, key0.to_string()))
                 .map(String::as_str),
-            Some("z")
+            Some("off")
         );
 
         // Empty buffer → unset (removed from map).
@@ -666,14 +759,13 @@ mod tests {
     #[test]
     fn config_tui_rejects_invalid_value() {
         let mut app = ConfigApp::new(ConfigMap::new());
-        // Select a validated local-scope key (FLEETY_AUTO_INSTALL_DEPS is Shared
-        // and accepts only 0/1).
+        // Select a validated CLI-owned key.
         app.sel = app
             .rows
             .iter()
-            .position(|r| r.key == "FLEETY_AUTO_INSTALL_DEPS")
-            .expect("FLEETY_AUTO_INSTALL_DEPS present");
-        let setting = config::find("FLEETY_AUTO_INSTALL_DEPS").expect("known");
+            .position(|r| r.key == "FLEETY_VOICE_AUDIO")
+            .expect("FLEETY_VOICE_AUDIO present");
+        let setting = config::find("FLEETY_VOICE_AUDIO").expect("known");
 
         // Type an out-of-domain value and commit it.
         on_key(&mut app, KeyCode::Enter);
@@ -687,17 +779,17 @@ mod tests {
         assert!(!saved, "an invalid commit must not request a save");
         assert!(
             !app.map
-                .contains_key(&(setting.scope, "FLEETY_AUTO_INSTALL_DEPS".to_string())),
+                .contains_key(&(setting.scope, "FLEETY_VOICE_AUDIO".to_string())),
             "the rejected value must not enter the map"
         );
         assert!(
-            app.status.contains("FLEETY_AUTO_INSTALL_DEPS"),
+            app.status.contains("FLEETY_VOICE_AUDIO"),
             "status: {}",
             app.status
         );
         assert!(
-            app.status.contains('0') && app.status.contains('1'),
-            "status should list the accepted 0/1 values, got: {}",
+            app.status.contains("auto") && app.status.contains("off"),
+            "status should list the accepted voice values, got: {}",
             app.status
         );
     }
@@ -708,15 +800,15 @@ mod tests {
         assert!(!rows.is_empty());
         for r in &rows {
             assert!(
-                r.scope == "cli" || r.scope == "shared",
-                "local edit rows are Cli/Shared only, got {} [{}]",
+                r.scope == "cli",
+                "local edit rows are CLI-only, got {} [{}]",
                 r.key,
                 r.scope
             );
         }
         assert!(
-            rows.iter().any(|r| r.key == "FLEETY_TZ"),
-            "a Shared key is present"
+            !rows.iter().any(|r| r.key == "FLEETY_TZ"),
+            "a Shared key is excluded"
         );
         assert!(
             !rows.iter().any(|r| r.key == "FLEETY_ADDR"),

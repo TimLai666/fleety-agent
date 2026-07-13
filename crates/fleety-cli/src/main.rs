@@ -75,8 +75,8 @@ fn print_help() {
         "  status                           this host (cli version, daemon) + the connected server"
     );
     println!("  version                          print the CLI version (also --version / -v)");
-    println!("  config <list|get|set|unset|edit> [--target server|local|<device-id>]");
-    println!("  config provider|model <...>      manage providers + model roles (providers.toml)");
+    println!("  config <list|get|set|unset|edit> [--target server|daemon|cli|<device-id>]");
+    println!("  config provider|model <...>      manage the connected server's providers + roles");
     println!("  auth <login|status|logout>       ChatGPT/Codex OAuth sign-in");
     println!("  audit list [<limit>]             this device's audit-log entries");
     println!("  audit show <index>               one audit entry in full");
@@ -91,6 +91,20 @@ fn print_help() {
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    // Parse side-effect-free top-level queries before logging, config seeding,
+    // or legacy migration. `--help` and `--version` must never touch user data.
+    let (args, target) = take_server_override(std::env::args().collect());
+    match args.get(1).map(String::as_str) {
+        Some("help" | "--help" | "-h") if args.len() == 2 => {
+            print_help();
+            return std::process::ExitCode::SUCCESS;
+        }
+        Some("version" | "--version" | "-v" | "-V") if args.len() == 2 => {
+            println!("fleety {}", agent_core::VERSION);
+            return std::process::ExitCode::SUCCESS;
+        }
+        _ => {}
+    }
     obs::init();
     // Seed env from ~/.fleety/config.toml so client settings (e.g. transport mode)
     // set via `fleety config` apply; an explicit env var still wins.
@@ -98,11 +112,11 @@ async fn main() -> std::process::ExitCode {
         &fleety_tools::config::config_path(),
     ));
     // One-time, idempotent migration of the legacy config.json into
-    // connections.toml (best-effort — a fresh device has nothing to migrate).
-    let _ = connection::migrate_from_config_json();
-    // Pull a leading per-invocation server override (`fleety -s <name> …` /
-    // `fleety --url <ws> …`) out of the args, so it applies to this command only.
-    let (args, target) = take_server_override(std::env::args().collect());
+    // connections.toml. A real migration failure is actionable and must not be
+    // hidden behind a partially initialized command.
+    if let Err(e) = connection::migrate_from_config_json() {
+        return fail(e);
+    }
     let _ = OVERRIDE.set(target);
     match args.get(1).map(String::as_str) {
         Some("init") => {
@@ -112,16 +126,34 @@ async fn main() -> std::process::ExitCode {
             // from the list, save it, and offer to pair right away.
             let mut url = String::new();
             let mut name: Option<String> = None;
+            let mut pairing_code: Option<String> = None;
             let mut it = args.iter().skip(2);
             while let Some(a) = it.next() {
                 match a.as_str() {
                     "--name" => {
-                        if let Some(n) = it.next() {
-                            name = Some(n.clone());
+                        if name.is_some() {
+                            return usage("usage: fleety init <ws-url> [--name <name>] [--pairing-code <code>]");
                         }
+                        let Some(n) = it.next() else {
+                            return usage("usage: fleety init <ws-url> [--name <name>] [--pairing-code <code>]");
+                        };
+                        name = Some(n.clone());
+                    }
+                    "--pairing-code" => {
+                        if pairing_code.is_some() {
+                            return usage("usage: fleety init <ws-url> [--name <name>] [--pairing-code <code>]");
+                        }
+                        let Some(code) = it.next() else {
+                            return usage("usage: fleety init <ws-url> [--name <name>] [--pairing-code <code>]");
+                        };
+                        pairing_code = Some(code.clone());
                     }
                     _ if url.is_empty() => url = a.clone(),
-                    _ => {}
+                    _ => {
+                        return usage(
+                            "usage: fleety init <ws-url> [--name <name>] [--pairing-code <code>]",
+                        )
+                    }
                 }
             }
             if url.is_empty() {
@@ -149,42 +181,13 @@ async fn main() -> std::process::ExitCode {
                 }
                 return std::process::ExitCode::from(2);
             }
-            done(init(url, name).await)
+            done(init(url, name, pairing_code).await)
         }
         Some("ask") => {
-            // Parse: fleety ask [--image P]* [--audio P]* [--video P]* [--file P]* "<text>"
-            let mut text = String::new();
-            let mut attachment_paths: Vec<(PathBuf, &'static str)> = Vec::new();
-            let mut iter = args.iter().skip(2);
-            while let Some(arg) = iter.next() {
-                match arg.as_str() {
-                    "--image" | "-i" => {
-                        if let Some(p) = iter.next() {
-                            attachment_paths.push((PathBuf::from(p), "image"));
-                        }
-                    }
-                    "--audio" => {
-                        if let Some(p) = iter.next() {
-                            attachment_paths.push((PathBuf::from(p), "audio"));
-                        }
-                    }
-                    "--video" => {
-                        if let Some(p) = iter.next() {
-                            attachment_paths.push((PathBuf::from(p), "video"));
-                        }
-                    }
-                    "--file" => {
-                        if let Some(p) = iter.next() {
-                            attachment_paths.push((PathBuf::from(p), "file"));
-                        }
-                    }
-                    _ => {
-                        if text.is_empty() {
-                            text = arg.clone();
-                        }
-                    }
-                }
-            }
+            let (text, attachment_paths) = match parse_ask_args(&args[2..]) {
+                Ok(parsed) => parsed,
+                Err(e) => return fail(e),
+            };
             if text.is_empty() && attachment_paths.is_empty() {
                 return usage(
                     "usage: fleety ask [--image PATH]... [--audio PATH]... [--video PATH]... [--file PATH]... \"<message>\"",
@@ -197,73 +200,111 @@ async fn main() -> std::process::ExitCode {
             done(ask(text, attachments).await)
         }
         Some("resume") => {
-            let conversation_id = args.get(2).cloned().unwrap_or_default();
-            let after_seq = args.get(3).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
-            if conversation_id.is_empty() {
+            if !(args.len() == 3 || args.len() == 4) {
                 return usage("usage: fleety resume <conversation_id> [after_seq]");
             }
+            let conversation_id = args[2].clone();
+            let after_seq = match args.get(3) {
+                Some(value) => match value.parse::<u64>() {
+                    Ok(value) => value,
+                    Err(_) => {
+                        return usage(&format!(
+                            "invalid after_seq '{value}'; expected an unsigned integer\nusage: fleety resume <conversation_id> [after_seq]"
+                        ))
+                    }
+                },
+                None => 0,
+            };
             done(resume(conversation_id, after_seq).await)
         }
-        Some("tui") => done(run_tui().await),
+        Some("tui") if args.len() == 2 => done(run_tui().await),
+        Some("tui") => usage("usage: fleety tui"),
         Some("conversations") => {
-            // `fleety conversations [<limit>]` — list recent conversations so the
-            // user can find the id `fleety resume` needs.
-            let limit = args.get(2).and_then(|s| s.parse::<u32>().ok());
+            if args.len() > 3 {
+                return usage("usage: fleety conversations [<limit>]");
+            }
+            let limit = match args.get(2) {
+                Some(value) => match value.parse::<u32>() {
+                    Ok(value) => Some(value),
+                    Err(_) => {
+                        return usage(&format!(
+                            "invalid limit '{value}'; expected an unsigned integer\nusage: fleety conversations [<limit>]"
+                        ))
+                    }
+                },
+                None => None,
+            };
             done(conversations(limit).await)
         }
         Some("audit") => {
             let sub = args.get(2).cloned().unwrap_or_default();
             match sub.as_str() {
                 "list" => {
-                    let limit = args.get(3).and_then(|s| s.parse::<u32>().ok());
+                    if args.len() > 4 {
+                        return usage("usage: fleety audit list [<limit>]");
+                    }
+                    let limit = match args.get(3) {
+                        Some(value) => match value.parse::<u32>() {
+                            Ok(value) => Some(value),
+                            Err(_) => {
+                                return usage(&format!(
+                                    "invalid audit limit '{value}'; expected an unsigned integer\nusage: fleety audit list [<limit>]"
+                                ))
+                            }
+                        },
+                        None => None,
+                    };
                     done(audit_list(limit).await)
                 }
-                "show" => match args.get(3).and_then(|s| s.parse::<u64>().ok()) {
-                    Some(i) => done(audit_show(i).await),
-                    None => usage("usage: fleety audit show <index>"),
-                },
+                "show" if args.len() == 4 => {
+                    match args.get(3).and_then(|s| s.parse::<u64>().ok()) {
+                        Some(i) => done(audit_show(i).await),
+                        None => usage(&format!(
+                            "invalid audit index '{}'; expected an unsigned integer\nusage: fleety audit show <index>",
+                            args[3]
+                        )),
+                    }
+                }
+                "show" => usage("usage: fleety audit show <index>"),
                 _ => usage("usage: fleety audit list [<limit>]  |  fleety audit show <index>"),
             }
         }
         Some("rollback") => {
             let sub = args.get(2).cloned().unwrap_or_default();
             match sub.as_str() {
-                "list" => done(rollback_list().await),
-                "apply" => {
-                    let id = args.get(3).cloned().unwrap_or_default();
-                    if id.is_empty() {
-                        usage("usage: fleety rollback apply <backup_id>")
-                    } else {
-                        done(rollback_apply(id).await)
-                    }
-                }
+                "list" if args.len() == 3 => done(rollback_list().await),
+                "apply" if args.len() == 4 => done(rollback_apply(args[3].clone()).await),
+                "apply" => usage("usage: fleety rollback apply <backup_id>"),
                 _ => usage("usage: fleety rollback list  |  fleety rollback apply <backup_id>"),
             }
         }
         Some("server") => done(server::run(&args[2..])),
-        Some("status") => done(status().await),
-        Some("voice") => done(voice_chat().await),
+        Some("status") if args.len() == 2 => done(status().await),
+        Some("status") => usage("usage: fleety status"),
+        Some("voice") if args.len() == 2 => done(voice_chat().await),
+        Some("voice") => usage("usage: fleety voice"),
         Some("config") => {
-            // `--target server` (default) manages the connected server's config
-            // over the connection; `--target local` (and interactive `edit`) edit
-            // this host's own files. `--target <device-id>` is sent to the server
-            // (which reports it as a follow-up for now).
-            let (target, rest) = config::split_target(&args[2..]);
-            // Bare `fleety config` on a TTY → the guided menu (Providers /
-            // Models / Settings; Settings is the three-region panel); no
-            // `--target` needed.
             let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
-            let res = if rest.is_empty() && is_tty {
-                config_panel::run().await
-            } else if config::is_remote_provider_edit(&rest, &target) && is_tty {
-                // Default-target provider editing acts on the CONNECTED SERVER's
-                // providers (snapshot → edit → apply); `--target local` below
-                // keeps this host's own file.
-                config::provider_edit_remote().await
-            } else if config::is_interactive_edit(&rest) || matches!(target, ConfigTarget::Local) {
-                config::run(&rest)
-            } else {
-                config_remote(target, &rest).await
+            let res = match config::split_target(&args[2..]) {
+                Err(e) => Err(e),
+                Ok((_requested, rest)) if rest.is_empty() && is_tty => config_panel::run().await,
+                Ok((requested, rest)) => {
+                    async {
+                        let target = config::resolve_target(requested, &rest, &device_id())?;
+                        if matches!(target, config::Target::Auto)
+                            && matches!(rest.first().map(String::as_str), None | Some("list"))
+                        {
+                            config_list_all().await
+                        } else if config::is_remote_provider_edit(&rest, &target) && is_tty {
+                            config::provider_edit_remote().await
+                        } else if matches!(target, config::Target::Cli) {
+                            config::run(&rest)
+                        } else {
+                            config_remote(config::wire_target(&target)?, &rest).await
+                        }
+                    }
+                    .await
+                }
             };
             done(res)
         }
@@ -275,24 +316,38 @@ async fn main() -> std::process::ExitCode {
             // Drive the local daemon from the unified CLI: `fleety daemon <verb>`
             // forwards to the `fleetyd` binary (install/start/stop/status/update/…).
             let sub = &args[2..];
-            if sub.is_empty() {
+            if sub.is_empty() || sub.len() > 1 {
                 usage(
                     "usage: fleety daemon <install|uninstall|start|stop|restart|enable|disable|status|up|down|update>",
                 )
             } else {
-                done(daemon_delegate(sub))
+                let verb = match sub[0].as_str() {
+                    "up" => "start",
+                    "down" => "stop",
+                    known @ ("install" | "uninstall" | "start" | "stop" | "restart"
+                    | "enable" | "disable" | "status" | "update") => known,
+                    _ => {
+                        return usage(
+                            "usage: fleety daemon <install|uninstall|start|stop|restart|enable|disable|status|up|down|update>",
+                        )
+                    }
+                };
+                done(daemon_delegate(&[verb.to_string()]))
             }
         }
-        Some("update") => {
+        Some("update") if args.len() == 2 => {
             // Update every fleety component installed on this host (CLI + any
             // local server + daemon). One command, per the unified update model.
             done(update_all().await)
         }
+        Some("update") => usage("usage: fleety update"),
         Some("acp") => {
             // `fleety acp install [--server <url>]` writes the Zed agent-server
             // config; plain `fleety acp` runs the adapter over stdio (stdout is
             // only JSON-RPC, logs go to stderr, so the editor's parser is safe).
-            if args.get(2).map(String::as_str) == Some("install") {
+            if args.get(2).is_none() {
+                done(async { acp::run_resolved(resolve_target()?).await }.await)
+            } else if args.get(2).map(String::as_str) == Some("install") {
                 let server = args
                     .iter()
                     .position(|a| a == "--server")
@@ -302,29 +357,34 @@ async fn main() -> std::process::ExitCode {
                 // configures that editor; with none, print the generic setup that
                 // works with any ACP-capable editor.
                 let target = args.get(3).filter(|a| !a.starts_with("--")).cloned();
-                done(acp::install(target, server))
+                let known = args[3..].iter().all(|arg| {
+                    arg == "zed" || arg == "--server" || server.as_deref() == Some(arg.as_str())
+                });
+                let invalid = !known
+                    || args.iter().filter(|arg| *arg == "--server").count() > 1
+                    || (args.iter().any(|arg| arg == "--server") && server.is_none());
+                if invalid {
+                    usage("usage: fleety acp install [zed] [--server <url>]")
+                } else {
+                    done(acp::install(target, server))
+                }
+            } else if matches!(
+                args.get(2).map(String::as_str),
+                Some("help" | "--help" | "-h")
+            ) && args.len() == 3
+            {
+                println!("usage: fleety acp [install [zed] [--server <url>]]");
+                std::process::ExitCode::SUCCESS
             } else {
-                done(acp::run(agent_url()).await)
+                usage("usage: fleety acp [install [zed] [--server <url>]]")
             }
         }
-        Some("pair") => {
-            let code = args.get(2).cloned().unwrap_or_default();
-            if code.is_empty() {
-                return usage(
-                    "usage: fleety pair <pairing-code>   (mint one with `fleety pair-code` on the server)",
-                );
-            }
-            done(pair(code).await)
-        }
-        Some("pair-code") => done(pair_code().await),
-        Some("help") | Some("--help") | Some("-h") => {
-            print_help();
-            std::process::ExitCode::SUCCESS
-        }
-        Some("version") | Some("--version") | Some("-v") | Some("-V") => {
-            println!("fleety {}", agent_core::VERSION);
-            std::process::ExitCode::SUCCESS
-        }
+        Some("pair") if args.len() == 3 => done(pair(args[2].clone()).await),
+        Some("pair") => usage(
+            "usage: fleety pair <pairing-code>   (mint one with `fleety pair-code` on the server)",
+        ),
+        Some("pair-code") if args.len() == 2 => done(pair_code().await),
+        Some("pair-code") => usage("usage: fleety pair-code"),
         Some(other) => {
             eprintln!("unknown command '{other}' — run `fleety help` for the full list");
             std::process::ExitCode::from(2)
@@ -361,7 +421,20 @@ async fn update_all() -> Result<()> {
     // fleetyd: delegate to its own complete update (binary + insyra + restart +
     // its own sibling pass, which is a no-op after the update above).
     if let Some(exe) = sibling_bin("fleetyd") {
-        let _ = std::process::Command::new(&exe).arg("update").status();
+        let status = std::process::Command::new(&exe)
+            .arg("update")
+            .status()
+            .map_err(|e| {
+                CoreError::Message(format!(
+                    "could not run fleetyd update ({}): {e}",
+                    exe.display()
+                ))
+            })?;
+        if !status.success() {
+            return Err(CoreError::Message(format!(
+                "fleetyd update failed with {status}; fleety update is incomplete"
+            )));
+        }
     }
 
     // Self-heal any already-installed ACP agent configs (e.g. Zed) so they point
@@ -757,14 +830,6 @@ fn resolve_target() -> Result<connection::Resolved> {
     Ok(r)
 }
 
-/// The resolved server URL (used by the ACP bridge, which manages its own
-/// connection). Falls back to the localhost default if resolution errors.
-fn agent_url() -> String {
-    resolve_target()
-        .map(|r| r.url)
-        .unwrap_or_else(|_| connection::DEFAULT_URL.to_string())
-}
-
 /// Resolve + connect in one step: returns the split streams plus the resolved
 /// target (so callers can read its url/token). Every non-`init` connect site
 /// goes through here so they share one resolution (one mDNS probe, one token).
@@ -800,42 +865,6 @@ async fn open() -> Result<(Tx, Rx, connection::Resolved)> {
             Ok((tx, rx, target))
         }
     }
-}
-
-/// Add-or-update a named profile's url and make it current — the shared core of
-/// `fleety init` (sugar for `server add <name> <url> --use`). Returns the
-/// profile's existing token, if any (so a re-init of a paired server keeps
-/// authenticating).
-fn upsert_profile_and_use(name: &str, url: &str) -> Result<Option<String>> {
-    let mut conns = connection::load()?;
-    // Persist this device's id on first enrollment so it stays stable regardless
-    // of later hostname/env changes.
-    if conns.device_id.is_empty() {
-        conns.device_id = fleety_tools::device::device_id();
-    }
-    let profile = conns.profiles.entry(name.to_string()).or_default();
-    profile.url = url.to_string();
-    let token = profile.token.clone();
-    conns.current = Some(name.to_string());
-    connection::save(&conns)?;
-    Ok(token)
-}
-
-/// Write a freshly-minted pairing token onto the current profile (replacing the
-/// legacy config.json write). Errors if there is no current server to attach it
-/// to (the user should `fleety init <url>` first).
-fn set_current_token(token: &str) -> Result<()> {
-    let mut conns = connection::load()?;
-    let name = conns.current.clone().ok_or_else(|| {
-        CoreError::Message(
-            "no current server to attach the token to — run `fleety init <ws-url>` first"
-                .to_string(),
-        )
-    })?;
-    if let Some(p) = conns.profiles.get_mut(&name) {
-        p.token = Some(token.to_string());
-    }
-    connection::save(&conns)
 }
 
 /// The collecting scan + entry type live in `fleety_tools::connection` (shared
@@ -985,12 +1014,10 @@ async fn init_interactive(name_override: Option<String>) -> Result<()> {
         found.insert(0, local);
     }
     if found.is_empty() {
-        println!("No Fleety server found (no local server, none on the LAN).");
-        println!("Point the CLI at one explicitly: fleety init ws://host:8787 [--name <name>]");
-        println!(
-            "(the server announces itself on the LAN only when it is running and mDNS is enabled)"
-        );
-        return Ok(());
+        return Err(CoreError::Message(
+            "No Fleety server found locally or on the LAN. Start fleety-server, or run `fleety init ws://host:8787 --name <name> --pairing-code <code>`. Mint a code with `fleety pair-code` on an already paired device"
+                .to_string(),
+        ));
     }
     let saved_urls: Vec<String> = connection::load()
         .map(|c| c.profiles.values().map(|p| p.url.clone()).collect())
@@ -1005,32 +1032,27 @@ async fn init_interactive(name_override: Option<String>) -> Result<()> {
         match parse_selection(&read_prompt_line(), found.len()) {
             Selection::Pick(i) => break i,
             Selection::Cancel => break 0,
-            Selection::Invalid => continue,
+            Selection::Invalid => {
+                eprintln!("Please enter a number from 1 to {}.", found.len());
+                continue;
+            }
         }
     };
     let chosen = found[picked].clone();
     let is_local = chosen.url == local_url;
     let profile = name_override.unwrap_or_else(|| chosen.name.clone());
-    // Upsert keeps an existing profile's token, so re-running init on an
-    // already-paired server never loses the enrollment.
-    upsert_profile_and_use(&profile, &chosen.url)?;
-    println!("Using '{profile}' ({}) as the current server.", chosen.url);
-    // The local server is loopback-trusted — no pairing code needed.
-    if is_local {
-        println!("It's your local server — no pairing needed. Try: fleety tui");
-        return Ok(());
-    }
-    eprint!(
-        "Pairing code — printed on the server's first run, or minted by `pair_create` on an \
-         already-paired device (Enter to skip): "
-    );
-    let code = read_prompt_line().trim().to_string();
-    if code.is_empty() {
-        println!("Skipped pairing — run `fleety pair <code>` when you have one.");
-        return Ok(());
-    }
-    pair(code).await?;
-    println!("Paired; '{profile}' is now your current server.");
+    let pairing_code = if is_local {
+        None
+    } else {
+        eprint!(
+            "Pairing code — mint one with `fleety pair-code` on an already-paired device \
+             (Enter only if this profile is already paired): "
+        );
+        let code = read_prompt_line().trim().to_string();
+        (!code.is_empty()).then_some(code)
+    };
+    init(chosen.url.clone(), profile.clone(), pairing_code).await?;
+    println!("Using verified server '{profile}' ({}).", chosen.url);
     Ok(())
 }
 
@@ -1088,7 +1110,19 @@ fn hello(token: Option<String>, pairing_code: Option<String>) -> ClientMsg {
 /// `fleety pair <code>`: enroll this device against the current server; the
 /// minted token is written onto the current profile in connections.toml.
 async fn pair(code: String) -> Result<()> {
-    let (mut tx, mut rx, target) = open().await?;
+    let target = resolve_target()?;
+    let profile_name = match &target.source {
+        connection::Source::Profile(name) => name.clone(),
+        _ => {
+            return Err(CoreError::Message(
+                "pairing needs a named server profile so the credential has an unambiguous owner. Run `fleety init <ws-url> --name <name>`, then retry; no profile was modified"
+                    .to_string(),
+            ))
+        }
+    };
+    let (mut tx, mut rx) = transport::connect(&target.url, target.token.as_deref())
+        .await?
+        .split();
     let url = target.url.clone();
     send(&mut tx, &hello(target.token.clone(), Some(code))).await?;
     let result = match recv(&mut rx).await? {
@@ -1097,20 +1131,12 @@ async fn pair(code: String) -> Result<()> {
             server_fingerprint,
             ..
         }) => {
-            set_current_token(&tok)?;
-            // Pin the server's identity so a later IP change can heal to this
-            // exact server (and only this one).
-            if let Some(fp) = server_fingerprint.as_deref() {
-                if let Ok(connection::PinDecision::IdentityChanged) =
-                    connection::pin_current_fingerprint(fp)
-                {
-                    eprintln!(
-                        "warning: this server's identity fingerprint differs from the one \
-                         previously pinned; keeping the old pin — re-run `fleety init` if the \
-                         server was intentionally rebuilt"
-                    );
-                }
-            }
+            connection::store_profile_pairing(
+                &profile_name,
+                &url,
+                &tok,
+                server_fingerprint.as_deref(),
+            )?;
             println!("✓ paired with {url}; token saved");
             Ok(())
         }
@@ -1202,29 +1228,101 @@ fn origin() -> OriginContext {
     }
 }
 
+fn parse_ask_args(args: &[String]) -> Result<(String, Vec<(PathBuf, &'static str)>)> {
+    let mut words = Vec::new();
+    let mut attachments = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let kind = match args[index].as_str() {
+            "--image" | "-i" => Some("image"),
+            "--audio" => Some("audio"),
+            "--video" => Some("video"),
+            "--file" => Some("file"),
+            flag if flag.starts_with('-') => {
+                return Err(CoreError::Message(format!("unknown ask flag '{flag}'")))
+            }
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            let value = args
+                .get(index + 1)
+                .ok_or_else(|| CoreError::Message(format!("{} needs a file path", args[index])))?;
+            if value.starts_with('-') {
+                return Err(CoreError::Message(format!(
+                    "{} needs a file path, got '{value}'",
+                    args[index]
+                )));
+            }
+            attachments.push((PathBuf::from(value), kind));
+            index += 2;
+        } else {
+            words.push(args[index].clone());
+            index += 1;
+        }
+    }
+    Ok((words.join(" "), attachments))
+}
+
 /// `fleety init <ws-url> [--name <name>]`: sugar for `server add <name> <url>
 /// --use` plus enrollment. Records/updates the named profile (default `default`),
 /// makes it current, connects, and registers this device.
-async fn init(url: String, name: String) -> Result<()> {
-    // Persist the profile first (add-or-update + make current), so the connect
-    // below and every later command resolve to it.
-    let token = upsert_profile_and_use(&name, &url)?;
+async fn init(url: String, name: String, pairing_code: Option<String>) -> Result<()> {
+    // Build the proposed state in memory. Nothing is persisted until this exact
+    // endpoint returns a valid Welcome (and, when supplied, redeems the pairing
+    // code), so a typo or unreachable server cannot poison current selection.
+    let mut proposed = connection::load()?;
+    if proposed.device_id.is_empty() {
+        proposed.device_id = fleety_tools::device::device_id();
+    }
+    let profile = proposed.profiles.entry(name.clone()).or_default();
+    let token = profile.token.clone();
+    let old_fingerprint = profile.fingerprint.clone();
+    profile.url = url.clone();
+    proposed.current = Some(name.clone());
     let (mut tx, mut rx) = transport::connect(&url, token.as_deref()).await?.split();
 
-    send(&mut tx, &hello(token, None)).await?;
+    send(&mut tx, &hello(token, pairing_code)).await?;
     match recv(&mut rx).await? {
-        Some(ServerMsg::Welcome { session_id, .. }) => {
+        Some(ServerMsg::Welcome {
+            session_id,
+            token: minted_token,
+            server_fingerprint,
+            ..
+        }) => {
+            if let Some(seen) = server_fingerprint.as_deref() {
+                if connection::tofu_pin_decision(old_fingerprint.as_deref(), seen)
+                    == connection::PinDecision::IdentityChanged
+                {
+                    return Err(CoreError::Message(format!(
+                        "server '{name}' has a different identity fingerprint; connections.toml was not changed"
+                    )));
+                }
+            }
+            let profile = proposed.profiles.get_mut(&name).ok_or_else(|| {
+                CoreError::Message("proposed server profile disappeared".to_string())
+            })?;
+            if let Some(minted) = minted_token {
+                profile.token = Some(minted);
+            }
+            if old_fingerprint.is_none() {
+                profile.fingerprint = server_fingerprint;
+            }
+            connection::save(&proposed)?;
             println!("✓ connected to {url}");
             println!(
                 "✓ registered device '{}' as server '{name}' (session {session_id})",
                 device_id()
             );
         }
-        other => {
-            return Err(CoreError::Provider(format!(
-                "unexpected reply during init: {other:?}"
+        Some(ServerMsg::Error { error }) => {
+            return Err(CoreError::Message(format!(
+                "server rejected init: {}. connections.toml was not changed. If pairing is required, mint a code with `fleety pair-code` and pass `--pairing-code <code>`",
+                error.message
             )))
         }
+        other => return Err(CoreError::Provider(format!(
+            "unexpected reply during init: {other:?}; connections.toml was not changed"
+        ))),
     }
     let _ = tx.close().await;
     Ok(())
@@ -1325,11 +1423,12 @@ async fn ask(text: String, attachments: Vec<WireAttachment>) -> Result<()> {
                 eprintln!("(conversation {conversation_id} — continue with: fleety resume {conversation_id})");
                 break;
             }
-            None => break,
-            Some(ServerMsg::Error { error }) => {
-                eprintln!("agent error: {}", error.message);
-                break;
+            None => {
+                return Err(CoreError::Provider(
+                    "connection closed before the request completed".to_string(),
+                ))
             }
+            Some(ServerMsg::Error { error }) => return Err(CoreError::Message(error.message)),
             Some(ServerMsg::RunTool { call_id, tool, .. }) => {
                 // This connection is a viewer (no daemon): decline instead of
                 // letting the server wait out its 30 s dispatch timeout.
@@ -1505,11 +1604,13 @@ async fn voice_chat() -> Result<()> {
                         }
                     }
                 }
-                Some(ServerMsg::Done { .. }) | None => break,
-                Some(ServerMsg::Error { error }) => {
-                    eprintln!("agent error: {}", error.message);
-                    break;
+                Some(ServerMsg::Done { .. }) => break,
+                None => {
+                    return Err(CoreError::Provider(
+                        "connection closed before the voice turn completed".to_string(),
+                    ))
                 }
+                Some(ServerMsg::Error { error }) => return Err(CoreError::Message(error.message)),
                 Some(ServerMsg::ApprovalRequested {
                     approval_id,
                     tool,
@@ -1561,11 +1662,13 @@ async fn resume(conversation_id: String, after_seq: u64) -> Result<()> {
             Some(ServerMsg::Replay {
                 seq, role, content, ..
             }) => println!("[{seq}] {role}: {content}"),
-            Some(ServerMsg::Done { .. }) | None => break,
-            Some(ServerMsg::Error { error }) => {
-                eprintln!("agent error: {}", error.message);
-                break;
+            Some(ServerMsg::Done { .. }) => break,
+            None => {
+                return Err(CoreError::Provider(
+                    "connection closed before resume completed".to_string(),
+                ))
             }
+            Some(ServerMsg::Error { error }) => return Err(CoreError::Message(error.message)),
             _ => {}
         }
     }
@@ -1701,10 +1804,12 @@ fn tofu_pin(fingerprint: Option<&str>, target: &connection::Resolved) {
     let Some(fp) = fingerprint.filter(|f| !f.is_empty()) else {
         return;
     };
-    if !matches!(target.source, connection::Source::Profile(_)) {
+    let connection::Source::Profile(ref name) = target.source else {
         return;
-    }
-    if let Ok(connection::PinDecision::IdentityChanged) = connection::pin_current_fingerprint(fp) {
+    };
+    if let Ok(connection::PinDecision::IdentityChanged) =
+        connection::pin_profile_fingerprint(name, fp)
+    {
         eprintln!(
             "warning: the server's identity fingerprint changed since it was pinned; keeping \
              the old pin — re-pair (`fleety init` / `fleety pair`) if the server was \
@@ -1717,7 +1822,28 @@ fn tofu_pin(fingerprint: Option<&str>, target: &connection::Resolved) {
 /// config protocol (the credential-support gate) and the resolved target, so
 /// auth can refuse an old server up front and name the server it acts on.
 pub(crate) async fn connect_hello_for_auth() -> Result<(Tx, Rx, u32, connection::Resolved)> {
-    let (mut tx, mut rx, target) = open().await?;
+    let target = resolve_target()?;
+    let (tx, rx, config_protocol, _fingerprint) = connect_hello_for_auth_target(&target).await?;
+    Ok((tx, rx, config_protocol, target))
+}
+
+/// Resolve once for a long-running auth transaction and retain both the target
+/// and the server identity observed during preflight.
+pub(crate) async fn connect_hello_for_auth_transaction(
+) -> Result<(Tx, Rx, u32, connection::Resolved, Option<String>)> {
+    let target = resolve_target()?;
+    let (tx, rx, config_protocol, fingerprint) = connect_hello_for_auth_target(&target).await?;
+    Ok((tx, rx, config_protocol, target, fingerprint))
+}
+
+/// Connect to one immutable target snapshot. This deliberately does not
+/// re-resolve current profile or mDNS, so a browser wait cannot redirect a
+/// credential to another server.
+pub(crate) async fn connect_hello_for_auth_target(
+    target: &connection::Resolved,
+) -> Result<(Tx, Rx, u32, Option<String>)> {
+    let ws = transport::connect(&target.url, target.token.as_deref()).await?;
+    let (mut tx, mut rx) = ws.split();
     send(&mut tx, &hello(target.token.clone(), None)).await?;
     match recv(&mut rx).await? {
         Some(ServerMsg::Welcome {
@@ -1727,8 +1853,8 @@ pub(crate) async fn connect_hello_for_auth() -> Result<(Tx, Rx, u32, connection:
             ..
         }) => {
             maybe_converge_cli(&server_version).await;
-            tofu_pin(server_fingerprint.as_deref(), &target);
-            Ok((tx, rx, config_protocol, target))
+            tofu_pin(server_fingerprint.as_deref(), target);
+            Ok((tx, rx, config_protocol, server_fingerprint))
         }
         other => Err(CoreError::Message(hello_failure_message(other.as_ref()))),
     }
@@ -1736,14 +1862,20 @@ pub(crate) async fn connect_hello_for_auth() -> Result<(Tx, Rx, u32, connection:
 
 /// Manage a remote (server / device) host's config over the connection: connect,
 /// send `ConfigExec`, print the rendered result and when it takes effect. A
-/// connection failure suggests `--target local`.
+/// A connection failure is returned; configuration never falls back to files
+/// owned by another runtime.
 async fn config_remote(target: ConfigTarget, args: &[String]) -> Result<()> {
     let (mut tx, mut rx) = connect_hello().await.map_err(|e| {
         CoreError::Message(format!(
-            "could not reach the server: {} — use `--target local` to edit this host, or set the server URL with `fleety init <ws-url>`",
+            "could not reach the configuration owner: {} — no local file fallback was used; check the server/daemon connection or select the correct --target",
             e.report().message
         ))
     })?;
+    let restart_hint = match &target {
+        ConfigTarget::Server => "restart the server (`fleety-server restart`)",
+        ConfigTarget::Device(_) => "restart the daemon (`fleetyd restart`)",
+        ConfigTarget::Local => "restart the owning CLI process",
+    };
     send(
         &mut tx,
         &ClientMsg::ConfigExec {
@@ -1765,33 +1897,44 @@ async fn config_remote(target: ConfigTarget, args: &[String]) -> Result<()> {
                     println!("{out}");
                 }
                 if let Some(eff) = effect {
-                    println!(
-                        "{}",
-                        match eff {
-                            Effect::NextConnection =>
-                                "(applied — takes effect on the next connection)",
-                            Effect::Restart =>
-                                "(applied — takes effect after a server restart: run \
-                                 `fleety-server restart` on the server host)",
+                    let message = match eff {
+                        Effect::NextConnection => {
+                            "(applied — takes effect on the next connection)".to_string()
                         }
-                    );
+                        Effect::Restart => {
+                            format!("(applied — takes effect after you {restart_hint})")
+                        }
+                    };
+                    println!("{message}");
                 }
-            } else if let Some(e) = error {
-                eprintln!("error: {}", e.message);
-                if let Some(hint) = e.remediation {
-                    eprintln!("hint: {hint}");
-                }
+                Ok(())
+            } else {
+                let message = error
+                    .map(|e| match e.remediation {
+                        Some(hint) => format!("{} — {hint}", e.message),
+                        None => e.message,
+                    })
+                    .unwrap_or_else(|| "configuration request was rejected".to_string());
+                Err(CoreError::Message(message))
             }
-            Ok(())
         }
-        Some(ServerMsg::Error { error }) => {
-            eprintln!("error: {}", error.message);
-            Ok(())
-        }
+        Some(ServerMsg::Error { error }) => Err(CoreError::Message(match error.remediation {
+            Some(hint) => format!("{} — {hint}", error.message),
+            None => error.message,
+        })),
         other => Err(CoreError::Provider(format!(
             "expected a config result, got {other:?}"
         ))),
     }
+}
+
+async fn config_list_all() -> Result<()> {
+    println!("CLI settings:");
+    config::run(&["list".to_string()])?;
+    println!("\nDaemon settings:");
+    config_remote(ConfigTarget::Device(device_id()), &["list".to_string()]).await?;
+    println!("\nServer settings:");
+    config_remote(ConfigTarget::Server, &["list".to_string()]).await
 }
 
 /// Render a past unix timestamp as a short relative span (`5s ago`, `2h ago`,
@@ -1834,8 +1977,8 @@ async fn conversations(limit: Option<u32>) -> Result<()> {
     send(&mut tx, &ClientMsg::ConversationList { limit }).await?;
     match recv(&mut rx).await? {
         Some(ServerMsg::ConversationListResult { conversations_json }) => {
-            let items: Vec<serde_json::Value> =
-                serde_json::from_str(&conversations_json).unwrap_or_default();
+            let items: Vec<serde_json::Value> = serde_json::from_str(&conversations_json)
+                .map_err(|e| CoreError::Provider(format!("malformed conversation list: {e}")))?;
             if items.is_empty() {
                 println!("(no conversations)");
             } else {
@@ -1863,9 +2006,7 @@ async fn conversations(limit: Option<u32>) -> Result<()> {
                 }
             }
         }
-        Some(ServerMsg::Error { error }) => {
-            eprintln!("agent error: {}", error.message);
-        }
+        Some(ServerMsg::Error { error }) => return Err(CoreError::Message(error.message)),
         other => return Err(CoreError::Provider(format!("unexpected reply: {other:?}"))),
     }
     let _ = tx.close().await;
@@ -1885,8 +2026,8 @@ async fn audit_list(limit: Option<u32>) -> Result<()> {
     .await?;
     match recv(&mut rx).await? {
         Some(ServerMsg::AuditListResult { entries_json, .. }) => {
-            let entries: Vec<serde_json::Value> =
-                serde_json::from_str(&entries_json).unwrap_or_default();
+            let entries: Vec<serde_json::Value> = serde_json::from_str(&entries_json)
+                .map_err(|e| CoreError::Provider(format!("malformed audit list: {e}")))?;
             if entries.is_empty() {
                 println!("(no audit entries)");
             } else {
@@ -1908,9 +2049,7 @@ async fn audit_list(limit: Option<u32>) -> Result<()> {
                 }
             }
         }
-        Some(ServerMsg::Error { error }) => {
-            eprintln!("agent error: {}", error.message);
-        }
+        Some(ServerMsg::Error { error }) => return Err(CoreError::Message(error.message)),
         other => return Err(CoreError::Provider(format!("unexpected reply: {other:?}"))),
     }
     let _ = tx.close().await;
@@ -1929,15 +2068,14 @@ async fn audit_show(index: u64) -> Result<()> {
     .await?;
     match recv(&mut rx).await? {
         Some(ServerMsg::AuditShowResult { event_json, .. }) => {
-            let value: serde_json::Value = serde_json::from_str(&event_json).unwrap_or_default();
+            let value: serde_json::Value = serde_json::from_str(&event_json)
+                .map_err(|e| CoreError::Provider(format!("malformed audit event: {e}")))?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&value).unwrap_or(event_json)
             );
         }
-        Some(ServerMsg::Error { error }) => {
-            eprintln!("agent error: {}", error.message);
-        }
+        Some(ServerMsg::Error { error }) => return Err(CoreError::Message(error.message)),
         other => return Err(CoreError::Provider(format!("unexpected reply: {other:?}"))),
     }
     let _ = tx.close().await;
@@ -1955,8 +2093,8 @@ async fn rollback_list() -> Result<()> {
     .await?;
     match recv(&mut rx).await? {
         Some(ServerMsg::RollbackListResult { backups_json, .. }) => {
-            let backups: Vec<serde_json::Value> =
-                serde_json::from_str(&backups_json).unwrap_or_default();
+            let backups: Vec<serde_json::Value> = serde_json::from_str(&backups_json)
+                .map_err(|e| CoreError::Provider(format!("malformed rollback list: {e}")))?;
             if backups.is_empty() {
                 println!("(no backups)");
             } else {
@@ -1977,9 +2115,7 @@ async fn rollback_list() -> Result<()> {
                 }
             }
         }
-        Some(ServerMsg::Error { error }) => {
-            eprintln!("agent error: {}", error.message);
-        }
+        Some(ServerMsg::Error { error }) => return Err(CoreError::Message(error.message)),
         other => return Err(CoreError::Provider(format!("unexpected reply: {other:?}"))),
     }
     let _ = tx.close().await;
@@ -2021,7 +2157,7 @@ async fn status() -> Result<()> {
     println!("fleety (this host)");
     println!("  cli version:    {}", agent_core::VERSION);
     println!("  daemon:         {}", local_daemon_status());
-    let server_url = resolve_target().map(|r| r.url).unwrap_or_default();
+    let server_url = resolve_target()?.url;
     println!();
 
     let (mut tx, mut rx) = connect_hello().await?;
@@ -2034,7 +2170,8 @@ async fn status() -> Result<()> {
             device_ids_json,
             extra_json,
         }) => {
-            let ids: Vec<String> = serde_json::from_str(&device_ids_json).unwrap_or_default();
+            let ids: Vec<String> = serde_json::from_str(&device_ids_json)
+                .map_err(|e| CoreError::Provider(format!("malformed device id list: {e}")))?;
             println!("fleety-server ({server_url})");
             println!("  version:        {version}");
             println!("  uptime:         {}", format_uptime(uptime_secs));
@@ -2058,7 +2195,7 @@ async fn status() -> Result<()> {
                 }
             }
         }
-        Some(ServerMsg::Error { error }) => eprintln!("agent error: {}", error.message),
+        Some(ServerMsg::Error { error }) => return Err(CoreError::Message(error.message)),
         other => return Err(CoreError::Provider(format!("unexpected reply: {other:?}"))),
     }
     let _ = tx.close().await;
@@ -2096,12 +2233,10 @@ async fn rollback_apply(backup_id: String) -> Result<()> {
             if ok {
                 println!("✓ {message}");
             } else {
-                eprintln!("✗ rollback failed: {message}");
+                return Err(CoreError::Message(format!("rollback failed: {message}")));
             }
         }
-        Some(ServerMsg::Error { error }) => {
-            eprintln!("agent error: {}", error.message);
-        }
+        Some(ServerMsg::Error { error }) => return Err(CoreError::Message(error.message)),
         other => return Err(CoreError::Provider(format!("unexpected reply: {other:?}"))),
     }
     let _ = tx.close().await;
@@ -2384,14 +2519,14 @@ mod tests {
     }
 
     #[test]
-    fn agent_url_prefers_env_then_current_profile_then_default() {
+    fn resolved_target_prefers_env_then_current_profile_then_default() {
         let _lock = ENV_LOCK.lock().expect("env lock");
         let _guard = EnvGuard::new("agent-url");
         // No LAN probe: keep the "nothing configured" case fast and deterministic.
         std::env::set_var("FLEETY_MDNS_DISABLED", "1");
 
         // Nothing configured → the localhost default.
-        assert_eq!(agent_url(), connection::DEFAULT_URL);
+        assert_eq!(resolve_target().unwrap().url, connection::DEFAULT_URL);
 
         // A current profile in connections.toml → its url.
         let mut conns = connection::Connections::default();
@@ -2404,11 +2539,11 @@ mod tests {
         );
         conns.current = Some("home".to_string());
         connection::save(&conns).expect("save connections");
-        assert_eq!(agent_url(), "ws://cfg");
+        assert_eq!(resolve_target().unwrap().url, "ws://cfg");
 
         // The env override wins over the current profile.
         std::env::set_var("FLEETY_AGENT_URL", "ws://env");
-        assert_eq!(agent_url(), "ws://env");
+        assert_eq!(resolve_target().unwrap().url, "ws://env");
     }
 
     #[test]
@@ -2419,43 +2554,6 @@ mod tests {
         let first = device_id();
         assert!(!first.is_empty());
         assert_eq!(device_id(), first);
-    }
-
-    #[test]
-    fn init_upsert_then_pair_token_land_on_current_profile() {
-        let _lock = ENV_LOCK.lock().expect("env lock");
-        let _guard = EnvGuard::new("upsert-pair");
-        std::env::set_var("FLEETY_MDNS_DISABLED", "1");
-
-        // `init` sugar: add-or-update the profile + make it current; a fresh
-        // profile has no token yet.
-        let token = upsert_profile_and_use("default", "ws://srv:8787").expect("upsert");
-        assert!(token.is_none());
-        let conns = connection::load().expect("load");
-        assert_eq!(conns.current.as_deref(), Some("default"));
-        assert_eq!(
-            conns.current_profile().map(|p| p.url.as_str()),
-            Some("ws://srv:8787")
-        );
-
-        // `pair` writes the minted token onto the current profile.
-        set_current_token("minted-token").expect("set token");
-        let conns = connection::load().expect("reload");
-        assert_eq!(
-            conns.current_profile().and_then(|p| p.token.as_deref()),
-            Some("minted-token")
-        );
-        // A re-init of the same server keeps the token (returns it).
-        let token = upsert_profile_and_use("default", "ws://srv:8787").expect("re-init");
-        assert_eq!(token.as_deref(), Some("minted-token"));
-
-        // With no current server, pairing has nowhere to put the token.
-        let empty = connection::Connections {
-            current: None,
-            ..Default::default()
-        };
-        connection::save(&empty).expect("clear");
-        assert!(set_current_token("x").is_err());
     }
 
     #[test]

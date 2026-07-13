@@ -90,24 +90,49 @@ pub fn parse(args: &[String]) -> Result<Cmd> {
                 use_current,
             })
         }
-        Some("use") => Ok(Cmd::Use(need(rest.first(), "server name")?)),
-        Some("list") => Ok(Cmd::List),
-        Some("show") => Ok(Cmd::Show(rest.first().cloned())),
-        Some("current") => Ok(Cmd::Current),
-        Some("rename") => Ok(Cmd::Rename {
+        Some("use") if rest.len() == 1 => Ok(Cmd::Use(need(rest.first(), "server name")?)),
+        Some("use") => Err(CoreError::Message(format!(
+            "`server use` needs exactly one name\n{USAGE}"
+        ))),
+        Some("list") if rest.is_empty() => Ok(Cmd::List),
+        Some("list") => Err(CoreError::Message(format!(
+            "`server list` takes no arguments\n{USAGE}"
+        ))),
+        Some("show") if rest.len() <= 1 => Ok(Cmd::Show(rest.first().cloned())),
+        Some("show") => Err(CoreError::Message(format!(
+            "`server show` takes at most one name\n{USAGE}"
+        ))),
+        Some("current") if rest.is_empty() => Ok(Cmd::Current),
+        Some("current") => Err(CoreError::Message(format!(
+            "`server current` takes no arguments\n{USAGE}"
+        ))),
+        Some("rename") if rest.len() == 2 => Ok(Cmd::Rename {
             old: need(rest.first(), "old name")?,
             new: need(rest.get(1), "new name")?,
         }),
-        Some("remove") => {
+        Some("rename") => Err(CoreError::Message(format!(
+            "`server rename` needs exactly two names\n{USAGE}"
+        ))),
+        Some("remove") if rest.len() == 1 || (rest.len() == 2 && rest[1] == "--force") => {
             let name = need(rest.first(), "server name")?;
-            let force = rest.iter().skip(1).any(|a| a == "--force");
+            let force = rest.get(1).is_some();
             Ok(Cmd::Remove { name, force })
         }
-        Some("set-url") => Ok(Cmd::SetUrl {
+        Some("remove") => Err(CoreError::Message(format!(
+            "`server remove` accepts only <name> [--force]\n{USAGE}"
+        ))),
+        Some("set-url") if rest.len() == 2 => Ok(Cmd::SetUrl {
             name: need(rest.first(), "server name")?,
             url: need(rest.get(1), "server url")?,
         }),
-        Some("help") | None => Ok(Cmd::Help),
+        Some("set-url") => Err(CoreError::Message(format!(
+            "`server set-url` needs exactly a name and URL\n{USAGE}"
+        ))),
+        Some("help" | "--help" | "-h") if rest.is_empty() => Ok(Cmd::Help),
+        Some("help" | "--help" | "-h") => Err(CoreError::Message(format!(
+            "server help takes no arguments\n{USAGE}"
+        ))),
+        None => Err(CoreError::Message(USAGE.to_string())),
         Some(other) => Err(CoreError::Message(format!(
             "unknown `server` subcommand '{other}'\n{USAGE}"
         ))),

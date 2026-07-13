@@ -537,7 +537,15 @@ mod tests {
             protocol: PROTOCOL_VERSION,
             token: None,
             pairing_code: None,
-            local_tools_json: None,
+            local_tools_json: Some(
+                serde_json::to_string(&vec![agent_core::ToolSpec {
+                    name: "read_file".to_string(),
+                    description: "test daemon tool".to_string(),
+                    parameters: serde_json::json!({}),
+                    risk: agent_core::RiskLevel::Read,
+                }])
+                .expect("tool specs"),
+            ),
             hostname: None,
         })
         .expect("hello json");

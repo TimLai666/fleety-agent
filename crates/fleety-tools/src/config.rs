@@ -13,7 +13,9 @@
 //! any value (pass-through).
 
 use std::collections::HashMap;
+use std::fs::OpenOptions;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use agent_core::{CoreError, Result};
 
@@ -23,6 +25,40 @@ pub enum Scope {
     Daemon,
     Cli,
     Shared,
+}
+
+/// Runtime that owns persistence for a setting. Shared settings are daemon
+/// owned because they affect the local device processes, never the server or
+/// the invoking CLI process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Owner {
+    Server,
+    Daemon,
+    Cli,
+}
+
+pub const SERVER_SCOPES: &[Scope] = &[Scope::Server];
+pub const DAEMON_SCOPES: &[Scope] = &[Scope::Daemon, Scope::Shared];
+pub const CLI_SCOPES: &[Scope] = &[Scope::Cli];
+
+pub fn owner_for_scope(scope: Scope) -> Owner {
+    match scope {
+        Scope::Server => Owner::Server,
+        Scope::Daemon | Scope::Shared => Owner::Daemon,
+        Scope::Cli => Owner::Cli,
+    }
+}
+
+pub fn owner_for_key(key: &str) -> Result<Owner> {
+    if key == "FLEETY_DEVICE_ID" {
+        return Err(CoreError::Message(
+            "FLEETY_DEVICE_ID is stable device identity managed through connections.toml, not config.toml"
+                .to_string(),
+        ));
+    }
+    find(key)
+        .map(|setting| owner_for_scope(setting.scope))
+        .ok_or_else(|| CoreError::Message(format!("unknown setting '{key}'")))
 }
 
 impl Scope {
@@ -300,14 +336,10 @@ pub fn registry() -> &'static [Setting] {
         // transient env override in the shared resolver, never seeded from
         // config.toml — so there is no config.json / config.toml / env precedence
         // trap. `config set FLEETY_AGENT_URL` is therefore an unknown key.
-        Setting {
-            key: "FLEETY_DEVICE_ID",
-            scope: Daemon,
-            default: "(hostname)",
-            description: "This device's id.",
-            secret: false,
-            validator: None,
-        },
+        // FLEETY_DEVICE_ID is deliberately NOT a registry setting. Stable
+        // identity is resolved from the process override/machine id and stored
+        // with connection state, so accepting it here would create a setting
+        // that fleetyd never actually consumes.
         Setting {
             key: "FLEETY_FORCE_SSE",
             scope: Shared,
@@ -565,6 +597,110 @@ pub fn save(path: &std::path::Path, map: &ConfigMap) -> Result<()> {
         return Err(CoreError::Message(format!("replace config: {e}")));
     }
     Ok(())
+}
+
+struct MutationLock {
+    path: PathBuf,
+}
+
+impl Drop for MutationLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Serialize read-modify-write across processes. The lock file is a short-lived
+/// lease; an abandoned lease older than 30 seconds is reclaimed so a killed
+/// process cannot permanently brick configuration changes.
+fn acquire_mutation_lock(path: &std::path::Path) -> Result<MutationLock> {
+    let lock_path = path.with_extension("toml.lock");
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| CoreError::Message(format!("cannot create config dir: {e}")))?;
+    }
+    let started = Instant::now();
+    loop {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(_) => return Ok(MutationLock { path: lock_path }),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let abandoned = std::fs::metadata(&lock_path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.elapsed().ok())
+                    .is_some_and(|age| age > Duration::from_secs(30));
+                if abandoned {
+                    let _ = std::fs::remove_file(&lock_path);
+                    continue;
+                }
+                if started.elapsed() >= Duration::from_secs(5) {
+                    return Err(CoreError::Message(format!(
+                        "timed out waiting for config mutation lock {}",
+                        lock_path.display()
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => {
+                return Err(CoreError::Message(format!(
+                    "cannot lock config {}: {e}",
+                    lock_path.display()
+                )))
+            }
+        }
+    }
+}
+
+/// Strict, cross-process-safe read-modify-write primitive for config owners.
+pub fn mutate_strict(
+    path: &std::path::Path,
+    mutation: impl FnOnce(&mut ConfigMap) -> Result<()>,
+) -> Result<()> {
+    let _lock = acquire_mutation_lock(path)?;
+    let mut map = load_strict(path)?;
+    mutation(&mut map)?;
+    save(path, &map)
+}
+
+/// Like [`mutate_strict`], but rejects a stale optimistic-lock revision while
+/// still holding the same cross-process mutation lease used for the write.
+pub fn mutate_strict_at_revision(
+    path: &std::path::Path,
+    expected_revision: &str,
+    mutation: impl FnOnce(&mut ConfigMap) -> Result<()>,
+) -> Result<()> {
+    let _lock = acquire_mutation_lock(path)?;
+    let current = revision(path);
+    if current != expected_revision {
+        return Err(CoreError::Message(format!(
+            "config revision conflict: expected {expected_revision}, current {current}"
+        )));
+    }
+    let mut map = load_strict(path)?;
+    mutation(&mut map)?;
+    save(path, &map)
+}
+
+/// Replace only the supplied owner's scopes while preserving every foreign
+/// scope written by other runtimes since the panel was opened.
+pub fn replace_scopes_strict(
+    path: &std::path::Path,
+    scopes: &[Scope],
+    replacement: &ConfigMap,
+) -> Result<()> {
+    mutate_strict(path, |current| {
+        current.retain(|(scope, _), _| !scopes.contains(scope));
+        current.extend(
+            replacement
+                .iter()
+                .filter(|((scope, _), _)| scopes.contains(scope))
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
+        Ok(())
+    })
 }
 
 /// Load config, erroring on a present-but-broken file rather than fail-softing
@@ -833,7 +969,7 @@ pub fn rows(map: &ConfigMap) -> Vec<(String, String, String, String)> {
 /// The scopes a local CLI edits — its own device behavior. Server/Daemon
 /// settings are edited on their own hosts (the server remotely, the daemon via
 /// `fleetyd config`), not through `fleety config --target local`.
-pub const LOCAL_SCOPES: &[Scope] = &[Scope::Cli, Scope::Shared];
+pub const LOCAL_SCOPES: &[Scope] = CLI_SCOPES;
 
 /// Display rows restricted to `scopes` (same shape as [`rows`]).
 pub fn rows_in_scopes(map: &ConfigMap, scopes: &[Scope]) -> Vec<(String, String, String, String)> {
@@ -857,13 +993,16 @@ pub fn rows_in_scopes(map: &ConfigMap, scopes: &[Scope]) -> Vec<(String, String,
 /// `--target local` edit of a foreign key is redirected, not silently a no-op.
 /// An unknown key gets the usual unknown-setting error.
 pub fn ensure_scope(key: &str, scopes: &[Scope]) -> Result<()> {
+    if key == "FLEETY_DEVICE_ID" {
+        return owner_for_key(key).map(|_| ());
+    }
     match find(key) {
         Some(s) if scopes.contains(&s.scope) => Ok(()),
         Some(s) => {
             let where_to = match s.scope {
                 Scope::Server => "on the server (the default `fleety config set` targets it)",
-                Scope::Daemon => "on the daemon with `fleetyd config set`",
-                Scope::Cli | Scope::Shared => "locally",
+                Scope::Daemon | Scope::Shared => "through the selected daemon",
+                Scope::Cli => "through the CLI owner",
             };
             Err(CoreError::Message(format!(
                 "'{key}' is a {} setting — edit it {where_to}, not via `--target local`",
@@ -953,6 +1092,9 @@ pub fn run_rendered_scoped(args: &[String], scopes: Option<&[Scope]>) -> Result<
             }
         }
         Command::Set(key, value) => {
+            if key == "FLEETY_DEVICE_ID" {
+                owner_for_key(&key)?;
+            }
             if let Some(sc) = scopes {
                 ensure_scope(&key, sc)?;
             }
@@ -965,9 +1107,10 @@ pub fn run_rendered_scoped(args: &[String], scopes: Option<&[Scope]>) -> Result<
             // never lands silently (server/daemon and remote `--target` all
             // funnel through here).
             validate(setting, &value)?;
-            let mut map = load(&path);
-            map.insert((setting.scope, key.clone()), value);
-            save(&path, &map)?;
+            mutate_strict(&path, |map| {
+                map.insert((setting.scope, key.clone()), value.clone());
+                Ok(())
+            })?;
             let mut out = format!("set {key} (scope {})", setting.scope.as_str());
             // Tell the user which process must restart for the change to bite —
             // "takes effect after a restart" alone leaves them guessing.
@@ -986,14 +1129,18 @@ pub fn run_rendered_scoped(args: &[String], scopes: Option<&[Scope]>) -> Result<
             out
         }
         Command::Unset(key) => {
+            if key == "FLEETY_DEVICE_ID" {
+                owner_for_key(&key)?;
+            }
             if let Some(sc) = scopes {
                 ensure_scope(&key, sc)?;
             }
             let setting =
                 find(&key).ok_or_else(|| CoreError::Message(format!("unknown setting '{key}'")))?;
-            let mut map = load(&path);
-            map.remove(&(setting.scope, key.clone()));
-            save(&path, &map)?;
+            mutate_strict(&path, |map| {
+                map.remove(&(setting.scope, key.clone()));
+                Ok(())
+            })?;
             format!("unset {key} (reverts to env/default)")
         }
         Command::Edit => {
@@ -1593,26 +1740,24 @@ mod tests {
     }
 
     #[test]
-    fn rows_in_scopes_and_ensure_scope_restrict_to_local() {
+    fn rows_in_scopes_and_ensure_scope_restrict_to_cli_owner() {
         // rows_in_scopes lists only the requested scopes.
         let rows = rows_in_scopes(&ConfigMap::new(), LOCAL_SCOPES);
-        assert!(rows
-            .iter()
-            .all(|(_, scope, _, _)| scope == "cli" || scope == "shared"));
+        assert!(rows.iter().all(|(_, scope, _, _)| scope == "cli"));
         assert!(rows.iter().any(|(k, _, _, _)| k == "FLEETY_VOICE_AUDIO")); // a Cli key
         assert!(!rows.iter().any(|(k, _, _, _)| k == "FLEETY_ADDR")); // a Server key excluded
                                                                       // ensure_scope: a Cli/Shared key passes; a Server/Daemon key is refused
                                                                       // with direction; an unknown key is the usual unknown error.
         assert!(ensure_scope("FLEETY_VOICE_AUDIO", LOCAL_SCOPES).is_ok());
-        assert!(ensure_scope("FLEETY_TZ", LOCAL_SCOPES).is_ok());
+        let shared = ensure_scope("FLEETY_TZ", LOCAL_SCOPES)
+            .unwrap_err()
+            .to_string();
+        assert!(shared.contains("daemon"), "shared key redirected: {shared}");
         let err = ensure_scope("FLEETY_ADDR", LOCAL_SCOPES)
             .unwrap_err()
             .to_string();
         assert!(err.contains("server"), "server key redirected: {err}");
-        let derr = ensure_scope("FLEETY_DEVICE_ID", LOCAL_SCOPES)
-            .unwrap_err()
-            .to_string();
-        assert!(derr.contains("daemon"), "daemon key redirected: {derr}");
+        assert!(find("FLEETY_DEVICE_ID").is_none());
         assert!(ensure_scope("FLEETY_NOPE", LOCAL_SCOPES).is_err());
     }
 
@@ -1624,10 +1769,10 @@ mod tests {
         std::env::remove_var("FLEETY_ADDR");
         let v = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
 
-        // Local list omits Server keys, includes Cli/Shared.
+        // Local list omits Server/Daemon/Shared keys and includes only Cli.
         let list = run_rendered_scoped(&v(&["list"]), Some(LOCAL_SCOPES)).unwrap();
         assert!(!list.contains("FLEETY_ADDR"), "server key hidden: {list}");
-        assert!(list.contains("FLEETY_TZ"), "shared key shown: {list}");
+        assert!(!list.contains("FLEETY_TZ"), "shared key hidden: {list}");
         // Unfiltered list (server/daemon) still shows everything.
         assert!(run_rendered_scoped(&v(&["list"]), None)
             .unwrap()
@@ -1642,16 +1787,79 @@ mod tests {
             !path.exists(),
             "a refused local set must not create the file"
         );
-        // Local set of a Shared key works.
-        run_rendered_scoped(&v(&["set", "FLEETY_TZ", "Asia/Taipei"]), Some(LOCAL_SCOPES)).unwrap();
+        // Local set of a Cli key works.
+        run_rendered_scoped(
+            &v(&["set", "FLEETY_VOICE_AUDIO", "auto"]),
+            Some(LOCAL_SCOPES),
+        )
+        .unwrap();
         assert_eq!(
             load(&path)
-                .get(&(Scope::Shared, "FLEETY_TZ".to_string()))
+                .get(&(Scope::Cli, "FLEETY_VOICE_AUDIO".to_string()))
                 .map(String::as_str),
-            Some("Asia/Taipei")
+            Some("auto")
         );
         std::env::remove_var("FLEETY_CONFIG");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn owner_scope_sets_are_disjoint_and_complete() {
+        for setting in registry() {
+            let owner = owner_for_key(setting.key).unwrap();
+            let scopes = match owner {
+                Owner::Server => SERVER_SCOPES,
+                Owner::Daemon => DAEMON_SCOPES,
+                Owner::Cli => CLI_SCOPES,
+            };
+            assert!(
+                scopes.contains(&setting.scope),
+                "{} owner mismatch",
+                setting.key
+            );
+        }
+        assert_eq!(owner_for_key("FLEETY_ADDR").unwrap(), Owner::Server);
+        assert_eq!(owner_for_key("FLEETY_TZ").unwrap(), Owner::Daemon);
+        assert_eq!(owner_for_key("FLEETY_VOICE_AUDIO").unwrap(), Owner::Cli);
+        assert!(owner_for_key("FLEETY_DEVICE_ID").is_err());
+    }
+
+    #[test]
+    fn mutating_corrupt_config_never_overwrites() {
+        let path = std::env::temp_dir().join(format!("fleety-cfg-{}.toml", uuid::Uuid::new_v4()));
+        let original = b"{ definitely not toml";
+        std::fs::write(&path, original).unwrap();
+        let result = mutate_strict(&path, |map| {
+            map.insert((Scope::Cli, "FLEETY_VOICE_AUDIO".into()), "auto".into());
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn concurrent_config_mutations_preserve_both_values() {
+        let path = std::env::temp_dir().join(format!("fleety-cfg-{}.toml", uuid::Uuid::new_v4()));
+        let a = path.clone();
+        let b = path.clone();
+        let first = std::thread::spawn(move || {
+            mutate_strict(&a, |map| {
+                map.insert((Scope::Cli, "FLEETY_VOICE_AUDIO".into()), "auto".into());
+                Ok(())
+            })
+        });
+        let second = std::thread::spawn(move || {
+            mutate_strict(&b, |map| {
+                map.insert((Scope::Daemon, "FLEETY_PRESENCE".into()), "off".into());
+                Ok(())
+            })
+        });
+        first.join().unwrap().unwrap();
+        second.join().unwrap().unwrap();
+        let map = load_strict(&path).unwrap();
+        assert_eq!(map.len(), 2);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

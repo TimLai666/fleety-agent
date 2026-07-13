@@ -3,7 +3,7 @@
 //! user type an id. Parsing is pure (unit-tested); the fetch is best-effort and
 //! its failure degrades the wizard to manual entry rather than erroring.
 
-use agent_core::{CoreError, Result};
+#[cfg(test)]
 use serde_json::Value;
 
 /// Extract model ids from a `/models` response body: the standard OpenAI shape
@@ -11,6 +11,7 @@ use serde_json::Value;
 /// `models` array too. Returns them de-duplicated in first-seen order; a body
 /// that isn't recognisable yields an empty list (the caller falls back to manual
 /// entry). Pure.
+#[cfg(test)]
 pub fn parse_model_ids(v: &Value) -> Vec<String> {
     let arr = v
         .get("data")
@@ -35,35 +36,6 @@ pub fn parse_model_ids(v: &Value) -> Vec<String> {
         }
     }
     out
-}
-
-/// Fetch `{base_url}/models` and return the model ids. `key` (when present) is
-/// sent as a Bearer token. A non-2xx, a non-JSON body, or a network error is an
-/// `Err` the caller turns into "type the model id manually".
-pub async fn fetch_models(base_url: &str, key: Option<&str>) -> Result<Vec<String>> {
-    let url = format!("{}/models", base_url.trim_end_matches('/'));
-    let mut req = reqwest::Client::new().get(&url);
-    if let Some(k) = key.filter(|k| !k.is_empty()) {
-        req = req.bearer_auth(k);
-    }
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| CoreError::Provider(format!("fetching {url} failed: {e}")))?;
-    let status = resp.status();
-    if !status.is_success() {
-        return Err(CoreError::Provider(format!(
-            "{url} returned HTTP {}",
-            status.as_u16()
-        )));
-    }
-    let body = resp
-        .text()
-        .await
-        .map_err(|e| CoreError::Provider(format!("reading {url} failed: {e}")))?;
-    let v: Value = serde_json::from_str(&body)
-        .map_err(|e| CoreError::Provider(format!("{url}: response was not JSON ({e})")))?;
-    Ok(parse_model_ids(&v))
 }
 
 /// Case-insensitive substring filter over model ids, keeping order.

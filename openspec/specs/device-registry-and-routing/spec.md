@@ -174,3 +174,58 @@ code:
   - crates/fleety-server/src/bridge.rs
   - crates/fleety-server/src/conn.rs
 -->
+
+---
+### Requirement: Daemon routing is not displaced by interactive sessions
+
+Only a daemon-capable connection that advertises on-device tools SHALL occupy the routable device sender entry. An interactive CLI connection using the same stable device id SHALL receive its own replies but SHALL NOT replace or remove the daemon sender. Disconnect cleanup SHALL remove a sender only when the entry still belongs to the disconnecting connection.
+
+#### Scenario: CLI connection does not replace daemon
+
+- **GIVEN** fleetyd is connected under device id laptop
+- **WHEN** an interactive fleety CLI connects under the same device id
+- **THEN** device routing continues to send RunTool frames to fleetyd
+
+#### Scenario: CLI disconnect does not remove daemon
+
+- **GIVEN** fleetyd and an interactive CLI are connected under the same device id
+- **WHEN** the CLI disconnects
+- **THEN** the fleetyd sender remains routable
+
+#### Scenario: stale daemon disconnect does not remove replacement
+
+- **GIVEN** a newer fleetyd connection replaced an older daemon sender for the same device id
+- **WHEN** the older connection finishes cleanup
+- **THEN** the newer sender remains registered
+
+<!-- @trace
+source: route-config-to-owning-runtime
+updated: 2026-07-14
+code:
+  - crates/fleety-server/src/main.rs
+  - crates/fleety-server/src/http.rs
+  - crates/fleety-tools/src/oauth.rs
+  - crates/fleety-cli/src/config_panel.rs
+  - crates/fleety-cli/src/provider_tui.rs
+  - docs/design-cli-config.md
+  - docs/roadmap.md
+  - README.md
+  - crates/fleety-cli/src/model_picker.rs
+  - crates/fleety-daemon/src/main.rs
+  - crates/fleety-server/src/conn.rs
+  - crates/fleety-tools/src/connection.rs
+  - crates/fleety-cli/src/auth.rs
+  - crates/fleety-tools/src/config.rs
+  - crates/fleety-tools/src/providers_config.rs
+  - crates/fleety-cli/src/main.rs
+  - docs/STATUS.md
+  - crates/fleety-cli/src/config.rs
+  - crates/fleety-server/src/bridge.rs
+  - crates/fleety-cli/src/acp.rs
+  - docs/env.md
+  - crates/fleety-cli/src/server.rs
+tests:
+  - crates/fleety-cli/tests/cli_smoke.rs
+  - crates/fleety-daemon/tests/fleetyd_smoke.rs
+  - crates/fleety-server/tests/server_smoke.rs
+-->

@@ -485,95 +485,113 @@ pub(crate) async fn run_connection(
     peer_is_loopback: bool,
 ) -> Result<()> {
     // The first frame must be Hello; enforce auth if the server requires it.
-    let (device_id, minted_token, loopback_trusted) = match inbound.next_client().await? {
-        Some(ClientMsg::Hello {
-            device_id,
-            protocol,
-            token,
-            pairing_code,
-            local_tools_json,
-            hostname,
-        }) => {
-            if protocol != PROTOCOL_VERSION {
-                tracing::warn!(
-                    client_protocol = protocol,
-                    server_protocol = PROTOCOL_VERSION,
-                    "protocol version mismatch; proceeding (only v0 exists)"
-                );
-            }
-            // Trusted-loopback = accepted on same-host trust with no credential
-            // (a valid token still authenticates normally). Recorded so Welcome
-            // can tell the client it needn't pair.
-            let loopback_trusted = auth.required()
-                && token.is_none()
-                && pairing_code.is_none()
-                && peer_is_loopback
-                && trust_loopback_enabled();
-            match authenticate(
-                &auth,
-                &device_id,
-                token.as_deref(),
-                pairing_code.as_deref(),
-                peer_is_loopback,
-            ) {
-                Ok(minted) => {
-                    // Resolve the authoritative device id (token-bound when
-                    // authenticated) and migrate any legacy hostname/bound-id data
-                    // to it once.
-                    let device_id = resolve_device_identity(
-                        &auth,
-                        &storage,
-                        &device_id,
-                        token.as_deref(),
-                        hostname.as_deref(),
+    let (device_id, minted_token, loopback_trusted, daemon_capable, connection_tools) =
+        match inbound.next_client().await? {
+            Some(ClientMsg::Hello {
+                device_id,
+                protocol,
+                token,
+                pairing_code,
+                local_tools_json,
+                hostname,
+            }) => {
+                if protocol != PROTOCOL_VERSION {
+                    tracing::warn!(
+                        client_protocol = protocol,
+                        server_protocol = PROTOCOL_VERSION,
+                        "protocol version mismatch; proceeding (only v0 exists)"
                     );
-                    // Record the hostname as a display label on the device record
-                    // (ensure the record exists first; it is re-ensured below too).
-                    if let Some(h) = &hostname {
-                        let _ = storage.ensure_device(&device_id, "client_session");
-                        let _ = storage.set_device_label(&device_id, h);
-                    }
-                    // Stash any tool specs the device advertised so device_show
-                    // and downstream lookups can see them. Best-effort: a parse
-                    // failure means the device speaks a future shape we don't
-                    // recognise — log and proceed without specs.
-                    if let Some(json) = local_tools_json {
-                        match serde_json::from_str::<Vec<agent_core::ToolSpec>>(&json) {
-                            Ok(specs) => {
-                                device_tools.lock().await.insert(device_id.clone(), specs);
-                            }
-                            Err(e) => {
-                                tracing::warn!(%device_id, error = %e, "could not parse advertised tools");
+                }
+                // Trusted-loopback = accepted on same-host trust with no credential
+                // (a valid token still authenticates normally). Recorded so Welcome
+                // can tell the client it needn't pair.
+                let loopback_trusted = auth.required()
+                    && token.is_none()
+                    && pairing_code.is_none()
+                    && peer_is_loopback
+                    && trust_loopback_enabled();
+                match authenticate(
+                    &auth,
+                    &device_id,
+                    token.as_deref(),
+                    pairing_code.as_deref(),
+                    peer_is_loopback,
+                ) {
+                    Ok(minted) => {
+                        // Resolve the authoritative device id (token-bound when
+                        // authenticated) and migrate any legacy hostname/bound-id data
+                        // to it once.
+                        let device_id = resolve_device_identity(
+                            &auth,
+                            &storage,
+                            &device_id,
+                            token.as_deref(),
+                            hostname.as_deref(),
+                        );
+                        // Record the hostname as a display label on the device record
+                        // (ensure the record exists first; it is re-ensured below too).
+                        if let Some(h) = &hostname {
+                            let _ = storage.ensure_device(&device_id, "client_session");
+                            let _ = storage.set_device_label(&device_id, h);
+                        }
+                        // Stash any tool specs the device advertised so device_show
+                        // and downstream lookups can see them. Best-effort: a parse
+                        // failure means the device speaks a future shape we don't
+                        // recognise — log and proceed without specs.
+                        let mut connection_tools = Vec::new();
+                        let mut daemon_capable = false;
+                        if let Some(json) = local_tools_json {
+                            match serde_json::from_str::<Vec<agent_core::ToolSpec>>(&json) {
+                                Ok(specs) => {
+                                    daemon_capable = specs.iter().any(|spec| {
+                                        matches!(spec.name.as_str(), "read_file" | "run_command")
+                                    });
+                                    connection_tools = specs;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(%device_id, error = %e, "could not parse advertised tools");
+                                }
                             }
                         }
+                        if daemon_capable {
+                            device_tools
+                                .lock()
+                                .await
+                                .insert(device_id.clone(), connection_tools.clone());
+                        }
+                        (
+                            device_id,
+                            minted,
+                            loopback_trusted,
+                            daemon_capable,
+                            connection_tools,
+                        )
                     }
-                    (device_id, minted, loopback_trusted)
-                }
-                Err(message) => {
-                    tracing::warn!(%device_id, "rejected unauthenticated connection");
-                    send_error_frame(
+                    Err(message) => {
+                        tracing::warn!(%device_id, "rejected unauthenticated connection");
+                        send_error_frame(
                         &mut *writer,
                         "unauthenticated",
                         &message,
                         "pass a valid token, or a pairing_code from `pair_create` on a paired device",
                     )
                     .await;
-                    return Ok(());
+                        return Ok(());
+                    }
                 }
             }
-        }
-        Some(_) => {
-            send_error_frame(
-                &mut *writer,
-                "expected_hello",
-                "first frame must be Hello",
-                "send a Hello frame with your device_id before anything else",
-            )
-            .await;
-            return Ok(());
-        }
-        None => return Ok(()),
-    };
+            Some(_) => {
+                send_error_frame(
+                    &mut *writer,
+                    "expected_hello",
+                    "first frame must be Hello",
+                    "send a Hello frame with your device_id before anything else",
+                )
+                .await;
+                return Ok(());
+            }
+            None => return Ok(()),
+        };
 
     // Register / refresh this device in the registry.
     storage.ensure_device(&device_id, "client_session")?;
@@ -592,7 +610,9 @@ pub(crate) async fn run_connection(
             }
         }
     });
-    hub.lock().await.insert(device_id.clone(), out.clone());
+    if daemon_capable {
+        hub.lock().await.insert(device_id.clone(), out.clone());
+    }
 
     let result = serve(
         &mut *inbound,
@@ -609,11 +629,20 @@ pub(crate) async fn run_connection(
         minted_token,
         &device_id,
         loopback_trusted,
+        &connection_tools,
     )
     .await;
 
-    hub.lock().await.remove(&device_id);
-    device_tools.lock().await.remove(&device_id);
+    if daemon_capable {
+        let mut active = hub.lock().await;
+        if active
+            .get(&device_id)
+            .is_some_and(|sender| sender.same_channel(&out))
+        {
+            active.remove(&device_id);
+            device_tools.lock().await.remove(&device_id);
+        }
+    }
     writer_task.abort();
     tracing::info!(%device_id, "client disconnected");
     result
@@ -637,6 +666,7 @@ async fn serve(
     minted_token: Option<String>,
     device_id: &str,
     loopback_trusted: bool,
+    connection_tools: &[agent_core::ToolSpec],
 ) -> Result<()> {
     let session_id = uuid::Uuid::new_v4().to_string();
     let default_conversation = uuid::Uuid::new_v4().to_string();
@@ -676,18 +706,11 @@ async fn serve(
     let rollover_state = crate::conversation_lifecycle::new_state();
     // Editor-backed tools to offer this connection: the `editor_*` subset it
     // advertised in Hello (an ACP editor gates these by the editor's capabilities).
-    let editor_specs: Vec<agent_core::ToolSpec> = device_tools
-        .lock()
-        .await
-        .get(device_id)
-        .map(|specs| {
-            specs
-                .iter()
-                .filter(|s| s.name.starts_with("editor_"))
-                .cloned()
-                .collect()
-        })
-        .unwrap_or_default();
+    let editor_specs: Vec<agent_core::ToolSpec> = connection_tools
+        .iter()
+        .filter(|s| s.name.starts_with("editor_"))
+        .cloned()
+        .collect();
     let (mut tools, mut subagent_host, mut goal_state, mut session_effort) = build_connection_stack(
         storage,
         &current_root,
@@ -1496,7 +1519,12 @@ async fn serve(
                     };
                     emit(out, &reply)?;
                 } else {
-                    let reply = config_apply(target, &args);
+                    let reply = match target {
+                        fleety_protocol::ConfigTarget::Device(ref id) => {
+                            daemon_config_exec(hub, pending, id, &args).await
+                        }
+                        _ => config_apply(target, &args),
+                    };
                     // A successful mutation (effect present) is auditable — with
                     // secret values masked: the audit log is readable via
                     // `fleety audit`, so `set FLEETY_MODEL_KEY sk-…` must not land
@@ -1529,11 +1557,9 @@ async fn serve(
                             .to_string(),
                         None,
                     ),
-                    fleety_protocol::ConfigTarget::Device(_) => config_err(
-                        "unsupported",
-                        "per-device config snapshot is not supported yet".to_string(),
-                        None,
-                    ),
+                    fleety_protocol::ConfigTarget::Device(id) => {
+                        daemon_config_snapshot(hub, pending, &id).await
+                    }
                 };
                 emit(out, &reply)?;
             }
@@ -1575,11 +1601,17 @@ async fn serve(
                             .to_string(),
                         None,
                     ),
-                    fleety_protocol::ConfigTarget::Device(_) => config_err(
-                        "unsupported",
-                        "per-device config apply is not supported yet".to_string(),
-                        None,
-                    ),
+                    fleety_protocol::ConfigTarget::Device(id) => {
+                        daemon_config_apply(
+                            hub,
+                            pending,
+                            &id,
+                            &base_revision,
+                            &changes,
+                            providers_json.as_deref(),
+                        )
+                        .await
+                    }
                 };
                 emit(out, &reply)?;
             }
@@ -2096,25 +2128,47 @@ fn is_sensitive_key(key: &str) -> bool {
 /// settings as `ConfigEntry`s (secrets carry no value, only `is_set`) plus the
 /// structured provider/model config, tagged with the current revision.
 fn build_config_snapshot() -> ServerMsg {
-    let map = fleety_tools::config::load(&fleety_tools::config::config_path());
-    let entries = fleety_tools::config::snapshot_entries(&map, None)
-        .into_iter()
-        .map(|e| fleety_protocol::ConfigEntry {
-            key: e.key.to_string(),
-            scope: e.scope.as_str().to_string(),
-            value: e.value,
-            default: e.default.to_string(),
-            description: e.description.to_string(),
-            secret: e.secret,
-            is_set: e.is_set,
-            effect: e.effect.map(wire_effect),
-            choices: e.choices.iter().map(|c| c.to_string()).collect(),
-        })
-        .collect();
-    // Structured provider/model config (best-effort; "{}" when missing/broken).
-    let providers_json = fleety_tools::providers_config::load()
-        .and_then(|c| serde_json::to_string(&c).ok())
-        .unwrap_or_else(|| "{}".to_string());
+    let map = match fleety_tools::config::load_strict(&fleety_tools::config::config_path()) {
+        Ok(map) => map,
+        Err(e) => {
+            let report = e.report();
+            return config_err(&report.kind, report.message, report.remediation);
+        }
+    };
+    let entries =
+        fleety_tools::config::snapshot_entries(&map, Some(fleety_tools::config::SERVER_SCOPES))
+            .into_iter()
+            .map(|e| fleety_protocol::ConfigEntry {
+                key: e.key.to_string(),
+                scope: e.scope.as_str().to_string(),
+                value: e.value,
+                default: e.default.to_string(),
+                description: e.description.to_string(),
+                secret: e.secret,
+                is_set: e.is_set,
+                effect: e.effect.map(wire_effect),
+                choices: e.choices.iter().map(|c| c.to_string()).collect(),
+            })
+            .collect();
+    let providers = match fleety_tools::providers_config::load_or_default(
+        &fleety_tools::providers_config::providers_path(),
+    ) {
+        Ok(config) => config,
+        Err(e) => {
+            let report = e.report();
+            return config_err(&report.kind, report.message, report.remediation);
+        }
+    };
+    let providers_json = match serde_json::to_string(&providers) {
+        Ok(json) => json,
+        Err(e) => {
+            return config_err(
+                "serialization",
+                format!("could not serialize provider snapshot: {e}"),
+                None,
+            )
+        }
+    };
     ServerMsg::ConfigSnapshotResult {
         revision: config_revision(),
         entries,
@@ -2133,6 +2187,166 @@ fn config_err(kind: &str, message: String, remediation: Option<String>) -> Serve
             message,
             remediation,
         }),
+    }
+}
+
+const INTERNAL_CONFIG_TOOL: &str = "__fleety_internal_config";
+
+fn daemon_config_error(value: &serde_json::Value) -> Option<ServerMsg> {
+    if value.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+        return None;
+    }
+    Some(config_err(
+        value
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("daemon_config"),
+        value
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("the daemon rejected the configuration request")
+            .to_string(),
+        None,
+    ))
+}
+
+async fn daemon_config_request(
+    hub: &Hub,
+    pending: &Pending,
+    device: &str,
+    args: serde_json::Value,
+) -> std::result::Result<serde_json::Value, ServerMsg> {
+    crate::bridge::route_run_tool_to_device(hub, pending, device, INTERNAL_CONFIG_TOOL, args)
+        .await
+        .map_err(|e| {
+            let report = e.report();
+            config_err(&report.kind, report.message, report.remediation)
+        })
+}
+
+async fn daemon_config_exec(
+    hub: &Hub,
+    pending: &Pending,
+    device: &str,
+    args: &[String],
+) -> ServerMsg {
+    let value = match daemon_config_request(
+        hub,
+        pending,
+        device,
+        serde_json::json!({ "op": "exec", "args": args }),
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(reply) => return reply,
+    };
+    if let Some(error) = daemon_config_error(&value) {
+        return error;
+    }
+    let effect = value
+        .get("effect")
+        .cloned()
+        .filter(|v| !v.is_null())
+        .and_then(|v| serde_json::from_value(v).ok());
+    ServerMsg::ConfigResult {
+        ok: true,
+        output: value
+            .get("output")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        effect,
+        error: None,
+    }
+}
+
+async fn daemon_config_snapshot(hub: &Hub, pending: &Pending, device: &str) -> ServerMsg {
+    let value = match daemon_config_request(
+        hub,
+        pending,
+        device,
+        serde_json::json!({ "op": "snapshot" }),
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(reply) => return reply,
+    };
+    if let Some(error) = daemon_config_error(&value) {
+        return error;
+    }
+    let entries = match serde_json::from_value(
+        value
+            .get("entries")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([])),
+    ) {
+        Ok(entries) => entries,
+        Err(e) => {
+            return config_err(
+                "protocol",
+                format!("daemon returned malformed config entries: {e}"),
+                None,
+            )
+        }
+    };
+    let Some(revision) = value.get("revision").and_then(serde_json::Value::as_str) else {
+        return config_err(
+            "protocol",
+            "daemon config snapshot omitted its revision".to_string(),
+            None,
+        );
+    };
+    ServerMsg::ConfigSnapshotResult {
+        revision: revision.to_string(),
+        entries,
+        providers_json: String::new(),
+    }
+}
+
+async fn daemon_config_apply(
+    hub: &Hub,
+    pending: &Pending,
+    device: &str,
+    base_revision: &str,
+    changes: &[fleety_protocol::ConfigChange],
+    providers_json: Option<&str>,
+) -> ServerMsg {
+    if providers_json.is_some() {
+        return config_err(
+            "wrong_owner",
+            "provider and model configuration is owned by fleety-server".to_string(),
+            None,
+        );
+    }
+    let value = match daemon_config_request(
+        hub,
+        pending,
+        device,
+        serde_json::json!({
+            "op": "apply",
+            "base_revision": base_revision,
+            "changes": changes,
+        }),
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(reply) => return reply,
+    };
+    if let Some(error) = daemon_config_error(&value) {
+        return error;
+    }
+    let applied = value
+        .get("applied")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    ServerMsg::ConfigResult {
+        ok: true,
+        output: format!("applied {applied} change(s) on daemon '{device}'"),
+        effect: Some(fleety_protocol::Effect::Restart),
+        error: None,
     }
 }
 
@@ -2175,6 +2389,51 @@ fn apply_structured_changes(
             false,
         );
     }
+    if providers_json.is_some() && changes.iter().any(|c| !matches!(c.op, ChangeOp::Keep)) {
+        return (
+            config_err(
+                "invalid",
+                "one ConfigApply cannot mix flat settings with provider configuration".to_string(),
+                Some("save settings and providers as separate owner transactions".to_string()),
+            ),
+            0,
+            vec![],
+            false,
+        );
+    }
+    // Parse and validate every provider change before touching either file. A
+    // malformed provider payload must never leave the flat config half-applied.
+    let parsed_providers = match providers_json {
+        Some(json) => {
+            let cfg: fleety_tools::providers_config::ProvidersConfig =
+                match serde_json::from_str(json) {
+                    Ok(config) => config,
+                    Err(e) => {
+                        return (
+                            config_err(
+                                "invalid",
+                                format!("malformed providers payload: {e}"),
+                                Some("re-open the provider editor and save again".to_string()),
+                            ),
+                            0,
+                            vec![],
+                            false,
+                        )
+                    }
+                };
+            if let Err(e) = fleety_tools::providers_config::validate(&cfg) {
+                let report = e.report();
+                return (
+                    config_err(&report.kind, report.message, report.remediation),
+                    0,
+                    vec![],
+                    false,
+                );
+            }
+            Some(cfg)
+        }
+        None => None,
+    };
     let path = fleety_tools::config::config_path();
     let mut map = match fleety_tools::config::load_strict(&path) {
         Ok(m) => m,
@@ -2202,6 +2461,17 @@ fn apply_structured_changes(
                         false,
                     );
                 };
+                if let Err(e) =
+                    fleety_tools::config::ensure_scope(&ch.key, fleety_tools::config::SERVER_SCOPES)
+                {
+                    let report = e.report();
+                    return (
+                        config_err(&report.kind, report.message, report.remediation),
+                        0,
+                        vec![],
+                        false,
+                    );
+                }
                 let v = ch.value.clone().unwrap_or_default();
                 if let Err(e) = fleety_tools::config::validate(setting, &v) {
                     let r = e.report();
@@ -2227,6 +2497,17 @@ fn apply_structured_changes(
                         false,
                     );
                 };
+                if let Err(e) =
+                    fleety_tools::config::ensure_scope(&ch.key, fleety_tools::config::SERVER_SCOPES)
+                {
+                    let report = e.report();
+                    return (
+                        config_err(&report.kind, report.message, report.remediation),
+                        0,
+                        vec![],
+                        false,
+                    );
+                }
                 map.remove(&(setting.scope, ch.key.clone()));
                 if is_sensitive_key(&ch.key) {
                     sensitive.push(ch.key.clone());
@@ -2250,23 +2531,7 @@ fn apply_structured_changes(
     // atomic write via the same path the local editor uses. Nothing lands on a
     // parse or validation failure.
     let mut providers_changed = false;
-    if let Some(json) = providers_json {
-        let cfg: fleety_tools::providers_config::ProvidersConfig = match serde_json::from_str(json)
-        {
-            Ok(c) => c,
-            Err(e) => {
-                return (
-                    config_err(
-                        "invalid",
-                        format!("malformed providers payload: {e}"),
-                        Some("re-open the provider editor and save again".to_string()),
-                    ),
-                    applied,
-                    sensitive,
-                    false,
-                )
-            }
-        };
+    if let Some(cfg) = parsed_providers {
         if let Err(e) = fleety_tools::providers_config::write_providers(
             &fleety_tools::providers_config::providers_path(),
             &cfg,
@@ -2303,7 +2568,10 @@ fn apply_structured_changes(
 fn config_apply(target: fleety_protocol::ConfigTarget, args: &[String]) -> ServerMsg {
     use fleety_protocol::{ConfigTarget, Effect};
     match target {
-        ConfigTarget::Server => match fleety_tools::config::run_rendered(args) {
+        ConfigTarget::Server => match fleety_tools::config::run_rendered_scoped(
+            args,
+            Some(fleety_tools::config::SERVER_SCOPES),
+        ) {
             Ok(output) => {
                 let effect = match fleety_tools::config::config_effect(args) {
                     Some(fleety_tools::config::ConfigEffect::NextConnection) => {
@@ -3551,6 +3819,38 @@ mod tests {
         }
         assert!(providers_changed);
         assert!(providers_path.exists(), "providers.toml written");
+
+        // A single request may not span both owner files. Reject it before
+        // touching either file so an I/O failure can never leave a half-apply.
+        std::fs::write(&config_path, "[server]\nFLEETY_ADDR = \"before:8787\"\n")
+            .expect("seed config");
+        let config_before = std::fs::read(&config_path).expect("read config bytes");
+        let providers_before = std::fs::read(&providers_path).expect("read provider bytes");
+        let rev = config_revision();
+        let mixed = [fleety_protocol::ConfigChange {
+            key: "FLEETY_ADDR".to_string(),
+            op: fleety_protocol::ChangeOp::Set,
+            value: Some("after:8787".to_string()),
+        }];
+        let (reply, applied, _, changed) =
+            apply_structured_changes(&rev, &mixed, Some(providers), true);
+        match reply {
+            ServerMsg::ConfigResult { ok, error, .. } => {
+                assert!(!ok);
+                assert_eq!(error.expect("mixed apply error").kind, "invalid");
+            }
+            other => panic!("unexpected reply {other:?}"),
+        }
+        assert_eq!(applied, 0);
+        assert!(!changed);
+        assert_eq!(
+            std::fs::read(&config_path).expect("config unchanged"),
+            config_before
+        );
+        assert_eq!(
+            std::fs::read(&providers_path).expect("providers unchanged"),
+            providers_before
+        );
 
         // Malformed JSON is rejected without touching the file.
         let before = std::fs::read_to_string(&providers_path).expect("read");
@@ -6481,7 +6781,26 @@ mod tests {
             .await
             .expect("daemon connect");
         let (mut dtx, mut drx) = dws.split();
-        send_client(&mut dtx, &hello("pi")).await;
+        send_client(
+            &mut dtx,
+            &ClientMsg::Hello {
+                device_id: "pi".into(),
+                protocol: PROTOCOL_VERSION,
+                token: None,
+                pairing_code: None,
+                local_tools_json: Some(
+                    serde_json::to_string(&vec![agent_core::ToolSpec {
+                        name: "read_file".to_string(),
+                        description: "test daemon tool".to_string(),
+                        parameters: serde_json::json!({}),
+                        risk: agent_core::RiskLevel::Read,
+                    }])
+                    .expect("tool specs"),
+                ),
+                hostname: None,
+            },
+        )
+        .await;
         assert!(matches!(
             recv_server(&mut drx).await,
             Some(ServerMsg::Welcome { .. })

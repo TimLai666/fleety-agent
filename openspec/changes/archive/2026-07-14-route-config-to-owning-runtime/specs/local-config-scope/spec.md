@@ -1,10 +1,4 @@
-# local-config-scope Specification
-
-## Purpose
-
-TBD - created by archiving change 'local-config-scope'. Update Purpose after archive.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: The local CLI config surface is scoped to this device's settings
 
@@ -29,35 +23,3 @@ fleety config --target cli and its compatibility alias --target local SHALL show
 
 - **WHEN** fleety config --target cli set FLEETY_VOICE_AUDIO auto runs
 - **THEN** the Cli-scoped value is persisted for the next fleety command
-
-<!-- @trace
-source: route-config-to-owning-runtime
-updated: 2026-07-14
-code:
-  - crates/fleety-server/src/main.rs
-  - crates/fleety-server/src/http.rs
-  - crates/fleety-tools/src/oauth.rs
-  - crates/fleety-cli/src/config_panel.rs
-  - crates/fleety-cli/src/provider_tui.rs
-  - docs/design-cli-config.md
-  - docs/roadmap.md
-  - README.md
-  - crates/fleety-cli/src/model_picker.rs
-  - crates/fleety-daemon/src/main.rs
-  - crates/fleety-server/src/conn.rs
-  - crates/fleety-tools/src/connection.rs
-  - crates/fleety-cli/src/auth.rs
-  - crates/fleety-tools/src/config.rs
-  - crates/fleety-tools/src/providers_config.rs
-  - crates/fleety-cli/src/main.rs
-  - docs/STATUS.md
-  - crates/fleety-cli/src/config.rs
-  - crates/fleety-server/src/bridge.rs
-  - crates/fleety-cli/src/acp.rs
-  - docs/env.md
-  - crates/fleety-cli/src/server.rs
-tests:
-  - crates/fleety-cli/tests/cli_smoke.rs
-  - crates/fleety-daemon/tests/fleetyd_smoke.rs
-  - crates/fleety-server/tests/server_smoke.rs
--->

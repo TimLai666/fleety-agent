@@ -222,7 +222,11 @@ pub fn load() -> Option<ProvidersConfig> {
 pub fn load_or_default(path: &Path) -> Result<ProvidersConfig> {
     match std::fs::read_to_string(path) {
         Ok(text) => parse(&text),
-        Err(_) => Ok(ProvidersConfig::default()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ProvidersConfig::default()),
+        Err(e) => Err(CoreError::Message(format!(
+            "cannot read providers.toml at {}: {e}",
+            path.display()
+        ))),
     }
 }
 

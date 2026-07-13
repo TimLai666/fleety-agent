@@ -13,9 +13,6 @@
 //! in-place provider editing from the old single-tier UI are dropped; use
 //! remove+add, or the non-interactive commands, for those.)
 
-use std::collections::BTreeMap;
-use std::path::Path;
-
 use agent_core::{CoreError, Result};
 use fleety_tools::providers_config::{
     self as pc, Member, ModelPool, Provider, ProvidersConfig, Strategy,
@@ -25,6 +22,7 @@ use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Paragraph};
 use ratatui::Frame;
+use std::collections::BTreeMap;
 
 use crate::input::LineEditor;
 
@@ -129,8 +127,8 @@ impl ProviderEditor {
 }
 
 /// What a save attempt did. The remote saver reports a concurrent-edit
-/// conflict as data (not an error) so the editor can exit and the caller
-/// reload from a fresh snapshot instead of overwriting.
+/// conflict as data (not an error) so the editor can retain the staged edit
+/// without overwriting a newer snapshot.
 pub enum SaveOutcome {
     Saved,
     Conflict(String),
@@ -169,26 +167,8 @@ fn masked_key(key: &Option<String>) -> &'static str {
     }
 }
 
-/// Fetch `{base_url}/models` synchronously from inside the TUI's blocking key
-/// loop. The loop runs on the multi-threaded tokio runtime (`#[tokio::main]`),
-/// so `block_in_place` + the current runtime handle drives the async fetch
-/// without a nested runtime. Any error (including "no runtime" when called from
-/// a plain thread, e.g. a test) is returned as a `String` the wizard turns into
-/// manual entry.
-fn fetch_provider_models(
-    base: &str,
-    key: Option<String>,
-) -> std::result::Result<Vec<String>, String> {
-    let handle =
-        tokio::runtime::Handle::try_current().map_err(|_| "no async runtime".to_string())?;
-    let base = base.to_string();
-    tokio::task::block_in_place(move || {
-        handle.block_on(crate::model_picker::fetch_models(&base, key.as_deref()))
-    })
-    .map_err(|e| e.to_string())
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(test)]
 enum ModelFetchTarget {
     Api {
         base_url: String,
@@ -201,6 +181,7 @@ enum ModelFetchTarget {
 
 /// Select the discovery authority before touching a provider endpoint. OAuth
 /// providers have no `base_url`; remote editors use the server authority.
+#[cfg(test)]
 fn model_fetch_target(
     provider_name: &str,
     provider: &Provider,
@@ -252,6 +233,9 @@ enum Action {
 
 enum Mode {
     Browse,
+    /// Confirmation shown before a dirty editor may close. The selection order
+    /// is deliberately Save / Discard / Cancel, matching the rendered prompt.
+    ConfirmExit(ExitConfirm),
     Input {
         action: Action,
         prompt: &'static str,
@@ -271,6 +255,23 @@ enum Mode {
     /// sign out, or switch account. The chosen action is carried out after the
     /// editor exits (the browser flow can't run under the full-screen UI).
     OauthActions(OauthMenu),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ExitChoice {
+    Save,
+    Discard,
+    Cancel,
+}
+
+const EXIT_CHOICES: &[(&str, ExitChoice)] = &[
+    ("Save", ExitChoice::Save),
+    ("Discard", ExitChoice::Discard),
+    ("Cancel", ExitChoice::Cancel),
+];
+
+struct ExitConfirm {
+    sel: usize,
 }
 
 /// The two editable fields of an api provider, in order.
@@ -536,7 +537,11 @@ struct App {
     mode: Mode,
     status: String,
     auth_states: ProviderAuthStates,
+    /// True when the in-memory provider/model graph differs from the last
+    /// successful save. A failed save never clears this flag.
+    dirty: bool,
     save_now: bool,
+    after_save: AfterSave,
     /// Set by the set-model wizard when it enters `Fetching`; the run loop does
     /// the blocking `/models` fetch (I/O belongs there, not in `on_key`) and
     /// feeds the result back via [`ModelWizard::apply_fetch`].
@@ -545,7 +550,17 @@ struct App {
     /// and quits, and the caller runs the action (browser flow) after the
     /// full-screen UI is torn down.
     auth_request: Option<AuthRequest>,
+    /// Last concurrent-edit conflict. It remains available to the caller if the
+    /// user discards the staged edit and exits, preserving the existing reload
+    /// contract without forcing an immediate, lossy exit on conflict.
+    conflict: Option<String>,
     quit: bool,
+}
+
+enum AfterSave {
+    Stay,
+    Quit,
+    Auth(AuthRequest),
 }
 
 impl App {
@@ -563,9 +578,12 @@ impl App {
             // `hints_for`); the status line starts empty and shows action results.
             status: "editing providers.toml".to_string(),
             auth_states,
+            dirty: false,
             save_now: false,
+            after_save: AfterSave::Stay,
             fetch_models_now: false,
             auth_request: None,
+            conflict: None,
             quit: false,
         }
     }
@@ -580,9 +598,61 @@ impl App {
             },
         };
         self.status = match res {
-            Ok(()) => "ok".to_string(),
+            Ok(()) => {
+                self.dirty = true;
+                "model change staged, not saved".to_string()
+            }
             Err(e) => format!("error: {e}"),
         };
+    }
+
+    fn mark_staged(&mut self, message: impl Into<String>) {
+        self.dirty = true;
+        self.status = format!("{} — staged, not saved", message.into());
+    }
+
+    fn request_save(&mut self, after_save: AfterSave) {
+        self.save_now = true;
+        self.after_save = after_save;
+    }
+
+    fn request_auth(&mut self, request: AuthRequest) {
+        self.request_save(AfterSave::Auth(request));
+    }
+
+    /// Apply one saver result to the editor state. OAuth is deliberately held
+    /// in `after_save` and is only released into the public outcome after a
+    /// confirmed `Saved` result.
+    fn finish_save(&mut self, result: Result<SaveOutcome>) {
+        let after_save = std::mem::replace(&mut self.after_save, AfterSave::Stay);
+        match result {
+            Ok(SaveOutcome::Saved) => {
+                self.dirty = false;
+                self.conflict = None;
+                self.status = "saved".to_string();
+                match after_save {
+                    AfterSave::Stay => {}
+                    AfterSave::Quit => self.quit = true,
+                    AfterSave::Auth(request) => {
+                        self.auth_request = Some(request);
+                        self.quit = true;
+                    }
+                }
+            }
+            Ok(SaveOutcome::Conflict(message)) => {
+                self.dirty = true;
+                self.mode = Mode::Browse;
+                self.auth_request = None;
+                self.conflict = Some(message.clone());
+                self.status = format!("save conflict: {message} — staged changes kept, not saved");
+            }
+            Err(error) => {
+                self.dirty = true;
+                self.mode = Mode::Browse;
+                self.auth_request = None;
+                self.status = format!("save failed: {error} — staged changes kept, not saved");
+            }
+        }
     }
 }
 
@@ -667,20 +737,20 @@ fn on_key_add_wizard(app: &mut App, code: KeyCode) {
                     .add_provider(w.name.clone(), w.kind.clone(), base_url, key)
                 {
                     Ok(()) => {
+                        app.mark_staged(format!("added provider '{}'", w.name));
                         // An oauth:codex provider is useless until it is signed in,
                         // so go straight into login: save the new provider (to the
                         // server, via the caller) then run the sign-in flow —
                         // exactly what the OAuth-action menu does.
                         if is_oauth {
-                            app.auth_request = Some(AuthRequest {
+                            app.request_auth(AuthRequest {
                                 action: AuthAction::Login,
                                 provider: w.name.clone(),
                             });
-                            app.save_now = true;
-                            app.quit = true;
-                            app.status = format!("added '{}' — signing in…", w.name);
-                        } else {
-                            app.status = format!("added provider '{}'", w.name);
+                            app.status = format!(
+                                "added provider '{}' — staged, saving before sign-in…",
+                                w.name
+                            );
                         }
                     }
                     Err(e) => app.status = format!("error: {e}"),
@@ -865,7 +935,7 @@ fn on_key_model_wizard(app: &mut App, code: KeyCode) {
                 Strategy::Single,
             );
             app.mode = Mode::Browse;
-            app.status = format!("set {role} = {model} (single)");
+            app.mark_staged(format!("set {role} = {model} (single)"));
         }
     }
 }
@@ -934,14 +1004,14 @@ fn on_key_edit_wizard(app: &mut App, code: KeyCode) {
         } => {
             app.ed.set_provider(name.clone(), kind, base_url, key);
             app.mode = Mode::Browse;
-            app.status = format!("edited provider '{name}' (s to save)");
+            app.mark_staged(format!("edited provider '{name}'"));
         }
     }
 }
 
 /// Drive the OAuth action menu for an `oauth:codex` provider. Enter records the
-/// chosen action, saves, and quits so the caller runs it after the full-screen UI
-/// is torn down (the browser flow can't run under ratatui).
+/// chosen action and requests a save. The action is released to the caller only
+/// after that save succeeds, once the full-screen UI is torn down.
 fn on_key_oauth_menu(app: &mut App, code: KeyCode) {
     let Mode::OauthActions(m) = &mut app.mode else {
         return;
@@ -958,15 +1028,54 @@ fn on_key_oauth_menu(app: &mut App, code: KeyCode) {
             let provider = m.provider.clone();
             // Save first (so the provider entry exists on the server the login
             // pushes to), then leave the editor to run the action.
-            app.auth_request = Some(AuthRequest { action, provider });
-            app.save_now = true;
-            app.quit = true;
+            app.request_auth(AuthRequest { action, provider });
         }
         _ => {}
     }
 }
 
+fn on_key_exit_confirm(app: &mut App, code: KeyCode) {
+    let Mode::ConfirmExit(confirm) = &mut app.mode else {
+        return;
+    };
+    let choice = match code {
+        KeyCode::Up => {
+            confirm.sel = confirm.sel.saturating_sub(1);
+            return;
+        }
+        KeyCode::Down => {
+            confirm.sel = (confirm.sel + 1).min(EXIT_CHOICES.len() - 1);
+            return;
+        }
+        KeyCode::Char('s') => Some(ExitChoice::Save),
+        KeyCode::Char('d') => Some(ExitChoice::Discard),
+        KeyCode::Char('c') | KeyCode::Esc => Some(ExitChoice::Cancel),
+        KeyCode::Enter => Some(EXIT_CHOICES[confirm.sel].1),
+        _ => None,
+    };
+    match choice {
+        Some(ExitChoice::Save) => {
+            app.mode = Mode::Browse;
+            app.request_save(AfterSave::Quit);
+            app.status = "saving staged changes…".to_string();
+        }
+        Some(ExitChoice::Discard) => {
+            app.quit = true;
+            app.auth_request = None;
+        }
+        Some(ExitChoice::Cancel) => {
+            app.mode = Mode::Browse;
+            app.status = "exit cancelled — staged changes not saved".to_string();
+        }
+        None => {}
+    }
+}
+
 fn on_key(app: &mut App, code: KeyCode) {
+    if matches!(app.mode, Mode::ConfirmExit(_)) {
+        on_key_exit_confirm(app, code);
+        return;
+    }
     if matches!(app.mode, Mode::AddProvider(_)) {
         on_key_add_wizard(app, code);
         return;
@@ -987,7 +1096,8 @@ fn on_key(app: &mut App, code: KeyCode) {
         Mode::AddProvider(_)
         | Mode::SetModel(_)
         | Mode::EditProvider(_)
-        | Mode::OauthActions(_) => {} // handled above
+        | Mode::OauthActions(_)
+        | Mode::ConfirmExit(_) => {} // handled above
         Mode::Input { buffer, .. } => match code {
             KeyCode::Char(c) => buffer.insert(c),
             KeyCode::Backspace => buffer.backspace(),
@@ -1011,8 +1121,21 @@ fn on_key(app: &mut App, code: KeyCode) {
             _ => {}
         },
         Mode::Browse => match code {
-            KeyCode::Char('q') => app.quit = true,
-            KeyCode::Char('s') => app.save_now = true,
+            KeyCode::Char('q') => {
+                if app.dirty {
+                    app.mode = Mode::ConfirmExit(ExitConfirm { sel: 0 });
+                } else {
+                    app.quit = true;
+                }
+            }
+            KeyCode::Char('s') => {
+                if app.dirty {
+                    app.request_save(AfterSave::Stay);
+                    app.status = "saving staged changes…".to_string();
+                } else {
+                    app.status = "no staged changes".to_string();
+                }
+            }
             KeyCode::Up => app.sel = app.sel.saturating_sub(1),
             KeyCode::Down => {
                 let max = app.ed.provider_names().len().saturating_sub(1);
@@ -1022,12 +1145,10 @@ fn on_key(app: &mut App, code: KeyCode) {
                 app.mode = Mode::AddProvider(AddWizard::new());
             }
             KeyCode::Char('d') => match app.ed.provider_names().get(app.sel).cloned() {
-                Some(name) => {
-                    app.status = match app.ed.remove_provider(&name) {
-                        Ok(()) => format!("removed '{name}'"),
-                        Err(e) => format!("error: {e}"),
-                    };
-                }
+                Some(name) => match app.ed.remove_provider(&name) {
+                    Ok(()) => app.mark_staged(format!("removed '{name}'")),
+                    Err(e) => app.status = format!("error: {e}"),
+                },
                 None => app.status = "nothing selected".to_string(),
             },
             KeyCode::Char('e') => match app.ed.provider_names().get(app.sel).cloned() {
@@ -1121,9 +1242,14 @@ fn render(f: &mut Frame, app: &App) {
     let inner_h = chunks[0].height.saturating_sub(2);
     let sel_line = 1 + app.sel as u16;
     let offset = (sel_line + 1).saturating_sub(inner_h);
+    let config_title = if app.dirty {
+        "providers.toml — staged, not saved"
+    } else {
+        "providers.toml — saved"
+    };
     f.render_widget(
         Paragraph::new(lines)
-            .block(Block::bordered().title("providers.toml"))
+            .block(Block::bordered().title(config_title))
             .scroll((offset, 0)),
         chunks[0],
     );
@@ -1136,6 +1262,25 @@ fn render(f: &mut Frame, app: &App) {
     let cursor_col = |x: u16| -> u16 { (2 + x as usize).min(max_w) as u16 };
     let (title, body, cursor_x): (String, String, Option<u16>) = match &app.mode {
         Mode::Browse => ("providers.toml".to_string(), app.status.clone(), None),
+        Mode::ConfirmExit(confirm) => {
+            let choices = EXIT_CHOICES
+                .iter()
+                .enumerate()
+                .map(|(index, (label, _))| {
+                    if index == confirm.sel {
+                        format!("▶{label}")
+                    } else {
+                        format!(" {label}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("   ");
+            (
+                "unsaved changes".to_string(),
+                format!("Save / Discard / Cancel: {choices}"),
+                None,
+            )
+        }
         Mode::AddProvider(wiz) => match wiz.step {
             AddStep::PickType => {
                 let sel = pc::provider_types()
@@ -1288,6 +1433,9 @@ fn render(f: &mut Frame, app: &App) {
 fn hints_for(mode: &Mode) -> &'static str {
     match mode {
         Mode::Browse => "a: add · e: edit · d: del · m: set-model · u: unset · s: save · q: quit",
+        Mode::ConfirmExit(_) => {
+            "↑↓: choose · Enter: confirm · s: save · d: discard · c/Esc: cancel"
+        }
         Mode::AddProvider(w) => match w.step {
             AddStep::PickType => "↑↓: pick type · Enter: next · Esc: cancel",
             _ => "type the value · Enter: next · Esc: cancel",
@@ -1304,45 +1452,12 @@ fn hints_for(mode: &Mode) -> &'static str {
     }
 }
 
-/// Why the editor exited (beyond a normal quit): a concurrent-edit conflict the
-/// caller should reload from, and/or an OAuth action to run once the full-screen
-/// UI is torn down (then reopen the editor).
+/// Why the editor exited (beyond a normal quit): the last concurrent-edit
+/// conflict, retained until the user decides to leave, and/or an OAuth action
+/// released only by a successful save.
 pub struct EditorOutcome {
     pub conflict: Option<String>,
     pub auth_request: Option<AuthRequest>,
-}
-
-/// Open the interactive providers editor over `path` (this host's own file).
-/// Returns an OAuth action the caller must run after the terminal is restored
-/// (then reopen), or `None` on a normal quit. A local file write never conflicts.
-pub fn run(path: &Path) -> Result<Option<AuthRequest>> {
-    let cfg = pc::load_or_default(path)?;
-    run_with_saver(cfg, |edited| {
-        pc::write_providers(path, edited).map(|()| SaveOutcome::Saved)
-    })
-    .map(|outcome| outcome.auth_request)
-}
-
-/// Open the interactive providers editor over an in-memory configuration; every
-/// save goes through `save` (local file write or remote apply — the editor does
-/// not care). Returns an [`EditorOutcome`]: a conflict message when a save hit a
-/// concurrent edit (the caller reloads and reopens), and/or a requested OAuth
-/// action (the caller runs it after the UI is torn down, then reopens).
-pub fn run_with_saver(
-    cfg: ProvidersConfig,
-    save: impl FnMut(&ProvidersConfig) -> Result<SaveOutcome>,
-) -> Result<EditorOutcome> {
-    run_with_saver_and_fetcher(
-        cfg,
-        save,
-        |provider_name, provider| match model_fetch_target(provider_name, provider, false)? {
-            ModelFetchTarget::Api { base_url, key } => fetch_provider_models(&base_url, key),
-            ModelFetchTarget::Server { .. } => {
-                Err("OAuth model discovery requires a connected server".to_string())
-            }
-        },
-        ProviderAuthStates::new(),
-    )
 }
 
 /// Open the editor with caller-owned model discovery and credential-status
@@ -1357,7 +1472,6 @@ pub fn run_with_saver_and_fetcher(
 ) -> Result<EditorOutcome> {
     use ratatui::crossterm::event::{self, Event, KeyEventKind};
     let mut app = App::with_auth_states(cfg, auth_states);
-    let mut conflict: Option<String> = None;
     let mut terminal = ratatui::init();
     let result = (|| -> Result<()> {
         loop {
@@ -1374,16 +1488,8 @@ pub fn run_with_saver_and_fetcher(
                     on_key(&mut app, k.code);
                     if app.save_now {
                         app.save_now = false;
-                        match save(app.ed.config()) {
-                            Ok(SaveOutcome::Saved) => app.status = "saved".to_string(),
-                            Ok(SaveOutcome::Conflict(msg)) => {
-                                // Someone else changed the target while editing:
-                                // never overwrite — leave, let the caller reload.
-                                conflict = Some(msg);
-                                app.quit = true;
-                            }
-                            Err(e) => app.status = format!("save failed: {e}"),
-                        }
+                        let save_result = save(app.ed.config());
+                        app.finish_save(save_result);
                     }
                     if app.fetch_models_now {
                         // The set-model wizard asked to fetch the provider's
@@ -1409,6 +1515,7 @@ pub fn run_with_saver_and_fetcher(
         Ok(())
     })();
     ratatui::restore();
+    let conflict = app.conflict.take();
     let auth_request = app.auth_request.take();
     result.map(|()| EditorOutcome {
         conflict,
@@ -1757,17 +1864,106 @@ mod tests {
         on_key(&mut app, KeyCode::Enter); // pick oauth:codex → Name step
         type_str(&mut app, "tingzhen-codex");
         on_key(&mut app, KeyCode::Enter); // oauth has no base_url/key → Complete
-                                          // The provider is added AND a sign-in is requested (save + quit), so the
-                                          // caller runs login right away instead of leaving a signed-out shell.
+                                          // The provider is staged and a sign-in is pending behind its save.
         assert!(app.ed.cfg.provider("tingzhen-codex").is_some());
+        assert!(
+            app.auth_request.is_none(),
+            "OAuth waits for SaveOutcome::Saved"
+        );
+        assert!(app.save_now, "saves the new provider before signing in");
+        assert!(!app.quit, "does not leave before the saver succeeds");
+        app.finish_save(Ok(SaveOutcome::Saved));
         let req = app
             .auth_request
             .as_ref()
-            .expect("login request on oauth add");
+            .expect("login released after save");
         assert_eq!(req.action, AuthAction::Login);
         assert_eq!(req.provider, "tingzhen-codex");
-        assert!(app.save_now, "saves the new provider before signing in");
         assert!(app.quit, "leaves the editor to run the browser flow");
+    }
+
+    #[test]
+    fn provider_mutation_is_staged_and_quit_requires_a_decision() {
+        let mut app = App::new(ProvidersConfig::default());
+        on_key(&mut app, KeyCode::Char('a'));
+        on_key(&mut app, KeyCode::Enter);
+        type_str(&mut app, "openai1");
+        on_key(&mut app, KeyCode::Enter);
+        type_str(&mut app, "https://u/v1");
+        on_key(&mut app, KeyCode::Enter);
+        type_str(&mut app, "sk");
+        on_key(&mut app, KeyCode::Enter);
+
+        assert!(app.dirty);
+        assert!(app.status.contains("staged"));
+        on_key(&mut app, KeyCode::Char('q'));
+        assert!(matches!(app.mode, Mode::ConfirmExit(_)));
+        assert!(!app.quit);
+    }
+
+    #[test]
+    fn dirty_exit_supports_save_discard_and_cancel() {
+        let mut cancel = App::new(ProvidersConfig::default());
+        cancel.dirty = true;
+        on_key(&mut cancel, KeyCode::Char('q'));
+        on_key(&mut cancel, KeyCode::Char('c'));
+        assert!(matches!(cancel.mode, Mode::Browse));
+        assert!(cancel.dirty);
+        assert!(!cancel.quit);
+
+        let mut discard = App::new(ProvidersConfig::default());
+        discard.dirty = true;
+        on_key(&mut discard, KeyCode::Char('q'));
+        on_key(&mut discard, KeyCode::Char('d'));
+        assert!(discard.quit);
+        assert!(!discard.save_now);
+
+        let mut save = App::new(ProvidersConfig::default());
+        save.dirty = true;
+        on_key(&mut save, KeyCode::Char('q'));
+        on_key(&mut save, KeyCode::Char('s'));
+        assert!(save.save_now);
+        assert!(!save.quit, "quit waits for a successful save");
+    }
+
+    #[test]
+    fn save_conflict_or_error_keeps_staged_changes_and_blocks_oauth() {
+        for result in [
+            Ok(SaveOutcome::Conflict("revision changed".into())),
+            Err(CoreError::Message("offline".into())),
+        ] {
+            let mut app = App::new(ProvidersConfig::default());
+            app.dirty = true;
+            app.request_auth(AuthRequest {
+                action: AuthAction::Login,
+                provider: "codex1".into(),
+            });
+
+            app.finish_save(result);
+
+            assert!(app.dirty);
+            assert!(!app.quit);
+            assert!(app.auth_request.is_none());
+            assert!(app.status.contains("staged"));
+        }
+    }
+
+    #[test]
+    fn only_saved_outcome_releases_pending_oauth_request() {
+        let mut app = App::new(ProvidersConfig::default());
+        app.dirty = true;
+        app.request_auth(AuthRequest {
+            action: AuthAction::Switch,
+            provider: "codex1".into(),
+        });
+
+        app.finish_save(Ok(SaveOutcome::Saved));
+
+        assert!(!app.dirty);
+        assert!(app.quit);
+        let req = app.auth_request.expect("OAuth released after save");
+        assert_eq!(req.action, AuthAction::Switch);
+        assert_eq!(req.provider, "codex1");
     }
 
     #[test]
@@ -1781,10 +1977,16 @@ mod tests {
         on_key(&mut app, KeyCode::Down); // Sign in → Sign out
         on_key(&mut app, KeyCode::Down); // → Switch account
         on_key(&mut app, KeyCode::Enter);
-        let req = app.auth_request.as_ref().expect("auth request recorded");
+        assert!(
+            app.auth_request.is_none(),
+            "OAuth waits for a successful save"
+        );
+        assert!(app.save_now, "saves before running the action");
+        assert!(!app.quit, "does not leave before save succeeds");
+        app.finish_save(Ok(SaveOutcome::Saved));
+        let req = app.auth_request.as_ref().expect("auth request released");
         assert_eq!(req.action, AuthAction::Switch);
         assert_eq!(req.provider, "codex1");
-        assert!(app.save_now, "saves before running the action");
         assert!(app.quit, "leaves the editor to run the action");
     }
 
@@ -1821,6 +2023,7 @@ mod tests {
         // Browse, both add-wizard step kinds, every set-model step, and the input
         // line each expose a non-empty key-hint line.
         assert!(!hints_for(&Mode::Browse).is_empty());
+        assert!(!hints_for(&Mode::ConfirmExit(ExitConfirm { sel: 0 })).is_empty());
         assert!(!hints_for(&Mode::AddProvider(AddWizard::new())).is_empty()); // PickType
         let mut add = AddWizard::new();
         add.step = AddStep::Name;

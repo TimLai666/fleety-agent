@@ -254,17 +254,17 @@ explicitly deferred items:
 - **M8 scheduling — show/update** — Create/List/Delete ship; no `schedule_show` /
   `schedule_update` (edit = delete + recreate). The human-readable per-schedule
   `mandate` string is stored but enforcement is via the `allowed_tools` allow-list.
-- **Unified remote config — device targets** — `fleety config` (incl.
-  `provider/group/role`) manages the **connected server** by default
-  (`--target server`) and this host with `--target local`. Still open:
-  `--target <device-id>` is reported as not-yet-supported (configure the device
-  on its own host with `fleetyd config`), and interactive `config edit` /
-  `config provider edit` remain local-only.
+- **Owner-routed config** — shipped: each key routes to its owning runtime.
+  Server/provider/model changes go to fleety-server, Daemon/Shared changes go
+  to fleetyd through the selected device route, and only Cli scope is written
+  by the CLI. Explicit `--target server|daemon|cli|<device-id>` values enforce
+  that ownership. An unavailable runtime is a hard failure with no direct-file
+  fallback. The TTY panel exposes Connection / CLI / Daemon / Server regions.
 - **Presence inference** — using a mobile device's location to infer "is someone home /
   did they leave". Needs auto-site-detection (daemon co-location reporting), a
   `home_site` baseline, and a presence timeline first; privacy opt-in by design.
 - **Codex OAuth backend** — shipped: `fleety auth login|status|logout` (browser
-  PKCE flow on loopback :1455, tokens at `~/.fleety/codex-oauth.json`) +
+  PKCE flow on loopback :1455, per-provider tokens stored by the owning server) +
   `auth = "oauth:codex"` in `providers.toml` routes via the Responses API.
   Remaining caveat: live-backend behavior is network-gated and unverified from
   CI (request/SSE shapes unit-tested offline).
