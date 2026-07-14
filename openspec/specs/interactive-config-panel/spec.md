@@ -167,7 +167,7 @@ code:
 ---
 ### Requirement: Guided provider and model editing
 
-Adding a provider SHALL be guided: the user selects the provider type from a menu of the registered types, then is prompted for each required field in turn (name, and for an api type its base_url and api key) rather than entering one delimited line. Setting a model role SHALL be two-level: the user first selects a provider, then selects that provider's model. For an api provider with a base_url, the editor SHALL fetch the provider's model list from its `/models` endpoint and present it as a searchable, selectable list. For an `oauth:codex` provider in the remote Server region, the editor SHALL request model IDs through the server's provider-model discovery operation when the connected server supports it. If discovery fails, returns nothing, the provider has no queryable endpoint, or the connected server lacks the discovery capability, the editor SHALL fall back to manual model-id entry without failing. An existing provider SHALL be editable in place: for an api provider the editor SHALL prompt to change its base_url and api key (its name fixed), and for an `oauth:codex` provider the editor SHALL offer that provider's OAuth actions ? sign in, sign out, and switch account (switch being sign out then sign in). Because the OAuth sign-in flow is asynchronous, opens a browser, and needs the plain terminal, the editor SHALL run those OAuth actions by saving the current config, leaving the full-screen editor, performing the sign-in or sign-out for the selected provider, and then reopening the editor ? never attempting the browser flow inside the full-screen UI. All edits SHALL go through the same validation and atomic write as the non-interactive provider commands.
+Adding a provider SHALL be guided: the user selects the provider type from a menu of the registered types, then is prompted for each required field in turn (name, and for an api type its base_url and api key) rather than entering one delimited line. Setting a model role SHALL be two-level: the user first selects a provider, then selects that provider's model. For an api provider with a base_url, the editor SHALL fetch the provider's model list from its `/models` endpoint and present it as a searchable, selectable list. For an `oauth:codex` provider in the remote Server region, the editor SHALL request model IDs through the server's provider-model discovery operation when the connected server supports it. If discovery fails, returns nothing, the provider has no queryable endpoint, or the connected server lacks the discovery capability, the editor SHALL fall back to manual model-id entry without failing. An existing provider SHALL be editable in place: for an api provider the editor SHALL prompt to change its base_url and api key (its name fixed), and for an `oauth:codex` provider the editor SHALL offer that provider's OAuth actions: sign in, sign out, and switch account (switch being sign out then sign in). Because the OAuth sign-in flow is asynchronous, opens a browser, and needs the plain terminal, the editor SHALL run those OAuth actions by saving the current config, leaving the full-screen editor, performing the sign-in or sign-out for the selected provider, and then reopening the editor, never attempting the browser flow inside the full-screen UI. All edits SHALL go through the same validation and atomic write as the non-interactive provider commands.
 
 #### Scenario: model selection lists the chosen API provider's models
 
@@ -252,7 +252,7 @@ code:
 ---
 ### Requirement: Daemon and server regions persist only through their owners
 
-The Daemon and Server panel regions SHALL keep independent availability, revision, snapshot entries, staged changes, and apply targets. A daemon edit SHALL be sent to fleetyd and a server edit SHALL be sent to fleety-server. If an owner is unavailable, its region SHALL display an unavailable state and SHALL NOT offer a direct-file fallback.
+The Daemon and Server panel regions SHALL keep independent availability, revision, snapshot entries, staged changes, and apply targets. A daemon edit SHALL be sent to fleetyd and a server edit SHALL be sent to fleety-server. If an owner is unavailable, its region SHALL display an unavailable state and SHALL NOT offer a direct-file fallback. After the user saves a different current connection profile, the panel SHALL close the previous connection, discard both remote regions' prior snapshot, revision, and staged changes, connect using the newly selected profile, and reload the Server and current-device Daemon snapshots before either region can apply a change. A failed reconnect SHALL leave both remote regions unavailable and SHALL NOT restore or reuse the previous connection.
 
 #### Scenario: daemon unavailable leaves other regions usable
 
@@ -271,34 +271,33 @@ The Daemon and Server panel regions SHALL keep independent availability, revisio
 - **WHEN** the user stages one daemon setting and one server setting
 - **THEN** applying in either region sends only that region's changes and revision to its owner
 
+#### Scenario: saved profile switch reconnects before remote use
+
+- **GIVEN** the panel is connected to server B and profile A identifies a different server
+- **WHEN** the user selects profile A as current and saves the Connection region
+- **THEN** the panel closes the B connection, connects using profile A, and reloads A's Server and current-device Daemon snapshots before enabling either remote apply action
+
+#### Scenario: old remote state is not carried to the new server
+
+- **GIVEN** the panel has snapshot entries, revisions, and staged changes from server B
+- **WHEN** the user saves profile A as current
+- **THEN** all B-derived Server and Daemon state is discarded and no B-derived change can be sent through the A connection
+
+#### Scenario: reconnect failure cannot fall back to the old server
+
+- **GIVEN** the panel is connected to server B and the newly saved profile A cannot complete its connection and Hello handshake
+- **WHEN** the profile switch is attempted
+- **THEN** the B connection remains closed, Server and Daemon are unavailable, Connection and CLI remain usable, and no remote config file is modified
+
+#### Scenario: daemon refresh failure does not hide a usable server
+
+- **GIVEN** profile A connects and returns a Server snapshot but the current device daemon is unavailable on A
+- **WHEN** the panel refreshes both remote regions
+- **THEN** the Server region is usable with A's state and the Daemon region is unavailable
+
 <!-- @trace
-source: route-config-to-owning-runtime
+source: reconnect-config-panel-profile-switch
 updated: 2026-07-14
 code:
-  - crates/fleety-server/src/main.rs
-  - crates/fleety-server/src/http.rs
-  - crates/fleety-tools/src/oauth.rs
   - crates/fleety-cli/src/config_panel.rs
-  - crates/fleety-cli/src/provider_tui.rs
-  - docs/design-cli-config.md
-  - docs/roadmap.md
-  - README.md
-  - crates/fleety-cli/src/model_picker.rs
-  - crates/fleety-daemon/src/main.rs
-  - crates/fleety-server/src/conn.rs
-  - crates/fleety-tools/src/connection.rs
-  - crates/fleety-cli/src/auth.rs
-  - crates/fleety-tools/src/config.rs
-  - crates/fleety-tools/src/providers_config.rs
-  - crates/fleety-cli/src/main.rs
-  - docs/STATUS.md
-  - crates/fleety-cli/src/config.rs
-  - crates/fleety-server/src/bridge.rs
-  - crates/fleety-cli/src/acp.rs
-  - docs/env.md
-  - crates/fleety-cli/src/server.rs
-tests:
-  - crates/fleety-cli/tests/cli_smoke.rs
-  - crates/fleety-daemon/tests/fleetyd_smoke.rs
-  - crates/fleety-server/tests/server_smoke.rs
 -->
