@@ -106,6 +106,9 @@ struct Panel {
     confirm_sensitive: Option<String>,
     // Connection region.
     conns: Connections,
+    /// Profile selected with `u` and awaiting a successful Connection-region
+    /// save before the run loop is allowed to replace the live transport.
+    profile_switch_pending: Option<String>,
     // CLI region.
     local: Vec<(String, String, String, String)>,
     local_map: fleety_tools::config::ConfigMap,
@@ -158,6 +161,7 @@ impl Panel {
             tz_pick: None,
             confirm_sensitive: None,
             conns,
+            profile_switch_pending: None,
             local,
             local_map,
             daemon_supported: daemon.supported,
@@ -175,6 +179,30 @@ impl Panel {
             status: String::new(),
             quit: false,
         }
+    }
+
+    /// Invalidate every piece of state tied to the previously connected
+    /// server before attempting a saved profile switch. The run loop owns and
+    /// closes the transport itself; this method makes both remote regions
+    /// unusable immediately so no old revision or staged change can leak into
+    /// the replacement connection.
+    fn begin_saved_profile_switch(&mut self, profile: &str) {
+        self.daemon_supported = false;
+        self.daemon_entries.clear();
+        self.daemon_revision.clear();
+        self.daemon_staged.clear();
+        self.apply_daemon_now = false;
+
+        self.server_supported = false;
+        self.entries.clear();
+        self.revision.clear();
+        self.staged.clear();
+        self.apply_now = false;
+
+        self.confirm_sensitive = None;
+        self.status = format!(
+            "connecting to '{profile}' (discarded staged remote changes from the previous server)…"
+        );
     }
 
     /// The number of rows in the active region.
@@ -397,6 +425,7 @@ fn on_key(p: &mut Panel, code: KeyCode) -> bool {
         KeyCode::Char('u') if p.region == Region::Connection => {
             if let Some(name) = p.profile_names().get(p.sel).cloned() {
                 p.conns.current = Some(name.clone());
+                p.profile_switch_pending = Some(name.clone());
                 p.status = format!("current → '{name}' (s to save)");
             }
         }
@@ -623,6 +652,50 @@ fn has_local_profile(conns: &Connections, local_url: &str) -> bool {
     conns.profiles.values().any(|p| p.url == local_url)
 }
 
+/// Resolve exactly the profile the user saved in the Connection region. This
+/// deliberately ignores environment overrides, mDNS, and later changes to the
+/// global current profile so the reconnect transaction cannot drift to a
+/// different server while awaiting network I/O.
+fn resolve_saved_profile(conns: &Connections, name: &str) -> Result<connection::Resolved> {
+    let profile = conns
+        .profiles
+        .get(name)
+        .ok_or_else(|| CoreError::Message(format!("server profile '{name}' no longer exists")))?;
+    if profile.url.is_empty() {
+        return Err(CoreError::Message(format!(
+            "server profile '{name}' has no url; set one before making it current"
+        )));
+    }
+    Ok(connection::Resolved {
+        url: profile.url.clone(),
+        token: profile.token.clone(),
+        source: connection::Source::Profile(name.to_string()),
+    })
+}
+
+/// Close and remove the previous panel transport before connecting one
+/// immutable profile snapshot. On failure `old` remains `None`, which prevents
+/// any caller from silently falling back to the previous server.
+async fn replace_profile_connection(
+    old: &mut Option<(
+        fleety_tools::transport::Sender,
+        fleety_tools::transport::Receiver,
+    )>,
+    target: &connection::Resolved,
+) -> Result<(
+    (
+        fleety_tools::transport::Sender,
+        fleety_tools::transport::Receiver,
+    ),
+    u32,
+)> {
+    if let Some((mut tx, _)) = old.take() {
+        tx.close().await;
+    }
+    let (tx, rx, config_protocol, _) = crate::connect_hello_for_auth_target(target).await?;
+    Ok(((tx, rx), config_protocol))
+}
+
 /// Top-level `fleety config` menu items.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MenuChoice {
@@ -774,7 +847,7 @@ async fn run_settings() -> Result<()> {
     // Resolve + connect, capturing the Welcome so we know the server's config
     // protocol. On any connection failure, the panel still opens for the CLI
     // + connection regions; the daemon and server regions report unavailable.
-    let (mut conn, cp): (
+    let (mut conn, config_protocol): (
         Option<(
             fleety_tools::transport::Sender,
             fleety_tools::transport::Receiver,
@@ -797,7 +870,7 @@ async fn run_settings() -> Result<()> {
     let mut daemon_supported = false;
     let mut daemon_entries: Vec<ConfigEntry> = Vec::new();
     let mut daemon_revision = String::new();
-    if let (Some((tx, rx)), Some(cp)) = (conn.as_mut(), cp) {
+    if let (Some((tx, rx)), Some(cp)) = (conn.as_mut(), config_protocol) {
         server_supported = cp >= 1;
         if server_supported {
             match pull_snapshot(tx, rx, ConfigTarget::Server).await {
@@ -870,79 +943,140 @@ async fn run_settings() -> Result<()> {
     });
 
     let mut terminal = ratatui::init();
-    let result: Result<()> =
-        loop {
-            if let Err(e) = terminal.draw(|f| render(f, &app)) {
-                break Err(CoreError::Message(format!("draw failed: {e}")));
-            }
-            if app.quit {
-                break Ok(());
-            }
-            let Some(code) = key_rx.recv().await else {
-                break Ok(());
-            };
-            let persist = on_key(&mut app, code);
-            // Connection "save" is signalled via a status sentinel.
-            if app.status == "__save_conns__" {
-                app.status = match connection::save(&app.conns) {
-                    Ok(()) => "saved connections".to_string(),
-                    Err(e) => format!("save failed: {}", e.report().message),
-                };
-            }
-            if persist {
-                if let Err(e) = fleety_tools::config::replace_scopes_strict(
-                    &fleety_tools::config::config_path(),
-                    fleety_tools::config::CLI_SCOPES,
-                    &app.local_map,
-                ) {
+    let result: Result<()> = loop {
+        if let Err(e) = terminal.draw(|f| render(f, &app)) {
+            break Err(CoreError::Message(format!("draw failed: {e}")));
+        }
+        if app.quit {
+            break Ok(());
+        }
+        let Some(code) = key_rx.recv().await else {
+            break Ok(());
+        };
+        let persist = on_key(&mut app, code);
+        // Connection "save" is signalled via a status sentinel.
+        if app.status == "__save_conns__" {
+            match connection::save(&app.conns) {
+                Ok(()) => {
+                    if let Some(profile) = app.profile_switch_pending.take() {
+                        app.begin_saved_profile_switch(&profile);
+                        if let Err(e) = terminal.draw(|f| render(f, &app)) {
+                            break Err(CoreError::Message(format!("draw failed: {e}")));
+                        }
+                        match resolve_saved_profile(&app.conns, &profile) {
+                            Ok(target) => {
+                                match replace_profile_connection(&mut conn, &target).await {
+                                    Ok((new_connection, cp)) => {
+                                        let (mut new_tx, mut new_rx) = new_connection;
+                                        let (server, daemon, notes) = reload_remote_regions(
+                                            &mut new_tx,
+                                            &mut new_rx,
+                                            cp,
+                                            &crate::device_id(),
+                                        )
+                                        .await;
+                                        app.server_supported = server.supported;
+                                        app.entries = server.entries;
+                                        app.revision = server.revision;
+                                        app.daemon_supported = daemon.supported;
+                                        app.daemon_entries = daemon.entries;
+                                        app.daemon_revision = daemon.revision;
+                                        conn = Some((new_tx, new_rx));
+                                        app.status = if notes.is_empty() {
+                                            format!(
+                                                    "connected to '{profile}'; Server and Daemon settings reloaded"
+                                                )
+                                        } else {
+                                            format!(
+                                                "connected to '{profile}'; {}",
+                                                notes.join(" | ")
+                                            )
+                                        };
+                                    }
+                                    Err(e) => {
+                                        app.status = format!(
+                                                "saved current profile '{profile}', but reconnect failed: {} — Server and Daemon are unavailable; the previous server will not be reused",
+                                                e.report().message
+                                            );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                if let Some((mut old_tx, _)) = conn.take() {
+                                    old_tx.close().await;
+                                }
+                                app.status = format!(
+                                        "saved current profile '{profile}', but it cannot be connected: {} — Server and Daemon are unavailable; the previous server will not be reused",
+                                        e.report().message
+                                    );
+                            }
+                        }
+                    } else {
+                        app.status = "saved connections".to_string();
+                    }
+                }
+                Err(e) => {
                     app.status = format!("save failed: {}", e.report().message);
                 }
             }
-            if app.apply_now {
-                app.apply_now = false;
-                if let Some((tx, rx)) = conn.as_mut() {
-                    let changes: Vec<ConfigChange> = app.staged.values().cloned().collect();
-                    app.status =
-                        match apply_changes(tx, rx, ConfigTarget::Server, &app.revision, changes)
-                            .await
-                        {
-                            Ok(msg) => {
-                                app.staged.clear();
-                                // Re-pull so the revision + values reflect the applied state.
-                                if let Ok((rev, es)) =
-                                    pull_snapshot(tx, rx, ConfigTarget::Server).await
-                                {
-                                    app.revision = rev;
-                                    app.entries = es;
-                                }
-                                msg
-                            }
-                            Err(e) => format!("apply failed: {}", e.report().message),
-                        };
-                }
+        }
+        if persist {
+            if let Err(e) = fleety_tools::config::replace_scopes_strict(
+                &fleety_tools::config::config_path(),
+                fleety_tools::config::CLI_SCOPES,
+                &app.local_map,
+            ) {
+                app.status = format!("save failed: {}", e.report().message);
             }
-            if app.apply_daemon_now {
-                app.apply_daemon_now = false;
-                if let Some((tx, rx)) = conn.as_mut() {
-                    let changes: Vec<ConfigChange> = app.daemon_staged.values().cloned().collect();
-                    let target = ConfigTarget::Device(crate::device_id());
-                    app.status =
-                        match apply_changes(tx, rx, target.clone(), &app.daemon_revision, changes)
-                            .await
-                        {
-                            Ok(msg) => {
-                                app.daemon_staged.clear();
-                                if let Ok((rev, es)) = pull_snapshot(tx, rx, target).await {
-                                    app.daemon_revision = rev;
-                                    app.daemon_entries = es;
-                                }
-                                msg
+        }
+        if app.apply_now {
+            app.apply_now = false;
+            if let Some((tx, rx)) = conn.as_mut() {
+                let changes: Vec<ConfigChange> = app.staged.values().cloned().collect();
+                app.status =
+                    match apply_changes(tx, rx, ConfigTarget::Server, &app.revision, changes).await
+                    {
+                        Ok(msg) => {
+                            app.staged.clear();
+                            // Re-pull so the revision + values reflect the applied state.
+                            if let Ok((rev, es)) = pull_snapshot(tx, rx, ConfigTarget::Server).await
+                            {
+                                app.revision = rev;
+                                app.entries = es;
                             }
-                            Err(e) => format!("daemon apply failed: {}", e.report().message),
-                        };
-                }
+                            msg
+                        }
+                        Err(e) => format!("apply failed: {}", e.report().message),
+                    };
             }
-        };
+        }
+        if app.apply_daemon_now {
+            app.apply_daemon_now = false;
+            if let Some((tx, rx)) = conn.as_mut() {
+                let changes: Vec<ConfigChange> = app.daemon_staged.values().cloned().collect();
+                let target = ConfigTarget::Device(crate::device_id());
+                app.status = match apply_changes(
+                    tx,
+                    rx,
+                    target.clone(),
+                    &app.daemon_revision,
+                    changes,
+                )
+                .await
+                {
+                    Ok(msg) => {
+                        app.daemon_staged.clear();
+                        if let Ok((rev, es)) = pull_snapshot(tx, rx, target).await {
+                            app.daemon_revision = rev;
+                            app.daemon_entries = es;
+                        }
+                        msg
+                    }
+                    Err(e) => format!("daemon apply failed: {}", e.report().message),
+                };
+            }
+        }
+    };
     ratatui::restore();
     if let Some((mut tx, _)) = conn {
         let _ = tx.close().await;
@@ -966,6 +1100,46 @@ async fn pull_snapshot(
             "expected a config snapshot, got {other:?}"
         ))),
     }
+}
+
+/// Reload the two owner-scoped regions over one freshly authenticated server
+/// connection. Each result is independent: a missing daemon does not hide a
+/// usable server snapshot, while an old config protocol leaves both regions
+/// unavailable instead of falling back to direct files.
+async fn reload_remote_regions(
+    tx: &mut fleety_tools::transport::Sender,
+    rx: &mut fleety_tools::transport::Receiver,
+    config_protocol: u32,
+    device_id: &str,
+) -> (RemoteRegionState, RemoteRegionState, Vec<String>) {
+    if config_protocol < 1 {
+        return (
+            RemoteRegionState::new(false, vec![], String::new()),
+            RemoteRegionState::new(false, vec![], String::new()),
+            vec![
+                "server does not support structured config; Server and Daemon are unavailable"
+                    .to_string(),
+            ],
+        );
+    }
+
+    let mut notes = Vec::new();
+    let server = match pull_snapshot(tx, rx, ConfigTarget::Server).await {
+        Ok((revision, entries)) => RemoteRegionState::new(true, entries, revision),
+        Err(e) => {
+            notes.push(format!("Server unavailable: {}", e.report().message));
+            RemoteRegionState::new(false, vec![], String::new())
+        }
+    };
+    let daemon_target = ConfigTarget::Device(device_id.to_string());
+    let daemon = match pull_snapshot(tx, rx, daemon_target).await {
+        Ok((revision, entries)) => RemoteRegionState::new(true, entries, revision),
+        Err(e) => {
+            notes.push(format!("Daemon unavailable: {}", e.report().message));
+            RemoteRegionState::new(false, vec![], String::new())
+        }
+    };
+    (server, daemon, notes)
 }
 
 /// Send a `ConfigApply` and return the result message (or an error).
@@ -1010,6 +1184,133 @@ async fn apply_changes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::{SinkExt, StreamExt};
+    use tokio::sync::oneshot;
+    use tokio_tungstenite::tungstenite::Message;
+
+    async fn start_close_observer() -> (String, oneshot::Receiver<bool>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind close observer");
+        let addr = listener.local_addr().expect("close observer address");
+        let (closed_tx, closed_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept old connection");
+            let mut ws = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("accept old websocket");
+            let closed = matches!(ws.next().await, Some(Ok(Message::Close(_))) | None);
+            let _ = closed_tx.send(closed);
+        });
+        (format!("ws://{addr}"), closed_rx)
+    }
+
+    async fn start_welcome_server() -> (String, oneshot::Receiver<ClientMsg>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind welcome server");
+        let addr = listener.local_addr().expect("welcome server address");
+        let (hello_tx, hello_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept new connection");
+            let mut ws = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("accept new websocket");
+            let frame = ws
+                .next()
+                .await
+                .expect("hello frame")
+                .expect("read hello frame");
+            let hello =
+                serde_json::from_str::<ClientMsg>(frame.to_text().expect("hello is a text frame"))
+                    .expect("deserialize hello");
+            ws.send(Message::Text(
+                serde_json::to_string(&ServerMsg::Welcome {
+                    session_id: "session-a".into(),
+                    conversation_id: "conversation-a".into(),
+                    protocol: fleety_protocol::PROTOCOL_VERSION,
+                    server_version: String::new(),
+                    audio_input: false,
+                    config_protocol: 4,
+                    server_fingerprint: Some("fingerprint-a".into()),
+                    loopback_trusted: false,
+                    token: None,
+                })
+                .expect("serialize welcome"),
+            ))
+            .await
+            .expect("send welcome");
+            let _ = hello_tx.send(hello);
+            let _ = ws.next().await;
+        });
+        (format!("ws://{addr}"), hello_rx)
+    }
+
+    async fn start_snapshot_server(daemon_ok: bool) -> (String, oneshot::Receiver<Vec<ClientMsg>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind snapshot server");
+        let addr = listener.local_addr().expect("snapshot server address");
+        let (requests_tx, requests_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept snapshot connection");
+            let mut ws = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("accept snapshot websocket");
+            let mut requests = Vec::new();
+            for step in 0..3 {
+                let frame = ws
+                    .next()
+                    .await
+                    .expect("client frame")
+                    .expect("read client frame");
+                let request = serde_json::from_str::<ClientMsg>(
+                    frame.to_text().expect("client frame is text"),
+                )
+                .expect("deserialize client request");
+                requests.push(request.clone());
+                let response = match step {
+                    0 => ServerMsg::Welcome {
+                        session_id: "session-a".into(),
+                        conversation_id: "conversation-a".into(),
+                        protocol: fleety_protocol::PROTOCOL_VERSION,
+                        server_version: String::new(),
+                        audio_input: false,
+                        config_protocol: 4,
+                        server_fingerprint: Some("fingerprint-a".into()),
+                        loopback_trusted: false,
+                        token: None,
+                    },
+                    1 => ServerMsg::ConfigSnapshotResult {
+                        revision: "server-a-rev".into(),
+                        entries: vec![entry("FLEETY_POLICY", "full_access", false)],
+                        providers_json: String::new(),
+                    },
+                    2 if daemon_ok => ServerMsg::ConfigSnapshotResult {
+                        revision: "daemon-a-rev".into(),
+                        entries: vec![entry("FLEETY_TZ", "Asia/Taipei", false)],
+                        providers_json: String::new(),
+                    },
+                    2 => ServerMsg::Error {
+                        error: fleety_protocol::WireError {
+                            kind: "not_connected".into(),
+                            message: "daemon unavailable".into(),
+                            remediation: None,
+                        },
+                    },
+                    _ => unreachable!(),
+                };
+                ws.send(Message::Text(
+                    serde_json::to_string(&response).expect("serialize scripted response"),
+                ))
+                .await
+                .expect("send scripted response");
+            }
+            let _ = requests_tx.send(requests);
+            let _ = ws.next().await;
+        });
+        (format!("ws://{addr}"), requests_rx)
+    }
 
     #[test]
     fn has_local_profile_matches_by_url() {
@@ -1040,6 +1341,186 @@ mod tests {
             RemoteRegionState::new(false, vec![], String::new()),
             RemoteRegionState::new(true, entries, "rev-1".to_string()),
         )
+    }
+
+    #[test]
+    fn profile_switch_invalidates_old_remote_state() {
+        let mut panel = Panel::new(
+            Connections::default(),
+            fleety_tools::config::ConfigMap::new(),
+            RemoteRegionState::new(
+                true,
+                vec![entry("FLEETY_TZ", "UTC", false)],
+                "daemon-b".into(),
+            ),
+            RemoteRegionState::new(
+                true,
+                vec![entry("FLEETY_POLICY", "full_access", false)],
+                "server-b".into(),
+            ),
+        );
+        panel.daemon_staged.insert(
+            "FLEETY_TZ".into(),
+            ConfigChange {
+                key: "FLEETY_TZ".into(),
+                op: ChangeOp::Set,
+                value: Some("Asia/Taipei".into()),
+            },
+        );
+        panel.staged.insert(
+            "FLEETY_POLICY".into(),
+            ConfigChange {
+                key: "FLEETY_POLICY".into(),
+                op: ChangeOp::Set,
+                value: Some("require_approval".into()),
+            },
+        );
+        panel.apply_daemon_now = true;
+        panel.apply_now = true;
+
+        panel.begin_saved_profile_switch("a");
+
+        assert!(!panel.daemon_supported);
+        assert!(panel.daemon_entries.is_empty());
+        assert!(panel.daemon_revision.is_empty());
+        assert!(panel.daemon_staged.is_empty());
+        assert!(!panel.apply_daemon_now);
+        assert!(!panel.server_supported);
+        assert!(panel.entries.is_empty());
+        assert!(panel.revision.is_empty());
+        assert!(panel.staged.is_empty());
+        assert!(!panel.apply_now);
+        assert!(panel.status.contains("connecting to 'a'"));
+        assert!(panel.status.contains("discarded staged remote changes"));
+    }
+
+    #[tokio::test]
+    async fn profile_switch_connects_selected_profile_and_closes_old_connection() {
+        let (old_url, old_closed) = start_close_observer().await;
+        let old_transport = fleety_tools::transport::connect(&old_url, None)
+            .await
+            .expect("connect to server B");
+        let mut old_connection = Some(old_transport.split());
+
+        let (new_url, hello_received) = start_welcome_server().await;
+        let mut conns = Connections {
+            current: Some("a".into()),
+            ..Default::default()
+        };
+        conns.profiles.insert(
+            "a".into(),
+            connection::Profile {
+                url: new_url.clone(),
+                token: Some("token-a".into()),
+                fingerprint: Some("fingerprint-a".into()),
+                ..Default::default()
+            },
+        );
+        let mut panel = Panel::new(
+            conns.clone(),
+            fleety_tools::config::ConfigMap::new(),
+            RemoteRegionState::new(false, vec![], String::new()),
+            RemoteRegionState::new(false, vec![], String::new()),
+        );
+        on_key(&mut panel, KeyCode::Char('u'));
+        assert_eq!(panel.profile_switch_pending.as_deref(), Some("a"));
+
+        let target = resolve_saved_profile(&conns, "a").expect("resolve profile A");
+        assert_eq!(target.url, new_url);
+        assert_eq!(target.token.as_deref(), Some("token-a"));
+        assert_eq!(target.source, connection::Source::Profile("a".into()));
+
+        let ((mut new_tx, _new_rx), config_protocol) =
+            replace_profile_connection(&mut old_connection, &target)
+                .await
+                .expect("switch to profile A");
+
+        assert!(old_connection.is_none());
+        assert_eq!(config_protocol, 4);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), old_closed)
+                .await
+                .expect("server B close deadline")
+                .expect("server B close observation")
+        );
+        match hello_received.await.expect("server A hello") {
+            ClientMsg::Hello { token, .. } => assert_eq!(token.as_deref(), Some("token-a")),
+            other => panic!("expected Hello for server A, got {other:?}"),
+        }
+        new_tx.close().await;
+    }
+
+    #[tokio::test]
+    async fn profile_switch_reloads_owner_snapshots() {
+        let (url, requests_received) = start_snapshot_server(false).await;
+        let target = connection::Resolved {
+            url,
+            token: Some("token-a".into()),
+            source: connection::Source::Override,
+        };
+        let mut old_connection = None;
+        let ((mut tx, mut rx), config_protocol) =
+            replace_profile_connection(&mut old_connection, &target)
+                .await
+                .expect("connect profile A");
+
+        let (server, daemon, notes) =
+            reload_remote_regions(&mut tx, &mut rx, config_protocol, "device-a").await;
+
+        assert!(server.supported);
+        assert_eq!(server.revision, "server-a-rev");
+        assert_eq!(server.entries[0].key, "FLEETY_POLICY");
+        assert!(!daemon.supported);
+        assert!(daemon.entries.is_empty());
+        assert!(daemon.revision.is_empty());
+        assert!(notes.iter().any(|note| note.contains("daemon unavailable")));
+
+        let requests = requests_received.await.expect("snapshot requests");
+        assert!(matches!(requests[0], ClientMsg::Hello { .. }));
+        assert!(matches!(
+            requests[1],
+            ClientMsg::ConfigSnapshot {
+                target: ConfigTarget::Server
+            }
+        ));
+        assert!(matches!(
+            &requests[2],
+            ClientMsg::ConfigSnapshot {
+                target: ConfigTarget::Device(id)
+            } if id == "device-a"
+        ));
+        tx.close().await;
+    }
+
+    #[tokio::test]
+    async fn profile_switch_failure_never_reuses_old_connection() {
+        let (old_url, old_closed) = start_close_observer().await;
+        let old_transport = fleety_tools::transport::connect(&old_url, None)
+            .await
+            .expect("connect to server B");
+        let mut old_connection = Some(old_transport.split());
+
+        let unavailable = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve unavailable address");
+        let address = unavailable.local_addr().expect("unavailable address");
+        drop(unavailable);
+        let target = connection::Resolved {
+            url: format!("ws://{address}"),
+            token: None,
+            source: connection::Source::Profile("a".into()),
+        };
+
+        let result = replace_profile_connection(&mut old_connection, &target).await;
+
+        assert!(result.is_err());
+        assert!(old_connection.is_none());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), old_closed)
+                .await
+                .expect("server B close deadline")
+                .expect("server B close observation")
+        );
     }
 
     fn entry(key: &str, value: &str, secret: bool) -> ConfigEntry {
