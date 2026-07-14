@@ -364,7 +364,7 @@ async fn fetch_codex_models_at(
         .get(&endpoint)
         .query(&[("client_version", agent_core::VERSION)])
         .bearer_auth(&creds.bearer)
-        .header("originator", originator())
+        .header("originator", backend_originator())
         .header(
             "User-Agent",
             "Mozilla/5.0 (compatible; Fleety/1.0; +https://github.com/) Codex",
@@ -410,6 +410,17 @@ fn originator() -> String {
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "fleety".to_string())
+}
+
+/// Identifies authenticated requests to the Codex backend. Unlike the OAuth
+/// authorize flow, the backend model catalog uses the same first-party default
+/// as the Codex Responses client. The override remains shared so deployments
+/// that explicitly select another accepted originator stay consistent.
+fn backend_originator() -> String {
+    std::env::var("FLEETY_CODEX_ORIGINATOR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "codex_cli_rs".to_string())
 }
 
 /// Build the authorization URL for the Codex PKCE flow. Pure so its query is
@@ -885,7 +896,7 @@ mod tests {
         // The Codex simplified-flow params the client id expects.
         assert!(url.contains("codex_cli_simplified_flow=true"));
         assert!(url.contains("id_token_add_organizations=true"));
-        assert!(url.contains("originator="));
+        assert!(url.contains("originator=fleety"));
         // Redirect uri is percent-encoded and points at the fixed loopback port.
         assert!(url.contains("1455"));
     }
@@ -958,6 +969,7 @@ mod tests {
         assert!(request.contains("GET /models?client_version="));
         assert!(request.contains("authorization: Bearer secret-access-token"));
         assert!(request.contains("chatgpt-account-id: account-1"));
+        assert!(request.contains("originator: codex_cli_rs"));
         assert!(!request.contains("refresh_token"));
     }
 
