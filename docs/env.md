@@ -239,7 +239,7 @@ installs only.
 
 | Var | Default | Meaning |
 |---|---|---|
-| `FLEETY_CODEX_ORIGINATOR` | `codex_cli_rs` | Originator sent on the Responses call (`fleety` is used on the authorize request). |
+| `FLEETY_CODEX_ORIGINATOR` | `codex_cli_rs` | Originator sent on authenticated Codex backend requests, including Responses and the model catalog (`fleety` is used on the authorize request). |
 | `FLEETY_CODEX_TOKENS` | per-provider `~/.fleety/codex-oauth/<provider>.json` | Override the token-store path to a single explicit file **on the server host** (tests / non-default installs). Unset → the per-provider default. |
 | `FLEETY_CODEX_AUDIT` | `~/.fleety/` (auth audit file) | Override the auth-audit log path (login/logout events, never token values). |
 | `FLEETY_MODEL_AUTH` / `FLEETY_CHEAP_MODEL_AUTH` | unset | Bootstrap-seed twin of a provider's `type`: set `oauth:codex` to route the env-seeded main / economy tier through the Codex Responses backend without a providers.toml. |
