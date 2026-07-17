@@ -350,8 +350,35 @@ the upgrade). Force or disable it with `FLEETY_FORCE_SSE` / `FLEETY_DISABLE_SSE`
 
 ## Acknowledgements
 
-Fleety stands on a lot of open-source work — thank you to everyone who made it:
+Fleety stands on a lot of open-source work — thank you to everyone who made it.
 
+**Designs and techniques we studied and adopted:**
+
+- **[openclaw](https://github.com/openclaw/openclaw)** — the self-managed
+  scheduler/cron design, the CDP browser automation (snapshot-refs, named
+  profiles), the graceful defer-until-idle restart (ported from its
+  `src/infra/restart.ts`), and the one-CLI-manages-everything control-plane style.
+- **[hermes-agent](https://github.com/NousResearch/hermes-agent)** (Nous
+  Research) — the knowledge wiki (Obsidian-format llm-wiki, three-layer
+  structure), the agent-authored skills tier, and the post-task skill-learning
+  reflection loop.
+- **[headroom](https://github.com/headroomlabs-ai/headroom)** — the
+  context-compression techniques (rolling summary, smart tool-result crushing,
+  AST-aware code compression, cache alignment) that `agent-core` clean-room
+  re-implements in Rust.
+- **[picoclaw](https://github.com/sipeed/picoclaw)** (Sipeed) — the WebSocket
+  heartbeat/liveness design and the push toward small-device support (sidecar
+  arm64/riscv64 builds), with more of its embedded-device ideas on our roadmap.
+- **[open-dynamic-workflow](https://github.com/travisliu/open-dynamic-workflow)**
+  — the workflow-as-code orchestration model (`meta`/`phase()`/`agent()`/
+  `parallel()`) behind Fleety's internal `run_workflow` tool.
+- **[computer-use-mcp](https://github.com/domdomegg/computer-use-mcp)** — the
+  design template for Fleety's native `computer_*` tools (tool surface and
+  usage-restraint rules).
+- **[eve](https://github.com/vercel/eve)** (Vercel) — evaluated as a possible
+  base; we didn't depend on it, but borrowed its agent-as-directory idea and its
+  durable-workflow checkpointing (mirrored by Fleety's event sequence + reconnect
+  replay).
 - **[Insyra](https://github.com/HazelnutParadise/insyra)** — the Go data-analysis
   DSL Fleety bundles as the [`fleety-insyra`](sidecars/fleety-insyra) sidecar and
   drives through the `insyra_exec` tool.
@@ -359,18 +386,37 @@ Fleety stands on a lot of open-source work — thank you to everyone who made it
   the video-understanding technique behind the `video_extract` tool.
 - **OpenAI's Codex CLI** — Fleety's "sign in with ChatGPT" flow and its Codex
   Responses provider follow the Codex CLI's documented OAuth + Responses
-  contract; **codex-openai-proxy** and **heddle** were a great help for
-  cross-checking the request/header/SSE shapes.
-- The Rust ecosystem Fleety is built on — among many:
-  [tokio](https://github.com/tokio-rs/tokio) (async runtime),
-  [ratatui](https://github.com/ratatui/ratatui) (the interactive `fleety config`
-  / `fleety tui` screens),
-  [tokio-tungstenite](https://github.com/snapview/tokio-tungstenite) (the
-  WebSocket transport), [reqwest](https://github.com/seanmonstar/reqwest),
-  [serde](https://github.com/serde-rs/serde),
-  [mdns-sd](https://github.com/keepsimple1/mdns-sd) (LAN discovery),
-  [chrono-tz](https://github.com/chronotope/chrono-tz), and the many other crates
-  listed across the workspace `Cargo.toml`s.
+  contract; **[codex-openai-proxy](https://github.com/Securiteru/codex-openai-proxy)**
+  and **[heddle](https://github.com/roackb2/heddle)** were a great help for
+  cross-checking the request/header/SSE shapes and the real OAuth values.
+- **[Claude Code](https://github.com/anthropics/claude-code)** (Anthropic) — a
+  standing design reference and compatibility target: Fleety reuses installed
+  Claude Code plugins/skills, parses its `settings.json` hooks, and mirrors its
+  Workflow-tool idea.
+- **[Agent Client Protocol](https://agentclientprotocol.com)** (Zed) — the editor
+  protocol `fleety acp` implements, so ACP-capable editors can drive Fleety.
+
+**Runtime tools and libraries Fleety ships or builds on** — among many:
+[ddgs](https://github.com/deedy5/ddgs) (the built-in web-search MCP),
+[uv](https://github.com/astral-sh/uv) (provisions the managed Python runtime),
+[sqlite-vec](https://github.com/asg017/sqlite-vec) +
+[fastembed-rs](https://github.com/Anush008/fastembed-rs) (local semantic search),
+[tree-sitter](https://github.com/tree-sitter/tree-sitter) (AST-aware code
+compression), [enigo](https://github.com/enigo-rs/enigo) +
+[xcap](https://github.com/nashaofu/xcap) (the native computer-use tools),
+[tokio](https://github.com/tokio-rs/tokio),
+[ratatui](https://github.com/ratatui/ratatui),
+[tokio-tungstenite](https://github.com/snapview/tokio-tungstenite),
+[reqwest](https://github.com/seanmonstar/reqwest),
+[serde](https://github.com/serde-rs/serde),
+[mdns-sd](https://github.com/keepsimple1/mdns-sd) (LAN discovery),
+[chrono-tz](https://github.com/chronotope/chrono-tz), and the many other crates
+listed across the workspace `Cargo.toml`s.
+
+Fleety's development itself is spec-driven with **Spectra** (SDD tooling) and
+grew out of the author's earlier Python agent
+([TimLai666/agent](https://github.com/TimLai666/agent)) — its memory-file model,
+compaction design, and subagent spec carried over.
 
 ## License
 
