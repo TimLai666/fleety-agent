@@ -344,7 +344,10 @@ pub fn install(target: Option<String>, server: Option<String>) -> agent_core::Re
     match target.as_deref().map(str::to_ascii_lowercase).as_deref() {
         Some("zed") => install_zed(server),
         Some(other) => {
-            println!("No built-in auto-config for editor '{other}' (supported: zed).\n");
+            println!(
+                "No built-in auto-config for editor '{}' (supported: zed).\n",
+                crate::terminal_safe_text(other)
+            );
             print_generic(server.as_deref());
             Ok(())
         }
@@ -359,10 +362,13 @@ pub fn install(target: Option<String>, server: Option<String>) -> agent_core::Re
 fn print_generic(server: Option<&str>) {
     let cmd = current_exe_str();
     println!("Fleety is an ACP agent — point any ACP-capable editor at this command:\n");
-    println!("    command: {cmd}");
+    println!("    command: {}", crate::terminal_safe_text(&cmd));
     println!("    args:    [\"acp\"]");
     match server {
-        Some(s) => println!("    env:     FLEETY_AGENT_URL={s}\n"),
+        Some(s) => println!(
+            "    env:     FLEETY_AGENT_URL={}\n",
+            crate::terminal_safe_endpoint(s)
+        ),
         None => println!("    env:     FLEETY_AGENT_URL=ws://127.0.0.1:8787   (or your server)\n"),
     }
     println!("Auto-configure a supported editor:");
@@ -385,7 +391,10 @@ pub fn install_zed(server: Option<String>) -> agent_core::Result<()> {
     .unwrap_or_default();
 
     let Some(path) = zed_settings_path() else {
-        println!("Could not locate Zed's settings.json. Add this to it manually:\n\n{snippet}");
+        println!(
+            "Could not locate Zed's settings.json. Add this to it manually:\n\n{}",
+            crate::terminal_safe_multiline(&snippet)
+        );
         return Ok(());
     };
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
@@ -1836,7 +1845,7 @@ mod tests {
             fleety_tools::connection::Resolved {
                 url: url.to_string(),
                 token: None,
-                source: fleety_tools::connection::Source::Override,
+                source: fleety_tools::connection::Source::OverrideUrl,
             },
             std::sync::Arc::new(tokio::sync::Mutex::new(tokio::io::BufReader::new(
                 editor_in,

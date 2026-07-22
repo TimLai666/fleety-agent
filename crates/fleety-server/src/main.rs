@@ -69,6 +69,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use agent_core::{obs, ModelProvider};
+use clap::{Arg, ArgAction, Command};
 use tokio::net::TcpListener;
 
 use crate::storage::Storage;
@@ -114,70 +115,58 @@ fn policy_from_env() -> agent_core::Policy {
     }
 }
 
-const USAGE: &str = "Usage: fleety-server [COMMAND]\n\nCommands:\n  run-service     Run as the installed OS service\n  install         Install and enable the OS service\n  uninstall       Remove the OS service\n  start           Start the installed service\n  stop            Stop the installed service\n  restart [--force]\n                  Restart now or after in-flight work completes\n  enable          Enable service startup at boot\n  disable         Disable service startup at boot\n  status          Show service status\n  up              Install, enable, and start the service\n  down            Stop the service\n  update          Update fleety-server and its sidecar\n  backup <now|restore>\n                  Back up or restore server state\n  config ...      Inspect or edit server-owned settings\n  version         Print the version\n  help            Print this help\n\nWith no command, fleety-server runs in the foreground.";
-
-fn is_help(args: &[String]) -> bool {
-    matches!(args, [arg] if matches!(arg.as_str(), "help" | "--help" | "-h"))
-}
-
-fn validate_command_line(args: &[String]) -> std::result::Result<(), String> {
-    let Some(command) = args.first().map(String::as_str) else {
-        return Ok(());
-    };
-    if command == "config" {
-        return Ok(());
-    }
-    if command == "backup" {
-        return match args {
-            [_, action] if matches!(action.as_str(), "now" | "restore") => Ok(()),
-            _ => Err("backup requires exactly one action: now or restore".to_string()),
-        };
-    }
-    if command == "restart" {
-        return match args {
-            [_] => Ok(()),
-            [_, flag] if flag == "--force" => Ok(()),
-            _ => Err("restart accepts only the optional --force flag".to_string()),
-        };
-    }
-    let known = matches!(
-        command,
-        "run-service"
-            | "install"
-            | "uninstall"
-            | "start"
-            | "stop"
-            | "enable"
-            | "disable"
-            | "status"
-            | "up"
-            | "down"
-            | "update"
-            | "version"
-            | "--version"
-            | "-v"
-            | "-V"
-    );
-    if !known {
-        return Err(format!("unknown command '{command}'"));
-    }
-    if args.len() != 1 {
-        return Err(format!("command '{command}' does not accept arguments"));
-    }
-    Ok(())
+fn command() -> Command {
+    let lifecycle = |name| Command::new(name).about("Manage the installed Server service");
+    Command::new("fleety-server")
+        .version(agent_core::VERSION)
+        .about("Fleety Agent Server")
+        .after_help("With no command, fleety-server runs in the foreground.")
+        .arg(
+            Arg::new("legacy-version")
+                .short('v')
+                .action(ArgAction::Version)
+                .hide(true),
+        )
+        .subcommands([
+            lifecycle("run-service").hide(true),
+            lifecycle("install"),
+            lifecycle("uninstall"),
+            lifecycle("start"),
+            lifecycle("stop"),
+            lifecycle("restart").arg(Arg::new("force").long("force").action(ArgAction::SetTrue)),
+            lifecycle("enable"),
+            lifecycle("disable"),
+            lifecycle("status"),
+            lifecycle("up"),
+            lifecycle("down"),
+            lifecycle("update"),
+            Command::new("backup")
+                .about("Back up or restore Server state")
+                .subcommand_required(true)
+                .subcommands([
+                    Command::new("now").about("Create a backup now"),
+                    Command::new("restore").about("Restore a backup"),
+                ]),
+            fleety_tools::config::clap_command(),
+            Command::new("version").about("Print the version"),
+        ])
 }
 
 fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if is_help(&args) {
-        println!("{USAGE}");
-        return std::process::ExitCode::SUCCESS;
-    }
-    if let Err(message) = validate_command_line(&args) {
-        eprintln!("error: {message}\n\n{USAGE}");
-        return std::process::ExitCode::FAILURE;
+    let mut argv = Vec::with_capacity(args.len() + 1);
+    argv.push("fleety-server".to_string());
+    argv.extend(args.iter().cloned());
+    if let Err(error) = command().try_get_matches_from(argv) {
+        let code = error.exit_code();
+        let _ = error.print();
+        return std::process::ExitCode::from(code as u8);
     }
     let cmd = args.first().cloned();
+    if cmd.as_deref() == Some("version") {
+        println!("fleety-server {}", agent_core::VERSION);
+        return std::process::ExitCode::SUCCESS;
+    }
 
     obs::init();
     // Seed env from ~/.fleety/config.toml before anything reads env: an explicit
@@ -189,11 +178,19 @@ fn main() -> std::process::ExitCode {
     // `config ...` inspects/edits this host's settings (model, addr, token, …),
     // then exits — no runtime needed. Same command surface as `fleety config`.
     if cmd.as_deref() == Some("config") {
-        if let Err(e) = fleety_tools::config::run(&args[1..]) {
+        if let Err(e) = fleety_tools::config::with_server_transaction(|| {
+            fleety_tools::config::run_scoped(&args[1..], Some(fleety_tools::config::SERVER_SCOPES))
+        }) {
             let report = e.report();
-            eprintln!("error: {}", report.message);
+            eprintln!(
+                "error: {}",
+                fleety_tools::transport::terminal_safe_multiline(&report.message)
+            );
             if let Some(hint) = report.remediation {
-                eprintln!("hint: {hint}");
+                eprintln!(
+                    "hint: {}",
+                    fleety_tools::transport::terminal_safe_multiline(&hint)
+                );
             }
             return std::process::ExitCode::FAILURE;
         }

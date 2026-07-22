@@ -2,7 +2,7 @@
 
 > **Config file.** The most-used `FLEETY_*` settings are also **config keys** you
 > can set without exporting env: `fleety config list` / `get` / `set <KEY>
-> <VALUE>` / `unset`, or bare **`fleety config`** (on a TTY) for a guided menu —
+> <VALUE>` / `unset`, or bare **`fleety config`** (on a TTY) for owner-aware Settings —
 > pick Providers / Models / Settings and drill in (add a provider by type, pick a
 > model from its API `/models` list or the connected server's authenticated Codex
 > catalog, choose a timezone). OAuth rows show whether the server is signed in,
@@ -120,7 +120,7 @@ Two tiers:
 
 - **Providers** are endpoints/accounts, tagged by `type` (an extensible registry):
   `type = "api"` carries a `base_url` and optional `key`; `type = "oauth:codex"`
-  sources a per-provider OAuth token from `fleety auth login <provider>` (each
+  sources a per-provider OAuth token from `fleety provider login <provider>` (each
   such provider its own account) and carries no `base_url`/`key`.
 - **Model roles** are `main` and `cheap`; each is a pool with a `strategy`
   (`single` / `round_robin` / `failover`) and a list of `members`, where a member
@@ -139,7 +139,7 @@ base_url = "https://api.openai.com/v1"
 key = "sk-aaa"
 
 [providers.codex1]
-type = "oauth:codex"        # token from `fleety auth login codex1`; no base_url/key
+type = "oauth:codex"        # token from `fleety provider login codex1`; no base_url/key
 
 [models.main]
 strategy = "failover"
@@ -163,45 +163,54 @@ written atomically; an invalid change is rejected with a message and nothing is
 written. Provider keys are masked in `list`.
 
 ```
-config provider add openai1 --type api --base-url https://api.openai.com/v1 --key sk-aaa
-config provider add codex1 --type oauth:codex          # then: fleety auth login codex1
-config provider set openai1 --base-url https://…       # change only the given fields
-config provider remove openai1                         # blocked if a model role references it
-config provider list                                   # by type; keys masked
-config model set main --member openai1/gpt-4o --member codex1/gpt-5 --strategy failover
-config model set cheap --member openai1/gpt-4o-mini    # one member → strategy defaults to single
-config model show [main|cheap]  |  config model unset main  |  config model list
+fleety provider add openai1 --type api --base-url https://api.openai.com/v1 --key sk-aaa
+fleety provider add codex1 --type oauth:codex          # then: fleety provider login codex1
+fleety provider edit                                   # connected-Server editor
+fleety provider set openai1 --clear-key                # explicit Server-side key removal
+fleety provider remove openai1                         # blocked if a model role references it
+fleety provider list                                   # by type; keys masked
+fleety model set main --member openai1/gpt-4o --member codex1/gpt-5 --strategy failover
+fleety model set cheap --member openai1/gpt-4o-mini    # one member → strategy defaults to single
+fleety model show main  |  fleety model unset main  |  fleety model list
 ```
 
-On a TTY, bare `fleety config` opens the interactive **four-region panel**
-(Connection / CLI / Daemon / Server). Daemon and Server changes are sent to
-their owning runtimes. `fleety config provider edit` (CLI only) opens
-the provider-only editor, and like the subcommands it acts on the **connected
-server's** providers by default (snapshot → edit → apply under an optimistic
-lock; a concurrent edit reloads instead of overwriting). There is no local
-provider-file editing path. A
-server older than config protocol 2 is refused up front (it would silently
-ignore the write-back) — update it first. Without a TTY, the subcommands above
-are used.
+On a TTY, bare `fleety config` opens the shared terminal workspace at the
+five owner-aware Settings pages: Connection / CLI / Daemon / Server /
+Providers & Models. Edits stage and apply per owner. Daemon and Server changes
+are sent to their owning runtimes; Provider/Model/OAuth changes go through the
+connected Server's structured snapshot/apply service. `fleety provider edit`
+opens the same provider workflow. There is no local provider-file fallback.
+Provider keys are Server-owned, write-only secrets: snapshots return presence
+metadata only, blank edits keep an existing key, `--key` replaces it, and
+`--clear-key` (or `k` in the editor) removes it after confirmation. A Server
+older than config protocol 5 is refused up front because it cannot enforce that
+contract. Without a TTY, the subcommands above are used.
 
-#### Remote vs local (`--target`)
+#### Remote vs local (`--owner`)
 
-`fleety config …` automatically routes a key to its owner. Use `--target` to
-assert the owner or select a device:
+`fleety config …` automatically routes a key to its owner. Use `--owner` to
+assert the owner or select a device. `--target` remains a compatibility alias:
 
-- `--target server` — the connected server. The result reports when the
+- `--owner server` — the connected server. The result reports when the
   change takes effect: a provider/model change on the next connection; a flat
   `set`/`unset` after a server restart (flat settings are env-seeded at boot, and
   the environment takes precedence). A mutating change is **refused when the
   server runs with auth disabled** (enable auth first).
-- `--target daemon` — the current device's daemon. Daemon and Shared keys are
+- `--owner daemon` — the current device's daemon. Daemon and Shared keys are
   applied by `fleetyd` through the server.
-- `--target cli` (alias `local`) — only the CLI scope in this host's
+- `--owner cli` — only the CLI scope in this host's
   `config.toml`; it cannot select provider/model, Shared, Daemon, or Server keys.
-- `--target <device-id>` — that device's daemon through the server.
+- `--owner <device-id>` — that device's daemon through the server.
 
 An unavailable owner is a hard error. The CLI never falls back to editing the
 daemon's or server's files.
+
+Reads that span owners are independent: available CLI/Daemon/Server results are
+retained, unavailable owners are reported, human output is labeled `PARTIAL`,
+and the process exits 1. `--json` returns one stable
+`{schema_version, ok, context, data, errors}` envelope with `ok:false` and one
+structured error per failed owner. Mutations always resolve exactly one owner
+before I/O and never use another owner or a direct file as fallback.
 
 `fleety-server config` (run on the server host) stays available as a bootstrap
 path before the CLI can connect. Remote config travels only over the
@@ -209,7 +218,7 @@ authenticated connection — use TLS for remote/untrusted networks.
 
 ## Codex ChatGPT OAuth (sign in instead of an API key)
 
-`fleety auth login <provider>` signs a named `oauth:codex` provider in to ChatGPT
+`fleety provider login <provider>` signs a named `oauth:codex` provider in to ChatGPT
 (OAuth 2.0 with PKCE, the same public client id and simplified flow as the
 upstream Codex CLI) **for the connected server**: the browser flow runs on the
 CLI host, and the exchanged tokens are delivered over the paired connection and
@@ -219,8 +228,8 @@ stored on the server **per provider** at its `~/.fleety/codex-oauth/<provider>.j
 to different accounts and re-running `login` on one switches its account. Nothing
 is persisted on the CLI host (login also cleans up a leftover token file from
 older versions). This is distinct from `fleety pair`, which enrolls the device
-itself. `fleety auth status [<provider>]` lists each (or one) provider's sign-in
-state; `fleety auth logout <provider>` clears that provider's **server-side**
+itself. `fleety provider status [<provider>]` lists each (or one) provider's sign-in
+state; `fleety provider logout <provider>` clears that provider's **server-side**
 credential — all of this is also reachable from `fleety config` (Providers →
 select the codex provider → `e`). Upgrading to per-provider Codex clears any old
 global login (no migration — sign in again per provider). A server too old to
@@ -330,7 +339,7 @@ first as the default pick, then scans the LAN for a few seconds and lists
 **every** announced server by name (the instance name minus the `fleety-`
 prefix; saved ones are marked), lets you pick one (Enter takes the default),
 saves it as the current profile, and — for a non-local pick — prompts for a
-pairing code in the same flow. Switch servers later with `fleety server use
+pairing code in the same flow. Switch servers later with `fleety connection use
 <name>` (config and every command land on whichever profile is current). With
 mDNS disabled, no TTY, or nothing found, it falls back to the explicit
 `fleety init ws://host:8787` guidance. The server install script installs the
@@ -341,8 +350,10 @@ server this way out of the box.
 fingerprint on first start (stored at `<agent home>/server-id`, stable across
 restarts and address changes) and advertises it in the mDNS TXT record (`fp`)
 and in `Welcome`. A device pins it when pairing and back-fills it on the next
-authenticated connection (devices enrolled before this existed need no
-re-pairing). Then, if the saved server URL stops answering, the CLI and fleetyd
+authenticated connection when the saved profile still has a URL. A legacy
+token-only, URL-less profile has neither an endpoint nor a pin to prove which
+LAN advertiser owns the token, so the token is withheld and that profile must be
+paired again instead of trusting the first mDNS response. Then, if the saved server URL stops answering, the CLI and fleetyd
 scan once and reconnect to the **same identity** at its new address — updating
 the saved profile automatically. Only an advertiser whose fingerprint exactly
 matches the pin is adopted; a different or absent fingerprint is ignored and the
@@ -363,10 +374,10 @@ sniff the token; TLS / challenge-based proof is a separate follow-up.
 
 | Var | Default | Meaning |
 |---|---|---|
-| `FLEETY_AGENT_URL` | (see Connection profiles) | **Transient** override of the server URL (never written to a file). The persistent connection target lives in `~/.fleety/connections.toml`, managed by `fleety server …` — see **Connection profiles** below. |
+| `FLEETY_AGENT_URL` | (see Connection profiles) | **Transient** override of the server URL (never written to a file). It inherits the current profile token only when the URLs are identical; otherwise set `FLEETY_TOKEN` explicitly. The persistent connection target lives in `~/.fleety/connections.toml`, managed by `fleety connection …` (`server` is an alias) — see **Connection profiles** below. |
 | `FLEETY_DEVICE_ID` | OS machine id → hostname | Override for this device's id (path-safe; no slashes / `:`). See **Device identity** below. |
 | `FLEETY_DEVICE_ROOT` | cwd | Filesystem root the on-device tools operate within. |
-| `FLEETY_TOKEN` | (unset → current profile's token) | Auth-token override. A freshly-paired token is persisted to the **current profile** in `~/.fleety/connections.toml` (migrated from the old `fleetyd.token`); this env var overrides it. |
+| `FLEETY_TOKEN` | (unset → exact target profile's token) | Auth-token override. A freshly-minted token is persisted only to the profile that owns the resolved URL. A different transient env URL cannot overwrite or clear the current profile; a pure-env first run with no profile may create `default`. |
 | `FLEETY_PAIRING_CODE` | (unset) | Pass once to enroll a new device; server mints a token in `Welcome`, fleetyd writes it to disk. |
 
 ## Connection profiles (`connections.toml`)
@@ -374,23 +385,27 @@ sniff the token; TLS / challenge-based proof is a separate follow-up.
 Which server this device connects to (and its token) lives in
 `~/.fleety/connections.toml` — shared by `fleety` and `fleetyd` on the same host,
 so the CLI (the window) and the daemon (the hand) target the same server. Manage
-it with `fleety server`:
+it with `fleety connection`:
 
 ```
-fleety server add home ws://192.168.1.10:8787 --use   # add a profile + switch to it
-fleety server use home           # switch the current server (CLI + this host's daemon)
-fleety server list | show | current | rename | remove | set-url
+fleety connection add home ws://192.168.1.10:8787 --use   # add a profile + switch to it
+fleety connection use home           # switch the current server (CLI + this host's daemon)
+fleety connection list | show | rename | remove | set-url
 fleety init <ws-url>             # sugar for `server add … --use` + enroll
 fleety pair <code>               # enroll; the minted token is written to the current profile
-fleety -s <name> <cmd> | --url <ws> <cmd>   # one-shot override; doesn't change current
+fleety --profile <name> <cmd> | --server <ws> <cmd>   # one-shot override; doesn't change current
 ```
 
 Resolution precedence: a one-shot `-s`/`--url` → the `FLEETY_AGENT_URL` env
-(transient) → the current profile's URL + token → mDNS (only until enrolled;
+(transient, with no inherited token unless its URL equals the current profile) → the current profile's URL + token → mDNS (only until enrolled;
 sticky + fingerprint-guarded afterward) → `ws://127.0.0.1:8787`. `FLEETY_AGENT_URL`
 is **no longer a `config` key** — the connection target is managed here, not in
 `config.toml`. A legacy `config.json` / `fleetyd.token` is migrated once into
 `connections.toml` on first run (device_id preserved). The file is `0600`.
+When discovery is needed, clients collect the full probe window and prefer an
+advertiser matching the current profile's own fingerprint. Other saved profiles
+never participate in automatic selection. If the current profile has no matching
+pin, the first discovered result remains unowned and receives no stored token.
 
 ## Transport (WebSocket + SSE fallback)
 

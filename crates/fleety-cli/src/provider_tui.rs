@@ -1,41 +1,42 @@
-//! Interactive `config provider edit` screen (CLI-only; needs a TTY).
+//! Interactive `fleety provider edit` screen (CLI-only; needs a TTY).
 //!
-//! Lists the type-tagged providers and the `main`/`cheap` model roles from
-//! `providers.toml` and edits them in place via single-line inputs: add/remove a
-//! provider (by `type`), set a model role's members + strategy, and unset a
-//! role. Saving runs the same validation + atomic write as the non-interactive
-//! `config provider|model` subcommands (so the two paths can't diverge), and
-//! provider keys are masked on screen.
+//! Lists a Server-owned provider snapshot and its `main`/`cheap` model roles.
+//! Changes are staged in memory, validated through the same provider service as
+//! the non-interactive `fleety provider|model` commands, and sent back to the
+//! connected Server on save. The CLI never writes the provider configuration
+//! file directly. Provider keys are masked on screen.
 //!
 //! The state mutations live on [`ProviderEditor`] as small, pure methods that
-//! are unit-tested; the ratatui render + key loop around them is thin. (Design
-//! note: this is the minimal-viable two-tier editor — per-field forms and
-//! in-place provider editing from the old single-tier UI are dropped; use
-//! remove+add, or the non-interactive commands, for those.)
+//! are unit-tested; the ratatui render + key loop around them is thin.
 
 use agent_core::{CoreError, Result};
-use fleety_tools::providers_config::{
-    self as pc, Member, ModelPool, Provider, ProvidersConfig, Strategy,
-};
+use fleety_tools::providers_config::{self as pc, Member, ProvidersConfig, Strategy};
 use ratatui::crossterm::event::KeyCode;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Paragraph};
 use ratatui::Frame;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::input::LineEditor;
+use crate::provider_service::{
+    catalog_gate, catalog_label, provider_views, AuthState, CatalogRequest, CatalogState,
+    ModelSelection, ProviderIssue,
+};
 
-/// The editable two-tier `providers.toml` model. Full validation runs on
-/// [`save`](Self::save); the immediate guards here give friendly errors for the
-/// common mistakes (dup provider, removing a referenced provider).
+/// An editable in-memory Server snapshot. Mutations use the shared provider
+/// service, so command and TUI validation cannot diverge.
 pub struct ProviderEditor {
     cfg: ProvidersConfig,
+    clear_keys: BTreeSet<String>,
 }
 
 impl ProviderEditor {
     pub fn new(cfg: ProvidersConfig) -> Self {
-        Self { cfg }
+        Self {
+            cfg,
+            clear_keys: BTreeSet::new(),
+        }
     }
 
     /// The provider names in display order (BTreeMap → sorted).
@@ -51,21 +52,8 @@ impl ProviderEditor {
         kind: String,
         base_url: Option<String>,
         key: Option<String>,
-    ) -> Result<()> {
-        if self.cfg.providers.contains_key(&name) {
-            return Err(CoreError::Message(format!(
-                "provider '{name}' already exists"
-            )));
-        }
-        self.cfg.providers.insert(
-            name,
-            Provider {
-                kind,
-                base_url,
-                key,
-            },
-        );
-        Ok(())
+    ) -> std::result::Result<(), ProviderIssue> {
+        crate::provider_service::add_provider(&mut self.cfg, name, kind, base_url, key)
     }
 
     /// Upsert a provider: replace an existing entry (edit) or add a new one. No
@@ -78,51 +66,84 @@ impl ProviderEditor {
         kind: String,
         base_url: Option<String>,
         key: Option<String>,
-    ) {
-        self.cfg.providers.insert(
-            name,
-            Provider {
-                kind,
-                base_url,
-                key,
-            },
-        );
+    ) -> std::result::Result<(), ProviderIssue> {
+        let replaces_key = key.is_some();
+        crate::provider_service::set_provider(
+            &mut self.cfg,
+            &name,
+            Some(kind),
+            base_url,
+            key,
+            false,
+        )?;
+        if replaces_key {
+            self.clear_keys.remove(&name);
+        }
+        Ok(())
+    }
+
+    /// Stage an explicit API-key removal. This intent stays separate from the
+    /// redacted `None` in Server snapshots, which means Keep.
+    pub fn clear_provider_key(&mut self, name: &str) -> std::result::Result<(), ProviderIssue> {
+        let provider = self.cfg.providers.get_mut(name).ok_or_else(|| {
+            ProviderIssue::new(
+                "not_found",
+                format!("No Provider named '{name}'"),
+                Some("Select an existing API Provider"),
+            )
+        })?;
+        let allows_key = pc::provider_types()
+            .iter()
+            .find(|kind| kind.name.eq_ignore_ascii_case(&provider.kind))
+            .is_some_and(|kind| kind.allows_key);
+        if !allows_key {
+            return Err(ProviderIssue::new(
+                "not_applicable",
+                format!("Provider '{name}' does not use an API key"),
+                Some("Use the OAuth actions for this Provider"),
+            ));
+        }
+        provider.key = None;
+        self.clear_keys.insert(name.to_string());
+        Ok(())
     }
 
     /// Remove a provider; rejected if a model role member still references it
     /// (the error names the role).
-    pub fn remove_provider(&mut self, name: &str) -> Result<()> {
-        if !self.cfg.providers.contains_key(name) {
-            return Err(CoreError::Message(format!("no such provider '{name}'")));
-        }
-        if let Some(role) = self.cfg.role_referencing(name) {
-            return Err(CoreError::Message(format!(
-                "model role '{role}' references provider '{name}'"
-            )));
-        }
-        self.cfg.providers.remove(name);
+    pub fn remove_provider(&mut self, name: &str) -> std::result::Result<(), ProviderIssue> {
+        crate::provider_service::remove_provider(&mut self.cfg, name)?;
+        self.clear_keys.remove(name);
         Ok(())
     }
 
     /// Create or replace a model role's member pool.
-    pub fn set_model(&mut self, role: String, members: Vec<Member>, strategy: Strategy) {
-        self.cfg
-            .models
-            .insert(role, ModelPool { strategy, members });
+    pub fn set_model(
+        &mut self,
+        role: String,
+        members: Vec<Member>,
+        strategy: Strategy,
+    ) -> std::result::Result<(), ProviderIssue> {
+        crate::provider_service::set_model(&mut self.cfg, role, members, strategy)
     }
 
     /// Unset a model role; an undefined role is reported by name.
     pub fn unset_model(&mut self, role: &str) -> Result<()> {
-        if self.cfg.models.remove(role).is_none() {
-            return Err(CoreError::Message(format!("no such model role '{role}'")));
-        }
-        Ok(())
+        crate::provider_service::unset_model(&mut self.cfg, role)
+            .map_err(crate::provider_service::issue_as_error)
     }
 
     /// The current edited configuration (for savers that ship it elsewhere,
     /// e.g. the remote apply).
     pub fn config(&self) -> &ProvidersConfig {
         &self.cfg
+    }
+
+    pub fn clear_keys(&self) -> &BTreeSet<String> {
+        &self.clear_keys
+    }
+
+    fn finish_save(&mut self) {
+        self.clear_keys.clear();
     }
 }
 
@@ -131,6 +152,10 @@ impl ProviderEditor {
 /// without overwriting a newer snapshot.
 pub enum SaveOutcome {
     Saved,
+    /// `ConfigApply` succeeded, but the editor could not obtain the fresh
+    /// revision required for another safe edit. The applied graph is no longer
+    /// dirty, while this editor session becomes exit-only.
+    SavedRefreshRequired(String),
     Conflict(String),
 }
 
@@ -160,13 +185,6 @@ fn parse_members(s: &str) -> Result<Vec<Member>> {
     Ok(out)
 }
 
-fn masked_key(key: &Option<String>) -> &'static str {
-    match key {
-        Some(k) if !k.is_empty() => "********",
-        _ => "(none)",
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg(test)]
 enum ModelFetchTarget {
@@ -184,7 +202,7 @@ enum ModelFetchTarget {
 #[cfg(test)]
 fn model_fetch_target(
     provider_name: &str,
-    provider: &Provider,
+    provider: &pc::Provider,
     server_discovery: bool,
 ) -> std::result::Result<ModelFetchTarget, String> {
     if provider.kind == "oauth:codex" {
@@ -206,22 +224,9 @@ fn model_fetch_target(
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProviderAuthState {
-    SignedIn,
-    NotSignedIn,
-    Unavailable,
-}
-
-pub type ProviderAuthStates = BTreeMap<String, ProviderAuthState>;
-
-fn auth_state_label(state: ProviderAuthState) -> &'static str {
-    match state {
-        ProviderAuthState::SignedIn => "signed in",
-        ProviderAuthState::NotSignedIn => "not signed in",
-        ProviderAuthState::Unavailable => "unavailable",
-    }
-}
+#[cfg(test)]
+pub type ProviderAuthState = AuthState;
+pub type ProviderAuthStates = BTreeMap<String, AuthState>;
 
 // ---- interactive screen ----
 
@@ -233,6 +238,13 @@ enum Action {
 
 enum Mode {
     Browse,
+    /// A second confirmation before a staged endpoint or static API-key change
+    /// is sent to the connected Server. The summary contains names/change kinds
+    /// only and never includes a credential value.
+    ConfirmSensitiveSave {
+        summary: String,
+        after_save: AfterSave,
+    },
     /// Confirmation shown before a dirty editor may close. The selection order
     /// is deliberately Save / Discard / Cancel, matching the rendered prompt.
     ConfirmExit(ExitConfirm),
@@ -455,6 +467,7 @@ enum ModelStep {
     /// Transient: the run loop performs the `/models` fetch, then calls
     /// [`ModelWizard::apply_fetch`] to advance to `PickModel`.
     Fetching,
+    CatalogFailed,
     PickModel,
 }
 
@@ -479,6 +492,8 @@ struct ModelWizard {
     filter: LineEditor,
     /// One-line hint shown in the title (model count, or why it fell to manual).
     note: String,
+    selection: Option<ModelSelection>,
+    show_catalog_details: bool,
 }
 
 impl ModelWizard {
@@ -495,6 +510,8 @@ impl ModelWizard {
             manual: false,
             filter: LineEditor::default(),
             note: String::new(),
+            selection: None,
+            show_catalog_details: false,
         }
     }
 
@@ -507,25 +524,39 @@ impl ModelWizard {
     /// non-empty list becomes a searchable pick; an empty list or an error
     /// degrades to manual entry (the wizard never dead-ends on a bad fetch).
     /// Pure — unit-tested.
-    fn apply_fetch(&mut self, result: std::result::Result<Vec<String>, String>) {
-        match result {
-            Ok(models) if !models.is_empty() => {
+    fn apply_fetch(&mut self, result: std::result::Result<Vec<String>, ProviderIssue>) {
+        let Some(selection) = &mut self.selection else {
+            self.note = "catalog result arrived without a selection".to_string();
+            self.step = ModelStep::CatalogFailed;
+            return;
+        };
+        selection.finish(result);
+        self.apply_fetch_state();
+    }
+
+    fn apply_fetch_state(&mut self) {
+        let Some(catalog) = self
+            .selection
+            .as_ref()
+            .map(|selection| selection.catalog.clone())
+        else {
+            return;
+        };
+        match catalog {
+            CatalogState::Available(models) => {
                 self.note = format!("{} models · type to filter", models.len());
                 self.models = models;
                 self.manual = false;
+                self.step = ModelStep::PickModel;
             }
-            Ok(_) => {
+            CatalogState::Failed(error) | CatalogState::Unavailable(error) => {
                 self.models = Vec::new();
-                self.manual = true;
-                self.note = "no models returned · type the id".to_string();
+                self.manual = false;
+                self.note = error.message;
+                self.step = ModelStep::CatalogFailed;
             }
-            Err(e) => {
-                self.models = Vec::new();
-                self.manual = true;
-                self.note = format!("fetch failed ({e}) · type the id");
-            }
+            CatalogState::Idle | CatalogState::Loading { .. } | CatalogState::Manual { .. } => {}
         }
-        self.step = ModelStep::PickModel;
         self.model_sel = 0;
         self.filter = LineEditor::default();
     }
@@ -533,13 +564,21 @@ impl ModelWizard {
 
 struct App {
     ed: ProviderEditor,
+    /// Last snapshot confirmed by the Server, used to identify endpoint/key
+    /// changes that require an explicit confirmation before the next save.
+    persisted_cfg: ProvidersConfig,
     sel: usize,
     mode: Mode,
     status: String,
     auth_states: ProviderAuthStates,
+    connection_id: String,
+    config_protocol: u32,
     /// True when the in-memory provider/model graph differs from the last
     /// successful save. A failed save never clears this flag.
     dirty: bool,
+    /// The previous mutation was confirmed, but its replacement snapshot was
+    /// not. No edit or save is safe until the editor is reopened.
+    refresh_required: bool,
     save_now: bool,
     after_save: AfterSave,
     /// Set by the set-model wizard when it enters `Fetching`; the run loop does
@@ -557,6 +596,50 @@ struct App {
     quit: bool,
 }
 
+/// Describe endpoint/key mutations without exposing either key value. Provider
+/// additions/removals are included when they introduce or remove one of these
+/// sensitive fields; model-only edits return an empty list.
+fn sensitive_provider_changes(
+    before: &ProvidersConfig,
+    after: &ProvidersConfig,
+    clear_keys: &BTreeSet<String>,
+) -> Vec<String> {
+    let names = before
+        .providers
+        .keys()
+        .chain(after.providers.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut changes = Vec::new();
+    for name in names {
+        let old = before.providers.get(&name);
+        let new = after.providers.get(&name);
+        if old.and_then(|provider| provider.base_url.as_ref())
+            != new.and_then(|provider| provider.base_url.as_ref())
+        {
+            changes.push(format!(
+                "endpoint for '{}'",
+                crate::terminal_safe_text(&name)
+            ));
+        }
+        if old.and_then(|provider| provider.key.as_ref())
+            != new.and_then(|provider| provider.key.as_ref())
+        {
+            changes.push(format!(
+                "API key for '{}'",
+                crate::terminal_safe_text(&name)
+            ));
+        }
+    }
+    for name in clear_keys {
+        let description = format!("API key for '{}'", crate::terminal_safe_text(name));
+        if !changes.contains(&description) {
+            changes.push(description);
+        }
+    }
+    changes
+}
+
 enum AfterSave {
     Stay,
     Quit,
@@ -566,19 +649,28 @@ enum AfterSave {
 impl App {
     #[cfg(test)]
     fn new(cfg: ProvidersConfig) -> Self {
-        Self::with_auth_states(cfg, ProviderAuthStates::new())
+        Self::with_auth_states(cfg, ProviderAuthStates::new(), "test-server".to_string(), 4)
     }
 
-    fn with_auth_states(cfg: ProvidersConfig, auth_states: ProviderAuthStates) -> Self {
+    fn with_auth_states(
+        cfg: ProvidersConfig,
+        auth_states: ProviderAuthStates,
+        connection_id: String,
+        config_protocol: u32,
+    ) -> Self {
         Self {
-            ed: ProviderEditor::new(cfg),
+            ed: ProviderEditor::new(cfg.clone()),
+            persisted_cfg: cfg,
             sel: 0,
             mode: Mode::Browse,
             // The key hints live on their own persistent footer line (see
             // `hints_for`); the status line starts empty and shows action results.
-            status: "editing providers.toml".to_string(),
+            status: "editing Server provider configuration".to_string(),
             auth_states,
+            connection_id,
+            config_protocol,
             dirty: false,
+            refresh_required: false,
             save_now: false,
             after_save: AfterSave::Stay,
             fetch_models_now: false,
@@ -611,9 +703,23 @@ impl App {
         self.status = format!("{} — staged, not saved", message.into());
     }
 
-    fn request_save(&mut self, after_save: AfterSave) {
+    fn begin_save(&mut self, after_save: AfterSave) {
         self.save_now = true;
         self.after_save = after_save;
+    }
+
+    fn request_save(&mut self, after_save: AfterSave) {
+        let sensitive =
+            sensitive_provider_changes(&self.persisted_cfg, self.ed.config(), self.ed.clear_keys());
+        if sensitive.is_empty() {
+            self.begin_save(after_save);
+        } else {
+            self.status = "sensitive Provider changes require confirmation".to_string();
+            self.mode = Mode::ConfirmSensitiveSave {
+                summary: sensitive.join(", "),
+                after_save,
+            };
+        }
     }
 
     fn request_auth(&mut self, request: AuthRequest) {
@@ -627,6 +733,8 @@ impl App {
         let after_save = std::mem::replace(&mut self.after_save, AfterSave::Stay);
         match result {
             Ok(SaveOutcome::Saved) => {
+                self.persisted_cfg = self.ed.config().clone();
+                self.ed.finish_save();
                 self.dirty = false;
                 self.conflict = None;
                 self.status = "saved".to_string();
@@ -638,6 +746,18 @@ impl App {
                         self.quit = true;
                     }
                 }
+            }
+            Ok(SaveOutcome::SavedRefreshRequired(reason)) => {
+                self.persisted_cfg = self.ed.config().clone();
+                self.ed.finish_save();
+                self.dirty = false;
+                self.refresh_required = true;
+                self.mode = Mode::Browse;
+                self.auth_request = None;
+                self.conflict = None;
+                self.status = format!(
+                    "changes applied, but refresh failed: {reason} — exit and reopen before editing"
+                );
             }
             Ok(SaveOutcome::Conflict(message)) => {
                 self.dirty = true;
@@ -769,12 +889,14 @@ fn on_key_model_wizard(app: &mut App, code: KeyCode) {
         Stay,
         Cancel,
         Fetch,
+        Login(String),
         Complete {
             role: String,
             provider: String,
             model: String,
         },
     }
+    let connection_id = app.connection_id.clone();
     let action = {
         let Mode::SetModel(w) = &mut app.mode else {
             return;
@@ -809,6 +931,11 @@ fn on_key_model_wizard(app: &mut App, code: KeyCode) {
                 }
                 KeyCode::Enter => {
                     w.provider = w.prov_names.get(w.prov_sel).cloned().unwrap_or_default();
+                    w.selection = Some(ModelSelection::loading(
+                        connection_id,
+                        w.provider.clone(),
+                        w.role.clone(),
+                    ));
                     w.step = ModelStep::Fetching;
                     MdAction::Fetch
                 }
@@ -821,6 +948,39 @@ fn on_key_model_wizard(app: &mut App, code: KeyCode) {
             // The run loop owns this step; only allow bailing out.
             ModelStep::Fetching => match code {
                 KeyCode::Esc => MdAction::Cancel,
+                _ => MdAction::Stay,
+            },
+            ModelStep::CatalogFailed => match code {
+                KeyCode::Char('r') => {
+                    if w.selection
+                        .as_mut()
+                        .and_then(ModelSelection::retry)
+                        .is_some()
+                    {
+                        w.step = ModelStep::Fetching;
+                        MdAction::Fetch
+                    } else {
+                        MdAction::Stay
+                    }
+                }
+                KeyCode::Char('m') => {
+                    if let Some(selection) = &mut w.selection {
+                        selection.enter_manual();
+                    }
+                    w.manual = true;
+                    w.filter = LineEditor::default();
+                    w.step = ModelStep::PickModel;
+                    MdAction::Stay
+                }
+                KeyCode::Char('l') => MdAction::Login(w.provider.clone()),
+                KeyCode::Char('d') => {
+                    w.show_catalog_details = !w.show_catalog_details;
+                    MdAction::Stay
+                }
+                KeyCode::Esc => {
+                    w.step = ModelStep::PickProvider;
+                    MdAction::Stay
+                }
                 _ => MdAction::Stay,
             },
             ModelStep::PickModel => {
@@ -916,14 +1076,53 @@ fn on_key_model_wizard(app: &mut App, code: KeyCode) {
             app.status = "cancelled".to_string();
         }
         MdAction::Fetch => {
-            app.fetch_models_now = true;
+            let gate = match &app.mode {
+                Mode::SetModel(w) => app
+                    .ed
+                    .cfg
+                    .provider(&w.provider)
+                    .map(|provider| {
+                        let auth = app.auth_states.get(&w.provider).cloned().unwrap_or(
+                            AuthState::Unavailable(ProviderIssue::new(
+                                "unknown",
+                                "Provider authentication state is unavailable",
+                                Some("Refresh Provider status"),
+                            )),
+                        );
+                        catalog_gate(&provider.kind, &auth, app.config_protocol)
+                    })
+                    .unwrap_or_else(|| {
+                        CatalogState::Unavailable(ProviderIssue::new(
+                            "not_found",
+                            format!("No Provider named '{}'", w.provider),
+                            Some("Select another Provider"),
+                        ))
+                    }),
+                _ => CatalogState::Unavailable(ProviderIssue::new(
+                    "state",
+                    "Model selection is no longer active",
+                    Some("Start model selection again"),
+                )),
+            };
+            if matches!(gate, CatalogState::Idle) {
+                app.fetch_models_now = true;
+            } else if let Mode::SetModel(w) = &mut app.mode {
+                if let Some(selection) = &mut w.selection {
+                    selection.catalog = gate;
+                }
+                w.apply_fetch_state();
+            }
         }
+        MdAction::Login(provider) => app.request_auth(AuthRequest {
+            action: AuthAction::Login,
+            provider,
+        }),
         MdAction::Complete {
             role,
             provider,
             model,
         } => {
-            app.ed.set_model(
+            let result = app.ed.set_model(
                 role.clone(),
                 vec![Member {
                     provider,
@@ -935,7 +1134,10 @@ fn on_key_model_wizard(app: &mut App, code: KeyCode) {
                 Strategy::Single,
             );
             app.mode = Mode::Browse;
-            app.mark_staged(format!("set {role} = {model} (single)"));
+            match result {
+                Ok(()) => app.mark_staged(format!("set {role} = {model} (single)")),
+                Err(error) => app.status = format!("error: {error}"),
+            }
         }
     }
 }
@@ -1001,11 +1203,16 @@ fn on_key_edit_wizard(app: &mut App, code: KeyCode) {
             kind,
             base_url,
             key,
-        } => {
-            app.ed.set_provider(name.clone(), kind, base_url, key);
-            app.mode = Mode::Browse;
-            app.mark_staged(format!("edited provider '{name}'"));
-        }
+        } => match app.ed.set_provider(name.clone(), kind, base_url, key) {
+            Ok(()) => {
+                app.mode = Mode::Browse;
+                app.mark_staged(format!("edited provider '{name}'"));
+            }
+            Err(error) => {
+                app.mode = Mode::Browse;
+                app.status = format!("error: {error}");
+            }
+        },
     }
 }
 
@@ -1072,6 +1279,31 @@ fn on_key_exit_confirm(app: &mut App, code: KeyCode) {
 }
 
 fn on_key(app: &mut App, code: KeyCode) {
+    if app.refresh_required {
+        if matches!(code, KeyCode::Char('q') | KeyCode::Esc) {
+            app.quit = true;
+        }
+        return;
+    }
+    if matches!(app.mode, Mode::ConfirmSensitiveSave { .. }) {
+        match code {
+            KeyCode::Enter => {
+                if let Mode::ConfirmSensitiveSave { after_save, .. } =
+                    std::mem::replace(&mut app.mode, Mode::Browse)
+                {
+                    app.status = "saving confirmed sensitive Provider changes…".to_string();
+                    app.begin_save(after_save);
+                }
+            }
+            KeyCode::Esc => {
+                app.mode = Mode::Browse;
+                app.status =
+                    "sensitive Provider save cancelled — changes remain staged".to_string();
+            }
+            _ => {}
+        }
+        return;
+    }
     if matches!(app.mode, Mode::ConfirmExit(_)) {
         on_key_exit_confirm(app, code);
         return;
@@ -1097,7 +1329,8 @@ fn on_key(app: &mut App, code: KeyCode) {
         | Mode::SetModel(_)
         | Mode::EditProvider(_)
         | Mode::OauthActions(_)
-        | Mode::ConfirmExit(_) => {} // handled above
+        | Mode::ConfirmExit(_)
+        | Mode::ConfirmSensitiveSave { .. } => {} // handled above
         Mode::Input { buffer, .. } => match code {
             KeyCode::Char(c) => buffer.insert(c),
             KeyCode::Backspace => buffer.backspace(),
@@ -1151,6 +1384,13 @@ fn on_key(app: &mut App, code: KeyCode) {
                 },
                 None => app.status = "nothing selected".to_string(),
             },
+            KeyCode::Char('k') => match app.ed.provider_names().get(app.sel).cloned() {
+                Some(name) => match app.ed.clear_provider_key(&name) {
+                    Ok(()) => app.mark_staged(format!("cleared API key for '{name}'")),
+                    Err(error) => app.status = format!("error: {error}"),
+                },
+                None => app.status = "nothing selected".to_string(),
+            },
             KeyCode::Char('e') => match app.ed.provider_names().get(app.sel).cloned() {
                 Some(name) => match app.ed.cfg.provider(&name) {
                     // oauth:codex → the sign-in/out/switch menu; api → field edit.
@@ -1200,30 +1440,19 @@ fn render(f: &mut Frame, app: &App) {
 
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from("Providers:"));
-    for (i, (name, p)) in app.ed.cfg.providers.iter().enumerate() {
+    let provider_views = provider_views(&app.ed.cfg, &app.auth_states, app.config_protocol);
+    for (i, provider) in provider_views.iter().enumerate() {
         let marker = if i == app.sel { "▶" } else { " " };
-        let endpoint = p.base_url.as_deref().unwrap_or("(oauth login)");
-        let auth = if p.kind == "oauth:codex" {
-            format!(
-                " auth={}",
-                auth_state_label(
-                    app.auth_states
-                        .get(name)
-                        .copied()
-                        .unwrap_or(ProviderAuthState::Unavailable)
-                )
-            )
-        } else {
-            String::new()
-        };
-        lines.push(Line::from(format!(
-            "{marker} {:<14} [{}] {} key={}{}",
-            name,
-            p.kind,
-            endpoint,
-            masked_key(&p.key),
-            auth,
-        )));
+        let roles = provider.roles.join(",");
+        lines.push(Line::from(crate::terminal_safe_text(&format!(
+            "{marker} {:<14} [{}] endpoint={} auth={} catalog={} roles={}",
+            provider.name,
+            provider.kind,
+            provider.endpoint.label(),
+            provider.auth.label(),
+            catalog_label(&provider.catalog),
+            if roles.is_empty() { "(none)" } else { &roles },
+        ))));
     }
     lines.push(Line::from(""));
     lines.push(Line::from("Model roles:"));
@@ -1234,18 +1463,20 @@ fn render(f: &mut Frame, app: &App) {
             .map(|m| format!("{}/{}", m.provider, m.model))
             .collect::<Vec<_>>()
             .join(", ");
-        lines.push(Line::from(format!(
+        lines.push(Line::from(crate::terminal_safe_text(&format!(
             "  {:<8} [{:?}] {}",
             role, pool.strategy, members
-        )));
+        ))));
     }
     let inner_h = chunks[0].height.saturating_sub(2);
     let sel_line = 1 + app.sel as u16;
     let offset = (sel_line + 1).saturating_sub(inner_h);
-    let config_title = if app.dirty {
-        "providers.toml — staged, not saved"
+    let config_title = if app.refresh_required {
+        "Provider configuration — reload required"
+    } else if app.dirty {
+        "Provider configuration — pending Server save"
     } else {
-        "providers.toml — saved"
+        "Provider configuration — Server snapshot"
     };
     f.render_widget(
         Paragraph::new(lines)
@@ -1261,7 +1492,11 @@ fn render(f: &mut Frame, app: &App) {
     let max_w = chunks[1].width.saturating_sub(2) as usize;
     let cursor_col = |x: u16| -> u16 { (2 + x as usize).min(max_w) as u16 };
     let (title, body, cursor_x): (String, String, Option<u16>) = match &app.mode {
-        Mode::Browse => ("providers.toml".to_string(), app.status.clone(), None),
+        Mode::Browse => (
+            "Server provider configuration".to_string(),
+            app.status.clone(),
+            None,
+        ),
         Mode::ConfirmExit(confirm) => {
             let choices = EXIT_CHOICES
                 .iter()
@@ -1281,6 +1516,11 @@ fn render(f: &mut Frame, app: &App) {
                 None,
             )
         }
+        Mode::ConfirmSensitiveSave { summary, .. } => (
+            "confirm sensitive Server changes".to_string(),
+            format!("{summary} — Enter: apply to Server · Esc: cancel"),
+            None,
+        ),
         Mode::AddProvider(wiz) => match wiz.step {
             AddStep::PickType => {
                 let sel = pc::provider_types()
@@ -1345,11 +1585,55 @@ fn render(f: &mut Frame, app: &App) {
                     None,
                 )
             }
-            ModelStep::Fetching => (
-                format!("set model [{}]", w.role),
-                format!("fetching {}/models …", w.provider),
-                None,
-            ),
+            ModelStep::Fetching => {
+                let previous = w
+                    .selection
+                    .as_ref()
+                    .and_then(|selection| match &selection.catalog {
+                        CatalogState::Loading { previous_error } => previous_error.as_ref(),
+                        _ => None,
+                    })
+                    .map(|error| format!(" · previous: {}", error.message))
+                    .unwrap_or_default();
+                (
+                    format!("set model [{}]", w.role),
+                    format!("fetching {}/models …{previous}", w.provider),
+                    None,
+                )
+            }
+            ModelStep::CatalogFailed => {
+                let issue = w
+                    .selection
+                    .as_ref()
+                    .and_then(|selection| match &selection.catalog {
+                        CatalogState::Failed(issue) | CatalogState::Unavailable(issue) => {
+                            Some(issue)
+                        }
+                        _ => None,
+                    });
+                let summary = issue
+                    .map(|issue| issue.message.as_str())
+                    .unwrap_or("Catalog is unavailable");
+                let line = if w.show_catalog_details {
+                    issue
+                        .map(|issue| {
+                            format!(
+                                "{} · kind={} · fix={}",
+                                issue.message,
+                                issue.kind,
+                                issue.remediation.as_deref().unwrap_or("none")
+                            )
+                        })
+                        .unwrap_or_else(|| "No additional details".to_string())
+                } else {
+                    summary.to_string()
+                };
+                (
+                    format!("catalog failed [{}] {}", w.role, w.provider),
+                    line,
+                    None,
+                )
+            }
             ModelStep::PickModel => {
                 if w.manual {
                     let (view, x) = w.filter.display_window(max_w.saturating_sub(2));
@@ -1417,9 +1701,18 @@ fn render(f: &mut Frame, app: &App) {
             (prompt.to_string(), format!("> {view}"), Some(cursor_col(x)))
         }
     };
+    let title = crate::terminal_safe_text(&title);
+    let body = crate::terminal_safe_text(&body);
     f.render_widget(
-        Paragraph::new(vec![Line::from(body), Line::from(hints_for(&app.mode))])
-            .block(Block::bordered().title(title)),
+        Paragraph::new(vec![
+            Line::from(body),
+            Line::from(if app.refresh_required {
+                "q/Esc: exit and reopen to reload the Server snapshot"
+            } else {
+                hints_for(&app.mode)
+            }),
+        ])
+        .block(Block::bordered().title(title)),
         chunks[1],
     );
     if let Some(cx) = cursor_x {
@@ -1432,9 +1725,14 @@ fn render(f: &mut Frame, app: &App) {
 /// stay visible). Pure — a non-empty hint exists for every screen.
 fn hints_for(mode: &Mode) -> &'static str {
     match mode {
-        Mode::Browse => "a: add · e: edit · d: del · m: set-model · u: unset · s: save · q: quit",
+        Mode::Browse => {
+            "a: add · e: edit · k: clear-key · d: del · m: set-model · u: unset · s: save · q: quit"
+        }
         Mode::ConfirmExit(_) => {
             "↑↓: choose · Enter: confirm · s: save · d: discard · c/Esc: cancel"
+        }
+        Mode::ConfirmSensitiveSave { .. } => {
+            "Enter: confirm endpoint/key changes · Esc: keep staged without saving"
         }
         Mode::AddProvider(w) => match w.step {
             AddStep::PickType => "↑↓: pick type · Enter: next · Esc: cancel",
@@ -1443,7 +1741,10 @@ fn hints_for(mode: &Mode) -> &'static str {
         Mode::SetModel(w) => match w.step {
             ModelStep::PickRole => "↑↓: pick role · Enter: next · Esc: cancel",
             ModelStep::PickProvider => "↑↓: provider · Enter: fetch models · Esc: back",
-            ModelStep::Fetching => "fetching the provider's models…",
+            ModelStep::Fetching => "fetching the provider's models… · Esc: cancel",
+            ModelStep::CatalogFailed => {
+                "r: retry · m: enter model ID · l: login · d: details · Esc: back"
+            }
             ModelStep::PickModel => "↑↓: pick · type: filter · Enter: set · Esc: back",
         },
         Mode::EditProvider(_) => "type the value · Enter: next · Esc: cancel",
@@ -1460,56 +1761,135 @@ pub struct EditorOutcome {
     pub auth_request: Option<AuthRequest>,
 }
 
+type CatalogFetchResult = std::result::Result<Vec<String>, ProviderIssue>;
+type ActiveCatalogFetch = (
+    CatalogRequest,
+    std::sync::mpsc::Receiver<CatalogFetchResult>,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+);
+
+fn cancel_hidden_catalog_fetch(app: &App, active_fetch: &mut Option<ActiveCatalogFetch>) {
+    use std::sync::atomic::Ordering;
+
+    let active_request_still_visible = match active_fetch.as_ref() {
+        None => true,
+        Some((request, _, _)) => {
+            matches!(
+                &app.mode,
+                Mode::SetModel(w)
+                    if w.step == ModelStep::Fetching
+                        && w.selection.as_ref().map(ModelSelection::request)
+                            == Some(request.clone())
+            )
+        }
+    };
+    if !active_request_still_visible {
+        if let Some((_, _, cancellation)) = active_fetch.take() {
+            cancellation.store(true, Ordering::Release);
+        }
+    }
+}
+
 /// Open the editor with caller-owned model discovery and credential-status
-/// providers. The remote config editor uses this to keep both operations on its
-/// existing authenticated connection; the local wrapper above retains the API
-/// endpoint behavior.
+/// providers. The remote config editor uses this to keep every operation bound
+/// to its existing authenticated Server target.
 pub fn run_with_saver_and_fetcher(
     cfg: ProvidersConfig,
-    mut save: impl FnMut(&ProvidersConfig) -> Result<SaveOutcome>,
-    mut fetch_models: impl FnMut(&str, &Provider) -> std::result::Result<Vec<String>, String>,
+    mut save: impl FnMut(&ProvidersConfig, &BTreeSet<String>) -> Result<SaveOutcome>,
+    fetch_models: impl Fn(&CatalogRequest, std::sync::Arc<std::sync::atomic::AtomicBool>) -> CatalogFetchResult
+        + Send
+        + Sync
+        + 'static,
     auth_states: ProviderAuthStates,
+    connection_id: String,
+    config_protocol: u32,
+    terminal_input: &mut crate::workspace::WorkspaceInput,
 ) -> Result<EditorOutcome> {
-    use ratatui::crossterm::event::{self, Event, KeyEventKind};
-    let mut app = App::with_auth_states(cfg, auth_states);
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+
+    let mut app = App::with_auth_states(cfg, auth_states, connection_id, config_protocol);
+    let fetch_models = Arc::new(fetch_models);
+    let mut active_fetch: Option<ActiveCatalogFetch> = None;
     let mut terminal = ratatui::init();
     let result = (|| -> Result<()> {
         loop {
+            cancel_hidden_catalog_fetch(&app, &mut active_fetch);
+            if let Some((request, receiver, _)) = &active_fetch {
+                match receiver.try_recv() {
+                    Ok(fetch_result) => {
+                        let matches_active_request = matches!(
+                            &app.mode,
+                            Mode::SetModel(w)
+                                if w.step == ModelStep::Fetching
+                                    && w.selection.as_ref().map(ModelSelection::request)
+                                        == Some(request.clone())
+                        );
+                        if matches_active_request {
+                            if let Mode::SetModel(w) = &mut app.mode {
+                                w.apply_fetch(fetch_result);
+                            }
+                        }
+                        active_fetch = None;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        if let Mode::SetModel(w) = &mut app.mode {
+                            w.apply_fetch(Err(ProviderIssue::new(
+                                "catalog_worker",
+                                "Provider catalog worker stopped unexpectedly",
+                                Some("Retry the catalog request"),
+                            )));
+                        }
+                        active_fetch = None;
+                    }
+                }
+            }
             terminal
                 .draw(|f| render(f, &app))
                 .map_err(|e| CoreError::Message(format!("draw failed: {e}")))?;
             if app.quit {
                 break;
             }
-            if let Event::Key(k) =
-                event::read().map_err(|e| CoreError::Message(format!("read failed: {e}")))?
-            {
-                if k.kind != KeyEventKind::Release {
-                    on_key(&mut app, k.code);
+            match terminal_input.try_recv() {
+                Ok(key) => {
+                    on_key(&mut app, key.code);
                     if app.save_now {
                         app.save_now = false;
-                        let save_result = save(app.ed.config());
+                        let save_result = save(app.ed.config(), app.ed.clear_keys());
                         app.finish_save(save_result);
                     }
                     if app.fetch_models_now {
-                        // The set-model wizard asked to fetch the provider's
-                        // models. The caller supplies the authority, so remote
-                        // OAuth discovery never needs a local base_url/token.
                         app.fetch_models_now = false;
-                        let result = match &app.mode {
-                            Mode::SetModel(w) => app
-                                .ed
-                                .cfg
-                                .provider(&w.provider)
-                                .ok_or_else(|| format!("no provider '{}'", w.provider))
-                                .and_then(|provider| fetch_models(&w.provider, provider)),
-                            _ => Err("not in set-model".to_string()),
+                        let request = match &app.mode {
+                            Mode::SetModel(w) => w.selection.as_ref().map(ModelSelection::request),
+                            _ => None,
                         };
-                        if let Mode::SetModel(w) = &mut app.mode {
-                            w.apply_fetch(result);
+                        if let Some(request) = request {
+                            let (result_tx, result_rx) = mpsc::channel();
+                            let worker = Arc::clone(&fetch_models);
+                            let worker_request = request.clone();
+                            let cancellation = Arc::new(AtomicBool::new(false));
+                            let worker_cancellation = Arc::clone(&cancellation);
+                            std::thread::spawn(move || {
+                                let result = worker(&worker_request, worker_cancellation);
+                                let _ = result_tx.send(result);
+                            });
+                            active_fetch = Some((request, result_rx, cancellation));
+                        } else if let Mode::SetModel(w) = &mut app.mode {
+                            w.apply_fetch(Err(ProviderIssue::new(
+                                "invalid_state",
+                                "No Provider catalog request is active",
+                                Some("Go back and select the Provider again"),
+                            )));
                         }
                     }
                 }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
             }
         }
         Ok(())
@@ -1575,7 +1955,7 @@ mod tests {
         let mut states = ProviderAuthStates::new();
         states.insert("signed".into(), ProviderAuthState::SignedIn);
         states.insert("signed-out".into(), ProviderAuthState::NotSignedIn);
-        let app = App::with_auth_states(cfg, states);
+        let app = App::with_auth_states(cfg, states, "test-server".into(), 4);
         let mut terminal = Terminal::new(TestBackend::new(100, 12)).expect("term");
         terminal.draw(|f| render(f, &app)).expect("draw");
         let content: String = terminal
@@ -1585,9 +1965,91 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(content.contains("signed in"));
-        assert!(content.contains("not signed in"));
-        assert!(content.contains("auth=unavailable"));
+        assert!(content.contains("Signed in"));
+        assert!(content.contains("Not signed in"));
+        assert!(content.contains("auth=Unavailable"));
+    }
+
+    #[test]
+    fn provider_render_redacts_endpoint_secrets_and_terminal_controls() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut cfg = ProvidersConfig::default();
+        cfg.providers.insert(
+            "api\u{1b}]52;c;STEAL\u{7}\nnext".into(),
+            pc::Provider {
+                kind: "api".into(),
+                base_url: Some("https://user:pass@example.test/v1?token=SECRET#fragment".into()),
+                key: None,
+            },
+        );
+        let app = App::new(cfg);
+        let mut terminal = Terminal::new(TestBackend::new(120, 12)).expect("term");
+        terminal.draw(|frame| render(frame, &app)).expect("draw");
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        for secret in ["pass", "SECRET", "#fragment"] {
+            assert!(!content.contains(secret), "leaked {secret}: {content}");
+        }
+        assert!(!content.contains('\u{1b}'), "{content}");
+        assert!(!content.contains('\u{7}'), "{content}");
+        assert!(
+            content.contains("\\u{1b}]52;c;STEAL\\u{7}\\nnext"),
+            "{content}"
+        );
+
+        let hostile = "wss://user:pass@host/x?token=SECRET#tail\u{1b}]52;c;STEAL\u{7}\r\nnext";
+        let mut app = App::new(ProvidersConfig::default());
+        app.status = hostile.into();
+        let mut terminal = Terminal::new(TestBackend::new(120, 12)).expect("term");
+        terminal.draw(|frame| render(frame, &app)).expect("draw");
+        let status: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        for forbidden in ["pass", "SECRET", "#tail", "\u{1b}", "\u{7}", "\r"] {
+            assert!(
+                !status.contains(forbidden),
+                "leaked {forbidden:?}: {status}"
+            );
+        }
+
+        let mut wizard = ModelWizard::new(vec!["codex".into()]);
+        wizard.provider = "codex".into();
+        wizard.role = "main".into();
+        wizard.step = ModelStep::CatalogFailed;
+        wizard.selection = Some(ModelSelection {
+            connection_id: "server".into(),
+            provider: "codex".into(),
+            role: "main".into(),
+            catalog: CatalogState::Failed(ProviderIssue::new(hostile, hostile, Some(hostile))),
+        });
+        app.mode = Mode::SetModel(wizard);
+        let mut terminal = Terminal::new(TestBackend::new(120, 12)).expect("term");
+        terminal.draw(|frame| render(frame, &app)).expect("draw");
+        let catalog: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        for forbidden in ["pass", "SECRET", "#tail", "\u{1b}", "\u{7}", "\r"] {
+            assert!(
+                !catalog.contains(forbidden),
+                "leaked {forbidden:?}: {catalog}"
+            );
+        }
     }
 
     fn api(base: &str) -> (String, Option<String>, Option<String>) {
@@ -1607,6 +2069,29 @@ mod tests {
     }
 
     #[test]
+    fn command_and_tui_provider_validation_have_identical_kind_and_remediation() {
+        let command_error = fleety_tools::provider_service::validate_provider_input(
+            "../escape",
+            "api",
+            Some("not-an-absolute-url"),
+            None,
+        )
+        .expect_err("command validation");
+        let mut editor = ProviderEditor::new(ProvidersConfig::default());
+        let tui_error = editor
+            .add_provider(
+                "../escape".into(),
+                "api".into(),
+                Some("not-an-absolute-url".into()),
+                None,
+            )
+            .expect_err("TUI validation");
+        assert_eq!(tui_error.kind, command_error.kind);
+        assert_eq!(tui_error.remediation, command_error.remediation);
+        assert!(editor.config().providers.is_empty());
+    }
+
+    #[test]
     fn remove_guarded_by_model_reference() {
         let mut ed = ProviderEditor::new(ProvidersConfig::default());
         ed.add_provider("p1".into(), "api".into(), Some("https://u/v1".into()), None)
@@ -1621,7 +2106,8 @@ mod tests {
                 effort: None,
             }],
             Strategy::Single,
-        );
+        )
+        .unwrap();
         // Referenced by the main role → cannot remove (error names the role).
         assert!(ed
             .remove_provider("p1")
@@ -1649,7 +2135,8 @@ mod tests {
             "main".into(),
             parse_members("p1/gpt-4o|p1/gpt-4o-2").unwrap(),
             Strategy::RoundRobin,
-        );
+        )
+        .unwrap();
         let path = std::env::temp_dir().join(format!("fleety-tui-{}.toml", uuid::Uuid::new_v4()));
         pc::write_providers(&path, ed.config()).expect("save");
         let back = pc::load_from(&path).expect("re-read");
@@ -1659,17 +2146,17 @@ mod tests {
     }
 
     #[test]
-    fn save_rejects_dangling_member() {
+    fn model_edit_rejects_dangling_member_before_staging() {
         let mut ed = ProviderEditor::new(ProvidersConfig::default());
-        // A model member referencing an undefined provider fails validation on save.
-        ed.set_model(
-            "main".into(),
-            parse_members("ghost/m").unwrap(),
-            Strategy::Single,
-        );
-        let path = std::env::temp_dir().join(format!("fleety-tui-{}.toml", uuid::Uuid::new_v4()));
-        assert!(pc::write_providers(&path, ed.config()).is_err());
-        assert!(!path.exists());
+        let error = ed
+            .set_model(
+                "main".into(),
+                parse_members("ghost/m").unwrap(),
+                Strategy::Single,
+            )
+            .expect_err("dangling member");
+        assert_eq!(error.kind, "invalid_provider");
+        assert!(ed.config().models.is_empty());
     }
 
     #[test]
@@ -1681,7 +2168,8 @@ mod tests {
             "main".into(),
             parse_members("p1/gpt-4o").unwrap(),
             Strategy::Single,
-        );
+        )
+        .unwrap();
         ed.unset_model("main").unwrap();
         assert!(ed.cfg.model("main").is_none());
         assert!(ed
@@ -1735,21 +2223,26 @@ mod tests {
     }
 
     #[test]
-    fn apply_fetch_picks_list_or_manual() {
+    fn apply_fetch_picks_list_or_offers_recovery() {
         let mut w = ModelWizard::new(vec!["p1".to_string()]);
+        w.selection = Some(ModelSelection::loading("server", "p1", "main"));
         // A non-empty list → searchable pick (not manual), models retained.
         w.apply_fetch(Ok(vec!["gpt-4o".into(), "gpt-4o-mini".into()]));
         assert!(!w.manual);
         assert_eq!(w.step, ModelStep::PickModel);
         assert_eq!(w.filtered().len(), 2);
-        // An empty list → manual entry.
+        // An empty list keeps the failure visible and offers recovery.
         let mut w = ModelWizard::new(vec!["p1".to_string()]);
+        w.selection = Some(ModelSelection::loading("server", "p1", "main"));
         w.apply_fetch(Ok(vec![]));
-        assert!(w.manual);
-        // An error → manual entry (never dead-ends), note carries the reason.
+        assert_eq!(w.step, ModelStep::CatalogFailed);
+        assert!(!w.manual);
+        // A typed error remains inspectable until the user chooses recovery.
         let mut w = ModelWizard::new(vec!["p1".to_string()]);
-        w.apply_fetch(Err("boom".into()));
-        assert!(w.manual);
+        w.selection = Some(ModelSelection::loading("server", "p1", "main"));
+        w.apply_fetch(Err(ProviderIssue::new("transport", "boom", Some("Retry"))));
+        assert_eq!(w.step, ModelStep::CatalogFailed);
+        assert!(!w.manual);
         assert!(w.note.contains("boom"));
     }
 
@@ -1772,10 +2265,15 @@ mod tests {
         on_key(&mut app, KeyCode::Enter); // role=main → PickProvider
         on_key(&mut app, KeyCode::Enter); // provider=p1 → Fetching (flags fetch)
         assert!(app.fetch_models_now);
-        // Simulate the run loop's fetch failing → manual entry.
+        // Simulate the run loop's fetch failing, then explicitly choose manual entry.
         if let Mode::SetModel(w) = &mut app.mode {
-            w.apply_fetch(Err("no network".into()));
+            w.apply_fetch(Err(ProviderIssue::new(
+                "transport",
+                "no network",
+                Some("Retry"),
+            )));
         }
+        on_key(&mut app, KeyCode::Char('m'));
         type_str(&mut app, "gpt-4o");
         on_key(&mut app, KeyCode::Enter); // save
         let pool = app.ed.cfg.model("main").unwrap();
@@ -1820,11 +2318,31 @@ mod tests {
             "api".into(),
             Some("https://new/v1".into()),
             Some("k2".into()),
-        );
+        )
+        .unwrap();
         let p = ed.cfg.provider("p1").unwrap();
         assert_eq!(p.base_url.as_deref(), Some("https://new/v1"));
         assert_eq!(p.key.as_deref(), Some("k2"));
         assert_eq!(ed.provider_names(), vec!["p1".to_string()]);
+    }
+
+    #[test]
+    fn clear_key_action_stages_explicit_intent_and_requires_sensitive_confirmation() {
+        let mut cfg = ProvidersConfig::default();
+        cfg.providers.insert(
+            "p1".into(),
+            pc::Provider {
+                kind: "api".into(),
+                base_url: Some("https://api.example.test/v1".into()),
+                key: None,
+            },
+        );
+        let mut app = App::new(cfg);
+        on_key(&mut app, KeyCode::Char('k'));
+        assert_eq!(app.ed.clear_keys(), &BTreeSet::from(["p1".to_string()]));
+        assert!(app.dirty);
+        on_key(&mut app, KeyCode::Char('s'));
+        assert!(matches!(app.mode, Mode::ConfirmSensitiveSave { .. }));
     }
 
     #[test]
@@ -1927,6 +2445,49 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_and_key_changes_require_a_secret_free_second_confirmation() {
+        let mut cfg = ProvidersConfig::default();
+        cfg.providers.insert(
+            "private-api".to_string(),
+            pc::Provider {
+                kind: "api".to_string(),
+                base_url: Some("https://old.example/v1".to_string()),
+                key: Some("old-secret".to_string()),
+            },
+        );
+        let mut app = App::new(cfg);
+        let provider = app
+            .ed
+            .cfg
+            .providers
+            .get_mut("private-api")
+            .expect("provider");
+        provider.base_url = Some("https://new.example/v1".to_string());
+        provider.key = Some("new-secret".to_string());
+        app.dirty = true;
+
+        on_key(&mut app, KeyCode::Char('s'));
+
+        assert!(
+            !app.save_now,
+            "the first save request must not reach ConfigApply"
+        );
+        let Mode::ConfirmSensitiveSave { summary, .. } = &app.mode else {
+            panic!("expected sensitive confirmation");
+        };
+        assert!(summary.contains("endpoint for 'private-api'"));
+        assert!(summary.contains("API key for 'private-api'"));
+        assert!(!summary.contains("old-secret"));
+        assert!(!summary.contains("new-secret"));
+
+        on_key(&mut app, KeyCode::Enter);
+        assert!(
+            app.save_now,
+            "the confirmed request may now reach ConfigApply"
+        );
+    }
+
+    #[test]
     fn save_conflict_or_error_keeps_staged_changes_and_blocks_oauth() {
         for result in [
             Ok(SaveOutcome::Conflict("revision changed".into())),
@@ -1964,6 +2525,55 @@ mod tests {
         let req = app.auth_request.expect("OAuth released after save");
         assert_eq!(req.action, AuthAction::Switch);
         assert_eq!(req.provider, "codex1");
+    }
+
+    #[test]
+    fn applied_but_refresh_failed_clears_dirty_and_blocks_every_action_until_exit() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(ProvidersConfig::default());
+        app.dirty = true;
+        app.finish_save(Ok(SaveOutcome::SavedRefreshRequired(
+            "the Server closed before returning a fresh snapshot".into(),
+        )));
+
+        assert!(!app.dirty, "the mutation was confirmed by ConfigApply");
+        assert!(app.refresh_required);
+        assert!(app.status.contains("applied"));
+        assert!(app.status.contains("refresh failed"));
+        assert!(app.status.contains("reopen"));
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).expect("term");
+        terminal.draw(|frame| render(frame, &app)).expect("draw");
+        let content = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(content.contains("reload required"), "{content}");
+        assert!(content.contains("exit and reopen"), "{content}");
+
+        for code in [
+            KeyCode::Char('a'),
+            KeyCode::Char('e'),
+            KeyCode::Char('d'),
+            KeyCode::Char('m'),
+            KeyCode::Char('u'),
+            KeyCode::Char('s'),
+            KeyCode::Enter,
+        ] {
+            on_key(&mut app, code);
+            assert!(matches!(app.mode, Mode::Browse));
+            assert!(!app.save_now);
+            assert!(!app.dirty);
+            assert!(!app.quit);
+        }
+
+        on_key(&mut app, KeyCode::Char('q'));
+        assert!(app.quit, "reopen is the only recovery path");
     }
 
     #[test]
@@ -2016,6 +2626,74 @@ mod tests {
             content.contains("add api provider"),
             "wizard prompt visible in title"
         );
+    }
+
+    #[test]
+    fn fetching_screen_keeps_previous_error_visible_and_can_be_cancelled() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut app = App::new(ProvidersConfig::default());
+        let mut wizard = ModelWizard::new(vec!["codex".into()]);
+        wizard.provider = "codex".into();
+        wizard.role = "main".into();
+        wizard.step = ModelStep::Fetching;
+        wizard.selection = Some(ModelSelection {
+            connection_id: "ws://server.test".into(),
+            provider: "codex".into(),
+            role: "main".into(),
+            catalog: CatalogState::Loading {
+                previous_error: Some(ProviderIssue::new(
+                    "backend",
+                    "catalog temporarily unavailable",
+                    Some("Retry"),
+                )),
+            },
+        });
+        app.mode = Mode::SetModel(wizard);
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).expect("term");
+        terminal.draw(|frame| render(frame, &app)).expect("draw");
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(content.contains("fetching codex/models"), "{content}");
+        assert!(
+            content.contains("previous: catalog temporarily unavailable"),
+            "{content}"
+        );
+        assert!(content.contains("Esc"), "{content}");
+
+        on_key(&mut app, KeyCode::Esc);
+        assert!(matches!(app.mode, Mode::Browse));
+    }
+
+    #[test]
+    fn leaving_fetching_signals_worker_cancellation_and_releases_the_slot() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{mpsc, Arc};
+
+        let app = App::new(ProvidersConfig::default());
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let (_sender, receiver) = mpsc::channel();
+        let mut active = Some((
+            CatalogRequest {
+                connection_id: "ws://server.test".into(),
+                provider: "codex".into(),
+                role: "main".into(),
+            },
+            receiver,
+            Arc::clone(&cancellation),
+        ));
+
+        cancel_hidden_catalog_fetch(&app, &mut active);
+
+        assert!(cancellation.load(Ordering::Acquire));
+        assert!(active.is_none(), "a second fetch can start immediately");
     }
 
     #[test]

@@ -239,20 +239,169 @@ pub async fn connect(agent_url: &str, token: Option<&str>) -> Result<Connection>
         Mode::Auto => match connect_ws(agent_url).await {
             Ok(c) => Ok(c),
             Err(e) => {
-                tracing::warn!(%e, "websocket connect failed; trying SSE+POST fallback");
+                let error = redact_urls_in_text(&e.to_string());
+                let endpoint = redact_endpoint(agent_url);
+                tracing::warn!(%error, %endpoint, "websocket connect failed; trying SSE+POST fallback");
                 connect_sse(agent_url, token).await
             }
         },
     }
 }
 
+/// Render an endpoint without credentials, fragment, or query values. This is
+/// the only form safe for human output, diagnostics, and tracing.
+pub fn redact_endpoint(value: &str) -> String {
+    let Ok(url) = reqwest::Url::parse(value) else {
+        return "<invalid endpoint>".to_string();
+    };
+    if !matches!(url.scheme(), "ws" | "wss" | "http" | "https") || url.host_str().is_none() {
+        return "<invalid endpoint>".to_string();
+    }
+    let Some((scheme, tail)) = value.split_once("://") else {
+        return "<invalid endpoint>".to_string();
+    };
+    let authority_end = tail.find(['/', '?', '#']).unwrap_or(tail.len());
+    let authority = &tail[..authority_end];
+    let host = authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority);
+    let suffix = &tail[authority_end..];
+    let without_fragment = suffix.split('#').next().unwrap_or_default();
+    let (path, query) = without_fragment
+        .split_once('?')
+        .map_or((without_fragment, None), |(path, query)| {
+            (path, Some(query))
+        });
+    let mut redacted = format!("{scheme}://{host}{path}");
+    if let Some(query) = query.filter(|query| !query.is_empty()) {
+        let query = query
+            .split('&')
+            .filter(|part| !part.is_empty())
+            .map(|part| {
+                let key = part.split_once('=').map(|(key, _)| key).unwrap_or(part);
+                format!("{key}=<redacted>")
+            })
+            .collect::<Vec<_>>()
+            .join("&");
+        if !query.is_empty() {
+            redacted.push('?');
+            redacted.push_str(&query);
+        }
+    }
+    redacted
+}
+
+/// Redact every URL embedded in a transport or HTTP error string.
+///
+/// ```
+/// use fleety_tools::transport::redact_urls_in_text;
+///
+/// assert_eq!(
+///     redact_urls_in_text(
+///         "OAuth failed (HtTpS://user:pass@example.test/Case?AccessToken=secret#fragment)."
+///     ),
+///     "OAuth failed (HtTpS://example.test/Case?AccessToken=<redacted>)."
+/// );
+/// ```
+pub fn redact_urls_in_text(value: &str) -> String {
+    const SCHEMES: [&str; 4] = ["ws://", "wss://", "http://", "https://"];
+    let mut rendered = String::with_capacity(value.len());
+    let mut offset = 0;
+    while offset < value.len() {
+        let next = value[offset..].char_indices().find_map(|(relative, _)| {
+            let start = offset + relative;
+            let has_scheme = SCHEMES.iter().any(|scheme| {
+                value
+                    .get(start..start + scheme.len())
+                    .is_some_and(|candidate| candidate.eq_ignore_ascii_case(scheme))
+            });
+            (has_scheme && is_url_scheme_boundary(value, start)).then_some(start)
+        });
+        let Some(start) = next else {
+            rendered.push_str(&value[offset..]);
+            break;
+        };
+        rendered.push_str(&value[offset..start]);
+        let token_end = value[start..]
+            .char_indices()
+            .find_map(|(index, ch)| {
+                (index > 0
+                    && (ch.is_whitespace()
+                        || ch.is_control()
+                        || matches!(ch, '\'' | '"' | '<' | '>')))
+                .then_some(start + index)
+            })
+            .unwrap_or(value.len());
+        let end = trim_sentence_punctuation(value, start, token_end);
+        let candidate = &value[start..end];
+        if reqwest::Url::parse(candidate).is_ok() {
+            rendered.push_str(&redact_endpoint(candidate));
+        } else {
+            rendered.push_str("<invalid endpoint>");
+        }
+        offset = end;
+    }
+    rendered
+}
+
+fn is_url_scheme_boundary(value: &str, start: usize) -> bool {
+    start == 0
+        || value[..start].chars().next_back().map_or(true, |ch| {
+            !ch.is_alphanumeric() && !matches!(ch, '+' | '-' | '.')
+        })
+}
+
+fn trim_sentence_punctuation(value: &str, start: usize, mut end: usize) -> usize {
+    loop {
+        let candidate = &value[start..end];
+        let Some((index, last)) = candidate.char_indices().next_back() else {
+            return end;
+        };
+        let is_unmatched_closer = match last {
+            ')' => candidate.matches(')').count() > candidate.matches('(').count(),
+            ']' => candidate.matches(']').count() > candidate.matches('[').count(),
+            '}' => candidate.matches('}').count() > candidate.matches('{').count(),
+            _ => false,
+        };
+        if is_unmatched_closer || matches!(last, ',' | '.' | ';' | ':' | '!' | '?') {
+            end = start + index;
+        } else {
+            return end;
+        }
+    }
+}
+
+/// Presentation boundary for direct binary output. URLs are redacted first,
+/// then terminal controls are made visible while semantic line breaks remain.
+/// Machine consumers should use the redacted rendered value instead of this
+/// human-only form.
+pub fn terminal_safe_multiline(value: &str) -> String {
+    let redacted = redact_urls_in_text(value);
+    let mut safe = String::with_capacity(redacted.len());
+    for ch in redacted.chars() {
+        match ch {
+            '\n' => safe.push('\n'),
+            '\r' => safe.push_str("\\r"),
+            '\t' => safe.push_str("\\t"),
+            control if control.is_control() => {
+                safe.push_str(&format!("\\u{{{:x}}}", control as u32));
+            }
+            printable => safe.push(printable),
+        }
+    }
+    safe
+}
+
 async fn connect_ws(agent_url: &str) -> Result<Connection> {
     // Deliberately NOT CoreError::Provider: that variant's remediation says to
     // check the model endpoint/key, which is misleading for a connection-layer
     // failure (the most common first-run error is simply "server not running").
+    let endpoint = redact_endpoint(agent_url);
     let (ws, _) = connect_async(agent_url).await.map_err(|e| {
+        let error = redact_urls_in_text(&e.to_string());
         CoreError::Message(format!(
-            "cannot connect (ws) to {agent_url}: {e} — is the Fleety server running at this \
+            "cannot connect (ws) to {endpoint}: {error} — is the Fleety server running at this \
              address? (CLI: save the right URL with `fleety init <ws-url>`)"
         ))
     })?;
@@ -277,9 +426,11 @@ async fn connect_sse(agent_url: &str, token: Option<&str>) -> Result<Connection>
     if let Some(t) = token {
         req = req.bearer_auth(t);
     }
+    let display_sse_url = redact_endpoint(&sse_url);
     let resp = req.send().await.map_err(|e| {
+        let error = redact_urls_in_text(&e.to_string());
         CoreError::Message(format!(
-            "cannot open SSE at {sse_url}: {e} — is the Fleety server running at this \
+            "cannot open SSE at {display_sse_url}: {error} — is the Fleety server running at this \
              address? (CLI: save the right URL with `fleety init <ws-url>`)"
         ))
     })?;
@@ -298,7 +449,8 @@ async fn connect_sse(agent_url: &str, token: Option<&str>) -> Result<Connection>
     }
     let (tx, rx) = mpsc::unbounded_channel::<String>();
     tokio::spawn(read_sse(resp, tx));
-    tracing::info!(%base, "connected via SSE+POST fallback");
+    let endpoint = redact_endpoint(&base);
+    tracing::info!(%endpoint, "connected via SSE+POST fallback");
     Ok(Connection {
         sender: Sender::Sse {
             client,
@@ -398,6 +550,93 @@ mod tests {
             waited.is_err(),
             "no ping was ever seen, so recv must still be waiting (got {waited:?})"
         );
+    }
+
+    #[test]
+    fn endpoint_redaction_removes_credentials_query_values_and_fragments() {
+        let redacted = redact_endpoint(
+            "wss://alice:USERINFOSECRET@example.test/socket?token=QUERYSECRET&mode=fast#FRAGMENTSECRET",
+        );
+
+        assert_eq!(
+            redacted,
+            "wss://example.test/socket?token=<redacted>&mode=<redacted>"
+        );
+        for secret in ["alice", "USERINFOSECRET", "QUERYSECRET", "FRAGMENTSECRET"] {
+            assert!(
+                !redacted.contains(secret),
+                "redacted endpoint leaked {secret}"
+            );
+        }
+    }
+
+    #[test]
+    fn text_redaction_sanitizes_every_embedded_endpoint() {
+        let redacted = redact_urls_in_text(
+            "failed ws://user:PASS@one.test/a?key=ONE, fallback https://two.test/b?q=TWO#THREE",
+        );
+
+        for secret in ["user", "PASS", "ONE", "TWO", "THREE"] {
+            assert!(!redacted.contains(secret), "redacted text leaked {secret}");
+        }
+        assert!(redacted.contains("ws://one.test/a?key=<redacted>"));
+        assert!(redacted.contains("https://two.test/b?q=<redacted>"));
+    }
+
+    #[test]
+    fn text_redaction_matches_schemes_case_insensitively_without_rewriting_url_text() {
+        let redacted = redact_urls_in_text(
+            "OAuth failed (HTTPS://alice:PASS@example.test/CasePath?AccessToken=SECRET#FRAGMENT).",
+        );
+
+        assert_eq!(
+            redacted,
+            "OAuth failed (HTTPS://example.test/CasePath?AccessToken=<redacted>)."
+        );
+        for secret in ["alice", "PASS", "SECRET", "FRAGMENT"] {
+            assert!(!redacted.contains(secret), "redacted text leaked {secret}");
+        }
+    }
+
+    #[test]
+    fn text_redaction_preserves_brackets_and_text_between_multiple_urls() {
+        let redacted = redact_urls_in_text(
+            "backend [WsS://alice:PASSWORD@one.test/A_(B)?FirstKey=ONE], then {hTtP://two.test/C?SecondKey=TWO}!",
+        );
+
+        assert_eq!(
+            redacted,
+            "backend [WsS://one.test/A_(B)?FirstKey=<redacted>], then {hTtP://two.test/C?SecondKey=<redacted>}!"
+        );
+        for secret in ["alice", "PASSWORD", "ONE", "TWO"] {
+            assert!(!redacted.contains(secret), "redacted text leaked {secret}");
+        }
+    }
+
+    #[test]
+    fn text_redaction_respects_controls_and_scheme_boundaries() {
+        let input = "prefixhttps://untouched.test/Case?Key=VALUE\u{1b} HTTPS://u:P@safe.test/X?Token=SECRET\u{7} tail";
+        let redacted = redact_urls_in_text(input);
+
+        assert_eq!(
+            redacted,
+            "prefixhttps://untouched.test/Case?Key=VALUE\u{1b} HTTPS://safe.test/X?Token=<redacted>\u{7} tail"
+        );
+        assert!(!redacted.contains("u:P"));
+        assert!(!redacted.contains("SECRET"));
+    }
+
+    #[test]
+    fn direct_output_boundary_redacts_urls_and_escapes_terminal_controls() {
+        let rendered = terminal_safe_multiline(
+            "name\u{1b}]52;c;owned\u{7}\r\nhttps://user:PASS@example.test/v1?token=SECRET#FRAG",
+        );
+        assert!(rendered.contains("name\\u{1b}]52;c;owned\\u{7}\\r\n"));
+        assert!(rendered.contains("https://example.test/v1?token=<redacted>"));
+        assert!(!rendered.contains("PASS"));
+        assert!(!rendered.contains("SECRET"));
+        assert!(!rendered.contains("FRAG"));
+        assert!(!rendered.chars().any(|ch| ch.is_control() && ch != '\n'));
     }
 
     #[test]

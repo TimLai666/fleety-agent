@@ -32,7 +32,7 @@ Done and on `main` since this backlog was generated:
 - **SSE streaming consumption** — `OpenAiCompat::with_streaming` (`FLEETY_MODEL_STREAM=1`) requests `stream:true` and assembles SSE chunks (content + tool-call deltas by index) into the full response. Incremental token *display* to the user still needs protocol deltas + a TUI.
 - **ssh_exec connector** — run commands on remote hosts over the system `ssh` client (non-interactive BatchMode; user/port/identity; host guarded against ssh option-injection). Zero new deps; lets the agent operate hosts without fleetyd.
 - **browser automation (CDP)** — `browser_navigate`/`browser_eval`/`browser_screenshot` drive a Chrome started with `--remote-debugging-port` over the DevTools Protocol (page discovery via `GET {base}/json`, commands over a WebSocket; zero new deps). `FLEETY_CHROME_URL` or a `chrome` arg targets the instance. Screenshot is the low-impact observation (risk=read). Browser tools are shared (`fleety-tools`), so they also run on any device via `device_exec`, with Chrome auto-provisioned (detect/launch/install/chrome-for-testing download). **computer-use** is native (`computer_*`: screenshot/move/click/type/key/scroll via `enigo` + `xcap`), also shared so it runs on any device via `device_exec` — not an MCP.
-- **interactive TUI** — `fleety tui` opens a multi-pane ratatui UI (conversation + input + status) over the WebSocket; type/Enter sends, Esc quits, replies stream into the pane. `App`/`on_key`/`render` are unit-tested headlessly via ratatui `TestBackend`.
+- **shared terminal workspace** — bare `fleety` on a TTY and canonical `fleety chat` open Chat inside one ratatui shell; `fleety config` opens the same shell at owner-aware Settings. Chat, Conversations, Settings, profile switching, contextual help, command palette, persistent notices, profile/Server/model context, drafts, cursor, attachments, reconnect, and Resume share one session. `fleety tui` remains an alias. Headless matrices cover 120x30, 80x24, 50x16, below-minimum, CJK, emoji, and long endpoints.
 - **device-scoping handle enforcement** — a shared `Handles` map (handle → owning device); `device_exec` binds handles a device returns and rejects using a handle against another device (actionable error: owner + two remediation paths). With the explicit per-call targets of `device_exec`/`ssh_exec`/`browser_*`, cross-device confusion is prevented.
 - **client_session on-device tool bridge** — the agent can run tools on *another* connected device. `RunTool`/`ToolResult`/`ToolError` protocol frames; the server keeps a `Hub` (device_id → outbound sender, via a per-connection writer task) + `Pending` (call_id → oneshot); the `device_exec` tool routes `{device, tool, args}` to the target daemon and awaits the reply (30s timeout, actionable error if the device isn't connected). The daemon runs a focused on-device tool set (read/list/write/run, path-escape guarded, `FLEETY_DEVICE_ROOT`). Verified by a localhost end-to-end test (user → server → daemon → back → audited). Server tools: 34.
 - **fleetyd autostart + self-update** — `fleetyd install`/`uninstall` write the OS service definition (systemd user unit / launchd LaunchAgent / Windows Task Scheduler) and print the enable command; `fleetyd update` fetches a manifest, compares version, downloads + SHA-256-verifies the artifact, and swaps it in (with rollback). Service-def, manifest parse, version compare, and sha256 are unit-tested.
@@ -68,7 +68,7 @@ The full v0 spec surface is implemented and verified (CI green).
 | fleetyd daemon: connection, heartbeat, local tool bridge, autostart | **done** | — |
 | Client runtime updater + version consistency (history_* restore tools NOT shipped — restore is via CLI `audit`/`rollback`) | partial | medium |
 | M6 interactive TUI (ratatui): multi-pane UI + ServerMsg UI events | **done** | — |
-| Model layer: SSE streaming + GET /models discovery shipped; models.cache.json + provider CLI NOT | partial | medium |
+| Model layer: SSE streaming + Provider catalog discovery + canonical provider/model CLI + OAuth/model Settings workflow | **done** | — |
 | Skills + MCP runtime: loaders, builtin/installed/authored, lifecycle tools | **done** | — |
 | Scheduling/cron (M8): schedule_* tools, mandate enforcement, fire loop | **done** | — |
 | Browser automation (M9, CDP, any-device) + computer-use (M10, native `computer_*`) | **done** | — |
@@ -81,7 +81,7 @@ Most of the original list has shipped (see the table above and "Shipped after th
 1. **Tool result envelope** — tool results in `agent-core/src/tools.rs` are still a bare `Value`. The `risk` class on `ToolSpec` shipped, but the structured envelope (`status`/`device_id`/`connector`/`history_step_id`) and a `device_id` param on `ToolRegistry::call()` are not.
 2. **Task records (M4)** — `TaskRecord` + `tasks/{id}.json` with states `running|done|failed|waiting_for_origin_device` (unverified; resume/replay itself shipped).
 3. **history_* restore tools** — `history_show`/`history_restore_preview`/`history_restore` over `history.jsonl`; today only `history_list` exists and restore is served via the CLI `audit`/`rollback` commands.
-4. **Model selection surface** — `models.cache.json` + a GET `/models` HTTP route / provider-selection CLI (SSE streaming and `list_models` discovery already shipped).
+4. **Model catalog cache / HTTP route** — canonical Provider/Model CLI, authenticated catalog discovery, manual recovery, role selection, and TUI are shipped. A standalone `models.cache.json` and public GET `/models` server route remain optional depth, not a missing selection surface.
 
 Voice follow-ups (real mac/Linux STT, device deixis) are tracked as their own change, not here.
 
@@ -217,7 +217,7 @@ changes, all implemented + tested + archived on 2026-07-10 (see
 - **config-value-validation** — `Setting` validators (enum / bool / uint / URL);
   `config set` and the interactive editors reject out-of-domain values before
   they reach `config.toml`.
-- **provider-editor-usability** — the `config provider edit` screen edits a
+- **provider-editor-usability** — canonical `provider edit` (`config provider edit` alias) edits a
   provider in place, removes groups / unsets roles, takes per-field input, and
   confirms deletes.
 - **conversation-discovery** — `fleety conversations` lists recent resumable
@@ -254,16 +254,19 @@ explicitly deferred items:
 - **M8 scheduling — show/update** — Create/List/Delete ship; no `schedule_show` /
   `schedule_update` (edit = delete + recreate). The human-readable per-schedule
   `mandate` string is stored but enforcement is via the `allowed_tools` allow-list.
-- **Owner-routed config** — shipped: each key routes to its owning runtime.
+- **Owner-routed config and terminal Settings** — shipped: each key routes to its owning runtime.
   Server/provider/model changes go to fleety-server, Daemon/Shared changes go
   to fleetyd through the selected device route, and only Cli scope is written
-  by the CLI. Explicit `--target server|daemon|cli|<device-id>` values enforce
+  by the CLI. Canonical `--owner server|daemon|cli|<device-id>` values enforce
   that ownership. An unavailable runtime is a hard failure with no direct-file
-  fallback. The TTY panel exposes Connection / CLI / Daemon / Server regions.
+  fallback (`--target` remains an alias). Settings exposes Connection / CLI /
+  Daemon / Server / Providers & Models pages with per-owner staging. Dirty
+  profile switches require Apply / Discard / Cancel before reconnect and fresh
+  Server/Daemon snapshots.
 - **Presence inference** — using a mobile device's location to infer "is someone home /
   did they leave". Needs auto-site-detection (daemon co-location reporting), a
   `home_site` baseline, and a presence timeline first; privacy opt-in by design.
-- **Codex OAuth backend** — shipped: `fleety auth login|status|logout` (browser
+- **Codex OAuth backend** — shipped: `fleety provider login|status|logout` (browser
   PKCE flow on loopback :1455, per-provider tokens stored by the owning server) +
   `auth = "oauth:codex"` in `providers.toml` routes via the Responses API.
   Remaining caveat: live-backend behavior is network-gated and unverified from

@@ -365,9 +365,10 @@ async fn fetch_codex_models_at(
         .query(&[("client_version", agent_core::VERSION)])
         .bearer_auth(&creds.bearer)
         .header("originator", backend_originator())
+        .header("version", agent_core::VERSION)
         .header(
             "User-Agent",
-            "Mozilla/5.0 (compatible; Fleety/1.0; +https://github.com/) Codex",
+            format!("codex_cli_rs/{}", agent_core::VERSION),
         );
     if let Some(account_id) = &creds.account_id {
         request = request.header("chatgpt-account-id", account_id);
@@ -377,9 +378,24 @@ async fn fetch_codex_models_at(
         .await
         .map_err(|e| CoreError::Provider(format!("Codex model catalog request failed: {e}")))?;
     if !response.status().is_success() {
+        let status = response.status();
+        let request_id = response
+            .headers()
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| catalog_diagnostic(value, creds));
+        let body = response.json::<Value>().await.ok();
+        let detail = body
+            .as_ref()
+            .and_then(|body| catalog_error_message(body, creds));
+        let detail = detail
+            .map(|message| format!(": {message}"))
+            .unwrap_or_default();
+        let request_id = request_id
+            .map(|id| format!(" (request id {id})"))
+            .unwrap_or_default();
         return Err(CoreError::Provider(format!(
-            "Codex model catalog returned HTTP {}",
-            response.status()
+            "Codex model catalog returned HTTP {status}{detail}{request_id}"
         )));
     }
     let body: Value = response
@@ -393,6 +409,26 @@ async fn fetch_codex_models_at(
         ));
     }
     Ok(ids)
+}
+
+fn catalog_error_message(body: &Value, creds: &agent_core::CodexCreds) -> Option<String> {
+    let error = body.get("error").unwrap_or(body);
+    let message = error.get("message").and_then(Value::as_str)?;
+    catalog_diagnostic(message, creds)
+}
+
+fn catalog_diagnostic(value: &str, creds: &agent_core::CodexCreds) -> Option<String> {
+    let mut sanitized: String = value
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect();
+    for secret in std::iter::once(creds.bearer.as_str()).chain(creds.account_id.as_deref()) {
+        if !secret.is_empty() {
+            sanitized = sanitized.replace(secret, "<redacted>");
+        }
+    }
+    let sanitized = sanitized.chars().take(240).collect::<String>();
+    (!sanitized.is_empty()).then_some(sanitized)
 }
 
 /// The fixed loopback port the Codex OAuth client id is registered with. The
@@ -970,7 +1006,33 @@ mod tests {
         assert!(request.contains("authorization: Bearer secret-access-token"));
         assert!(request.contains("chatgpt-account-id: account-1"));
         assert!(request.contains("originator: codex_cli_rs"));
+        assert!(request.contains(&format!("version: {}", agent_core::VERSION)));
+        assert!(request.contains(&format!("user-agent: codex_cli_rs/{}", agent_core::VERSION)));
         assert!(!request.contains("refresh_token"));
+    }
+
+    #[tokio::test]
+    async fn codex_catalog_http_error_keeps_safe_backend_detail() {
+        let (base, _rx) = serve_once_json(
+            "403 Forbidden",
+            r#"{"error":{"message":"account is not eligible\nretry login; authorization Bearer secret-access-token; account account-1"}}"#.to_string(),
+        );
+        let creds = agent_core::CodexCreds {
+            bearer: "secret-access-token".into(),
+            account_id: Some("account-1".into()),
+        };
+        let error = fetch_codex_models_at(&reqwest::Client::new(), &base, &creds)
+            .await
+            .expect_err("catalog should reject");
+        let message = error.report().message;
+        assert!(message.contains("HTTP 403"), "{message}");
+        assert!(
+            message.contains("account is not eligibleretry login"),
+            "{message}"
+        );
+        assert!(!message.contains("secret-access-token"), "{message}");
+        assert!(!message.contains("account-1"), "{message}");
+        assert!(message.contains("Bearer <redacted>"), "{message}");
     }
 
     #[tokio::test]

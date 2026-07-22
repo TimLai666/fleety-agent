@@ -27,6 +27,7 @@ reqwest = { workspace = true }
 futures = { workspace = true }
 tokio-tungstenite = { workspace = true }
 tracing = { workspace = true }
+clap = { workspace = true }
 zip = { workspace = true }
 # Native computer-use (desktop control) so it runs on any device via fleetyd.
 enigo = "0.6"

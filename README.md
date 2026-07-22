@@ -31,7 +31,7 @@ Then point it at your agent and chat:
 
 ```sh
 fleety init          # scan the LAN, pick a server from the list, pair — one flow
-fleety tui           # interactive UI  (or: fleety ask "hello")
+fleety chat          # terminal workspace (or: fleety ask "hello")
 # (or point it somewhere explicitly: fleety init ws://your-agent-host:8787)
 ```
 
@@ -71,7 +71,7 @@ it as a boot service with `fleety-server up` (systemd --user / launchd / SCM).
 | [`crates/fleety-tools`](crates/fleety-tools) | Shared, root-relative workspace tools (read/list/search-ripgrep/write/edit/run/git + unified diff). Used by the server **and** the daemon, so every device gets the full toolset. |
 | [`crates/fleety-server`](crates/fleety-server) | Fleety Agent server (`fleety-server`): runs the agent loop, the tool surface, cross-device routing, and the scheduler. |
 | [`crates/fleety-daemon`](crates/fleety-daemon) | Device background service (`fleetyd`): connects, runs on-device tools, `install`/`update` (also provisions the `fleety-insyra` sidecar so `insyra_exec` works on the device). |
-| [`crates/fleety-cli`](crates/fleety-cli) | CLI + interactive TUI (`fleety`): `init` / `ask` / `resume` / `conversations` / `tui` / `voice` / `status` / `config` / `audit` / `rollback` / `daemon` / `update` / `acp` / `pair` / `pair-code` (see [Command reference](#command-reference)). |
+| [`crates/fleety-cli`](crates/fleety-cli) | CLI + terminal workspace (`fleety`): `init` / `ask` / `chat` / `conversations` / `connection` / `provider` / `model` / `config` / `status` / `doctor` / `completion` / `voice` / `audit` / `rollback` / `daemon` / `update` / `acp` / pairing (see [Command reference](#command-reference)). |
 
 Dependency rule: everything may depend on `agent-core`; `agent-core` depends on
 nothing Fleety-specific, so it can later be extracted to its own repo and mounted
@@ -149,18 +149,29 @@ updates, troubleshooting): [`docs/acp.md`](docs/acp.md).
 
 `fleety` resolves the server URL in this order:
 
-1. a one-shot `-s <name>` / `--url <ws>` override, else
+1. a one-shot `--profile <name>` or legacy `-s` / `--server <ws-url>` override, else
 2. `FLEETY_AGENT_URL` (env, transient), else
 3. the current server profile in `~/.fleety/connections.toml` (set by
-   `fleety server use` / `fleety init`), else
+   `fleety connection use` / `fleety init`), else
 4. mDNS discovery on the LAN (a short 2 s probe; sticky once enrolled), else
 5. the local default `ws://127.0.0.1:8787`.
 
-So on one machine `fleety tui` just works. For a remote server the easiest path
+`FLEETY_AGENT_URL` never borrows credentials from a profile for a different
+URL. Set `FLEETY_TOKEN` explicitly for a transient endpoint, or use a named
+profile. A transient endpoint also cannot overwrite or clear another profile's
+token or fingerprint.
+
+mDNS keeps the advertised Server fingerprint and prefers a match for the current
+profile's own pin even if another Server responds first. It never borrows a pin
+or token from another saved profile. An old token-only profile with no URL and no
+fingerprint cannot safely identify its Server, so Fleety withholds that token and
+requires pairing again.
+
+So on one machine bare `fleety` or `fleety chat` just works. For a remote server the easiest path
 is bare `fleety init` on a TTY: it scans the LAN, lists every announced server by
 name (marking ones you already saved), lets you pick, saves the profile, and
 prompts for the pairing code in one flow. Or point it explicitly with
-`fleety init ws://host:8787` (or `fleety server add <name> <url> --use`) — every
+`fleety init ws://host:8787` (or `fleety connection add <name> <url> --use`) — every
 later command uses the saved profile. Auth is **required by default**, so enroll
 this device with a pairing code. Mint one on the **server host** with
 `fleety pair-code` — same-host loopback trust means it needs no auth there, and
@@ -198,9 +209,11 @@ Three ways, in increasing power:
 
 Use a ChatGPT subscription rather than a static key:
 
-1. Add an `oauth:codex` provider (name it, e.g. `codex1`) in `providers.toml`,
-   then `fleety auth login codex1` — opens the browser (or
-   `fleety auth login codex1 --no-browser` prints the URL), captures the redirect
+1. Add an `oauth:codex` provider (name it, e.g. `codex1`) with
+   `fleety provider add codex1 --type oauth:codex`, then
+   `fleety provider login codex1` — opens the browser (or
+   `fleety provider login codex1 --no-browser` copies the URL to the clipboard,
+   printing it only as an explicit fallback), captures the redirect
    on the fixed loopback port `http://localhost:1455/auth/callback` (must be free
    during login), and **delivers the tokens to the connected server**, which
    stores them **per provider** at its `~/.fleety/codex-oauth/<provider>.json`
@@ -212,8 +225,8 @@ Use a ChatGPT subscription rather than a static key:
 2. That provider (`type = "oauth:codex"`) then calls the ChatGPT/Codex backend
    over the **Responses API** with its own account's token (auto-refreshed) — no key.
 
-`fleety auth status` lists each `oauth:codex` provider's sign-in state (or
-`fleety auth status <provider>` for one); `fleety auth logout <provider>` clears
+`fleety provider status` lists each `oauth:codex` provider's sign-in state (or
+`fleety provider status <provider>` for one); `fleety provider logout <provider>` clears
 that provider's credential. You can also do all of this from **`fleety config`**
 (the Providers menu): it edits the **connected server's** providers over the
 connection (never a local file), so **adding an `oauth:codex` provider goes
@@ -221,27 +234,33 @@ straight into sign-in**, and selecting an existing one → `e` offers sign in /
 out / switch account. Upgrading to per-provider Codex clears any old global
 login — sign in again per provider.
 
+Static Provider API keys are write-only on the connected Server. Provider
+snapshots expose only whether a key exists. A blank editor field keeps it,
+entering a new key replaces it, and `k` in the Provider editor or
+`fleety provider set <name> --clear-key` removes it after an explicit sensitive
+operation confirmation. This workflow requires config protocol 5.
+
 > **Note:** end-to-end behavior against the live Codex backend is network-gated
 > and unverified from CI (the request/SSE shapes follow the documented Codex CLI
 > contract and are unit-tested offline). See
 > [`docs/env.md`](docs/env.md#codex-chatgpt-oauth-sign-in-instead-of-an-api-key).
 
-### Where config commands apply (`--target`)
+### Where config commands apply (`--owner`)
 
 `fleety config …` routes each key to its **owning runtime**. Server settings go
 to the connected server, daemon/shared settings go through that device's
 `fleetyd`, and CLI settings are the only settings written by the CLI process.
-Use `--target` to make the owner explicit:
+Use `--owner` to make the owner explicit. Legacy `--target` remains an alias:
 
-- `--target server` — the connected server. Requires an authenticated
+- `--owner server` — the connected server. Requires an authenticated
   connection; the result says when it takes effect (a provider/model change on the
   next connection; a flat `FLEETY_*` setting after a server restart). A mutating
   change is refused when the server runs with auth disabled.
-- `--target daemon` — the current device's daemon. `Shared` and `Daemon` keys are
+- `--owner daemon` — the current device's daemon. `Shared` and `Daemon` keys are
   changed by `fleetyd` through the server's device route.
-- `--target cli` (alias: `local`) — CLI-only settings on this host. It never
+- `--owner cli` — CLI-only settings on this host. It never
   includes Shared, Daemon, Server, provider, or model settings.
-- `--target <device-id>` — that device's daemon through the server.
+- `--owner <device-id>` — that device's daemon through the server.
 
 If an owner cannot be reached, the command fails and leaves files unchanged.
 There is no fallback that writes the owner's file directly.
@@ -251,23 +270,29 @@ There is no fallback that writes the owner's file directly.
 
 On a TTY:
 
-- **`fleety config`** (no args) — a guided **menu**: pick Providers & Models or
-  Settings and drill in. Providers/Models open the provider editor (add a
+- **`fleety config`** (no args) — opens the shared terminal workspace at
+  **Settings**, with Connection / CLI / Daemon / Server / Providers & Models
+  pages. The Provider page opens the structured provider editor (add a
   provider by type with per-field prompts; set a model role by picking a provider
   then choosing from its API `/models` list or the connected server's authenticated
   Codex catalog, or typing an id if discovery is unavailable). OAuth provider rows
-  show `auth=signed in`, `auth=not signed in`, or `auth=unavailable`. Settings is
-  the four-region panel (Connection / CLI / Daemon / Server). The Server region
-  edits the connected server's settings — including providers/models — live **over
+  show `auth=signed in`, `auth=not signed in`, or `auth=unavailable`. The Server page
+  edits the connected server's settings live **over
   the connection** (optimistic-locked; secrets stay write-only), so remote editing
   no longer needs shell access to the server host. Editing `FLEETY_TZ` opens a
   searchable IANA timezone picker (or follow the host device). The key hints stay
-  visible; Esc steps back, q quits.
-- `fleety config edit` — edit just the flat `FLEETY_*` settings (ratatui list;
-  secrets masked; line-based fallback when not a TTY).
-- `fleety config provider edit` — the provider-only editor for `providers.toml`:
-  add/remove providers, set a model role's members + strategy. Saving runs the
-  same validation + atomic write as the subcommands.
+  visible. Every owner stages and applies independently. Switching profiles
+  requires Apply / Discard / Cancel for dirty remote state, then reconnects and
+  reloads the selected Server and Daemon snapshots. Esc steps back; Ctrl+K opens
+  commands.
+- `fleety config open` — canonical explicit spelling for the same shared,
+  owner-aware Settings workspace. `fleety config edit` remains an alias. Both
+  require a TTY, stage edits per owner, and write only through the selected
+  owner's Apply action. There is no line-based or direct-file fallback.
+- `fleety provider edit` — the provider-only editor for the connected Server:
+  add/remove providers, set model-role members and strategy. It uses the same
+  Server-owned snapshot/apply service as commands and never edits a local
+  provider file. `fleety config provider edit` is a compatibility alias.
 
 ## Command reference
 
@@ -281,23 +306,45 @@ launchd / Windows SCM).
 
 | Command | What it does |
 |---|---|
-| `fleety init <ws-url>` | Point this device at a server (e.g. `ws://host:8787`) for later commands — sugar for `fleety server add default <url> --use`. |
-| `fleety server <add\|use\|list\|show\|current\|rename\|remove\|set-url>` | Manage the server profiles this device can connect to (`~/.fleety/connections.toml`). `use` switches the current one; `add … --use` adds and switches. |
+| `fleety init <ws-url>` | Point this device at a server (e.g. `ws://host:8787`) for later commands — guided sugar for adding and selecting a connection profile. |
+| `fleety connection <add\|use\|list\|show\|rename\|remove\|set-url>` | Manage the Server profiles this device can connect to (`~/.fleety/connections.toml`). `use` switches the current one; `add … --use` adds and switches. |
 | `fleety ask "<text>"` | One-shot prompt; prints the reply. Accepts file paths as attachments. |
-| `fleety resume <conversation_id>` | Continue an existing conversation. |
-| `fleety conversations [<limit>]` | List your recent conversations (most-recent-first) with a relative last-activity time and a first-message preview, so you can find the id `resume` needs. |
-| `fleety tui` | Interactive terminal UI (streaming chat). While a reply is generating, **Esc cancels** the turn (completed work is kept); when idle, Esc quits. Ctrl+C always quits. PgUp/PgDn scroll the history. |
+| `fleety chat` | Open the shared terminal workspace at Chat. Drafts, cursor, attachments, notices, conversation resume state, profile identity, and model context survive navigation through Conversations and Settings. |
+| `fleety conversations list [--limit N]` / `fleety conversations resume <id>` | List recent conversations or continue one. Legacy `fleety conversations [N]` and `fleety resume <id>` remain accepted. |
+| `fleety provider <add\|edit\|remove\|list\|login\|logout\|status>` | Manage connected-Server providers and OAuth state. |
+| `fleety model <catalog\|list\|show\|set\|unset>` | Discover model IDs and manage connected-Server model roles. |
 | `fleety voice` | Voice conversation (speech-to-text in, spoken reply out). |
-| `fleety status` | Server health: version, uptime, connected devices. |
-| `fleety config <list\|get\|set\|unset\|edit>` | Inspect/edit settings; secrets masked. Auto-routes each key to server, daemon, or CLI ownership. `--target server\|daemon\|cli\|<device-id>` is an owner assertion, not a file selector. |
-| `fleety config provider\|model <…>` | Manage the connected server's providers + model roles: `provider add\|set\|remove\|list`, `model set\|show\|unset\|list`. The CLI never writes `providers.toml` directly. |
+| `fleety status` | Read CLI, local Daemon, and connected Server status. This command requires the Server status request to succeed. |
+| `fleety doctor` | Run bounded read-only PASS / WARN / FAIL checks with remediation. Any FAIL exits 1. |
+| `fleety completion <bash\|zsh\|fish\|powershell\|elvish>` | Write completion source to stdout without modifying shell files. |
+| `fleety config <list\|get\|set\|unset\|edit>` | Inspect/edit settings; secrets masked. Auto-routes each key to Server, Daemon, or CLI ownership. `--owner server\|daemon\|cli\|<device-id>` is an owner assertion, not a file selector. |
 | `fleety audit list [<limit>]` / `fleety audit show <index>` | List this device's audit-log entries (tool calls/results/replies) / show one in full. |
-| `fleety rollback list` / `fleety rollback apply <backup_id>` | List backups / restore a file from a backup. |
+| `fleety rollback list` / `fleety rollback apply <backup_id>` | List or restore backups owned by the currently connected Server workspace. |
 | `fleety pair-code` | Mint a short-lived pairing code on the connected server (loopback-trusted on the server host, else token-authed) and print the `fleety pair <code>` to run on the new device. |
 | `fleety pair` | Enroll this device with a pairing code (auth-required servers). |
 | `fleety daemon <verb>` | Manage the local daemon from the unified CLI — forwards to `fleetyd` (`install`/`start`/`stop`/`restart`/`status`/`update`/…). |
 | `fleety update` | Update **every** fleety component installed on this host (CLI + any local server + daemon, incl. the `fleety-insyra` sidecar). One command. |
 | `fleety acp` | Run as an [Agent Client Protocol](https://agentclientprotocol.com) agent over stdio (for ACP editors like Zed). Not run by hand — the editor launches it. |
+| `fleety version` | Print the CLI version. |
+
+Compatibility aliases map to the same typed command before any I/O:
+
+| Compatibility spelling | Canonical spelling |
+|---|---|
+| `fleety tui` | `fleety chat` |
+| `fleety server …` | `fleety connection …` |
+| `fleety auth login\|logout\|status …` | `fleety provider login\|logout\|status …` |
+| `fleety config provider …` | `fleety provider …` |
+| `fleety config model …` | `fleety model …` |
+| `fleety config --target …` | `fleety config --owner …` |
+
+Global `--profile <name>` selects a saved profile for one invocation without
+changing the current profile. Legacy `--server <ws-url>` is a transient raw URL.
+`--json` emits `{schema_version, ok, context, data, errors}`; usage errors exit 2,
+runtime/owner failures exit 1, and success exits 0. Multi-owner reads keep all
+available data, set `ok: false`, include per-owner errors, label human output
+`PARTIAL`, and exit 1. Mutations always resolve exactly one owner and never fall
+back to direct file editing.
 
 ### `fleety-server` — the agent server
 

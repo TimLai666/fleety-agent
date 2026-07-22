@@ -13,7 +13,9 @@
 //! empty and drift off the configured server.
 
 use std::collections::BTreeMap;
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime};
 
 use agent_core::{CoreError, Result};
 use serde::{Deserialize, Serialize};
@@ -139,6 +141,77 @@ pub fn save(conns: &Connections) -> Result<()> {
     save_at(&connections_path(), conns)
 }
 
+struct MutationLease {
+    path: PathBuf,
+}
+
+impl Drop for MutationLease {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn acquire_mutation_lease(path: &Path) -> Result<MutationLease> {
+    let lock_path = path.with_extension("toml.lock");
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            CoreError::Message(format!("cannot create connection dir: {error}"))
+        })?;
+    }
+    let started = Instant::now();
+    loop {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(_) => return Ok(MutationLease { path: lock_path }),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = std::fs::metadata(&lock_path)
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+                    .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+                    .is_some_and(|age| age > Duration::from_secs(30));
+                if stale {
+                    let _ = std::fs::remove_file(&lock_path);
+                    continue;
+                }
+                if started.elapsed() >= Duration::from_secs(5) {
+                    return Err(CoreError::Message(format!(
+                        "timed out waiting to update {} — another Fleety process is changing connection profiles",
+                        path.display()
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => {
+                return Err(CoreError::Message(format!(
+                    "cannot lock {} for update: {error}",
+                    path.display()
+                )))
+            }
+        }
+    }
+}
+
+/// Cross-process-safe read-modify-write for the shared connection profile
+/// store. Callers must update only the fields they own and validate any
+/// expected URL/current preconditions inside `mutation`.
+pub fn mutate_at<T>(
+    path: &Path,
+    mutation: impl FnOnce(&mut Connections) -> Result<T>,
+) -> Result<T> {
+    let _lease = acquire_mutation_lease(path)?;
+    let mut connections = load_at(path)?;
+    let result = mutation(&mut connections)?;
+    save_at(path, &connections)?;
+    Ok(result)
+}
+
+pub fn mutate<T>(mutation: impl FnOnce(&mut Connections) -> Result<T>) -> Result<T> {
+    mutate_at(&connections_path(), mutation)
+}
+
 /// The outcome of a [`migrate_from_config_json_at`] call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Migration {
@@ -175,6 +248,11 @@ pub enum Migration {
 ///   file untouched.
 pub fn migrate_from_config_json_at(dir: &Path) -> Result<Migration> {
     let conns_path = dir.join("connections.toml");
+    // Migration participates in the same cross-process transaction as every
+    // normal profile mutation. Without this lease, a starter could read the
+    // legacy files while another process creates/updates connections.toml and
+    // then replace that newer state with its migration snapshot.
+    let _lease = acquire_mutation_lease(&conns_path)?;
     if conns_path.exists() {
         return Ok(Migration::AlreadyPresent);
     }
@@ -273,9 +351,9 @@ pub enum Target {
     /// No override — use the normal precedence (current profile → mDNS → local).
     #[default]
     Current,
-    /// `-s/--server <name>`: use that named profile (its url + token).
+    /// `--profile <name>`: use that named profile (its url + token).
     Named(String),
-    /// `--url <ws>`: connect to this url directly (token only if a profile pins it).
+    /// Legacy `-s/--server <ws>` or `--url <ws>`: connect directly without persistence.
     Url(String),
 }
 
@@ -292,8 +370,10 @@ pub struct Discovered {
 /// "no server configured, using localhost" fallback message).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
-    /// A single-shot `-s <name>` / `--url <ws>` override.
-    Override,
+    /// A single-shot named profile override.
+    OverrideProfile(String),
+    /// A single-shot raw URL override.
+    OverrideUrl,
     /// The `FLEETY_AGENT_URL` env var (temporary; never written).
     Env,
     /// The current profile (carries its name).
@@ -317,13 +397,13 @@ pub struct Resolved {
 /// Resolve which server (and token) to connect to, by the single precedence
 /// shared between the CLI and the daemon:
 ///
-/// 1. `over` — a single-shot `-s <name>` / `--url <ws>` override.
-/// 2. `env_url` — `FLEETY_AGENT_URL` (temporary; never written back).
+/// 1. `over` — a single-shot named `--profile` or raw `--server`/`--url` override.
+/// 2. `env_url` — `FLEETY_AGENT_URL` (temporary; never written back). It may
+///    inherit the current profile token only when both URLs are identical.
 /// 3. the current profile's url + token (**sticky**: once set, mDNS is skipped).
-/// 4. mDNS discovery (only when there is no usable current profile; a pinned
+/// 4. mDNS discovery (only when there is no usable current profile; the current
 ///    profile's token is sent **only** to a discovered server whose fingerprint
-///    matches — a rogue advertiser with a different/absent fingerprint gets no
-///    token).
+///    matches that same profile's pin — no other saved profile participates).
 /// 5. the localhost default ([`DEFAULT_URL`]).
 ///
 /// `env_token` (`FLEETY_TOKEN`) is an explicit token override that wins in every
@@ -356,7 +436,7 @@ pub fn resolve(
             return Ok(Resolved {
                 url: p.url.clone(),
                 token: env_token.or_else(|| p.token.clone()),
-                source: Source::Override,
+                source: Source::OverrideProfile(name.clone()),
             });
         }
         Target::Url(u) => {
@@ -368,17 +448,20 @@ pub fn resolve(
             return Ok(Resolved {
                 url: u.clone(),
                 token: env_token.or(tok),
-                source: Source::Override,
+                source: Source::OverrideUrl,
             });
         }
         Target::Current => {}
     }
 
     if let Some(u) = env_url.filter(|s| !s.is_empty()) {
-        // Temporary env override: keep the current profile's token available (so
-        // a unit-file `FLEETY_AGENT_URL` deployment still authenticates), but the
-        // url is never persisted.
-        let tok = conns.current_profile().and_then(|p| p.token.clone());
+        // A temporary URL may inherit the current profile's token only when it
+        // still names that exact endpoint. Sending profile A's credential to an
+        // unrelated env-selected server B would cross the owner boundary.
+        let tok = conns
+            .current_profile()
+            .filter(|profile| profile.url == u)
+            .and_then(|profile| profile.token.clone());
         return Ok(Resolved {
             url: u,
             token: env_token.or(tok),
@@ -400,21 +483,24 @@ pub fn resolve(
         }
     }
 
-    // mDNS fallback (no usable current profile url). Fingerprint guard: a pinned
-    // profile's token is handed to the discovered server only when the
-    // fingerprints match; a mismatched/absent fingerprint yields no token.
+    // mDNS fallback (no usable current profile url). Discovery may represent
+    // the current profile only when that profile's own pin matches. Pins and
+    // tokens belonging to any other profile are deliberately irrelevant here:
+    // choosing current A must never authenticate to, or mutate, saved B.
     if let Some(disc) = mdns() {
-        let tok = disc.fingerprint.as_deref().and_then(|fp| {
-            conns
-                .profiles
-                .values()
-                .find(|p| p.fingerprint.as_deref() == Some(fp))
-                .and_then(|p| p.token.clone())
+        let owner = conns.current.as_ref().and_then(|name| {
+            let profile = conns.profiles.get(name)?;
+            let pinned = profile.fingerprint.as_deref()?;
+            (disc.fingerprint.as_deref() == Some(pinned)).then(|| name.clone())
         });
+        let tok = owner
+            .as_ref()
+            .and_then(|name| conns.profiles.get(name))
+            .and_then(|profile| profile.token.clone());
         return Ok(Resolved {
             url: disc.url,
             token: env_token.or(tok),
-            source: Source::Mdns,
+            source: owner.map_or(Source::Mdns, Source::Profile),
         });
     }
 
@@ -516,6 +602,40 @@ pub fn discover_all_via_mdns(window: std::time::Duration) -> Vec<DiscoveredServe
     found
 }
 
+/// Select the safe mDNS target from a completed discovery window. A server
+/// whose advertised fingerprint matches the current profile's pin wins. No
+/// other profile participates in automatic selection: selecting A must never
+/// borrow B's identity or token. With no current pin (or no match), discovery
+/// order remains the unauthenticated fallback.
+pub fn select_discovered(conns: &Connections, found: &[DiscoveredServer]) -> Option<Discovered> {
+    let current_pin = conns
+        .current_profile()
+        .and_then(|profile| profile.fingerprint.as_deref());
+    let preferred = current_pin
+        .and_then(|pin| {
+            found
+                .iter()
+                .find(|server| server.fingerprint.as_deref() == Some(pin))
+        })
+        .or_else(|| found.first())?;
+    Some(Discovered {
+        url: preferred.url.clone(),
+        fingerprint: preferred.fingerprint.clone(),
+    })
+}
+
+/// Collect mDNS advertisements for the whole window and select one using the
+/// stored profile fingerprints. Keeping collection and selection together
+/// prevents callers from accidentally discarding identity metadata or trusting
+/// whichever responder happened to arrive first.
+pub fn discover_for_connections(
+    conns: &Connections,
+    window: std::time::Duration,
+) -> Option<Discovered> {
+    let found = discover_all_via_mdns(window);
+    select_discovered(conns, &found)
+}
+
 /// The trust-on-authenticated-connect rule for a server fingerprint seen on an
 /// authenticated connection (or minted at pairing). Pure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -542,35 +662,40 @@ pub fn tofu_pin_decision(existing: Option<&str>, seen: &str) -> PinDecision {
 /// Apply [`tofu_pin_decision`] to the CURRENT profile, persisting a new pin.
 /// Returns the decision so callers can warn on `IdentityChanged`.
 pub fn pin_current_fingerprint(seen: &str) -> Result<PinDecision> {
-    let mut conns = load()?;
-    let Some(name) = conns.current.clone() else {
-        return Ok(PinDecision::AlreadyPinned); // no current profile → nothing to pin onto
-    };
-    let Some(profile) = conns.profiles.get_mut(&name) else {
-        return Ok(PinDecision::AlreadyPinned);
-    };
-    let decision = tofu_pin_decision(profile.fingerprint.as_deref(), seen);
-    if decision == PinDecision::Pin {
-        profile.fingerprint = Some(seen.to_string());
-        save(&conns)?;
-    }
-    Ok(decision)
+    mutate(|conns| {
+        let Some(name) = conns.current.clone() else {
+            return Ok(PinDecision::AlreadyPinned);
+        };
+        let Some(profile) = conns.profiles.get_mut(&name) else {
+            return Ok(PinDecision::AlreadyPinned);
+        };
+        let decision = tofu_pin_decision(profile.fingerprint.as_deref(), seen);
+        if decision == PinDecision::Pin {
+            profile.fingerprint = Some(seen.to_string());
+        }
+        Ok(decision)
+    })
 }
 
 /// Apply trust-on-first-use to one named profile. This is used by commands that
 /// resolved a non-current profile and must not drift to whichever profile is
 /// current when the handshake finishes.
-pub fn pin_profile_fingerprint(name: &str, seen: &str) -> Result<PinDecision> {
-    let mut conns = load()?;
-    let Some(profile) = conns.profiles.get_mut(name) else {
-        return Ok(PinDecision::AlreadyPinned);
-    };
-    let decision = tofu_pin_decision(profile.fingerprint.as_deref(), seen);
-    if decision == PinDecision::Pin {
-        profile.fingerprint = Some(seen.to_string());
-        save(&conns)?;
-    }
-    Ok(decision)
+pub fn pin_profile_fingerprint(name: &str, expected_url: &str, seen: &str) -> Result<PinDecision> {
+    mutate(|conns| {
+        let Some(profile) = conns.profiles.get_mut(name) else {
+            return Ok(PinDecision::AlreadyPinned);
+        };
+        if profile.url != expected_url {
+            return Err(CoreError::Message(format!(
+                "server profile '{name}' changed during connection; its fingerprint was not updated"
+            )));
+        }
+        let decision = tofu_pin_decision(profile.fingerprint.as_deref(), seen);
+        if decision == PinDecision::Pin {
+            profile.fingerprint = Some(seen.to_string());
+        }
+        Ok(decision)
+    })
 }
 
 /// Persist pairing material only onto the named profile that supplied the
@@ -582,32 +707,32 @@ pub fn store_profile_pairing(
     token: &str,
     fingerprint: Option<&str>,
 ) -> Result<PinDecision> {
-    let mut conns = load()?;
-    let profile = conns.profiles.get_mut(name).ok_or_else(|| {
-        CoreError::Message(format!(
-            "server profile '{name}' disappeared during pairing; no credential was saved"
-        ))
-    })?;
-    if profile.url != expected_url {
-        return Err(CoreError::Message(format!(
-            "server profile '{name}' changed from '{expected_url}' to '{}' during pairing; no credential was saved",
-            profile.url
-        )));
-    }
-    let decision = fingerprint
-        .map(|seen| tofu_pin_decision(profile.fingerprint.as_deref(), seen))
-        .unwrap_or(PinDecision::AlreadyPinned);
-    if decision == PinDecision::IdentityChanged {
-        return Err(CoreError::Message(format!(
-            "server profile '{name}' has a different identity fingerprint; no credential was saved"
-        )));
-    }
-    profile.token = Some(token.to_string());
-    if decision == PinDecision::Pin {
-        profile.fingerprint = fingerprint.map(str::to_string);
-    }
-    save(&conns)?;
-    Ok(decision)
+    mutate(|conns| {
+        let profile = conns.profiles.get_mut(name).ok_or_else(|| {
+            CoreError::Message(format!(
+                "server profile '{name}' disappeared during pairing; no credential was saved"
+            ))
+        })?;
+        if profile.url != expected_url {
+            return Err(CoreError::Message(format!(
+                "server profile '{name}' changed from '{expected_url}' to '{}' during pairing; no credential was saved",
+                profile.url
+            )));
+        }
+        let decision = fingerprint
+            .map(|seen| tofu_pin_decision(profile.fingerprint.as_deref(), seen))
+            .unwrap_or(PinDecision::AlreadyPinned);
+        if decision == PinDecision::IdentityChanged {
+            return Err(CoreError::Message(format!(
+                "server profile '{name}' has a different identity fingerprint; no credential was saved"
+            )));
+        }
+        profile.token = Some(token.to_string());
+        if decision == PinDecision::Pin {
+            profile.fingerprint = fingerprint.map(str::to_string);
+        }
+        Ok(decision)
+    })
 }
 
 /// The sticky-heal candidate: among `found`, the advertiser whose fingerprint
@@ -621,25 +746,63 @@ pub fn heal_candidate(pinned: &str, old_url: &str, found: &[DiscoveredServer]) -
         .map(|d| d.url.clone())
 }
 
+/// Apply a fingerprint-matched healing result to one exact profile snapshot.
+/// The profile must still point at `old_url`; otherwise a concurrent/user edit
+/// wins and no stale discovery result is persisted.
+fn apply_profile_heal(
+    conns: &mut Connections,
+    name: &str,
+    old_url: &str,
+    found: &[DiscoveredServer],
+) -> Option<String> {
+    let profile = conns.profiles.get_mut(name)?;
+    if profile.url != old_url {
+        return None;
+    }
+    let pinned = profile.fingerprint.as_deref()?;
+    let new_url = heal_candidate(pinned, old_url, found)?;
+    profile.url = new_url.clone();
+    Some(new_url)
+}
+
+/// One sticky-heal attempt for an exact named profile. This is used for both
+/// the persisted current profile and invocation-only `--profile NAME` targets.
+pub fn heal_profile(name: &str, old_url: &str) -> Option<String> {
+    if std::env::var("FLEETY_MDNS_DISABLED").is_ok() {
+        return None;
+    }
+    let initial = load().ok()?;
+    let pinned = initial.profiles.get(name)?.fingerprint.clone()?;
+    if initial.profiles.get(name)?.url != old_url {
+        return None;
+    }
+    let found = discover_all_via_mdns(std::time::Duration::from_secs(3));
+    let new_url = heal_candidate(&pinned, old_url, &found)?;
+
+    // Apply under the cross-process lease so no unrelated profile/current edit
+    // can be lost between the post-discovery reload and save.
+    mutate(|current| {
+        let adopted = apply_profile_heal(current, name, old_url, &found).ok_or_else(|| {
+            CoreError::Message("profile changed while discovery was running".to_string())
+        })?;
+        if adopted != new_url {
+            return Err(CoreError::Message(
+                "profile fingerprint changed while discovery was running".to_string(),
+            ));
+        }
+        Ok(adopted)
+    })
+    .ok()
+}
+
 /// One sticky-heal attempt after a failed connect to the current profile's
 /// `old_url`: scan the LAN, adopt ONLY an advertiser matching the pinned
 /// fingerprint, persist its URL onto the profile, and return it. `None` (no
 /// pin, disabled mDNS, no match, or persistence failure) leaves everything
 /// untouched — the caller surfaces the original connection failure.
 pub fn heal_current_profile(old_url: &str) -> Option<String> {
-    if std::env::var("FLEETY_MDNS_DISABLED").is_ok() {
-        return None;
-    }
-    let mut conns = load().ok()?;
-    let name = conns.current.clone()?;
-    let pinned = conns.profiles.get(&name)?.fingerprint.clone()?;
-    let found = discover_all_via_mdns(std::time::Duration::from_secs(3));
-    let new_url = heal_candidate(&pinned, old_url, &found)?;
-    if let Some(profile) = conns.profiles.get_mut(&name) {
-        profile.url = new_url.clone();
-    }
-    save(&conns).ok()?;
-    Some(new_url)
+    let name = load().ok()?.current?;
+    heal_profile(&name, old_url)
 }
 
 #[cfg(test)]
@@ -970,7 +1133,7 @@ mod tests {
         let r = resolve(&conns, &Target::Named("work".into()), None, None, no_mdns).expect("named");
         assert_eq!(r.url, "ws://work:8787");
         assert_eq!(r.token.as_deref(), Some("work-tok"));
-        assert_eq!(r.source, Source::Override);
+        assert_eq!(r.source, Source::OverrideProfile("work".to_string()));
         // An unknown name is an error, not a silent fallback.
         assert!(resolve(&conns, &Target::Named("ghost".into()), None, None, no_mdns).is_err());
     }
@@ -989,11 +1152,11 @@ mod tests {
         .expect("url");
         assert_eq!(r.url, "ws://adhoc:9000");
         assert!(r.token.is_none());
-        assert_eq!(r.source, Source::Override);
+        assert_eq!(r.source, Source::OverrideUrl);
     }
 
     #[test]
-    fn resolve_env_url_wins_over_current_and_is_marked_env() {
+    fn resolve_env_url_does_not_inherit_a_different_profiles_token() {
         // Current profile home .20 exists, but FLEETY_AGENT_URL overrides it.
         let mut home = profile("ws://192.168.1.20:8787");
         home.token = Some("home-tok".to_string());
@@ -1008,8 +1171,85 @@ mod tests {
         .expect("env");
         assert_eq!(r.url, "ws://env-override:8787");
         assert_eq!(r.source, Source::Env);
-        // The current profile's token stays available for a unit-file deployment.
+        assert!(r.token.is_none());
+    }
+
+    #[test]
+    fn resolve_env_url_inherits_token_only_for_the_same_endpoint() {
+        let mut home = profile("ws://same:8787");
+        home.token = Some("home-tok".to_string());
+        let conns = conns_with(Some("home"), &[("home", home)]);
+        let r = resolve(
+            &conns,
+            &Target::Current,
+            Some("ws://same:8787".to_string()),
+            None,
+            no_mdns,
+        )
+        .expect("env");
         assert_eq!(r.token.as_deref(), Some("home-tok"));
+    }
+
+    #[test]
+    fn exact_profile_heal_updates_b_without_touching_current_a() {
+        let mut b = profile("ws://b-old:8787");
+        b.fingerprint = Some("fp-b".to_string());
+        let mut conns = conns_with(Some("a"), &[("a", profile("ws://a:8787")), ("b", b)]);
+        let found = vec![DiscoveredServer {
+            name: "server-b".to_string(),
+            url: "ws://b-new:8787".to_string(),
+            fingerprint: Some("fp-b".to_string()),
+        }];
+
+        assert_eq!(
+            apply_profile_heal(&mut conns, "b", "ws://b-old:8787", &found).as_deref(),
+            Some("ws://b-new:8787")
+        );
+        assert_eq!(conns.current.as_deref(), Some("a"));
+        assert_eq!(conns.profiles["a"].url, "ws://a:8787");
+        assert_eq!(conns.profiles["b"].url, "ws://b-new:8787");
+    }
+
+    #[test]
+    fn concurrent_precise_mutations_preserve_unrelated_connection_fields() {
+        let dir = tmp_dir();
+        let path = dir.join("connections.toml");
+        save_at(&path, &Connections::default()).expect("seed connections");
+        let start = std::sync::Arc::new(std::sync::Barrier::new(3));
+
+        let workers = [
+            ("a".to_string(), "ws://a:8787".to_string()),
+            ("b".to_string(), "ws://b:8787".to_string()),
+        ]
+        .into_iter()
+        .map(|(name, url)| {
+            let path = path.clone();
+            let start = std::sync::Arc::clone(&start);
+            std::thread::spawn(move || {
+                start.wait();
+                mutate_at(&path, |connections| {
+                    connections.profiles.insert(
+                        name,
+                        Profile {
+                            url,
+                            ..Default::default()
+                        },
+                    );
+                    Ok(())
+                })
+                .expect("mutate connections");
+            })
+        })
+        .collect::<Vec<_>>();
+        start.wait();
+        for worker in workers {
+            worker.join().expect("mutation worker");
+        }
+
+        let after = load_at(&path).expect("load merged connections");
+        assert_eq!(after.profiles["a"].url, "ws://a:8787");
+        assert_eq!(after.profiles["b"].url, "ws://b:8787");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1047,11 +1287,89 @@ mod tests {
     }
 
     #[test]
+    fn discovery_prefers_matching_pin_even_when_unrelated_server_arrives_first() {
+        let mut home = profile("");
+        home.token = Some("home-tok".to_string());
+        home.fingerprint = Some("fp-home".to_string());
+        let conns = conns_with(Some("home"), &[("home", home)]);
+        let found = vec![
+            DiscoveredServer {
+                name: "unrelated".to_string(),
+                url: "ws://wrong:8787".to_string(),
+                fingerprint: Some("fp-wrong".to_string()),
+            },
+            DiscoveredServer {
+                name: "home".to_string(),
+                url: "ws://right:8787".to_string(),
+                fingerprint: Some("fp-home".to_string()),
+            },
+        ];
+
+        let selected = select_discovered(&conns, &found).expect("matching advertiser");
+        assert_eq!(selected.url, "ws://right:8787");
+        assert_eq!(selected.fingerprint.as_deref(), Some("fp-home"));
+        let resolved = resolve(&conns, &Target::Current, None, None, || Some(selected))
+            .expect("resolve selected advertiser");
+        assert_eq!(resolved.token.as_deref(), Some("home-tok"));
+        assert_eq!(resolved.source, Source::Profile("home".to_string()));
+    }
+
+    #[test]
+    fn current_unpinned_a_never_borrows_pinned_b_identity_or_token() {
+        let mut a = profile("");
+        a.token = Some("token-a".to_string());
+        let mut b = profile("");
+        b.token = Some("token-b".to_string());
+        b.fingerprint = Some("fp-b".to_string());
+        let conns = conns_with(Some("a"), &[("a", a), ("b", b)]);
+        let found = vec![DiscoveredServer {
+            name: "server-b".to_string(),
+            url: "ws://b:8787".to_string(),
+            fingerprint: Some("fp-b".to_string()),
+        }];
+
+        let first = select_discovered(&conns, &found).expect("fallback advertiser");
+        let first =
+            resolve(&conns, &Target::Current, None, None, || Some(first)).expect("first discovery");
+        assert_eq!(first.source, Source::Mdns);
+        assert_eq!(first.token, None);
+
+        // A second reconnect remains unowned and unauthenticated. Automatic
+        // discovery cannot turn B's saved pin into A's provenance over time.
+        let second = select_discovered(&conns, &found).expect("fallback advertiser");
+        let second = resolve(&conns, &Target::Current, None, None, || Some(second))
+            .expect("second discovery");
+        assert_eq!(second.source, Source::Mdns);
+        assert_eq!(second.token, None);
+        assert_eq!(conns.profiles["a"].fingerprint, None);
+        assert_eq!(conns.profiles["a"].token.as_deref(), Some("token-a"));
+    }
+
+    #[test]
+    fn no_current_profile_never_implicitly_uses_another_saved_profile_token() {
+        let mut b = profile("");
+        b.token = Some("token-b".to_string());
+        b.fingerprint = Some("fp-b".to_string());
+        let conns = conns_with(None, &[("b", b)]);
+        let found = vec![DiscoveredServer {
+            name: "server-b".to_string(),
+            url: "ws://b:8787".to_string(),
+            fingerprint: Some("fp-b".to_string()),
+        }];
+
+        let selected = select_discovered(&conns, &found).expect("advertiser");
+        let resolved = resolve(&conns, &Target::Current, None, None, || Some(selected))
+            .expect("unowned discovery");
+        assert_eq!(resolved.source, Source::Mdns);
+        assert_eq!(resolved.token, None);
+    }
+
+    #[test]
     fn resolve_mdns_matching_fingerprint_attaches_pinned_token() {
         let mut home = profile("");
         home.token = Some("home-tok".to_string());
         home.fingerprint = Some("AA:BB".to_string());
-        let conns = conns_with(None, &[("home", home)]);
+        let conns = conns_with(Some("home"), &[("home", home)]);
         let r = resolve(&conns, &Target::Current, None, None, || {
             Some(Discovered {
                 url: "ws://192.168.1.20:8787".to_string(),
@@ -1060,6 +1378,7 @@ mod tests {
         })
         .expect("mdns");
         assert_eq!(r.token.as_deref(), Some("home-tok"));
+        assert_eq!(r.source, Source::Profile("home".to_string()));
     }
 
     #[test]

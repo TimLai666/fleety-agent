@@ -35,6 +35,9 @@ cpal = "0.15"
 uuid = { workspace = true }
 # The FLEETY_TZ picker offers the IANA zone list (TZ_VARIANTS) to search.
 chrono-tz = { workspace = true }
+clap = { workspace = true }
+clap_complete = { workspace = true }
+unicode-segmentation = "=1.13.3"
 
 [dev-dependencies]
 uuid = { workspace = true }

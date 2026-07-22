@@ -414,24 +414,121 @@ pub fn may_start(existing_live_pid: Option<u32>) -> bool {
     existing_live_pid.is_none()
 }
 
-/// Whether a process with `pid` is currently alive. Uses the platform's own
-/// query (no `unsafe`): `kill -0` on Unix, `tasklist` on Windows. A failure to
-/// determine is treated as "not alive" so we never wrongly refuse to start.
-pub fn pid_alive(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
+/// Result of probing whether a process currently owns a PID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PidState {
+    Alive,
+    Dead,
+    /// The probe failed, timed out, or was denied. This is deliberately not
+    /// treated as dead because doing so could hand ownership to two processes.
+    Unknown,
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn classify_probe_exit(code: Option<i32>) -> PidState {
+    match code {
+        Some(0) => PidState::Alive,
+        Some(1) => PidState::Dead,
+        _ => PidState::Unknown,
     }
-    if cfg!(target_os = "windows") {
-        Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
-            .output()
+}
+
+#[cfg(target_os = "windows")]
+const WINDOWS_NATIVE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(target_os = "windows")]
+const WINDOWS_FALLBACK_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[cfg(target_os = "windows")]
+fn csv_field(line: &str, wanted: usize) -> Option<String> {
+    let mut field = String::new();
+    let mut index = 0usize;
+    let mut quoted = false;
+    let mut chars = line.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' if quoted && chars.peek() == Some(&'"') => {
+                field.push('"');
+                chars.next();
+            }
+            '"' => quoted = !quoted,
+            ',' if !quoted => {
+                if index == wanted {
+                    return Some(field);
+                }
+                field.clear();
+                index += 1;
+            }
+            _ => field.push(ch),
+        }
+    }
+
+    (index == wanted && !quoted).then_some(field)
+}
+
+#[cfg(target_os = "windows")]
+fn tasklist_contains_pid(output: &[u8], pid: u32) -> bool {
+    let expected = pid.to_string();
+    String::from_utf8_lossy(output)
+        .lines()
+        .any(|line| csv_field(line.trim(), 1).as_deref() == Some(expected.as_str()))
+}
+
+/// Probe whether a process with `pid` is currently alive. Windows first uses
+/// native `tasklist.exe` CSV output as a language-independent live-process fast
+/// path. If that cannot confirm the PID, bounded PowerShell fallback
+/// distinguishes a missing process from access denial or another uncertainty.
+/// Command startup failures, access denial, unexpected errors, and timeouts
+/// remain `Unknown`.
+pub fn probe_pid(pid: u32) -> PidState {
+    if pid == 0 {
+        return PidState::Dead;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let native = Command::new("tasklist.exe")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
             .ok()
-            .map(|o| {
-                let out = String::from_utf8_lossy(&o.stdout);
-                out.contains(&pid.to_string())
-            })
-            .unwrap_or(false)
-    } else {
+            .and_then(|child| child_output_with_timeout(child, WINDOWS_NATIVE_PROBE_TIMEOUT));
+        if let Some(output) = native {
+            if output.status.success() {
+                return if tasklist_contains_pid(&output.stdout, pid) {
+                    PidState::Alive
+                } else {
+                    PidState::Dead
+                };
+            }
+        }
+
+        // PowerShell and System.Diagnostics expose process IDs as signed
+        // 32-bit integers. Values outside that domain cannot name a process.
+        if pid > i32::MAX as u32 {
+            return PidState::Unknown;
+        }
+        let script = format!(
+            "$ErrorActionPreference='Stop'; try {{ Get-Process -Id {pid} | Out-Null; exit 0 }} catch {{ if ($_.FullyQualifiedErrorId -like 'NoProcessFoundForGivenId*') {{ exit 1 }} else {{ exit 2 }} }}"
+        );
+        let code = Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &script,
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()
+            .and_then(|child| child_output_with_timeout(child, WINDOWS_FALLBACK_PROBE_TIMEOUT))
+            .and_then(|output| output.status.code());
+        classify_probe_exit(code)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
         // `-0` only probes; suppress output so a dead pid doesn't leak
         // "kill: <pid>: No such process" to the terminal (it is expected here).
         Command::new("kill")
@@ -439,8 +536,42 @@ pub fn pid_alive(pid: u32) -> bool {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+            .map(|status| {
+                if status.success() {
+                    PidState::Alive
+                } else {
+                    PidState::Dead
+                }
+            })
+            .unwrap_or(PidState::Unknown)
+    }
+}
+
+/// Compatibility predicate for status displays. An indeterminate probe is
+/// conservatively considered potentially alive; ownership decisions use
+/// [`probe_pid`] directly and retain the full three-state result.
+pub fn pid_alive(pid: u32) -> bool {
+    probe_pid(pid) != PidState::Dead
+}
+
+#[cfg(target_os = "windows")]
+fn child_output_with_timeout(
+    mut child: std::process::Child,
+    timeout: Duration,
+) -> Option<std::process::Output> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
     }
 }
 
@@ -448,9 +579,9 @@ pub fn pid_alive(pid: u32) -> bool {
 /// the pidfile holds a pid, it is `alive`, and — for a restart that must cycle
 /// the process — it is not the `replacing` pid we are moving away from. Returns
 /// the confirmed pid, or `None` if this sample doesn't qualify. Pure.
-pub fn sample_is_up(current: Option<u32>, alive: bool, replacing: Option<u32>) -> Option<u32> {
+pub fn sample_is_up(current: Option<u32>, state: PidState, replacing: Option<u32>) -> Option<u32> {
     match current {
-        Some(pid) if alive && replacing != Some(pid) => Some(pid),
+        Some(pid) if state == PidState::Alive && replacing != Some(pid) => Some(pid),
         _ => None,
     }
 }
@@ -484,8 +615,8 @@ fn wait_until_running_at(
     let mut confirmed_once: Option<u32> = None;
     loop {
         let current = read_pid(path);
-        let alive = current.map(pid_alive).unwrap_or(false);
-        match sample_is_up(current, alive, replacing) {
+        let state = current.map(probe_pid).unwrap_or(PidState::Dead);
+        match sample_is_up(current, state, replacing) {
             // The same live owner twice running → settled; report it up.
             Some(pid) if confirmed_once == Some(pid) => return Some(pid),
             Some(pid) => confirmed_once = Some(pid),
@@ -508,8 +639,11 @@ const STOP_SETTLE_POLL: Duration = Duration::from_millis(300);
 
 /// True when the pidfile has no live owner — the service has fully stopped
 /// (either the guard removed the file, or its pid is dead). Pure.
-pub fn sample_is_stopped(current: Option<u32>, alive: bool) -> bool {
-    !matches!(current, Some(pid) if alive && pid != 0)
+pub fn sample_is_stopped(current: Option<u32>, state: PidState) -> bool {
+    match current {
+        None | Some(0) => true,
+        Some(_) => state == PidState::Dead,
+    }
 }
 
 /// True when *this* process owns `name`'s pidfile — a "restart" of `name` is then
@@ -527,11 +661,23 @@ pub fn is_self_service(name: &str) -> bool {
 /// Windows `sc stop` and `sc start` so the start doesn't race a still-stopping
 /// service. Blocking.
 fn wait_until_stopped_at(path: &Path, timeout: Duration, poll: Duration) -> bool {
+    wait_until_stopped_at_with_probe(path, timeout, poll, probe_pid)
+}
+
+fn wait_until_stopped_at_with_probe<F>(
+    path: &Path,
+    timeout: Duration,
+    poll: Duration,
+    mut probe: F,
+) -> bool
+where
+    F: FnMut(u32) -> PidState,
+{
     let deadline = Instant::now() + timeout;
     loop {
         let current = read_pid(path);
-        let alive = current.map(pid_alive).unwrap_or(false);
-        if sample_is_stopped(current, alive) {
+        let state = current.map(&mut probe).unwrap_or(PidState::Dead);
+        if sample_is_stopped(current, state) {
             return true;
         }
         if Instant::now() >= deadline {
@@ -557,9 +703,23 @@ pub fn acquire(name: &str) -> Result<Acquire> {
 
 /// Claim a pidfile at an explicit path (testable form of [`acquire`]).
 pub fn acquire_at(path: &Path) -> Result<Acquire> {
+    acquire_at_with_probe(path, probe_pid)
+}
+
+fn acquire_at_with_probe<F>(path: &Path, mut probe: F) -> Result<Acquire>
+where
+    F: FnMut(u32) -> PidState,
+{
     if let Some(pid) = read_pid(path) {
-        if pid_alive(pid) {
-            return Ok(Acquire::AlreadyRunning(pid));
+        match probe(pid) {
+            PidState::Alive => return Ok(Acquire::AlreadyRunning(pid)),
+            PidState::Dead => {}
+            PidState::Unknown => {
+                return Err(CoreError::Message(format!(
+                    "could not verify pid {pid} from {}; refusing to replace its ownership file",
+                    path.display()
+                )));
+            }
         }
     }
     if let Some(parent) = path.parent() {
@@ -601,6 +761,92 @@ impl PushPath for Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn successful_probe_exit_classification_distinguishes_alive_and_dead() {
+        assert_eq!(classify_probe_exit(Some(0)), PidState::Alive);
+        assert_eq!(classify_probe_exit(Some(1)), PidState::Dead);
+    }
+
+    #[test]
+    fn access_denied_probe_is_unknown() {
+        assert_eq!(classify_probe_exit(Some(2)), PidState::Unknown);
+    }
+
+    #[test]
+    fn timed_out_or_unstarted_probe_is_unknown() {
+        assert_eq!(classify_probe_exit(None), PidState::Unknown);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn child_output_timeout_terminates_a_stuck_probe() {
+        let child = Command::new("powershell")
+            .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 5"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sleeping probe");
+        let started = Instant::now();
+        assert!(child_output_with_timeout(child, Duration::from_millis(50)).is_none());
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn bounded_fallback_allows_a_two_second_shell_startup() {
+        let child = Command::new("powershell.exe")
+            .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 2; exit 0"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn delayed probe");
+
+        let output = child_output_with_timeout(child, WINDOWS_FALLBACK_PROBE_TIMEOUT)
+            .expect("two-second startup must fit inside the fallback bound");
+
+        assert!(output.status.success());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn native_tasklist_csv_matching_ignores_image_name_and_localized_no_match_text() {
+        let pid = 4242;
+        assert!(tasklist_contains_pid(
+            br#""weird,""name.exe","4242","Console","1","12,345 K""#,
+            pid
+        ));
+        assert!(!tasklist_contains_pid(
+            "INFO: No tasks are running which match the specified criteria.".as_bytes(),
+            pid
+        ));
+        assert!(!tasklist_contains_pid(
+            "INFORMATION: Keine Aufgaben entsprechen den angegebenen Kriterien.".as_bytes(),
+            pid
+        ));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_probe_recognizes_a_live_owner_despite_shell_startup() {
+        assert_eq!(probe_pid(std::process::id()), PidState::Alive);
+    }
+
+    #[cfg(target_os = "windows")]
+    fn definitely_dead_pid() -> u32 {
+        let mut child = Command::new("cmd.exe")
+            .args(["/C", "exit", "0"])
+            .spawn()
+            .expect("spawn short-lived process");
+        let pid = child.id();
+        child.wait().expect("wait for short-lived process");
+        pid
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn definitely_dead_pid() -> u32 {
+        u32::MAX - 1
+    }
 
     fn spec() -> ServiceSpec {
         ServiceSpec {
@@ -788,23 +1034,39 @@ mod tests {
 
         // A dead pid → Started (we take over).
         let dead = dir.join("dead.pid");
-        std::fs::write(&dead, "4294967294").unwrap(); // u32::MAX-1, not a real pid
+        std::fs::write(&dead, definitely_dead_pid().to_string()).unwrap();
         assert!(matches!(acquire_at(&dead).unwrap(), Acquire::Started(_)));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
+    fn acquire_does_not_overwrite_owner_when_probe_is_unknown() {
+        let dir =
+            std::env::temp_dir().join(format!("fleety-acq-unknown-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("owner.pid");
+        std::fs::write(&path, "4242").unwrap();
+
+        let error = acquire_at_with_probe(&path, |_| PidState::Unknown).unwrap_err();
+
+        assert!(error.to_string().contains("could not verify pid 4242"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "4242");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn sample_is_up_needs_live_and_changed() {
         // Live owner, nothing to replace → up.
-        assert_eq!(sample_is_up(Some(42), true, None), Some(42));
+        assert_eq!(sample_is_up(Some(42), PidState::Alive, None), Some(42));
         // Live owner that differs from the one we're replacing → up (new process).
-        assert_eq!(sample_is_up(Some(43), true, Some(42)), Some(43));
+        assert_eq!(sample_is_up(Some(43), PidState::Alive, Some(42)), Some(43));
         // The still-present old process (== replacing) is not "up" yet.
-        assert_eq!(sample_is_up(Some(42), true, Some(42)), None);
+        assert_eq!(sample_is_up(Some(42), PidState::Alive, Some(42)), None);
         // A dead owner, or an empty pidfile, is never up.
-        assert_eq!(sample_is_up(Some(42), false, None), None);
-        assert_eq!(sample_is_up(None, false, None), None);
+        assert_eq!(sample_is_up(Some(42), PidState::Dead, None), None);
+        assert_eq!(sample_is_up(Some(42), PidState::Unknown, None), None);
+        assert_eq!(sample_is_up(None, PidState::Dead, None), None);
     }
 
     #[test]
@@ -815,11 +1077,19 @@ mod tests {
         // Our own pid is live → confirmed within the timeout.
         let live = dir.join("live.pid");
         std::fs::write(&live, std::process::id().to_string()).unwrap();
+        let live_confirmation_timeout = if cfg!(target_os = "windows") {
+            // Two bounded probes may both need the PowerShell fallback when
+            // native tasklist access is denied. Production lifecycle callers
+            // provide 20 seconds; keep this test below that real budget.
+            Duration::from_secs(15)
+        } else {
+            Duration::from_secs(2)
+        };
         assert_eq!(
             wait_until_running_at(
                 &live,
                 None,
-                Duration::from_secs(2),
+                live_confirmation_timeout,
                 Duration::from_millis(5)
             ),
             Some(std::process::id())
@@ -838,7 +1108,7 @@ mod tests {
 
         // A dead owner → times out (never confirmed).
         let dead = dir.join("dead.pid");
-        std::fs::write(&dead, "4294967294").unwrap(); // u32::MAX-1, not a real pid
+        std::fs::write(&dead, definitely_dead_pid().to_string()).unwrap();
         assert_eq!(
             wait_until_running_at(
                 &dead,
@@ -863,11 +1133,30 @@ mod tests {
     }
 
     #[test]
-    fn sample_is_stopped_means_no_live_owner() {
-        assert!(sample_is_stopped(None, false)); // no pidfile → stopped
-        assert!(sample_is_stopped(Some(42), false)); // dead owner → stopped
-        assert!(sample_is_stopped(Some(0), true)); // pid 0 is never a real owner
-        assert!(!sample_is_stopped(Some(42), true)); // live owner → not stopped
+    fn sample_is_stopped_requires_confirmed_dead_owner() {
+        assert!(sample_is_stopped(None, PidState::Unknown));
+        assert!(sample_is_stopped(Some(42), PidState::Dead));
+        assert!(sample_is_stopped(Some(0), PidState::Dead));
+        assert!(!sample_is_stopped(Some(42), PidState::Alive));
+        assert!(!sample_is_stopped(Some(42), PidState::Unknown));
+    }
+
+    #[test]
+    fn wait_until_stopped_times_out_while_probe_is_unknown() {
+        let dir =
+            std::env::temp_dir().join(format!("fleety-stop-unknown-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("owner.pid");
+        std::fs::write(&path, "4242").unwrap();
+
+        assert!(!wait_until_stopped_at_with_probe(
+            &path,
+            Duration::from_millis(30),
+            Duration::from_millis(5),
+            |_| PidState::Unknown,
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -885,7 +1174,7 @@ mod tests {
 
         // A dead owner → stopped.
         let dead = dir.join("dead.pid");
-        std::fs::write(&dead, "4294967294").unwrap();
+        std::fs::write(&dead, definitely_dead_pid().to_string()).unwrap();
         assert!(wait_until_stopped_at(
             &dead,
             Duration::from_millis(40),

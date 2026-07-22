@@ -13,12 +13,47 @@ use std::collections::VecDeque;
 
 use fleety_protocol::WireAttachment;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::input::LineEditor;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationSummary {
+    pub conversation_id: String,
+    pub last_ts_secs: u64,
+    pub events: u64,
+    pub preview: String,
+}
+
+pub fn parse_conversation_summaries(
+    json: &str,
+) -> std::result::Result<Vec<ConversationSummary>, serde_json::Error> {
+    let rows: Vec<serde_json::Value> = serde_json::from_str(json)?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            Some(ConversationSummary {
+                conversation_id: row.get("conversation_id")?.as_str()?.to_string(),
+                last_ts_secs: row
+                    .get("last_ts_secs")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default(),
+                events: row
+                    .get("events")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or_default(),
+                preview: row
+                    .get("preview")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            })
+        })
+        .collect())
+}
 
 /// Lines jumped per PageUp/PageDown press.
 const SCROLL_STEP: u16 = 5;
@@ -60,6 +95,10 @@ pub struct App {
     /// Whether an idle Esc is awaiting a second, confirming Esc because there is
     /// unsent input or a pending attachment. Cleared by any editing keypress.
     pub confirm_quit: bool,
+    /// Server-owned conversation summaries shown by the Conversations route.
+    pub conversations: Vec<ConversationSummary>,
+    pub conversation_selected: usize,
+    pub conversations_status: String,
 }
 
 impl App {
@@ -78,6 +117,9 @@ impl App {
             last_conversation_id: None,
             last_seq: 0,
             confirm_quit: false,
+            conversations: Vec::new(),
+            conversation_selected: 0,
+            conversations_status: "Not loaded".into(),
         }
     }
 
@@ -201,6 +243,58 @@ impl App {
         self.pending_approvals.push_back((approval_id, desc));
         self.status = "approval required — y approve · n deny".to_string();
     }
+
+    /// Commit a prepared user message after the transport accepts it. Until
+    /// this point the composer, attachments, transcript, and turn state stay
+    /// untouched so a failed write cannot destroy unsent work.
+    pub fn commit_send(&mut self) {
+        let text = self.input.take();
+        let attachments = std::mem::take(&mut self.pending_attachments);
+        let display = if attachments.is_empty() {
+            text
+        } else {
+            format!("{text} [+{} attachment(s)]", attachments.len())
+        };
+        self.push("you", display);
+        self.scroll_back = 0;
+        self.turn_in_flight = true;
+    }
+
+    /// Commit a prepared approval decision after the transport accepts it.
+    pub fn commit_approval(&mut self, approval_id: &str, approved: bool) {
+        let Some((pending_id, _)) = self.pending_approvals.front() else {
+            return;
+        };
+        if pending_id != approval_id {
+            return;
+        }
+        if let Some((_, desc)) = self.pending_approvals.pop_front() {
+            self.status = if approved {
+                format!("approved: {desc}")
+            } else {
+                format!("denied: {desc}")
+            };
+        }
+    }
+
+    /// Expire approvals owned by a transport that has disconnected. The
+    /// Server denies its approval gate on EOF, so carrying those UUIDs onto a
+    /// replacement connection would let a successful socket write masquerade
+    /// as an accepted decision.
+    pub fn expire_pending_approvals(&mut self) {
+        let count = self.pending_approvals.len();
+        if count == 0 {
+            return;
+        }
+        self.pending_approvals.clear();
+        let message = if count == 1 {
+            "approval expired after connection loss; retry the turn".to_string()
+        } else {
+            format!("{count} approvals expired after connection loss; retry the turn")
+        };
+        self.push("system", message.clone());
+        self.status = message;
+    }
 }
 
 /// What a keypress asks the outer loop to do.
@@ -274,15 +368,13 @@ pub fn on_key(app: &mut App, key: KeyEvent) -> Action {
     if !app.pending_approvals.is_empty() {
         match key.code {
             KeyCode::Char('y' | 'Y') => {
-                if let Some((id, desc)) = app.pending_approvals.pop_front() {
-                    app.status = format!("approved: {desc}");
-                    return Action::Approve(id);
+                if let Some((id, _)) = app.pending_approvals.front() {
+                    return Action::Approve(id.clone());
                 }
             }
             KeyCode::Char('n' | 'N') | KeyCode::Esc => {
-                if let Some((id, desc)) = app.pending_approvals.pop_front() {
-                    app.status = format!("denied: {desc}");
-                    return Action::Deny(id);
+                if let Some((id, _)) = app.pending_approvals.front() {
+                    return Action::Deny(id.clone());
                 }
             }
             _ => {}
@@ -345,13 +437,14 @@ pub fn on_key(app: &mut App, key: KeyEvent) -> Action {
                 app.input.insert_newline();
                 return Action::None;
             }
-            let text = app.input.take();
+            let text = app.input.text().to_string();
             // `/attach <path>` stages a local file instead of sending a message.
             if let Some(path) = attach_command_path(&text) {
                 if path.is_empty() {
                     app.status = "usage: /attach <path>".to_string();
                     app.input.set_text(text);
                 } else if let Some(att) = crate::clipboard::attach_path(path) {
+                    let _ = app.input.take();
                     app.attach(att);
                 } else {
                     // `attach_path` returns `None` for a missing/unreadable path
@@ -365,19 +458,10 @@ pub fn on_key(app: &mut App, key: KeyEvent) -> Action {
                 }
                 return Action::None;
             }
-            let attachments = std::mem::take(&mut app.pending_attachments);
+            let attachments = app.pending_attachments.clone();
             if text.trim().is_empty() && attachments.is_empty() {
                 Action::None
             } else {
-                let display = if attachments.is_empty() {
-                    text.clone()
-                } else {
-                    format!("{text} [+{} attachment(s)]", attachments.len())
-                };
-                app.push("you", display);
-                // Sending snaps the conversation back to the newest output.
-                app.scroll_back = 0;
-                app.turn_in_flight = true;
                 Action::Send { text, attachments }
             }
         }
@@ -430,8 +514,10 @@ pub fn on_key(app: &mut App, key: KeyEvent) -> Action {
 fn message_lines(app: &App) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for (role, text) in &app.messages {
+        let role = crate::terminal_safe_text(role);
+        let text = crate::terminal_safe_multiline_redacted(text);
         if role == "fleety" {
-            let mut rendered = crate::markdown::render(text);
+            let mut rendered = crate::markdown::render(&text);
             match rendered.first_mut() {
                 Some(first) => first.spans.insert(0, Span::raw(format!("{role}: "))),
                 None => rendered.push(Line::from(format!("{role}: "))),
@@ -454,7 +540,46 @@ fn message_lines(app: &App) -> Vec<Line<'static>> {
 const MAX_INPUT_ROWS: u16 = 6;
 
 /// Draw the three panes.
+#[cfg(test)]
 pub fn render(frame: &mut Frame, app: &App) {
+    render_in_area(frame, app, frame.area());
+}
+
+pub fn render_conversations_in_area(frame: &mut Frame, app: &App, area: Rect) {
+    let mut lines = vec![Line::from(crate::terminal_safe_field(
+        &app.conversations_status,
+    ))];
+    if app.conversations.is_empty() {
+        lines.push(Line::from("No conversations found."));
+    } else {
+        lines.extend(app.conversations.iter().enumerate().map(|(index, item)| {
+            let marker = if index == app.conversation_selected {
+                "▶"
+            } else {
+                " "
+            };
+            let preview = if item.preview.is_empty() {
+                "(no preview)".to_string()
+            } else {
+                crate::terminal_safe_field(&item.preview)
+            };
+            Line::from(format!(
+                "{marker} {preview} · {} events · {}",
+                item.events,
+                crate::terminal_safe_field(&item.conversation_id)
+            ))
+        }));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::bordered().title("Conversations"))
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
+/// Render Chat inside the shared workspace content region.
+pub fn render_in_area(frame: &mut Frame, app: &App, area: Rect) {
     // The input box grows with the composed line count (capped), then scrolls.
     let input_rows = u16::try_from(app.input.line_count())
         .unwrap_or(MAX_INPUT_ROWS)
@@ -466,7 +591,7 @@ pub fn render(frame: &mut Frame, app: &App) {
             Constraint::Length(input_rows + 2),
             Constraint::Length(1),
         ])
-        .split(frame.area());
+        .split(area);
 
     // Anchor the conversation to the bottom (newest output), minus any manual
     // scrollback; the wrapped height comes from the block-less paragraph so
@@ -544,9 +669,18 @@ mod tests {
                 attachments: Vec::new(),
             }
         );
-        assert_eq!(app.input.text(), ""); // cleared on send
+        assert_eq!(app.input.text(), "h", "prepare must retain the draft");
+        assert!(
+            app.messages.is_empty(),
+            "prepare must not change transcript"
+        );
+        assert!(
+            !app.turn_in_flight,
+            "prepare must not claim the turn was sent"
+        );
+        app.commit_send();
+        assert_eq!(app.input.text(), "");
         assert_eq!(app.messages.last().map(|(r, _)| r.as_str()), Some("you"));
-        // Sending marks a turn in flight; the reply clears it before we test quit.
         assert!(app.turn_in_flight);
         app.finish_assistant("hi back".to_string());
         // Empty Enter with no attachments does nothing.
@@ -580,7 +714,17 @@ mod tests {
         };
         assert_eq!(text, "see");
         assert_eq!(attachments.len(), 1);
-        assert!(app.pending_attachments.is_empty(), "cleared after send");
+        assert_eq!(app.input.text(), "see", "prepare retains the draft");
+        assert_eq!(
+            app.pending_attachments.len(),
+            1,
+            "prepare retains attachments"
+        );
+        app.commit_send();
+        assert!(
+            app.pending_attachments.is_empty(),
+            "commit clears attachments"
+        );
     }
 
     #[test]
@@ -809,6 +953,7 @@ mod tests {
             on_key(&mut app, key(KeyCode::Enter)),
             Action::Send { .. }
         ));
+        app.commit_send();
         assert_eq!(app.scroll_back, 0);
         terminal.draw(|f| render(f, &app)).expect("draw");
         let content: String = visible_rows(&terminal).concat();
@@ -920,6 +1065,7 @@ mod tests {
         let Action::Send { .. } = on_key(&mut app, key(KeyCode::Enter)) else {
             panic!("expected Send");
         };
+        app.commit_send();
         assert!(app.turn_in_flight);
         // Esc now cancels the turn (does NOT quit).
         assert_eq!(on_key(&mut app, key(KeyCode::Esc)), Action::CancelTurn);
@@ -994,6 +1140,7 @@ mod tests {
         let mut app = App::new("ready");
         app.input.set_text("go".into());
         let _ = on_key(&mut app, key(KeyCode::Enter));
+        app.commit_send();
         assert!(app.turn_in_flight);
         // A mid-turn approval request: Esc is deny (modal wins over cancel).
         app.request_approval("id1".into(), "write_file", "mutate", "write foo");
@@ -1018,6 +1165,8 @@ mod tests {
             on_key(&mut app, key(KeyCode::Char('y'))),
             Action::Approve("id1".into())
         );
+        assert_eq!(app.pending_approvals.len(), 1, "prepare retains approval");
+        app.commit_approval("id1", true);
         assert!(app.pending_approvals.is_empty());
         // Esc on a pending approval denies — it does not quit.
         app.request_approval("id2".into(), "run_command", "critical", "rm x");
@@ -1025,9 +1174,63 @@ mod tests {
             on_key(&mut app, key(KeyCode::Esc)),
             Action::Deny("id2".into())
         );
+        assert_eq!(app.pending_approvals.len(), 1, "prepare retains denial");
+        app.commit_approval("id2", false);
         assert!(!app.should_quit);
         // With no approval pending, Esc quits as before.
         assert_eq!(on_key(&mut app, key(KeyCode::Esc)), Action::Quit);
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn expired_transport_approval_cannot_be_committed_and_preserves_composer() {
+        let mut app = App::new("ready");
+        app.input.set_text("keep this draft".into());
+        app.attach(WireAttachment {
+            mime: "text/plain".into(),
+            bytes_b64: Some("aGVsbG8=".into()),
+            url: None,
+            name: Some("note.txt".into()),
+        });
+        app.request_approval("old-id".into(), "write_file", "mutate", "write foo");
+
+        app.expire_pending_approvals();
+
+        assert!(app.pending_approvals.is_empty());
+        assert_eq!(app.input.text(), "keep this draft");
+        assert_eq!(on_key(&mut app, key(KeyCode::Char('y'))), Action::None);
+        app.commit_approval("old-id", true);
+        assert!(!app.status.contains("approved"));
+        assert!(app.status.contains("expired"));
+        assert_eq!(app.input.text(), "keep this drafty");
+        assert_eq!(app.pending_attachments.len(), 1);
+    }
+
+    #[test]
+    fn conversation_list_parses_and_renders_real_server_rows() {
+        let mut app = App::new("ready");
+        app.conversations = parse_conversation_summaries(
+            r#"[{"conversation_id":"c-1","last_ts_secs":123,"events":4,"preview":"部署進度 🚀"}]"#,
+        )
+        .expect("parse conversation list");
+        assert_eq!(app.conversations[0].preview, "部署進度 🚀");
+        app.conversations_status = "1 conversation(s)".into();
+        let backend = ratatui::backend::TestBackend::new(80, 12);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render_conversations_in_area(frame, &app, frame.area()))
+            .expect("render conversations");
+        let content = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(content.contains('🚀'), "{content}");
+        assert!(content.contains("4 events"), "{content}");
+        assert!(content.contains("c-1"), "{content}");
+        assert!(!content.contains('�'), "{content}");
     }
 }

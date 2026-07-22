@@ -38,6 +38,7 @@ pub mod deps;
 pub mod device;
 mod insyra;
 pub mod oauth;
+pub mod provider_service;
 pub mod providers_config;
 pub mod restart;
 pub mod service;

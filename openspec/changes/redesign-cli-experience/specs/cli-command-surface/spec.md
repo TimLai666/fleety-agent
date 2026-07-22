@@ -1,0 +1,94 @@
+## ADDED Requirements
+
+### Requirement: The CLI exposes one coherent task-oriented command tree
+
+The `fleety` binary SHALL expose canonical command groups for chat, conversations, connection, provider, model, config, status, doctor, pairing, audit, rollback, daemon lifecycle, completion, ACP, and update. `server`, `tui`, `auth`, and config-nested provider/model commands SHALL remain compatibility aliases and SHALL invoke the same implementation as their canonical command.
+
+#### Scenario: canonical and alias commands are equivalent
+
+- **WHEN** a canonical command and its documented alias receive equivalent arguments
+- **THEN** they SHALL resolve the same profile and owner, send the same protocol request, return the same data and exit class, and differ only by an allowed interactive deprecation notice
+
+##### Example: connection alias
+
+- **GIVEN** profile `office` is current
+- **WHEN** `fleety connection list` and `fleety server list` run with captured stderr
+- **THEN** both return the same ordered rows and exit 0; with `--warnings`, the alias SHALL add exactly one deprecation warning to stderr, and without it their captured output SHALL be identical
+
+### Requirement: Help and parse errors are complete and side-effect free
+
+Every command node SHALL accept `--help`, `-h`, and the unambiguous `fleety help <command-path>` word form, print generated help to stdout, and exit zero before logging, migration, configuration seeding, network access, or persistence. A leaf with no positional arguments SHALL additionally accept trailing `help`, such as `fleety status help`. A command that accepts positional input SHALL preserve the word `help` as user data, so `fleety ask help` sends that prompt and its word-form help remains `fleety help ask`. Invalid input SHALL print a focused usage error and nearest valid command suggestions to stderr and exit 2.
+
+#### Scenario: subgroup help succeeds without side effects
+
+- **GIVEN** an empty temporary home with no Fleety files
+- **WHEN** the user runs `fleety help config`, `fleety ask --help`, `fleety provider -h`, or `fleety status help`
+- **THEN** each command SHALL exit zero, print the relevant subgroup help, and leave the temporary home byte-for-byte unchanged
+
+#### Scenario: typo suggests a valid command
+
+- **WHEN** the user runs `fleety conection list`
+- **THEN** the process SHALL exit 2 and suggest `fleety connection list` without performing network or file I/O
+
+### Requirement: Invocation context is explicit and non-mutating
+
+`--profile <name>` SHALL select one saved profile for the current invocation without changing the persisted current profile. Every remote human result SHALL identify the resolved profile and owner; every machine result SHALL include them in `context`. The raw `--server <ws-url>` override SHALL remain transient and SHALL be labeled as such.
+
+#### Scenario: profile override does not become current
+
+- **GIVEN** profile `A` is current and profile `B` exists
+- **WHEN** the user runs `fleety --profile B status`
+- **THEN** the command SHALL query `B`, identify `B` in its result, and leave `A` persisted as current
+
+### Requirement: Machine output has a stable envelope and exit classes
+
+Commands supporting structured output SHALL emit one JSON value with `schema_version`, `ok`, `context`, `data`, and `errors`. Usage failures SHALL exit 2, runtime or owner failures SHALL exit 1, and complete success SHALL exit 0. Secrets and connection tokens SHALL NOT appear in human or machine output.
+
+#### Scenario: partial owner read is machine-detectable
+
+- **WHEN** a multi-owner read obtains CLI and Server data but Daemon is unavailable
+- **THEN** JSON SHALL contain the available data, a Daemon error with remediation, `ok: false`, and the process SHALL exit 1
+
+##### Example: JSON envelope
+
+| Field | Expected value |
+| --- | --- |
+| `schema_version` | `1` |
+| `ok` | `false` |
+| `context.profile` | selected profile name |
+| `errors[0].owner` | `daemon` |
+
+### Requirement: Diagnosis and completion are first-class commands
+
+`fleety doctor` SHALL perform bounded read-only checks for CLI, current profile, Server, Daemon, config protocol, Provider/OAuth, and active model state, rendering PASS, WARN, or FAIL with remediation. Any FAIL SHALL exit 1. `fleety completion <shell>` SHALL write completion source to stdout and SHALL NOT modify shell files.
+
+#### Scenario: doctor identifies an unavailable daemon
+
+- **WHEN** the Server is connected but the local Daemon is unavailable
+- **THEN** doctor SHALL report the Server check independently and report the Daemon as WARN or FAIL with a concrete lifecycle command
+
+##### Example: stopped local daemon
+
+- **GIVEN** the selected Server answers status and no live `fleetyd` PID exists locally
+- **WHEN** the user runs `fleety doctor`
+- **THEN** Server is PASS, Daemon is WARN, and remediation names `fleetyd start` or the equivalent lifecycle command
+
+#### Scenario: completion is side-effect free
+
+- **WHEN** the user runs `fleety completion powershell`
+- **THEN** valid PowerShell completion source SHALL be written to stdout and no user file SHALL be created or modified
+
+### Requirement: OAuth authorization secrets stay out of terminal history by default
+
+Browser-based OAuth login SHALL display only a sanitized authorization origin and path. It SHALL NOT print state, PKCE challenge, or query values. An explicit `--no-browser` flow SHALL deliver the full URL through the clipboard when available and SHALL print it only as an explicit fallback with a warning.
+
+#### Scenario: automatic browser launch hides nonce values
+
+- **WHEN** OAuth login opens the browser successfully
+- **THEN** captured stdout and stderr SHALL contain neither the authorization state nor the PKCE challenge
+
+##### Example: browser flow for provider codex1
+
+- **GIVEN** the generated state is `state-secret` and the challenge is `challenge-secret`
+- **WHEN** `fleety provider login codex1` successfully opens the browser
+- **THEN** terminal output SHALL show only the sanitized authorization origin/path and SHALL contain neither secret value nor any query value

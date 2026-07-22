@@ -2,17 +2,17 @@
 //!
 //! Backed by the shared typed registry in `fleety_tools::config`. `list/get`
 //! show the resolved value and its source (env / config / default), secrets
-//! masked; CLI-owned `set/unset` edit `~/.fleety/config.toml` after validating the key;
-//! `edit` opens an interactive screen — a ratatui list when stdout is a TTY,
-//! else a line-based loop. Read precedence stays env → config → default, so an
-//! explicit env var always wins.
+//! masked; CLI-owned `set/unset` go through the CLI owner service after validating the key;
+//! `open` is routed by the CLI into the shared staged Settings workspace. Read
+//! precedence stays env → config → default, so an explicit env var always wins.
 
-use std::io::IsTerminal;
 use std::path::Path;
 
 use agent_core::{CoreError, Result};
-use fleety_protocol::{ClientMsg, ConfigTarget, ServerMsg};
-use fleety_tools::config::{self, ConfigMap, Owner, Source};
+use fleety_protocol::ConfigTarget;
+#[cfg(test)]
+use fleety_protocol::{ClientMsg, ServerMsg};
+use fleety_tools::config::{self, ConfigMap, Owner};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Target {
@@ -76,7 +76,7 @@ fn command_owner(args: &[String]) -> Result<Option<Owner>> {
             })?;
             config::owner_for_key(key).map(Some)
         }
-        Some("list") | None | Some("edit") => Ok(None),
+        Some("list") | None | Some("open" | "edit") => Ok(None),
         Some(other) => Err(CoreError::Message(format!(
             "unknown config command '{other}'"
         ))),
@@ -94,6 +94,7 @@ pub fn resolve_target(target: Target, args: &[String], device_id: &str) -> Resul
             Some(Owner::Cli) => Target::Cli,
             None => Target::Auto,
         },
+        Target::Daemon => Target::Device(device_id.to_string()),
         other => other,
     };
     if let Some(owner) = owner {
@@ -147,11 +148,12 @@ pub fn is_remote_provider_edit(args: &[String], target: &Target) -> bool {
     is_provider_edit(args) && matches!(target, Target::Server)
 }
 
-/// The version gate for remote provider editing: the full-config write-back
-/// rides `ConfigApply.providers_json`, which servers before config protocol 2
-/// silently ignore — refuse up front rather than losing the edit.
+/// The version gate for remote Provider editing. Config protocol 5 makes API
+/// keys write-only and merges omitted keys as Keep on the Server. Refuse older
+/// Servers before requesting a snapshot so a legacy plaintext key never enters
+/// the CLI process.
 fn provider_edit_support_err(config_protocol: u32) -> Option<CoreError> {
-    (config_protocol < 2).then(|| {
+    (config_protocol < 5).then(|| {
         CoreError::Message(
             "the connected server is too old for remote provider editing — update it first \
              (run `fleety update` on the server host); provider configuration is server-owned \
@@ -166,192 +168,182 @@ fn provider_edit_support_err(config_protocol: u32) -> Option<CoreError> {
 /// snapshot's optimistic-lock revision. A concurrent-edit conflict closes the
 /// editor and reloads from a fresh snapshot instead of overwriting.
 pub async fn provider_edit_remote() -> Result<()> {
+    let mut input = crate::workspace::WorkspaceInput::terminal();
+    let (tx, rx, config_protocol, target, server_fingerprint) =
+        crate::connect_hello_for_auth_transaction()
+            .await
+            .map_err(provider_editor_connect_error)?;
+    provider_edit_remote_loop(
+        tx,
+        rx,
+        config_protocol,
+        target,
+        server_fingerprint,
+        &mut input,
+    )
+    .await
+}
+
+pub(crate) async fn provider_edit_remote_on_target(
+    target: &fleety_tools::connection::Resolved,
+    expected_fingerprint: Option<&str>,
+    input: &mut crate::workspace::WorkspaceInput,
+) -> Result<()> {
+    let (tx, rx, config_protocol, fingerprint) = crate::connect_hello_for_auth_target(target)
+        .await
+        .map_err(provider_editor_connect_error)?;
+    crate::provider_service::validate_server_identity(
+        expected_fingerprint,
+        fingerprint.as_deref(),
+        "Provider editor launch",
+    )
+    .map_err(crate::provider_service::issue_as_error)?;
+    provider_edit_remote_loop(tx, rx, config_protocol, target.clone(), fingerprint, input).await
+}
+
+async fn provider_edit_remote_loop(
+    tx: fleety_tools::transport::Sender,
+    rx: fleety_tools::transport::Receiver,
+    config_protocol: u32,
+    target: fleety_tools::connection::Resolved,
+    server_fingerprint: Option<String>,
+    input: &mut crate::workspace::WorkspaceInput,
+) -> Result<()> {
+    let mut initial_connection = Some((tx, rx, config_protocol));
     loop {
-        let (mut tx, mut rx, config_protocol, _target) =
-            crate::connect_hello_for_auth().await.map_err(|e| {
-                CoreError::Message(format!(
-                    "could not reach the server whose providers this would edit: {} — pair this \
-                     device first (`fleety pair <code>`) or select the server with `fleety server \
-                     use <name>`; provider configuration is never written locally by the CLI",
-                    e.report().message
-                ))
-            })?;
+        let (mut tx, mut rx, config_protocol) = match initial_connection.take() {
+            Some(connection) => connection,
+            None => {
+                let (tx, rx, protocol, fingerprint) = crate::connect_hello_for_auth_target(&target)
+                    .await
+                    .map_err(provider_editor_connect_error)?;
+                crate::provider_service::validate_server_identity(
+                    server_fingerprint.as_deref(),
+                    fingerprint.as_deref(),
+                    "Provider editor reconnect",
+                )
+                .map_err(crate::provider_service::issue_as_error)?;
+                (tx, rx, protocol)
+            }
+        };
         if let Some(err) = provider_edit_support_err(config_protocol) {
             return Err(err);
         }
-        crate::send(
-            &mut tx,
-            &ClientMsg::ConfigSnapshot {
-                target: ConfigTarget::Server,
-            },
-        )
-        .await?;
-        let (mut revision, providers_json) = match crate::recv(&mut rx).await? {
-            Some(ServerMsg::ConfigSnapshotResult {
-                revision,
-                providers_json,
-                ..
-            }) => (revision, providers_json),
-            Some(ServerMsg::ConfigResult { error: Some(e), .. }) => {
-                return Err(CoreError::Message(match e.remediation {
-                    Some(r) => format!("{} — {r}", e.message),
-                    None => e.message,
-                }))
-            }
-            other => {
-                return Err(CoreError::Provider(format!(
-                    "expected a config snapshot, got {other:?}"
-                )))
-            }
-        };
-        let cfg: fleety_tools::providers_config::ProvidersConfig =
-            serde_json::from_str(&providers_json).map_err(|e| {
-                CoreError::Message(format!(
-                    "the server returned an unreadable provider snapshot: {e}"
-                ))
-            })?;
+        let snapshot =
+            crate::provider_service::load_snapshot(&mut tx, &mut rx, config_protocol).await?;
+        let mut revision = snapshot.revision;
+        let cfg = snapshot.config;
 
         // Credential status is server-owned. A status failure is deliberately
         // non-fatal so the editor never turns an unavailable query into a false
         // "not signed in" claim or blocks unrelated config edits.
-        let mut auth_states = crate::provider_tui::ProviderAuthStates::new();
-        for (provider_name, provider) in &cfg.providers {
-            if provider.kind != "oauth:codex" {
-                continue;
-            }
-            let state = if config_protocol < 3 {
-                crate::provider_tui::ProviderAuthState::Unavailable
-            } else {
-                let query = async {
-                    crate::send(
-                        &mut tx,
-                        &ClientMsg::CredentialStatus {
-                            kind: "codex-oauth".to_string(),
-                            provider: Some(provider_name.clone()),
-                        },
-                    )
-                    .await?;
-                    crate::recv(&mut rx).await
-                }
-                .await;
-                match query {
-                    Ok(Some(ServerMsg::CredentialStatusResult { present, error, .. }))
-                        if error.is_none() =>
-                    {
-                        if present {
-                            crate::provider_tui::ProviderAuthState::SignedIn
-                        } else {
-                            crate::provider_tui::ProviderAuthState::NotSignedIn
-                        }
-                    }
-                    _ => crate::provider_tui::ProviderAuthState::Unavailable,
-                }
-            };
-            auth_states.insert(provider_name.clone(), state);
-        }
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        let auth_states = crate::provider_service::load_auth_states(
+            &mut tx,
+            &mut rx,
+            config_protocol,
+            &cfg,
+            now_secs,
+        )
+        .await;
+        let connection_id = target.url.clone();
 
         // The editor loop is synchronous (crossterm events); each save runs the
         // async apply on the runtime from inside it.
         let handle = tokio::runtime::Handle::current();
         let io = std::rc::Rc::new(tokio::sync::Mutex::new((&mut tx, &mut rx)));
+        let catalog_handle = handle.clone();
+        let catalog_target = target.clone();
+        let catalog_connection_id = connection_id.clone();
+        let catalog_server_fingerprint = server_fingerprint.clone();
         let outcome = tokio::task::block_in_place(|| {
             crate::provider_tui::run_with_saver_and_fetcher(
                 cfg,
-                |edited| {
-                    let json = serde_json::to_string(edited)
-                        .map_err(|e| CoreError::Message(format!("serialize providers: {e}")))?;
+                |edited, clear_keys| {
                     handle.block_on(async {
                         let mut io = io.lock().await;
-                        crate::send(
-                            io.0,
-                            &ClientMsg::ConfigApply {
-                                target: ConfigTarget::Server,
-                                base_revision: revision.clone(),
-                                changes: vec![],
-                                providers_json: Some(json),
-                            },
+                        let (apply_tx, apply_rx) = &mut *io;
+                        match crate::provider_service::apply_snapshot(
+                            apply_tx,
+                            apply_rx,
+                            revision.clone(),
+                            edited,
+                            clear_keys,
                         )
-                        .await?;
-                        let reply = crate::recv(io.1).await?;
-                        match reply {
-                            Some(ServerMsg::ConfigResult { ok: true, .. }) => {
+                        .await
+                        {
+                            Ok(()) => {
                                 // Our own write moved the server's revision; refresh
                                 // it so the next save in this session doesn't
                                 // conflict with our own edit.
-                                crate::send(
-                                    io.0,
-                                    &ClientMsg::ConfigSnapshot {
-                                        target: ConfigTarget::Server,
-                                    },
-                                )
-                                .await?;
-                                let snapshot = crate::recv(io.1).await?;
-                                if let Some(ServerMsg::ConfigSnapshotResult {
-                                    revision: r, ..
-                                }) = snapshot
-                                {
-                                    revision = r;
-                                }
-                                Ok(crate::provider_tui::SaveOutcome::Saved)
+                                Ok(provider_refresh_outcome(
+                                    &mut revision,
+                                    refresh_provider_revision(apply_tx, apply_rx, config_protocol)
+                                        .await,
+                                ))
                             }
-                            Some(ServerMsg::ConfigResult { error: Some(e), .. })
-                                if e.kind == "conflict" =>
-                            {
-                                Ok(crate::provider_tui::SaveOutcome::Conflict(e.message))
+                            Err(issue) if issue.kind == "conflict" => {
+                                Ok(crate::provider_tui::SaveOutcome::Conflict(issue.message))
                             }
-                            Some(ServerMsg::ConfigResult { error: Some(e), .. }) => {
-                                Err(CoreError::Message(match e.remediation {
-                                    Some(r) => format!("{} — {r}", e.message),
-                                    None => e.message,
-                                }))
-                            }
-                            other => Err(CoreError::Provider(format!(
-                                "expected a config result, got {other:?}"
-                            ))),
+                            Err(issue) => Err(crate::provider_service::issue_as_error(issue)),
                         }
                     })
                 },
-                |provider_name, _provider| {
-                    if config_protocol < 4 {
-                        return Err(
-                            "server does not support provider model discovery (config protocol < 4)"
-                                .to_string(),
-                        );
+                move |request, cancellation| {
+                    if request.connection_id != catalog_connection_id {
+                        return Err(crate::provider_service::ProviderIssue::new(
+                            "target_changed",
+                            "Provider catalog request no longer matches this Server",
+                            Some("Reopen the Provider editor"),
+                        ));
                     }
-                    handle
-                        .block_on(async {
-                            let mut io = io.lock().await;
-                            crate::send(
-                                io.0,
-                                &ClientMsg::ProviderModelList {
-                                    provider: provider_name.to_string(),
-                                },
-                            )
-                            .await?;
-                            let reply = crate::recv(io.1).await?;
-                            match reply {
-                                Some(ServerMsg::ProviderModelListResult {
-                                    provider,
-                                    model_ids,
-                                    error,
-                                }) if provider == provider_name => match error {
-                                    None if !model_ids.is_empty() => Ok(model_ids),
-                                    Some(e) => Err(CoreError::Message(match e.remediation {
-                                        Some(r) => format!("{} — {r}", e.message),
-                                        None => e.message,
-                                    })),
-                                    None => Err(CoreError::Message(
-                                        "server returned no model IDs".to_string(),
-                                    )),
-                                },
-                                other => Err(CoreError::Provider(format!(
-                                    "expected provider model result, got {other:?}"
-                                ))),
+                    catalog_handle.block_on(async {
+                        tokio::select! {
+                            result = async {
+                                let (
+                                    mut catalog_tx,
+                                    mut catalog_rx,
+                                    catalog_protocol,
+                                    catalog_fingerprint,
+                                ) = crate::connect_hello_for_auth_target(&catalog_target)
+                                    .await
+                                    .map_err(|error| {
+                                        crate::provider_service::ProviderIssue::new(
+                                            "transport",
+                                            error.report().message,
+                                            Some("Reconnect to this Server and retry"),
+                                        )
+                                    })?;
+                                crate::provider_service::validate_server_identity(
+                                    catalog_server_fingerprint.as_deref(),
+                                    catalog_fingerprint.as_deref(),
+                                    "Provider catalog fetch",
+                                )?;
+                                crate::provider_service::fetch_catalog(
+                                    &mut catalog_tx,
+                                    &mut catalog_rx,
+                                    catalog_protocol,
+                                    request,
+                                )
+                                .await
+                            } => result,
+                            () = wait_for_catalog_cancel(cancellation) => {
+                                Err(crate::provider_service::ProviderIssue::new(
+                                    "cancelled",
+                                    "Provider catalog request was cancelled",
+                                    None::<String>,
+                                ))
                             }
-                        })
-                        .map_err(|e: CoreError| e.to_string())
+                        }
+                    })
                 },
                 auth_states,
+                connection_id.clone(),
+                config_protocol,
+                input,
             )
         })?;
         // An OAuth action the editor asked for: the just-added/edited provider is
@@ -360,31 +352,74 @@ pub async fn provider_edit_remote() -> Result<()> {
         // plain terminal. Run the sign-in/out/switch against THIS server, then
         // reopen the editor on a fresh snapshot.
         if let Some(req) = outcome.auth_request {
-            crate::config_panel::run_auth_action(&req).await;
+            crate::config_panel::run_auth_action_on_target(
+                &req,
+                &target,
+                server_fingerprint.as_deref(),
+                input,
+            )
+            .await;
             continue;
         }
         // A concurrent-edit conflict: reload from a fresh snapshot and reopen.
         match outcome.conflict {
             None => return Ok(()),
             Some(msg) => {
-                println!("{msg} — reloading the current server configuration…");
+                println!(
+                    "{} — reloading the current server configuration…",
+                    crate::terminal_safe_text(&msg)
+                );
                 continue;
             }
         }
     }
 }
-use ratatui::crossterm::event::KeyCode;
-use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::text::Line;
-use ratatui::widgets::{Block, Paragraph};
-use ratatui::Frame;
 
-use crate::input::LineEditor;
+async fn refresh_provider_revision(
+    tx: &mut fleety_tools::transport::Sender,
+    rx: &mut fleety_tools::transport::Receiver,
+    config_protocol: u32,
+) -> Result<String> {
+    Ok(
+        crate::provider_service::load_snapshot(tx, rx, config_protocol)
+            .await?
+            .revision,
+    )
+}
 
-/// Run a `config` subcommand. The dispatch (list/get/set/unset/help + the
-/// line-based edit) is shared in `fleety_tools::config` so `fleety-server` and
-/// `fleetyd` expose the same `config` command; the CLI only overrides `edit` to
-/// open the ratatui screen when stdout is a TTY.
+fn provider_refresh_outcome(
+    revision: &mut String,
+    refresh: Result<String>,
+) -> crate::provider_tui::SaveOutcome {
+    match refresh {
+        Ok(fresh_revision) => {
+            *revision = fresh_revision;
+            crate::provider_tui::SaveOutcome::Saved
+        }
+        Err(error) => {
+            crate::provider_tui::SaveOutcome::SavedRefreshRequired(error.report().message)
+        }
+    }
+}
+
+async fn wait_for_catalog_cancel(cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    use std::sync::atomic::Ordering;
+
+    while !cancellation.load(Ordering::Acquire) {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+fn provider_editor_connect_error(error: CoreError) -> CoreError {
+    CoreError::Message(format!(
+        "could not reach the Server whose Providers this would edit: {} — pair this device first \
+         (`fleety pair <code>`) or select it with `fleety connection use <name>`; Provider \
+         configuration is never written locally by the CLI",
+        error.report().message
+    ))
+}
+/// Run a non-interactive CLI-owned `config` subcommand. `open`/legacy `edit`
+/// are intercepted by `main` and routed into the shared Settings workspace.
 pub fn run(args: &[String]) -> Result<()> {
     if matches!(args.first().map(String::as_str), Some("provider" | "model")) {
         return Err(CoreError::Message(
@@ -393,240 +428,146 @@ pub fn run(args: &[String]) -> Result<()> {
                 .to_string(),
         ));
     }
-    if matches!(config::parse(args), config::Command::Edit) && std::io::stdout().is_terminal() {
-        run_tui_edit(&config::config_path())
-    } else {
-        // The CLI's config path is always the *local* target (main.rs routes
-        // remote via config_remote), so restrict it to this device's scopes.
-        config::run_scoped(args, Some(config::LOCAL_SCOPES))
-    }
+    // The CLI's config path is always the local target (main.rs routes remote
+    // operations and interactive Settings), so restrict it to CLI scopes.
+    config::run_scoped(args, Some(config::LOCAL_SCOPES))
 }
 
-// ---- ratatui edit screen (CLI-only; needs a TTY) ----
-
-/// One row in the config screen (raw resolved value + its source).
-struct Row {
-    key: &'static str,
-    scope: &'static str,
-    secret: bool,
-    value: String,
-    source: String,
-}
-
-fn source_label(s: Source) -> &'static str {
-    match s {
-        Source::Env => "env",
-        Source::Config => "config",
-        Source::Default => "default",
-    }
-}
-
-fn build_rows(map: &ConfigMap) -> Vec<Row> {
-    // The local edit screen shows only CLI-owned settings. Shared settings are
-    // daemon-owned and travel through fleetyd like other daemon settings.
-    config::registry()
-        .iter()
-        .filter(|s| config::LOCAL_SCOPES.contains(&s.scope))
-        .filter_map(|s| {
-            let r = config::resolve(s.key, map)?;
-            Some(Row {
-                key: s.key,
-                scope: s.scope.as_str(),
-                secret: s.secret,
-                value: r.value,
-                source: source_label(r.source).to_string(),
-            })
-        })
-        .collect()
-}
-
-/// Config-screen state. `on_key` is pure (no I/O) so it's unit-testable; the run
-/// loop owns terminal + file I/O.
-struct ConfigApp {
-    rows: Vec<Row>,
-    map: ConfigMap,
-    sel: usize,
-    /// `Some(editor)` while editing the selected row's value.
-    edit: Option<LineEditor>,
-    status: String,
-    quit: bool,
-}
-
-impl ConfigApp {
-    fn new(map: ConfigMap) -> Self {
-        Self {
-            rows: build_rows(&map),
-            map,
-            sel: 0,
-            edit: None,
-            status: "↑/↓ move · Enter edit · q quit".to_string(),
-            quit: false,
-        }
-    }
-}
-
-/// Handle one key. Returns `true` when the map changed and should be saved.
-fn on_key(app: &mut ConfigApp, key: KeyCode) -> bool {
-    if let Some(ed) = app.edit.as_mut() {
-        match key {
-            KeyCode::Char(c) => ed.insert(c),
-            KeyCode::Backspace => ed.backspace(),
-            KeyCode::Delete => ed.delete(),
-            KeyCode::Left => ed.left(),
-            KeyCode::Right => ed.right(),
-            KeyCode::Home => ed.home(),
-            KeyCode::End => ed.end(),
-            KeyCode::Esc => {
-                app.edit = None;
-                app.status = "edit cancelled".to_string();
-            }
-            KeyCode::Enter => {
-                let buf = app.edit.take().map(|mut e| e.take()).unwrap_or_default();
-                let Some(row) = app.rows.get(app.sel) else {
-                    return false;
-                };
-                let Some(setting) = config::find(row.key) else {
-                    return false;
-                };
-                if buf.is_empty() {
-                    app.map.remove(&(setting.scope, setting.key.to_string()));
-                    app.status = format!("unset {} (reverts to env/default)", setting.key);
-                } else {
-                    // Reject out-of-domain values before they reach the map/file;
-                    // reopen the editor with the rejected text so the user can
-                    // fix it, surface the reason, and skip the save.
-                    if let Err(e) = config::validate(setting, &buf) {
-                        app.status = e.to_string();
-                        let mut ed = LineEditor::default();
-                        ed.set_text(buf);
-                        app.edit = Some(ed);
-                        return false;
-                    }
-                    app.map
-                        .insert((setting.scope, setting.key.to_string()), buf);
-                    app.status = format!("set {}", setting.key);
-                }
-                if let Some(r) = config::resolve(setting.key, &app.map) {
-                    app.rows[app.sel].value = r.value;
-                    app.rows[app.sel].source = source_label(r.source).to_string();
-                }
-                return true;
-            }
-            _ => {}
-        }
-        return false;
-    }
-    match key {
-        KeyCode::Up | KeyCode::Char('k') => app.sel = app.sel.saturating_sub(1),
-        KeyCode::Down | KeyCode::Char('j') => {
-            if app.sel + 1 < app.rows.len() {
-                app.sel += 1;
-            }
-        }
-        KeyCode::Enter => {
-            // Prefill the raw value (never the mask) only when it really comes
-            // from the config file — env values and placeholder defaults like
-            // `(heuristic)` must not be one Enter away from being saved as if
-            // they were literal values.
-            let raw = app
-                .rows
-                .get(app.sel)
-                .filter(|r| r.source == "config")
-                .map(|r| r.value.clone())
-                .unwrap_or_default();
-            let mut ed = LineEditor::default();
-            ed.set_text(raw);
-            app.edit = Some(ed);
-            app.status = "type a value · Enter save · empty=unset · Esc cancel".to_string();
-        }
-        KeyCode::Char('q') | KeyCode::Esc => app.quit = true,
-        _ => {}
-    }
-    false
-}
-
-fn render(f: &mut Frame, app: &ConfigApp) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(3)])
-        .split(f.area());
-    let inner_w = chunks[0].width.saturating_sub(2) as usize;
-    let mut lines: Vec<Line> = Vec::with_capacity(app.rows.len());
-    for (i, r) in app.rows.iter().enumerate() {
-        let shown = if let (true, Some(ed)) = (i == app.sel, &app.edit) {
-            // Show the editor's window so the cursor stays visible even when
-            // a long value outgrows the row (prefix width mirrors the format
-            // string below with the ">" marker).
-            let prefix = format!("> [{:7}] {:<28} = ", r.scope, r.key);
-            let avail = inner_w.saturating_sub(Line::from(prefix.as_str()).width());
-            ed.display_window(avail).0.to_string()
-        } else if r.secret && !r.value.is_empty() {
-            "********".to_string()
-        } else {
-            r.value.clone()
-        };
-        let marker = if i == app.sel { ">" } else { " " };
-        lines.push(Line::from(format!(
-            "{marker} [{:7}] {:<28} = {shown}  ({})",
-            r.scope, r.key, r.source
-        )));
-    }
-    // Scroll so the selected row stays visible when the registry outgrows the
-    // pane (row i renders on content line i).
-    let inner_h = chunks[0].height.saturating_sub(2);
-    let offset = (app.sel as u16 + 1).saturating_sub(inner_h);
-    f.render_widget(
-        Paragraph::new(lines)
-            .block(Block::bordered().title("fleety config — settings"))
-            .scroll((offset, 0)),
-        chunks[0],
-    );
-    // While editing, put the terminal cursor at its column inside the value
-    // (same window as the row above, so cursor and glyphs line up).
-    if let (Some(ed), Some(r)) = (&app.edit, app.rows.get(app.sel)) {
-        let prefix = format!("> [{:7}] {:<28} = ", r.scope, r.key);
-        let prefix_w = Line::from(prefix.as_str()).width();
-        let (_, x) = ed.display_window(inner_w.saturating_sub(prefix_w));
-        f.set_cursor_position((
-            chunks[0].x + 1 + (prefix_w + x as usize).min(inner_w) as u16,
-            chunks[0].y + 1 + (app.sel as u16).saturating_sub(offset),
-        ));
-    }
-    f.render_widget(
-        Paragraph::new(app.status.clone()).block(Block::bordered()),
-        chunks[1],
-    );
-}
-
-fn run_tui_edit(path: &Path) -> Result<()> {
-    use ratatui::crossterm::event::{self, Event, KeyEventKind};
-    let mut app = ConfigApp::new(config::load(path));
-    let mut terminal = ratatui::init();
-    let result = (|| -> Result<()> {
-        loop {
-            terminal
-                .draw(|f| render(f, &app))
-                .map_err(|e| CoreError::Message(format!("draw failed: {e}")))?;
-            if app.quit {
-                break;
-            }
-            if let Event::Key(k) =
-                event::read().map_err(|e| CoreError::Message(format!("read failed: {e}")))?
-            {
-                if k.kind != KeyEventKind::Release && on_key(&mut app, k.code) {
-                    config::save(path, &app.map)?;
-                }
-            }
-        }
-        Ok(())
-    })();
-    ratatui::restore();
-    result
+/// Persist a complete staged CLI-owner snapshot without replacing settings
+/// owned by another runtime. All interactive CLI-owner applies pass through
+/// this boundary instead of calling the file serializer directly.
+pub(crate) fn apply_cli_owner(path: &Path, map: &ConfigMap) -> Result<()> {
+    config::replace_scopes_strict(path, config::CLI_SCOPES, map)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone, Copy)]
+    enum RefreshFailureReply {
+        Error,
+        Close,
+        WrongReply,
+    }
+
+    async fn provider_refresh_failure(
+        reply: RefreshFailureReply,
+    ) -> crate::provider_tui::SaveOutcome {
+        use futures::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind provider refresh server");
+        let address = listener.local_addr().expect("provider refresh address");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept refresh client");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("accept refresh websocket");
+            let frame = websocket
+                .next()
+                .await
+                .expect("refresh frame")
+                .expect("read refresh frame");
+            let request: ClientMsg =
+                serde_json::from_str(frame.to_text().expect("refresh request is text"))
+                    .expect("parse refresh request");
+            assert!(matches!(
+                request,
+                ClientMsg::ConfigSnapshot {
+                    target: ConfigTarget::Server
+                }
+            ));
+            match reply {
+                RefreshFailureReply::Error => websocket
+                    .send(Message::Text(
+                        serde_json::to_string(&ServerMsg::Error {
+                            error: fleety_protocol::WireError {
+                                kind: "snapshot_failed".into(),
+                                message: "fresh snapshot unavailable".into(),
+                                remediation: None,
+                            },
+                        })
+                        .expect("serialize snapshot error"),
+                    ))
+                    .await
+                    .expect("send snapshot error"),
+                RefreshFailureReply::WrongReply => websocket
+                    .send(Message::Text(
+                        serde_json::to_string(&ServerMsg::ConfigResult {
+                            ok: true,
+                            output: "not a snapshot".into(),
+                            effect: None,
+                            error: None,
+                        })
+                        .expect("serialize wrong reply"),
+                    ))
+                    .await
+                    .expect("send wrong reply"),
+                RefreshFailureReply::Close => {}
+            }
+        });
+        let connection = fleety_tools::transport::connect(&format!("ws://{address}"), None)
+            .await
+            .expect("connect provider refresh client");
+        let (mut tx, mut rx) = connection.split();
+        let refresh = refresh_provider_revision(&mut tx, &mut rx, 5).await;
+        server.await.expect("provider refresh server task");
+        let mut stale_revision = "stale-r1".to_string();
+        let outcome = provider_refresh_outcome(&mut stale_revision, refresh);
+        assert_eq!(
+            stale_revision, "stale-r1",
+            "a failed refresh cannot replace the revision"
+        );
+        outcome
+    }
+
+    fn refresh_required_reason(outcome: crate::provider_tui::SaveOutcome) -> String {
+        match outcome {
+            crate::provider_tui::SaveOutcome::SavedRefreshRequired(reason) => reason,
+            _ => panic!("refresh failure must lock the Provider editor"),
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_refresh_error_requires_reopen() {
+        let error =
+            refresh_required_reason(provider_refresh_failure(RefreshFailureReply::Error).await);
+        assert!(error.contains("fresh snapshot unavailable"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn provider_refresh_close_requires_reopen() {
+        let error =
+            refresh_required_reason(provider_refresh_failure(RefreshFailureReply::Close).await);
+        assert!(
+            error.contains("closed") || error.contains("ended"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_refresh_wrong_reply_requires_reopen() {
+        let error = refresh_required_reason(
+            provider_refresh_failure(RefreshFailureReply::WrongReply).await,
+        );
+        assert!(
+            error
+                .to_ascii_lowercase()
+                .contains("expected a provider configuration snapshot"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn successful_provider_refresh_replaces_the_revision_and_remains_editable() {
+        let mut revision = "stale-r1".to_string();
+        let outcome = provider_refresh_outcome(&mut revision, Ok("fresh-r2".into()));
+        assert!(matches!(outcome, crate::provider_tui::SaveOutcome::Saved));
+        assert_eq!(revision, "fresh-r2");
+    }
 
     #[test]
     fn split_target_extracts_and_defaults() {
@@ -663,19 +604,56 @@ mod tests {
             &Target::Server
         ));
 
-        // Version gate: pre-credential-era servers silently drop the write-back
-        // field, so the editor must not open against them.
+        // Version gate: only protocol 5 guarantees write-only Provider keys and
+        // Server-side Keep merging, so older snapshots must not be requested.
         let msg = provider_edit_support_err(1)
             .expect("old server refused")
             .to_string();
         assert!(msg.contains("update"), "gate names the remedy: {msg}");
         assert!(msg.contains("server-owned"), "gate names ownership: {msg}");
         assert!(provider_edit_support_err(0).is_some());
-        assert!(provider_edit_support_err(2).is_none());
+        assert!(provider_edit_support_err(2).is_some());
         assert!(
-            provider_edit_support_err(3).is_none(),
-            "future versions pass"
+            provider_edit_support_err(4).is_some(),
+            "protocol 4 still returned plaintext Provider keys"
         );
+        assert!(provider_edit_support_err(5).is_none());
+    }
+
+    #[test]
+    fn catalog_reconnect_requires_the_original_server_identity() {
+        let validate = |expected, actual| {
+            crate::provider_service::validate_server_identity(expected, actual, "catalog")
+        };
+        assert!(validate(Some("server-a"), Some("server-a")).is_ok());
+
+        let changed = validate(Some("server-a"), Some("server-b"))
+            .expect_err("different Server must be rejected");
+        assert_eq!(changed.kind, "server_identity_changed");
+
+        let missing = validate(None, Some("server-a"))
+            .expect_err("unverifiable original Server must be rejected");
+        assert_eq!(missing.kind, "server_identity_unavailable");
+
+        let disappeared = validate(Some("server-a"), None)
+            .expect_err("missing reconnect identity must be rejected");
+        assert_eq!(disappeared.kind, "server_identity_changed");
+    }
+
+    #[tokio::test]
+    async fn catalog_cancel_wait_finishes_after_the_signal() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let signal = Arc::clone(&cancellation);
+        let waiter = tokio::spawn(wait_for_catalog_cancel(cancellation));
+        signal.store(true, Ordering::Release);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("cancellation wait deadline")
+            .expect("cancellation wait task");
     }
 
     #[test]
@@ -690,6 +668,10 @@ mod tests {
             Target::Device("dev".into())
         );
         assert_eq!(
+            resolve_target(Target::Daemon, &s(&["list"]), "dev").unwrap(),
+            Target::Device("dev".into())
+        );
+        assert_eq!(
             resolve_target(
                 Target::Auto,
                 &s(&["set", "FLEETY_VOICE_AUDIO", "auto"]),
@@ -701,140 +683,5 @@ mod tests {
         assert!(resolve_target(Target::Server, &s(&["set", "FLEETY_TZ", "UTC"]), "dev").is_err());
         assert!(resolve_target(Target::Cli, &s(&["provider", "edit"]), "dev").is_err());
         assert!(split_target(&s(&["--target"])).is_err());
-    }
-
-    #[test]
-    fn config_tui_key_handling() {
-        let mut app = ConfigApp::new(ConfigMap::new());
-        assert!(app.rows.len() >= 2);
-
-        // Navigation.
-        on_key(&mut app, KeyCode::Down);
-        assert_eq!(app.sel, 1);
-        on_key(&mut app, KeyCode::Up);
-        assert_eq!(app.sel, 0);
-
-        // Drive the edit assertions on a CLI-owned key. Shared keys such as
-        // FLEETY_TZ belong to fleetyd and intentionally do not appear here.
-        app.sel = app
-            .rows
-            .iter()
-            .position(|r| r.key == "FLEETY_VOICE_AUDIO")
-            .expect("FLEETY_VOICE_AUDIO present");
-        let key0 = app.rows[app.sel].key;
-        let setting = config::find(key0).expect("known");
-
-        // Edit then cancel → no change, no save.
-        on_key(&mut app, KeyCode::Enter);
-        assert!(app.edit.is_some());
-        on_key(&mut app, KeyCode::Esc);
-        assert!(app.edit.is_none());
-        assert!(!app.map.contains_key(&(setting.scope, key0.to_string())));
-
-        // Edit then commit a value → saved + map updated.
-        on_key(&mut app, KeyCode::Enter);
-        app.edit = Some(LineEditor::default()); // clear the prefilled default for a clean assert
-        for c in "off".chars() {
-            on_key(&mut app, KeyCode::Char(c));
-        }
-        assert!(on_key(&mut app, KeyCode::Enter));
-        assert_eq!(
-            app.map
-                .get(&(setting.scope, key0.to_string()))
-                .map(String::as_str),
-            Some("off")
-        );
-
-        // Empty buffer → unset (removed from map).
-        on_key(&mut app, KeyCode::Enter);
-        app.edit = Some(LineEditor::default());
-        assert!(on_key(&mut app, KeyCode::Enter));
-        assert!(!app.map.contains_key(&(setting.scope, key0.to_string())));
-
-        // Quit.
-        on_key(&mut app, KeyCode::Char('q'));
-        assert!(app.quit);
-    }
-
-    #[test]
-    fn config_tui_rejects_invalid_value() {
-        let mut app = ConfigApp::new(ConfigMap::new());
-        // Select a validated CLI-owned key.
-        app.sel = app
-            .rows
-            .iter()
-            .position(|r| r.key == "FLEETY_VOICE_AUDIO")
-            .expect("FLEETY_VOICE_AUDIO present");
-        let setting = config::find("FLEETY_VOICE_AUDIO").expect("known");
-
-        // Type an out-of-domain value and commit it.
-        on_key(&mut app, KeyCode::Enter);
-        app.edit = Some(LineEditor::default()); // clear any prefill
-        for c in "abc".chars() {
-            on_key(&mut app, KeyCode::Char(c));
-        }
-        let saved = on_key(&mut app, KeyCode::Enter);
-
-        // Not saved, not stored, and the error names the key + accepted values.
-        assert!(!saved, "an invalid commit must not request a save");
-        assert!(
-            !app.map
-                .contains_key(&(setting.scope, "FLEETY_VOICE_AUDIO".to_string())),
-            "the rejected value must not enter the map"
-        );
-        assert!(
-            app.status.contains("FLEETY_VOICE_AUDIO"),
-            "status: {}",
-            app.status
-        );
-        assert!(
-            app.status.contains("auto") && app.status.contains("off"),
-            "status should list the accepted voice values, got: {}",
-            app.status
-        );
-    }
-
-    #[test]
-    fn build_rows_is_local_scope_only() {
-        let rows = build_rows(&ConfigMap::new());
-        assert!(!rows.is_empty());
-        for r in &rows {
-            assert!(
-                r.scope == "cli",
-                "local edit rows are CLI-only, got {} [{}]",
-                r.key,
-                r.scope
-            );
-        }
-        assert!(
-            !rows.iter().any(|r| r.key == "FLEETY_TZ"),
-            "a Shared key is excluded"
-        );
-        assert!(
-            !rows.iter().any(|r| r.key == "FLEETY_ADDR"),
-            "a Server key is excluded"
-        );
-    }
-
-    #[test]
-    fn config_edit_cursor_keys() {
-        let mut app = ConfigApp::new(ConfigMap::new());
-        on_key(&mut app, KeyCode::Enter);
-        app.edit = Some(LineEditor::default()); // start from a clean buffer
-        for c in "abc".chars() {
-            on_key(&mut app, KeyCode::Char(c));
-        }
-        // Left + insert edits mid-value; Home/Delete removes the first char.
-        on_key(&mut app, KeyCode::Left);
-        on_key(&mut app, KeyCode::Char('X'));
-        on_key(&mut app, KeyCode::Home);
-        on_key(&mut app, KeyCode::Delete);
-        assert_eq!(app.edit.as_ref().map(|e| e.text()), Some("bXc"));
-        // End puts the cursor back for a tail backspace.
-        on_key(&mut app, KeyCode::End);
-        on_key(&mut app, KeyCode::Backspace);
-        assert_eq!(app.edit.as_ref().map(|e| e.text()), Some("bX"));
-        on_key(&mut app, KeyCode::Esc);
-        assert!(app.edit.is_none());
     }
 }

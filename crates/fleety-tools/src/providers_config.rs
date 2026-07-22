@@ -275,6 +275,26 @@ pub fn validate(cfg: &ProvidersConfig) -> Result<()> {
                 p.kind
             )));
         }
+        if let Some(base_url) = p.base_url.as_deref() {
+            let parsed = reqwest::Url::parse(base_url).map_err(|error| {
+                CoreError::Message(format!(
+                    "provider '{name}' has an invalid base_url: {error}"
+                ))
+            })?;
+            if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+                return Err(CoreError::Message(format!(
+                    "provider '{name}' base_url must be an absolute http:// or https:// URL"
+                )));
+            }
+            if !parsed.username().is_empty()
+                || parsed.password().is_some()
+                || parsed.fragment().is_some()
+            {
+                return Err(CoreError::Message(format!(
+                    "provider '{name}' base_url must not contain credentials or a fragment"
+                )));
+            }
+        }
         if !t.requires_base_url && p.base_url.is_some() {
             return Err(CoreError::Message(format!(
                 "provider '{name}' (type {}) must not set base_url",
@@ -289,6 +309,11 @@ pub fn validate(cfg: &ProvidersConfig) -> Result<()> {
         }
     }
     for (role, pool) in &cfg.models {
+        if !matches!(role.as_str(), "main" | "cheap") {
+            return Err(CoreError::Message(format!(
+                "unknown model role '{role}' (expected main or cheap)"
+            )));
+        }
         if pool.members.is_empty() {
             return Err(CoreError::Message(format!(
                 "model role '{role}' has no members"

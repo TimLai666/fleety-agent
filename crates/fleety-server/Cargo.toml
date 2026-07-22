@@ -50,6 +50,7 @@ base64 = { workspace = true }
 # stays `forbid(unsafe_code)`.
 rusqlite = { version = "0.32", features = ["bundled"] }
 fleety-vec = { workspace = true }
+clap = { workspace = true }
 
 # Local embedding model (EmbeddingGemma via ONNX). Not on Intel macOS: the
 # ort/ONNX runtime ships no prebuilt x86_64-apple-darwin library, so semantic

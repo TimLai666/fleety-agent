@@ -19,7 +19,7 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// `provider`, and a `codex-oauth` frame without one is rejected); `4` adds
 /// provider-specific model discovery. Additive — an older server omits it and
 /// the client sees `0`.
-pub const CONFIG_PROTOCOL_VERSION: u32 = 4;
+pub const CONFIG_PROTOCOL_VERSION: u32 = 5;
 
 /// Wire form of an actionable error (mirrors `agent_core::ErrorReport`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -273,11 +273,11 @@ pub enum ClientMsg {
     /// Apply a sparse set of config changes under optimistic locking:
     /// `base_revision` is the revision of the snapshot the edit started from; the
     /// server rejects the apply as a conflict if it no longer matches (no lost
-    /// update). `providers_json`, when present, additionally writes back the full
-    /// structured provider config (the same shape `ConfigSnapshotResult` returns)
-    /// under the same revision lock — part of the config protocol 2 capability
-    /// set; older servers ignore unknown fields, so clients must gate on the
-    /// advertised version before sending it. Reply: `ConfigResult`.
+    /// update). `providers_json`, when present, writes back the structured
+    /// provider config under the same revision lock. Since config protocol 5,
+    /// snapshot keys are write-only: omitted keys mean Keep and newly supplied
+    /// values mean Set. Older servers must be rejected before a Provider snapshot
+    /// is requested. Reply: `ConfigResult`.
     ConfigApply {
         target: ConfigTarget,
         base_revision: String,
@@ -480,7 +480,9 @@ pub enum ServerMsg {
     ConfigSnapshotResult {
         revision: String,
         entries: Vec<ConfigEntry>,
-        /// JSON-encoded structured provider/model config (providers.toml shape).
+        /// JSON-encoded structured provider/model config. Provider key values are
+        /// never included; config protocol 5 adds non-secret `key_present`
+        /// metadata and treats omitted keys as Keep on apply.
         providers_json: String,
     },
     /// Reply to `CredentialPut` / `CredentialDelete`.
@@ -571,7 +573,7 @@ mod tests {
         let json = serde_json::to_string(&w).expect("ser");
         assert!(json.contains("\"server_version\":\"0.3.0\""));
         assert!(json.contains("\"audio_input\":true"));
-        assert!(json.contains("\"config_protocol\":4"));
+        assert!(json.contains("\"config_protocol\":5"));
         assert!(json.contains("\"server_fingerprint\":\"srv-fp-1\""));
         // An old server's frame (no server_version / audio_input / config_protocol)
         // still parses → defaults ("" / false / 0 → legacy ConfigExec + local STT).

@@ -1,0 +1,91 @@
+<!--
+Each task description MUST state:
+- the behavior or contract being delivered (what is observably true when the
+  task is complete), and
+- the verification target that proves completion (test, CLI invocation,
+  analyzer check, manual assertion, or content review).
+
+File paths are supporting context for locating the work, never the task
+itself. "Edit file X" is not a valid task — it is missing both behavior and
+verification.
+-->
+
+## 1. 命令契約與量測基準
+
+- [x] 1.1 先為「Help and parse errors are complete and side-effect free」與「Every command node has exhaustive parser coverage」加入 red tests，涵蓋所有 command node 的 `help`／`--help`／`-h`、trailing args、錯字提示、exit 0／1／2 與 temp-home 無副作用；以 `cargo test -p fleety-cli --test cli_smoke` 證明現行 `config help`、`ask --help`、`tui --help` 會先失敗。
+- [x] 1.2 量測目前 clean release build 的時間與三個 binary 大小，完成「Use one typed command definition and generated help」選型門檻；加入最小功能的 `clap` 4／`clap_complete` 後重測，將差異記錄在 change notes，並以 Rust 1.80 build 與 `cargo tree -p fleety-cli` 驗證相容性及 feature 範圍。
+
+## 2. 宣告式命令與穩定輸出
+
+- [x] 2.1 實作「The CLI exposes one coherent task-oriented command tree」及「Organize canonical commands by user task」，讓 canonical command 與 `server`／`tui`／`auth`／config-nested alias 在執行前映射到同一 typed value；以 parser table tests 與 fake Server smoke test 證明「Compatibility aliases cannot drift from canonical commands」及「Connection is the canonical profile command group」。
+- [x] 2.2 將 `fleety`、`fleetyd`、`fleety-server` help 與 parse 完全改由 typed definition 產生，確保 help 在任何初始化前返回且錯誤提供 nearest suggestions；以三個 binary 的 smoke tests、temp-home byte comparison 及 `fleety conection list` 驗證。
+- [x] 2.3 實作「Invocation context is explicit and non-mutating」與「Make context global, visible, and non-mutating」，加入 `--profile`、legacy `--server`、canonical `--owner`／legacy `--target` 的單次解析和 owner preflight；以 profile A/B integration test 證明 override 不修改 `connections.toml` 且 result 顯示正確 profile／owner。
+- [x] 2.4 實作「Machine output has a stable envelope and exit classes」與「Define stable human and machine output modes」，統一 `--json`／`--quiet`／`--no-color`／`--warnings`，並以 JSON schema assertions、secret redaction tests、partial read exit 1 與 usage exit 2 smoke tests驗證。
+- [x] 2.5 [P] 實作「Diagnosis and completion are first-class commands」與「Add diagnosis and completion as first-class discovery tools」，讓 `doctor` 產生 PASS／WARN／FAIL 與 remediation、completion 僅輸出 stdout；以 fake healthy/partial/offline environments、JSON envelope tests 及 temp-home 無修改檢查驗證。
+
+## 3. 共用服務與 owner 邊界
+
+- [x] 3.1 重構 config application service 以完成「Multi-owner reads preserve available results and owner failures」及「Configuration results identify the actual owner context」，並維持每個 mutation 單一 owner、無 fallback；以 Daemon offline／Server online smoke test證明可用資料保留、exit 1、所有非 owner 檔案 byte-for-byte 不變。
+- [x] 3.2 建立 Provider/Model/Auth 共用 application service，完成「Provider, authentication, model catalog, and roles form one workflow」、「Model discovery failure has retry and manual recovery」及「Provider commands and TUI share one application service」；以 command/TUI validation parity tests、OAuth 狀態矩陣、catalog retry recording server 與 alias payload equality 驗證「Integrate provider, OAuth, and model discovery」。
+
+## 4. 整合式 terminal workspace
+
+- [x] 4.1 建立 pure `WorkspaceState`、Route、ConnectionState、OwnerState、Notice 與 effect reducer，完成「Interactive entry points share one terminal workspace」、「The workspace keeps context and navigation visible」及「Use one terminal workspace shell」；以 state-transition unit tests 和 bare TTY／non-TTY smoke tests驗證入口與共享 context。
+- [x] 4.2 實作 workspace shell 的 header、route content、persistent notices、contextual footer、help 與 command palette，完成「Workspace key behavior is state-consistent」及「Notices preserve actionable errors」；以 Esc／Ctrl+C／`?`／Ctrl+K 狀態矩陣與 unresolved error persistence tests驗證。
+- [x] 4.3 重構 Settings route 以完成「Settings use owner-aware navigation and state」、「Settings stage and apply changes per owner」及「Make the settings center owner-aware and transactional per owner」；以 CLI／Daemon／Server／Provider dirty badges、per-owner apply、conflict retention、無 `providers.toml` 主標題的 headless assertions 驗證。
+- [x] 4.4 實作「Profile switching resolves dirty remote state before reconnect」與「Interactive profile switching is explicit and observable」，讓 Apply／Discard／Cancel 先處理舊 profile dirty state，之後關閉舊 transport 並刷新新 snapshot；以 A→B success、Cancel、apply failure、connect failure 及 old-state non-reuse integration tests驗證。
+- [x] 4.5 [P] 將 Chat 與 Conversations 接入共享 shell，完成「Chat participates in the shared workspace context」及「Chat input survives route changes and recoverable connection loss」；以 draft text／cursor／attachment 往返 Settings、reconnect/resume 與 profile-switch transport identity tests驗證。
+- [x] 4.6 [P] 完成「Workspace rendering is responsive and Unicode-safe」及「Verify terminal behavior through state matrices and snapshots」，建立 120×30、80×24、50×16、below-minimum 與 ASCII／CJK／emoji／long endpoint golden renders；以 headless snapshot tests、無 `�`、無 panic 與 minimum-size quit/help assertions驗證。
+
+## 5. 相容遷移、文件與獨立評估
+
+- [x] 5.1 依「Migration Plan」更新 README command reference、`docs/design-cli-config.md`、`docs/env.md`、`docs/STATUS.md` 與 shell completion 範例，明列 canonical→alias mapping、owner／partial-read／JSON 契約；以 docs command inventory 與 generated help diff checker 驗證文件沒有漂移。
+- [x] 5.2 執行完整 workspace test、clippy warnings denied、fmt、Spectra analyze/validate、release build 與 binary-size comparison，逐項審核「Implementation Contract」中的「Observable behavior」、「Interface and data shape」、「Failure modes」、「Acceptance criteria」、「Scope boundaries」及「Risks / Trade-offs」；任何未被證據覆蓋的 requirement 保持未完成。
+- [ ] 5.3 在每輪改進後由另一個 agent 針對 command IA、owner safety、settings state、TUI heuristics、accessibility、cross-platform 與 regression 做唯讀評估；將 Critical／High finding 轉成新增或修正 task，修正後重評，直到連續兩輪沒有 Critical／High，並保存每輪 evidence summary 作為完成證據。
+- [x] 5.4 修正第一輪評估的 Connection 輸出邊界：新增／改址拒絕 userinfo 與無 host 的 WebSocket URL，list／show／current 對既有 endpoint 移除 query、fragment、userinfo，並將 profile／label／fingerprint 控制字元轉成可見文字；以 `server` unit tests 與 human／JSON smoke tests 驗證 token、密碼、ESC、CR、LF 不會出現在輸出或造成額外終端行。
+- [x] 5.5 讓 approval 明確綁定原 Chat transport：連線中斷時使所有 pending approval 過期並顯示重試 turn 的通知，不得在新 transport 將舊 UUID 顯示為 approved；以 disconnect→reconnect→`y` state test 驗證舊 approval 不會送出或被 commit，draft／attachments 仍保留。
+- [x] 5.6 將共用 `LineEditor` 的 cursor、左右移動、Backspace、Delete、word／line navigation 與 display window 統一到 extended grapheme cluster 邊界；以 combining acute、skin-tone emoji、ZWJ family、Taiwan flag 與 CJK multiline tests 驗證永不拆字素且 column math 正確。
+- [x] 5.7 統一 `--quiet` 的 result-only 契約：`config list` 全成功或 partial failure 時抑制 owner headings、`PARTIAL` prose、effect explanation 與 context，只保留結果值及必要 stderr error；以兩個 fake-owner smoke tests 驗證 quiet stdout／stderr 與 exit class。
+- [x] 5.8 消除低風險契約漂移：對無 positional ambiguity 的 leaf 支援尾端 `help`，在 positional leaf 的 spec 明訂 canonical `fleety help <path>`／`--help`／`-h`，並移除文件中不存在的 `connection add --pair`；以 exhaustive parser matrix 與 docs inventory test 驗證 generated help、spec、README／design docs 一致。
+- [x] 5.9 封住 endpoint 的單一 presentation boundary：raw override、resolved target、transport fallback/error、status、doctor 與 OAuth human output 均不得洩漏 URL userinfo、query value 或 fragment，且 tracing 不得記錄 raw endpoint；以成功／失敗 fake transport smoke tests 與 userinfo/query sentinel 驗證 stdout、stderr、trace 均無 secret。
+- [x] 5.10 將 terminal input 收斂成 workspace session 唯一 event stream，route handoff 與巢狀 Provider editor 不得建立第二個 crossterm reader或讓舊 reader 存活；以 injectable event-source transition test 驗證每個 key 僅消費一次、返回後不重播且 stale `a` 不會 Apply。
+- [x] 5.11 將 Server／Daemon 回傳的 conversation、audit、rollback、status 與 sidecar 等 human scalar 統一經 terminal-control sanitizer，再進 renderer；以 ESC／OSC 52／CR／LF fake-owner smoke tests 驗證不注入額外行或控制序列，JSON data 保留原始語意值。
+- [x] 5.12 讓 typed parser 接受的 value-bearing option 語法與 execution extraction 完全一致，包括 `--profile=value`、`--server=value`、`--url=value`、`--owner=value`／`--target=value` 及 command-local options；以 separated／equals parser-dispatch matrix 驗證相同 target、payload、exit class 與副作用。
+- [x] 5.13 修正 audit execution context：`audit list/show` 應標示連線 Server 為實際 owner，device ID 僅作 filter/context，不得誤稱 Daemon 執行；以 recording Server 的 human／JSON assertions 驗證 owner、profile、device_id 與 payload。
+- [x] 5.14 完成 canonical `fleety config open`，並將 legacy `config edit` alias 導向 shared Settings workspace 的 staged／Apply transaction，不得維持另一個 Enter 即寫檔的 editor；以 help/alias parity、stage byte identity 與唯一 Apply write tests 驗證。
+- [x] 5.15 保留 `config open/edit --owner <device>` 的完整 device target，讓 snapshot、Apply、profile switch transaction 與 reload 全程指向使用者指定的同一台 Daemon，UI 同時顯示該 device ID；以 recording Server 驗證 `ConfigSnapshot`／`ConfigApply` frame 皆為 `remote-B` 且不觸及 local device。
+- [x] 5.16 對共享 `WorkspaceInput` 建立 route/editor handoff boundary，離開巢狀 Provider editor 時不得讓已排隊按鍵觸發 Settings action，且 OAuth return prompt 必須使用同一 event stream 而非另讀 stdin；以 `q` 後 queued `a` 不產生 `ConfigApply` 及 injected OAuth Enter test 驗證。
+- [x] 5.17 將 terminal-safe presentation boundary 套用到 Settings、Provider OAuth 與所有 workspace notices，human/TUI endpoint 移除 userinfo、query、fragment，其他 scalar 移除 ESC／OSC 52／CR／LF 控制效果，raw transport identity 與 JSON semantic value 保持不變；以 headless render 與 fake Server sentinel tests 驗證無 secret 與 terminal injection。
+- [x] 5.18 讓 short value option 的 Clap parse 與 execution dispatch 一致，至少涵蓋 `-s value`、`-s=value`、`-svalue` 且維持 `--` boundary 與 duplicate selector 規則；以 parser-dispatch matrix 驗證相同 target、payload、exit class 與副作用。
+- [x] 5.19 將 Settings 的 active profile identity 與 persisted current 分離，`--profile B config open` 的 header、owner snapshot、Apply、Providers、dirty-switch modal 與 already-selected 判斷一律以 B 為 active target，只有明確切換才更新 persisted current；以 persisted A／override B recording Servers 完整 transaction test 驗證。
+- [x] 5.20 將 `WorkspaceInput` handoff 升級為唯一 reader 確認的 epoch barrier：reader 先 drain crossterm queue、切換 epoch並回覆 acknowledgement，route 只接受新 epoch；以 delayed old-epoch `a` 在 boundary 後才送達的可控 reader test 驗證不產生 Settings Apply。
+- [x] 5.21 將 terminal-safe human output API 套用到 command Assistant、approval、voice/attention、ConfigResult/WireError、Settings 初始 snapshot error 與 Clap argv/error 回顯；以 fake Server 與 hostile argv matrix 注入 ESC／OSC 52／BEL／CR／LF，驗證 stdout/stderr/TUI 無控制效果且 JSON 保留原始語意。
+- [x] 5.22 讓 trailing-help normalization 正確略過 short global value options `-s value`、`-s=value`、`-svalue`，並維持 `--` terminator 與 positional leaf 規則；以 short/long placement 交叉 parser matrix 驗證相同 help、exit 0 與零副作用。
+- [x] 5.23 即使 invocation override profile 無法連線，Settings 的 active identity 仍須保留該 override，不得回退 persisted current；以 persisted A／`--profile B config open`／B 連線失敗測試驗證 header、Connection marker、Providers target、owner unavailable state 與後續 profile switch 都以 B 為舊 active target，且 `connections.toml` 仍為 A。
+- [x] [P] 5.24 將 Provider TUI 的 status、Provider/model labels、catalog error kind/message/remediation 與其他外部 scalar 統一經 terminal-safe render boundary；以 headless buffer 注入 ESC／OSC 52／BEL／CR／LF 與 credential-bearing URL，驗證無 raw control、無 secret 且可讀換行仍受版面約束。
+- [x] [P] 5.25 將 OAuth legacy token migration/status note 中的環境來源 path 經 terminal-safe presentation boundary，或改成不揭露完整 path；以 `FLEETY_CODEX_TOKENS` 指向含 ESC／OSC／CR／LF 的既有路徑測試 `auth status` 與 login note，驗證 stdout/stderr 無 raw terminal control，且 JSON semantic fields 不被改寫。
+- [x] 5.26 將 sticky profile healing notice 納入 output-mode 與 endpoint presentation contract：human 模式只在 stderr 顯示 sanitized profile 與 redacted endpoint，`--json`／`--quiet` 不得混入 prose，JSON 由更新後 context 表達實際 endpoint；以 hostile healing notice unit test 與 fake-healing output-mode smoke matrix 驗證。
+- [x] [P] 5.27 將 `fleety init` 自訂 URL validation error 的 positional value 經 terminal-safe endpoint boundary；以 http(s) 與非-WebSocket hostile argv 注入 userinfo、query、fragment、ESC／OSC／BEL／CR／LF，驗證 stderr 無 secret、無 raw control、exit 2 且未開始 network 或寫入設定。
+- [x] 5.28 讓 env URL override 的 credential 與持久化 provenance 跟 resolved target 一致：只有 env URL 與 current profile URL 相同時才可繼承其 token，fleetyd 的 minted token／fingerprint／unauthenticated cleanup 也只能改 exact owning profile；以 current A／env B 測試驗證不送出 A token且 B 的 handshake 結果不會覆寫或清除 A。
+- [x] [P] 5.29 將 Provider endpoint 與 direct config output 納入共用 secret-redaction／terminal-safe boundary，Server／Daemon direct binaries、CLI human 與 JSON envelope 都不得輸出 URL userinfo、query secret、fragment或 terminal controls；以 provider/config hostile-value smoke matrix 驗證所有平行 surface。
+- [x] [P] 5.30 讓 invocation-only `--profile B` 的 TOFU pin 與 sticky healing 精確操作 B，不得讀寫 persisted current A；以 A current／B override 的 successful Welcome、fingerprint mismatch 與 mDNS healing 測試驗證 A byte identity、B 更新及後續 target identity。
+- [x] [P] 5.31 讓 OAuth callback 依 application/x-www-form-urlencoded 規則解碼 code/state，並對 malformed encoding 與 duplicate security parameter fail closed；以 `%2B`、`%20`、encoded state、invalid percent 與 duplicate code/state 測試驗證 token exchange 收到唯一 decoded value。
+- [x] 5.32 將 ConfigApply 成功後的 fresh snapshot 視為重新編輯 barrier：refresh 失敗時明確顯示 applied-but-refresh-failed、清除已套用 staged state並禁止以 stale revision 再次修改或 Apply，直到重新載入；以 Server／Daemon／Provider 的 error、close與 wrong-reply 測試驗證不誤報 Saved且不送出 stale apply。
+- [x] [P] 5.33 將 mDNS picker、`init --name` 成功訊息及其他直接輸出的動態 identity 納入 terminal-safe presentation boundary；以 hostile service/profile name、endpoint與控制字元測試驗證無 terminal injection且 raw transport identity 不被改寫。
+- [x] 5.34 將 Windows service PID probe 的 Alive／Dead／Unknown 分離，Unknown 不得覆寫 ownership pidfile或誤報 stopped，並移除對語系化 `tasklist` 成功輸出的安全依賴；以 access denied、timeout、slow probe與真實 owner lifecycle tests 驗證單一 owner。
+- [x] 5.35 將 Server structured ConfigApply 的 composite revision check、config/providers load、validation與兩檔寫入包在同一個跨執行緒／跨程序 transaction lease，direct Server owner mutation亦使用同 lease；以 barrier concurrency test 驗證同 revision 只有一個 success、另一個 conflict且無 lost update。
+- [x] 5.36 將 `connections.toml` 所有 CLI／Daemon mutation 改成跨程序 lease 下的精確欄位 closure，附 expected URL/current 前置條件且不得存回 stale whole-file snapshot；以新增 profile、切 current、pair/pin/heal交錯測試驗證互不相關欄位不遺失。
+- [x] 5.37 修正 current 為空但 `default` 已被不同 URL 占用時的 env／mDNS persistence provenance：不同 target 保持 ephemeral，不得覆寫 default token或隱式設 current；以 occupied default A／env B及 mDNS/Default matrix驗證。
+- [x] 5.38 讓單結果 mDNS resolution 保留 TXT fingerprint並依 pinned profile挑 matching advertiser，不得因第一筆錯誤廣告而丟棄合法第二筆；明確定義無 pin legacy token的安全 re-pair policy，以 CLI／Daemon resolver tests驗證。
+- [x] [P] 5.39 將 shared direct config execution parser 的 value options統一支援 `--flag value`與`--flag=value`，不得 Clap接受後在手寫 parser失敗；以 fleety-server provider/model所有 value options smoke matrix驗證。
+- [x] [P] 5.40 將 embedded URL redaction改為 scheme case-insensitive且保留原 path/query key文字，涵蓋 uppercase/mixed-case、多 URL、括號與 OAuth/backend error；以 human／JSON／direct binary tests驗證 credential不洩漏。
+- [x] 5.41 Provider base URL或 key新增／變更在 Apply 前必須顯示敏感操作確認，取消不得送 ConfigApply；Server audit記錄 Provider名稱與不含 secret的 old/new host及 key-rotation metadata，以 TUI transaction與audit tests驗證。
+- [x] 5.42 完成「Provider credentials are Server-owned write-only secrets」：ConfigSnapshot 只回 key presence metadata，任何 auth mode／已配對 client 的 snapshot bytes 都不得含 key；ConfigApply 以 Keep／Set／Clear語意在 Server transaction lease內合併既有 secret，舊 client／舊 Server需以 config protocol capability fail closed，不得因完整 config write-back清除或回傳 secret。
+- [x] 5.43 完成「Automatic discovery never borrows another profile's identity」，讓 mDNS selection 與 Resolved target攜帶精確 profile provenance；自動 discovery只可使用 current profile本身的 pin/token，其他 profile advertiser必須經顯式選取，Daemon pair/pin/clear/heal只更新 resolved owner；以 current A URL-less token、pinned B、兩次 reconnect與 auth rejection matrix驗證不跨 Server送 token或把 B identity pin到 A。
+- [x] 5.44 完成「Provider credential operations require an authenticated owner boundary」，將 ProviderModelList 視為 Server credential operation：auth disabled／未建立可信 owner boundary時回 typed unauthenticated/auth-disabled error，且不得觸發任何帶 stored key/OAuth token的 outbound request；以 recording endpoint hit-count與 bearer capture測試驗證零請求、零 secret。
+- [x] 5.45 以 Windows native process query或經實測足夠的 bounded probe取代固定一秒 PowerShell subprocess假設，保留 Alive／Dead／Unknown fail-safe語意；以 slow startup、access denied、live owner、連續 Alive與 Server/Daemon start/restart lifecycle測試驗證不誤判。
+- [x] 5.46 完成「Persisted profile switching reconnects the active Daemon」：`connection use`與 Settings profile switch成功後必須透過 Daemon owner control path通知目前 fleetyd結束舊 session並立即 resolve/reconnect；以 A→B integration test驗證 CLI、Server snapshot、Daemon snapshot與 fleetyd實際 Hello/工作接收目標一致，失敗時提供可恢復且不假裝完成的狀態。
+- [x] 5.47 完成「Profile switching consumes one live leased target snapshot」：Settings profile switch必須在 connections mutation lease內取得 live profile完整 target credential/fingerprint snapshot並用該值重連，不得只比 URL後沿用 lease外舊 token；以 concurrent token rotation與 fingerprint更新測試驗證切換後使用最新 owner state。
+- [x] 5.48 完成「OAuth authorization secrets stay out of terminal history by default」：OAuth login預設 terminal output不得包含 state、PKCE challenge或任何 authorize URL query value；browser成功啟動時只顯示 sanitized origin/path，no-browser flow需提供不落入 scrollback/log的安全交付方式或明確 opt-in；以 stdout/stderr capture驗證 nonce與challenge不外洩。
+- [x] [P] 5.49 完成「Provider and model mutations report activation timing」：Provider/Model owner mutation成功時回傳與 shared config registry一致的 effect timing，changed結果標示 NextConnection，未變更查詢不顯示 effect；以 human/JSON direct command smoke驗證。
+- [x] [P] 5.50 清除 owner-routed spec EOF whitespace並以 `git diff --check HEAD`驗證完整 staged/unstaged diff，而非只檢查預設 diff範圍。

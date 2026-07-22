@@ -12,12 +12,13 @@
 //! typo never lands silently in `config.toml`. Keys with no validator accept
 //! any value (pass-through).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use agent_core::{CoreError, Result};
+use clap::{Arg, ArgAction, Command as ClapCommand};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Scope {
@@ -654,6 +655,20 @@ fn acquire_mutation_lock(path: &std::path::Path) -> Result<MutationLock> {
     }
 }
 
+/// Run one complete Server-owned configuration transaction under a shared
+/// cross-process lease. Both direct `fleety-server config` commands and remote
+/// snapshot/apply paths use this boundary, so revision checks, reads, and the
+/// eventual owner write cannot interleave with another Server mutation.
+fn server_transaction_resource(config: &std::path::Path) -> PathBuf {
+    config.with_file_name("server-configuration-transaction")
+}
+
+pub fn with_server_transaction<T>(operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    let resource = server_transaction_resource(&config_path());
+    let _lease = acquire_mutation_lock(&resource)?;
+    operation()
+}
+
 /// Strict, cross-process-safe read-modify-write primitive for config owners.
 pub fn mutate_strict(
     path: &std::path::Path,
@@ -918,6 +933,186 @@ pub fn config_effect(args: &[String]) -> Option<ConfigEffect> {
 
 // ---- command dispatch, shared by `fleety`, `fleety-server`, and `fleetyd` ----
 
+/// Shared, side-effect-free command grammar used by `fleety`, `fleetyd`, and
+/// `fleety-server`. Keeping this tree here prevents one binary from accepting
+/// config input that another rejects or from falling through to file handling
+/// before help and usage errors are resolved.
+pub fn clap_command() -> ClapCommand {
+    config_clap_command(false, true, false, false, true)
+}
+
+/// Daemon direct config excludes Server-owned provider/model commands.
+pub fn clap_command_for_daemon() -> ClapCommand {
+    config_clap_command(false, false, false, false, false)
+}
+
+/// CLI variant adds the historical `config provider login|logout|status`
+/// aliases. Daemon and Server direct config commands intentionally exclude
+/// these browser/client-side OAuth actions.
+pub fn clap_command_for_cli() -> ClapCommand {
+    // `fleety` already has a global `--url` connection override, so exposing
+    // the Provider alias here would make Clap register two different --url
+    // options. The CLI uses canonical --base-url; direct fleety-server keeps the
+    // legacy --url alias because it has no global selector.
+    config_clap_command(true, true, true, true, false)
+}
+
+fn config_clap_command(
+    provider_auth: bool,
+    providers: bool,
+    provider_edit: bool,
+    model_catalog: bool,
+    provider_url_alias: bool,
+) -> ClapCommand {
+    let mut command = ClapCommand::new("config")
+        .about("Inspect or edit owner configuration")
+        .subcommands([
+            ClapCommand::new("list").about("List settings"),
+            ClapCommand::new("get")
+                .about("Read a setting")
+                .arg(Arg::new("key").required(true)),
+            ClapCommand::new("set")
+                .about("Set a setting")
+                .arg(Arg::new("key").required(true))
+                .arg(Arg::new("value").required(true)),
+            ClapCommand::new("unset")
+                .about("Unset a setting")
+                .arg(Arg::new("key").required(true)),
+            ClapCommand::new("open")
+                .about("Open the shared Settings workspace")
+                .visible_alias("edit"),
+        ]);
+    if providers {
+        command = command.subcommands([
+            provider_clap_command(provider_auth, provider_edit, provider_url_alias),
+            model_clap_command(model_catalog),
+        ]);
+    }
+    command
+}
+
+fn provider_clap_command(
+    include_auth: bool,
+    include_edit: bool,
+    include_url_alias: bool,
+) -> ClapCommand {
+    let mut command = ClapCommand::new("provider")
+        .about("Manage Server-owned providers")
+        .subcommand_required(true)
+        .subcommands([
+            provider_fields(
+                ClapCommand::new("add")
+                    .about("Add a provider")
+                    .arg(Arg::new("name").required(true)),
+                true,
+                include_url_alias,
+            ),
+            provider_fields(
+                ClapCommand::new("set")
+                    .about("Update a provider")
+                    .arg(Arg::new("name").required(true)),
+                false,
+                include_url_alias,
+            ),
+            ClapCommand::new("remove")
+                .about("Remove a provider")
+                .arg(Arg::new("name").required(true)),
+            ClapCommand::new("list").about("List providers"),
+        ]);
+    if include_edit {
+        command = command.subcommand(ClapCommand::new("edit").about("Open the provider editor"));
+    }
+    if include_auth {
+        command = command.subcommands([
+            ClapCommand::new("login")
+                .about("Sign in an OAuth provider")
+                .arg(Arg::new("provider").required(true))
+                .arg(
+                    Arg::new("no-browser")
+                        .long("no-browser")
+                        .action(ArgAction::SetTrue),
+                ),
+            ClapCommand::new("logout")
+                .about("Sign out an OAuth provider")
+                .arg(Arg::new("provider").required(true)),
+            ClapCommand::new("status")
+                .about("Show OAuth status")
+                .arg(Arg::new("provider")),
+        ]);
+    }
+    command
+}
+
+fn provider_fields(
+    command: ClapCommand,
+    kind_required: bool,
+    include_url_alias: bool,
+) -> ClapCommand {
+    let base_url = Arg::new("base-url").long("base-url").value_name("URL");
+    let base_url = if include_url_alias {
+        base_url.visible_alias("url")
+    } else {
+        base_url
+    };
+    command
+        .arg(
+            Arg::new("type")
+                .long("type")
+                .value_name("TYPE")
+                .required(kind_required),
+        )
+        .arg(base_url)
+        .arg(Arg::new("key").long("key").value_name("KEY"))
+}
+
+fn model_clap_command(include_catalog: bool) -> ClapCommand {
+    let mut command = ClapCommand::new("model")
+        .about("Manage Server-owned model roles")
+        .subcommand_required(true)
+        .subcommands([
+            ClapCommand::new("list").about("List model roles"),
+            ClapCommand::new("show")
+                .about("Show a model role")
+                .arg(Arg::new("role")),
+            ClapCommand::new("unset")
+                .about("Unset a model role")
+                .arg(Arg::new("role").required(true)),
+            ClapCommand::new("set")
+                .about("Set a model role")
+                .arg(Arg::new("role").required(true))
+                .arg(
+                    Arg::new("member")
+                        .long("member")
+                        .value_name("PROVIDER/MODEL")
+                        .required(true)
+                        .action(ArgAction::Append),
+                )
+                .arg(Arg::new("stream").long("stream").action(ArgAction::Count))
+                .arg(
+                    Arg::new("modalities")
+                        .long("modalities")
+                        .value_name("LIST")
+                        .action(ArgAction::Append),
+                )
+                .arg(
+                    Arg::new("effort")
+                        .long("effort")
+                        .value_name("LEVEL")
+                        .action(ArgAction::Append),
+                )
+                .arg(Arg::new("strategy").long("strategy").value_name("STRATEGY")),
+        ]);
+    if include_catalog {
+        command = command.subcommand(
+            ClapCommand::new("catalog")
+                .about("Fetch a Provider's available model IDs")
+                .arg(Arg::new("provider").required(true))
+                .arg(Arg::new("role").long("role").value_name("ROLE")),
+        );
+    }
+    command
+}
+
 /// A parsed `config` subcommand.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -945,7 +1140,7 @@ pub fn parse(args: &[String]) -> Command {
             .get(1)
             .map(|k| Command::Unset(k.clone()))
             .unwrap_or(Command::Help),
-        Some("edit") => Command::Edit,
+        Some("open" | "edit") => Command::Edit,
         _ => Command::Help,
     }
 }
@@ -1014,8 +1209,8 @@ pub fn ensure_scope(key: &str, scopes: &[Scope]) -> Result<()> {
 }
 
 /// Run a `config` subcommand against the config file (unfiltered — server/daemon
-/// on their own hosts). `edit` is the line-based loop; the CLI overrides `edit`
-/// with a ratatui screen when stdout is a TTY.
+/// on their own hosts). `open` is the line-based host-local loop for direct
+/// Server/Daemon binaries; `fleety` routes it to the shared Settings workspace.
 pub fn run(args: &[String]) -> Result<()> {
     run_scoped(args, None)
 }
@@ -1033,7 +1228,7 @@ pub fn run_scoped(args: &[String], scopes: Option<&[Scope]>) -> Result<()> {
     let out = run_rendered_scoped(args, scopes)?;
     let out = out.trim_end_matches('\n');
     if !out.is_empty() {
-        println!("{out}");
+        println!("{}", crate::transport::terminal_safe_multiline(out));
     }
     Ok(())
 }
@@ -1049,11 +1244,19 @@ pub fn run_rendered(args: &[String]) -> Result<String> {
 /// key outside them is refused (see [`ensure_scope`]). `provider`/`model`
 /// manage the structured providers.toml; `edit` is interactive (an error here).
 pub fn run_rendered_scoped(args: &[String], scopes: Option<&[Scope]>) -> Result<String> {
+    if matches!(args.first().map(String::as_str), Some("provider" | "model"))
+        && scopes.is_some_and(|allowed| !allowed.contains(&Scope::Server))
+    {
+        return Err(CoreError::Message(
+            "provider and model configuration is owned by fleety-server".to_string(),
+        ));
+    }
     if matches!(args.first().map(String::as_str), Some("provider" | "model")) {
-        return run_providers_at(&pc::providers_path(), args);
+        return run_providers_at(&pc::providers_path(), args)
+            .map(|out| crate::transport::redact_urls_in_text(&out));
     }
     let path = config_path();
-    Ok(match parse(args) {
+    let rendered = match parse(args) {
         Command::List => {
             let map = load(&path);
             let displayed = match scopes {
@@ -1145,13 +1348,14 @@ pub fn run_rendered_scoped(args: &[String], scopes: Option<&[Scope]>) -> Result<
         }
         Command::Edit => {
             return Err(CoreError::Message(
-                "`config edit` is interactive — run it locally on a TTY".to_string(),
+                "`config open` is interactive — run it locally on a TTY".to_string(),
             ))
         }
         Command::Help => {
-            "usage: config [list | get <KEY> | set <KEY> <VALUE> | unset <KEY> | edit]".to_string()
+            "usage: config [list | get <KEY> | set <KEY> <VALUE> | unset <KEY> | open]".to_string()
         }
-    })
+    };
+    Ok(crate::transport::redact_urls_in_text(&rendered))
 }
 
 // ---- providers.toml subcommands (provider / group / role) ----
@@ -1174,6 +1378,7 @@ pub enum ProviderCmd {
         kind: Option<String>,
         base_url: Option<String>,
         key: Option<String>,
+        clear_key: bool,
     },
     ProviderRemove(String),
     ProviderList,
@@ -1199,48 +1404,113 @@ fn strategy_from(s: &str) -> Result<Strategy> {
     }
 }
 
-/// Split `--flag value` / bare `--flag` tokens into a (key→value, bare-set)
-/// pair. A `--flag` that needs a value but has none is an error; a non-flag
-/// token here is unexpected.
-fn split_flags(
+fn normalize_provider_model_value_options(args: &[String]) -> Vec<String> {
+    const VALUE_OPTIONS: &[&str] = &[
+        "--type",
+        "--base-url",
+        "--url",
+        "--key",
+        "--member",
+        "--modalities",
+        "--effort",
+        "--strategy",
+    ];
+
+    let mut normalized = Vec::with_capacity(args.len());
+    let mut options_enabled = true;
+    for arg in args {
+        if options_enabled && arg == "--" {
+            options_enabled = false;
+            normalized.push(arg.clone());
+            continue;
+        }
+
+        if options_enabled {
+            if let Some((flag, value)) = arg.split_once('=') {
+                if VALUE_OPTIONS.contains(&flag) {
+                    normalized.push(if flag == "--url" {
+                        "--base-url".to_string()
+                    } else {
+                        flag.to_string()
+                    });
+                    normalized.push(value.to_string());
+                    continue;
+                }
+            }
+            if arg == "--url" {
+                normalized.push("--base-url".to_string());
+                continue;
+            }
+        }
+
+        normalized.push(arg.clone());
+    }
+    normalized
+}
+
+/// Split one provider name and its `--flag value` fields without imposing an
+/// order. This matches clap's generated usage, which permits options before or
+/// after the positional name. `--` ends option parsing, matching clap.
+fn split_provider_args(
     args: &[String],
-) -> Result<(HashMap<String, String>, std::collections::HashSet<String>)> {
+    verb: &str,
+) -> Result<(String, HashMap<String, String>, HashSet<String>)> {
     let mut kv = HashMap::new();
-    let mut bare = std::collections::HashSet::new();
+    let mut switches = HashSet::new();
+    let mut provider_name = None;
     let mut i = 0;
+    let mut options_enabled = true;
     while i < args.len() {
-        let Some(name) = args[i].strip_prefix("--") else {
-            return Err(CoreError::Message(format!(
-                "unexpected argument '{}'",
-                args[i]
-            )));
-        };
-        if name == "stream" {
-            bare.insert(name.to_string());
+        if options_enabled && args[i] == "--" {
+            options_enabled = false;
             i += 1;
-        } else {
-            let v = args
+        } else if options_enabled {
+            let Some(name) = args[i].strip_prefix("--") else {
+                if provider_name.is_none() {
+                    provider_name = Some(args[i].clone());
+                    i += 1;
+                    continue;
+                }
+                return Err(CoreError::Message(format!(
+                    "provider {verb} needs exactly one provider name"
+                )));
+            };
+            if name == "clear-key" {
+                if !switches.insert(name.to_string()) {
+                    return Err(CoreError::Message(
+                        "flag --clear-key cannot be used multiple times".to_string(),
+                    ));
+                }
+                i += 1;
+                continue;
+            }
+            let value = args
                 .get(i + 1)
                 .ok_or_else(|| CoreError::Message(format!("flag --{name} needs a value")))?;
-            kv.insert(name.to_string(), v.clone());
+            if kv.insert(name.to_string(), value.clone()).is_some() {
+                return Err(CoreError::Message(format!(
+                    "flag --{name} cannot be used multiple times"
+                )));
+            }
             i += 2;
+        } else if provider_name.is_none() {
+            provider_name = Some(args[i].clone());
+            i += 1;
+        } else {
+            return Err(CoreError::Message(format!(
+                "provider {verb} needs exactly one provider name"
+            )));
         }
     }
-    Ok((kv, bare))
+    let name = provider_name
+        .ok_or_else(|| CoreError::Message(format!("provider {verb} needs a provider name")))?;
+    Ok((name, kv, switches))
 }
 
 /// Error if any flags were given but not consumed (catches typos/unknown flags).
 fn no_unknown_flags(kv: &HashMap<String, String>) -> Result<()> {
     if let Some(k) = kv.keys().next() {
         return Err(CoreError::Message(format!("unknown flag --{k}")));
-    }
-    Ok(())
-}
-
-/// Reject any bare (value-less) flags the caller didn't expect.
-fn reject_bare(bare: &std::collections::HashSet<String>) -> Result<()> {
-    if let Some(b) = bare.iter().next() {
-        return Err(CoreError::Message(format!("unexpected flag --{b}")));
     }
     Ok(())
 }
@@ -1310,7 +1580,11 @@ fn parse_model_set(role: String, rest: &[String]) -> Result<ProviderCmd> {
                 let v = rest
                     .get(i + 1)
                     .ok_or_else(|| CoreError::Message("--strategy needs a value".to_string()))?;
-                strategy = Some(strategy_from(v)?);
+                if strategy.replace(strategy_from(v)?).is_some() {
+                    return Err(CoreError::Message(
+                        "--strategy cannot be used multiple times".to_string(),
+                    ));
+                }
                 i += 2;
             }
             other => {
@@ -1337,9 +1611,55 @@ fn parse_model_set(role: String, rest: &[String]) -> Result<ProviderCmd> {
     })
 }
 
+fn parse_model_set_with_flexible_role(rest: &[String]) -> Result<ProviderCmd> {
+    let mut role = None;
+    let mut flags = Vec::new();
+    let mut index = 0;
+    let mut options_enabled = true;
+    while index < rest.len() {
+        if options_enabled && rest[index] == "--" {
+            options_enabled = false;
+            index += 1;
+            continue;
+        }
+        match (options_enabled, rest[index].as_str()) {
+            (true, flag @ ("--member" | "--modalities" | "--effort" | "--strategy")) => {
+                flags.push(flag.to_string());
+                let value = rest
+                    .get(index + 1)
+                    .ok_or_else(|| CoreError::Message(format!("{flag} needs a value")))?;
+                flags.push(value.clone());
+                index += 2;
+            }
+            (true, "--stream") => {
+                flags.push("--stream".to_string());
+                index += 1;
+            }
+            (_, value) if (!options_enabled || !value.starts_with('-')) && role.is_none() => {
+                role = Some(value.to_string());
+                index += 1;
+            }
+            (_, value) if !options_enabled || !value.starts_with('-') => {
+                return Err(CoreError::Message(
+                    "model set needs exactly one model role".to_string(),
+                ));
+            }
+            (_, other) => {
+                return Err(CoreError::Message(format!(
+                    "unknown flag '{other}' for `model set`"
+                )))
+            }
+        }
+    }
+    let role =
+        role.ok_or_else(|| CoreError::Message("missing model role (main|cheap)".to_string()))?;
+    parse_model_set(role, &flags)
+}
+
 /// Parse a `provider` / `model` subcommand. Pure and unit-testable; an unknown
 /// verb, missing required field, bad strategy, or unknown flag is an error.
 pub fn parse_providers(args: &[String]) -> Result<ProviderCmd> {
+    let args = normalize_provider_model_value_options(args);
     let kind = args.first().map(String::as_str);
     let verb = args.get(1).map(String::as_str);
     let rest = if args.len() > 2 { &args[2..] } else { &[][..] };
@@ -1348,21 +1668,23 @@ pub fn parse_providers(args: &[String]) -> Result<ProviderCmd> {
             .ok_or_else(|| CoreError::Message(format!("missing {what}")))
     };
     match (kind, verb) {
-        (Some("provider"), Some("list")) => Ok(ProviderCmd::ProviderList),
-        (Some("provider"), Some("remove")) => Ok(ProviderCmd::ProviderRemove(need(
-            rest.first(),
-            "provider name",
-        )?)),
+        (Some("provider"), Some("list")) if rest.is_empty() => Ok(ProviderCmd::ProviderList),
+        (Some("provider"), Some("remove")) if rest.len() == 1 => Ok(ProviderCmd::ProviderRemove(
+            need(rest.first(), "provider name")?,
+        )),
         (Some("provider"), Some("add")) => {
-            let name = need(rest.first(), "provider name")?;
-            let (mut kv, bare) = split_flags(rest.get(1..).unwrap_or(&[]))?;
-            reject_bare(&bare)?;
+            let (name, mut kv, switches) = split_provider_args(rest, "add")?;
             let kind = kv.remove("type").ok_or_else(|| {
                 CoreError::Message("missing --type (api|oauth:codex)".to_string())
             })?;
             let base_url = kv.remove("base-url");
             let key = kv.remove("key");
             no_unknown_flags(&kv)?;
+            if switches.contains("clear-key") {
+                return Err(CoreError::Message(
+                    "--clear-key is only valid with `provider set`".to_string(),
+                ));
+            }
             Ok(ProviderCmd::ProviderAdd {
                 name,
                 kind,
@@ -1371,29 +1693,33 @@ pub fn parse_providers(args: &[String]) -> Result<ProviderCmd> {
             })
         }
         (Some("provider"), Some("set")) => {
-            let name = need(rest.first(), "provider name")?;
-            let (mut kv, bare) = split_flags(rest.get(1..).unwrap_or(&[]))?;
-            reject_bare(&bare)?;
+            let (name, mut kv, switches) = split_provider_args(rest, "set")?;
             let kind = kv.remove("type");
             let base_url = kv.remove("base-url");
             let key = kv.remove("key");
             no_unknown_flags(&kv)?;
+            let clear_key = switches.contains("clear-key");
+            if clear_key && key.is_some() {
+                return Err(CoreError::Message(
+                    "--key and --clear-key cannot be used together".to_string(),
+                ));
+            }
             Ok(ProviderCmd::ProviderSet {
                 name,
                 kind,
                 base_url,
                 key,
+                clear_key,
             })
         }
-        (Some("model"), Some("list")) => Ok(ProviderCmd::ModelList),
-        (Some("model"), Some("show")) => Ok(ProviderCmd::ModelShow(rest.first().cloned())),
-        (Some("model"), Some("unset")) => {
+        (Some("model"), Some("list")) if rest.is_empty() => Ok(ProviderCmd::ModelList),
+        (Some("model"), Some("show")) if rest.len() <= 1 => {
+            Ok(ProviderCmd::ModelShow(rest.first().cloned()))
+        }
+        (Some("model"), Some("unset")) if rest.len() == 1 => {
             Ok(ProviderCmd::ModelUnset(need(rest.first(), "model role")?))
         }
-        (Some("model"), Some("set")) => {
-            let role = need(rest.first(), "model role (main|cheap)")?;
-            parse_model_set(role, rest.get(1..).unwrap_or(&[]))
-        }
+        (Some("model"), Some("set")) => parse_model_set_with_flexible_role(rest),
         _ => Err(CoreError::Message(
             "usage: config provider <add|set|remove|list> | model <set|show|unset|list>"
                 .to_string(),
@@ -1415,7 +1741,7 @@ pub fn run_providers(args: &[String]) -> Result<()> {
     let out = run_providers_at(&pc::providers_path(), args)?;
     let out = out.trim_end_matches('\n');
     if !out.is_empty() {
-        println!("{out}");
+        println!("{}", crate::transport::terminal_safe_multiline(out));
     }
     Ok(())
 }
@@ -1451,8 +1777,9 @@ pub fn run_providers_at(path: &std::path::Path, args: &[String]) -> Result<Strin
             for (name, p) in &cfg.providers {
                 match p.base_url.as_deref() {
                     Some(url) => out.push_str(&format!(
-                        "  {name:<16} [{}]  {url}  key={}\n",
+                        "  {name:<16} [{}]  {}  key={}\n",
                         p.kind,
+                        crate::transport::redact_endpoint(url),
                         mask_key(&p.key)
                     )),
                     None => out.push_str(&format!(
@@ -1492,6 +1819,7 @@ pub fn run_providers_at(path: &std::path::Path, args: &[String]) -> Result<Strin
             kind,
             base_url,
             key,
+            clear_key,
         } => {
             let mut cfg = pc::load_or_default(path)?;
             {
@@ -1505,7 +1833,9 @@ pub fn run_providers_at(path: &std::path::Path, args: &[String]) -> Result<Strin
                 if let Some(v) = base_url {
                     p.base_url = Some(v);
                 }
-                if key.is_some() {
+                if clear_key {
+                    p.key = None;
+                } else if key.is_some() {
                     p.key = key;
                 }
             }
@@ -1594,7 +1924,12 @@ pub fn edit_line_based(path: &std::path::Path) -> Result<()> {
     loop {
         println!("\nSettings (enter a number to edit, blank to finish):");
         for (i, (key, scope, value, source)) in rows(&map).iter().enumerate() {
-            println!("  {i:>2}) [{scope:6}] {key:<26} = {value}  ({source})");
+            println!(
+                "{}",
+                crate::transport::terminal_safe_multiline(&format!(
+                    "  {i:>2}) [{scope:6}] {key:<26} = {value}  ({source})"
+                ))
+            );
         }
         print!("> ");
         std::io::stdout().flush().ok();
@@ -1627,7 +1962,10 @@ pub fn edit_line_based(path: &std::path::Path) -> Result<()> {
         // Reject invalid values without saving; keep looping so the user can
         // retry (same rules as `config set`).
         if let Err(e) = validate(setting, &val) {
-            println!("{e}");
+            println!(
+                "{}",
+                crate::transport::terminal_safe_multiline(&e.to_string())
+            );
             continue;
         }
         map.insert((setting.scope, setting.key.to_string()), val);
@@ -1640,6 +1978,15 @@ pub fn edit_line_based(path: &std::path::Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_transaction_lease_is_distinct_from_the_config_file_mutation_lease() {
+        let config = PathBuf::from("root").join("config.toml");
+        let config_lock = config.with_extension("toml.lock");
+        let server_lock = server_transaction_resource(&config).with_extension("toml.lock");
+        assert_ne!(server_lock, config_lock);
+        assert!(server_lock.ends_with("server-configuration-transaction.toml.lock"));
+    }
 
     #[test]
     fn parse_commands() {
@@ -1658,8 +2005,24 @@ mod tests {
             Command::Unset("FLEETY_TZ".into())
         );
         assert_eq!(parse(&v(&["edit"])), Command::Edit);
+        assert_eq!(parse(&v(&["open"])), Command::Edit);
         assert_eq!(parse(&v(&["get"])), Command::Help); // missing operand
         assert_eq!(parse(&v(&["set", "X"])), Command::Help);
+    }
+
+    #[test]
+    fn scoped_execution_rejects_foreign_provider_and_flat_settings() {
+        let v = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(run_rendered_scoped(&v(&["provider", "list"]), Some(DAEMON_SCOPES)).is_err());
+        assert!(run_rendered_scoped(
+            &v(&["set", "FLEETY_ADDR", "127.0.0.1:9999"]),
+            Some(DAEMON_SCOPES)
+        )
+        .is_err());
+        assert!(
+            run_rendered_scoped(&v(&["set", "FLEETY_PRESENCE", "on"]), Some(SERVER_SCOPES))
+                .is_err()
+        );
     }
 
     #[test]
@@ -2071,6 +2434,26 @@ mod tests {
                 key: Some("sk".into()),
             }
         );
+        assert_eq!(
+            parse_providers(&v(&["provider", "set", "openai1", "--clear-key"]))
+                .expect("clear-key parses"),
+            ProviderCmd::ProviderSet {
+                name: "openai1".into(),
+                kind: None,
+                base_url: None,
+                key: None,
+                clear_key: true,
+            }
+        );
+        assert!(parse_providers(&v(&[
+            "provider",
+            "set",
+            "openai1",
+            "--key",
+            "sk",
+            "--clear-key",
+        ]))
+        .is_err());
         // provider add (oauth) → no base_url/key.
         assert_eq!(
             parse_providers(&v(&["provider", "add", "codex1", "--type", "oauth:codex"])).unwrap(),
@@ -2080,6 +2463,20 @@ mod tests {
                 base_url: None,
                 key: None,
             }
+        );
+        assert_eq!(
+            parse_providers(&v(&["provider", "add", "--type", "oauth:codex", "codex1"]))
+                .expect("options-first provider parses"),
+            parse_providers(&v(&["provider", "add", "codex1", "--type", "oauth:codex"]))
+                .expect("positional-first provider parses"),
+            "generated options-first usage and positional-first usage must agree"
+        );
+        assert_eq!(
+            parse_providers(&v(&["model", "set", "--member", "openai1/gpt-4o", "main",]))
+                .expect("options-first model parses"),
+            parse_providers(&v(&["model", "set", "main", "--member", "openai1/gpt-4o",]))
+                .expect("positional-first model parses"),
+            "model role placement must match generated usage"
         );
         // model set: per-member traits attach to the preceding --member; strategy pool-level.
         match parse_providers(&v(&[

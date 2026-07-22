@@ -1571,7 +1571,7 @@ async fn serve(
             } => {
                 let reply = match target {
                     fleety_protocol::ConfigTarget::Server => {
-                        let (reply, applied, sensitive, providers_changed) =
+                        let (reply, applied, sensitive, providers_changed, provider_audit) =
                             apply_structured_changes(
                                 &base_revision,
                                 &changes,
@@ -1589,6 +1589,7 @@ async fn serve(
                                     "applied": applied,
                                     "sensitive": sensitive,
                                     "providers": providers_changed,
+                                    "provider_changes": provider_audit,
                                 }),
                             };
                             let _ = storage.append_history(device_id, &event);
@@ -1659,7 +1660,7 @@ async fn serve(
                 emit(out, &reply)?;
             }
             ClientMsg::ProviderModelList { provider } => {
-                let reply = provider_model_list(&provider).await;
+                let reply = provider_model_list(&provider, auth.required()).await;
                 emit(out, &reply)?;
             }
             ClientMsg::CredentialDelete { kind, provider } => {
@@ -1932,7 +1933,18 @@ fn credential_status(
 
 /// Handle the structured provider-model discovery request. Credentials remain
 /// server-side: the reply contains only model IDs or a sanitized error.
-async fn provider_model_list(provider_name: &str) -> ServerMsg {
+async fn provider_model_list(provider_name: &str, auth_required: bool) -> ServerMsg {
+    // Model discovery is a credential operation: it may attach a Server-owned
+    // API key or OAuth token to an outbound request. An auth-disabled Server has
+    // no authenticated owner boundary, so fail before config or network access.
+    if !auth_required {
+        return model_list_error(
+            provider_name,
+            "unauthenticated",
+            "provider model discovery is unavailable while Server authentication is disabled",
+            "enable FLEETY_REQUIRE_AUTH=1 on the Server, restart it, then retry",
+        );
+    }
     let provider_name = provider_name.trim();
     if !fleety_tools::providers_config::valid_provider_name(provider_name) {
         return model_list_error(
@@ -1971,7 +1983,8 @@ async fn provider_model_list(provider_name: &str) -> ServerMsg {
             "enter a model ID manually or check the provider catalog",
         ),
         Err(error) => {
-            let detail = error.report().message.to_ascii_lowercase();
+            let report = error.report();
+            let detail = report.message.to_ascii_lowercase();
             if detail.contains("not signed in") || detail.contains("auth login") {
                 model_list_error(
                     provider_name,
@@ -1980,15 +1993,28 @@ async fn provider_model_list(provider_name: &str) -> ServerMsg {
                     &format!("run `fleety auth login {provider_name}`, then retry"),
                 )
             } else {
-                tracing::warn!(provider = %provider_name, error = %error.report().message, "provider model discovery failed");
+                tracing::warn!(provider = %provider_name, error = %report.message, "provider model discovery failed");
+                let message = model_discovery_error_message(
+                    provider_name,
+                    provider.is_oauth(),
+                    &report.message,
+                );
                 model_list_error(
                     provider_name,
                     "provider_model_list",
-                    &format!("could not fetch models for provider '{provider_name}'"),
+                    &message,
                     "enter a model ID manually or retry the catalog request",
                 )
             }
         }
+    }
+}
+
+fn model_discovery_error_message(provider: &str, oauth: bool, detail: &str) -> String {
+    if oauth {
+        format!("could not fetch models for provider '{provider}': {detail}")
+    } else {
+        format!("could not fetch models for provider '{provider}'")
     }
 }
 
@@ -2128,6 +2154,62 @@ fn is_sensitive_key(key: &str) -> bool {
 /// settings as `ConfigEntry`s (secrets carry no value, only `is_set`) plus the
 /// structured provider/model config, tagged with the current revision.
 fn build_config_snapshot() -> ServerMsg {
+    match fleety_tools::config::with_server_transaction(|| Ok(build_config_snapshot_unlocked())) {
+        Ok(reply) => reply,
+        Err(error) => {
+            let report = error.report();
+            config_err(&report.kind, report.message, report.remediation)
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct ProviderMutationAudit {
+    provider: String,
+    old_host: Option<String>,
+    new_host: Option<String>,
+    key_rotated: bool,
+}
+
+fn provider_host(endpoint: Option<&str>) -> Option<String> {
+    let url = reqwest::Url::parse(endpoint?).ok()?;
+    let host = url.host_str()?;
+    Some(match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    })
+}
+
+fn provider_mutation_audit(
+    before: &fleety_tools::providers_config::ProvidersConfig,
+    after: &fleety_tools::providers_config::ProvidersConfig,
+) -> Vec<ProviderMutationAudit> {
+    let names = before
+        .providers
+        .keys()
+        .chain(after.providers.keys())
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    names
+        .into_iter()
+        .filter_map(|provider| {
+            let old = before.providers.get(&provider);
+            let new = after.providers.get(&provider);
+            let old_endpoint = old.and_then(|entry| entry.base_url.as_deref());
+            let new_endpoint = new.and_then(|entry| entry.base_url.as_deref());
+            let key_rotated = old.and_then(|entry| entry.key.as_deref())
+                != new.and_then(|entry| entry.key.as_deref());
+            (old_endpoint != new_endpoint || key_rotated).then(|| ProviderMutationAudit {
+                provider,
+                old_host: provider_host(old_endpoint),
+                new_host: provider_host(new_endpoint),
+                key_rotated,
+            })
+        })
+        .collect()
+}
+
+fn build_config_snapshot_unlocked() -> ServerMsg {
     let map = match fleety_tools::config::load_strict(&fleety_tools::config::config_path()) {
         Ok(map) => map,
         Err(e) => {
@@ -2159,7 +2241,7 @@ fn build_config_snapshot() -> ServerMsg {
             return config_err(&report.kind, report.message, report.remediation);
         }
     };
-    let providers_json = match serde_json::to_string(&providers) {
+    let providers_json = match provider_snapshot_json(&providers) {
         Ok(json) => json,
         Err(e) => {
             return config_err(
@@ -2174,6 +2256,31 @@ fn build_config_snapshot() -> ServerMsg {
         entries,
         providers_json,
     }
+}
+
+/// Serialize the Provider/Model snapshot without ever letting a Provider key
+/// leave its Server owner. `key_present` is enough for UI/status decisions and
+/// is ignored by older serde readers as an additive top-level field.
+fn provider_snapshot_json(
+    providers: &fleety_tools::providers_config::ProvidersConfig,
+) -> serde_json::Result<String> {
+    let key_present = providers
+        .providers
+        .iter()
+        .filter_map(|(name, provider)| provider.key.is_some().then_some(name.clone()))
+        .collect::<Vec<_>>();
+    let mut redacted = providers.clone();
+    for provider in redacted.providers.values_mut() {
+        provider.key = None;
+    }
+    let mut value = serde_json::to_value(redacted)?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "key_present".to_string(),
+            serde_json::to_value(key_present)?,
+        );
+    }
+    serde_json::to_string(&value)
 }
 
 /// A `ConfigResult` error frame with the given kind/message.
@@ -2359,7 +2466,47 @@ fn apply_structured_changes(
     changes: &[fleety_protocol::ConfigChange],
     providers_json: Option<&str>,
     require_auth: bool,
-) -> (ServerMsg, u32, Vec<String>, bool) {
+) -> (
+    ServerMsg,
+    u32,
+    Vec<String>,
+    bool,
+    Vec<ProviderMutationAudit>,
+) {
+    match fleety_tools::config::with_server_transaction(|| {
+        Ok(apply_structured_changes_unlocked(
+            base_revision,
+            changes,
+            providers_json,
+            require_auth,
+        ))
+    }) {
+        Ok(result) => result,
+        Err(error) => {
+            let report = error.report();
+            (
+                config_err(&report.kind, report.message, report.remediation),
+                0,
+                vec![],
+                false,
+                vec![],
+            )
+        }
+    }
+}
+
+fn apply_structured_changes_unlocked(
+    base_revision: &str,
+    changes: &[fleety_protocol::ConfigChange],
+    providers_json: Option<&str>,
+    require_auth: bool,
+) -> (
+    ServerMsg,
+    u32,
+    Vec<String>,
+    bool,
+    Vec<ProviderMutationAudit>,
+) {
     use fleety_protocol::ChangeOp;
     if base_revision != config_revision() {
         return (
@@ -2371,6 +2518,7 @@ fn apply_structured_changes(
             0,
             vec![],
             false,
+            vec![],
         );
     }
     let mutates =
@@ -2387,6 +2535,7 @@ fn apply_structured_changes(
             0,
             vec![],
             false,
+            vec![],
         );
     }
     if providers_json.is_some() && changes.iter().any(|c| !matches!(c.op, ChangeOp::Keep)) {
@@ -2399,14 +2548,68 @@ fn apply_structured_changes(
             0,
             vec![],
             false,
+            vec![],
         );
     }
-    // Parse and validate every provider change before touching either file. A
-    // malformed provider payload must never leave the flat config half-applied.
+    // Parse every provider change before touching either file. Provider secrets
+    // are absent from snapshots, so validation happens after Server-side Keep
+    // merging under this transaction lease.
     let parsed_providers = match providers_json {
         Some(json) => {
+            let value: serde_json::Value = match serde_json::from_str(json) {
+                Ok(value) => value,
+                Err(e) => {
+                    return (
+                        config_err(
+                            "invalid",
+                            format!("malformed providers payload: {e}"),
+                            Some("re-open the provider editor and save again".to_string()),
+                        ),
+                        0,
+                        vec![],
+                        false,
+                        vec![],
+                    )
+                }
+            };
+            let clear_keys = match value.get("clear_keys") {
+                None => std::collections::BTreeSet::new(),
+                Some(serde_json::Value::Array(names)) => {
+                    let mut clear_keys = std::collections::BTreeSet::new();
+                    for name in names {
+                        let Some(name) = name.as_str() else {
+                            return (
+                                config_err(
+                                    "invalid",
+                                    "clear_keys must contain only Provider names".to_string(),
+                                    Some("re-open the provider editor and save again".to_string()),
+                                ),
+                                0,
+                                vec![],
+                                false,
+                                vec![],
+                            );
+                        };
+                        clear_keys.insert(name.to_string());
+                    }
+                    clear_keys
+                }
+                Some(_) => {
+                    return (
+                        config_err(
+                            "invalid",
+                            "clear_keys must be an array of Provider names".to_string(),
+                            Some("re-open the provider editor and save again".to_string()),
+                        ),
+                        0,
+                        vec![],
+                        false,
+                        vec![],
+                    )
+                }
+            };
             let cfg: fleety_tools::providers_config::ProvidersConfig =
-                match serde_json::from_str(json) {
+                match serde_json::from_value(value) {
                     Ok(config) => config,
                     Err(e) => {
                         return (
@@ -2418,19 +2621,11 @@ fn apply_structured_changes(
                             0,
                             vec![],
                             false,
+                            vec![],
                         )
                     }
                 };
-            if let Err(e) = fleety_tools::providers_config::validate(&cfg) {
-                let report = e.report();
-                return (
-                    config_err(&report.kind, report.message, report.remediation),
-                    0,
-                    vec![],
-                    false,
-                );
-            }
-            Some(cfg)
+            Some((cfg, clear_keys))
         }
         None => None,
     };
@@ -2444,6 +2639,7 @@ fn apply_structured_changes(
                 0,
                 vec![],
                 false,
+                vec![],
             );
         }
     };
@@ -2459,6 +2655,7 @@ fn apply_structured_changes(
                         0,
                         vec![],
                         false,
+                        vec![],
                     );
                 };
                 if let Err(e) =
@@ -2470,6 +2667,7 @@ fn apply_structured_changes(
                         0,
                         vec![],
                         false,
+                        vec![],
                     );
                 }
                 let v = ch.value.clone().unwrap_or_default();
@@ -2480,6 +2678,7 @@ fn apply_structured_changes(
                         0,
                         vec![],
                         false,
+                        vec![],
                     );
                 }
                 map.insert((setting.scope, ch.key.clone()), v);
@@ -2495,6 +2694,7 @@ fn apply_structured_changes(
                         0,
                         vec![],
                         false,
+                        vec![],
                     );
                 };
                 if let Err(e) =
@@ -2506,6 +2706,7 @@ fn apply_structured_changes(
                         0,
                         vec![],
                         false,
+                        vec![],
                     );
                 }
                 map.remove(&(setting.scope, ch.key.clone()));
@@ -2524,6 +2725,7 @@ fn apply_structured_changes(
                 0,
                 vec![],
                 false,
+                vec![],
             );
         }
     }
@@ -2531,7 +2733,78 @@ fn apply_structured_changes(
     // atomic write via the same path the local editor uses. Nothing lands on a
     // parse or validation failure.
     let mut providers_changed = false;
-    if let Some(cfg) = parsed_providers {
+    let mut provider_audit = Vec::new();
+    if let Some((mut cfg, clear_keys)) = parsed_providers {
+        let before = match fleety_tools::providers_config::load_or_default(
+            &fleety_tools::providers_config::providers_path(),
+        ) {
+            Ok(config) => config,
+            Err(error) => {
+                let report = error.report();
+                return (
+                    config_err(&report.kind, report.message, report.remediation),
+                    applied,
+                    sensitive,
+                    false,
+                    vec![],
+                );
+            }
+        };
+        // A missing key on an existing, same-kind Provider means Keep. A newly
+        // supplied value means Set. Provider removal omits the entry entirely;
+        // changing kind does not carry a key across incompatible auth schemes.
+        for name in &clear_keys {
+            let Some(provider) = cfg.providers.get(name) else {
+                return (
+                    config_err(
+                        "invalid",
+                        format!("cannot clear API key for missing Provider '{name}'"),
+                        Some("re-open the provider editor and retry".to_string()),
+                    ),
+                    applied,
+                    sensitive,
+                    false,
+                    vec![],
+                );
+            };
+            if !fleety_tools::providers_config::provider_type(&provider.kind)
+                .is_some_and(|kind| kind.allows_key)
+            {
+                return (
+                    config_err(
+                        "invalid",
+                        format!("Provider '{name}' does not use an API key"),
+                        Some("remove --clear-key or select an API Provider".to_string()),
+                    ),
+                    applied,
+                    sensitive,
+                    false,
+                    vec![],
+                );
+            }
+        }
+        for (name, provider) in &mut cfg.providers {
+            if clear_keys.contains(name) {
+                provider.key = None;
+            } else if provider.key.is_none() {
+                if let Some(existing) = before.providers.get(name) {
+                    if existing.kind == provider.kind {
+                        provider.key.clone_from(&existing.key);
+                    }
+                }
+            }
+        }
+        if let Err(e) = fleety_tools::providers_config::validate(&cfg) {
+            let report = e.report();
+            return (
+                config_err(&report.kind, report.message, report.remediation),
+                applied,
+                sensitive,
+                false,
+                vec![],
+            );
+        }
+        provider_audit = provider_mutation_audit(&before, &cfg);
         if let Err(e) = fleety_tools::providers_config::write_providers(
             &fleety_tools::providers_config::providers_path(),
             &cfg,
@@ -2542,6 +2815,7 @@ fn apply_structured_changes(
                 applied,
                 sensitive,
                 false,
+                vec![],
             );
         }
         providers_changed = true;
@@ -2556,6 +2830,7 @@ fn apply_structured_changes(
         applied,
         sensitive,
         providers_changed,
+        provider_audit,
     )
 }
 
@@ -2568,10 +2843,12 @@ fn apply_structured_changes(
 fn config_apply(target: fleety_protocol::ConfigTarget, args: &[String]) -> ServerMsg {
     use fleety_protocol::{ConfigTarget, Effect};
     match target {
-        ConfigTarget::Server => match fleety_tools::config::run_rendered_scoped(
-            args,
-            Some(fleety_tools::config::SERVER_SCOPES),
-        ) {
+        ConfigTarget::Server => match fleety_tools::config::with_server_transaction(|| {
+            fleety_tools::config::run_rendered_scoped(
+                args,
+                Some(fleety_tools::config::SERVER_SCOPES),
+            )
+        }) {
             Ok(output) => {
                 let effect = match fleety_tools::config::config_effect(args) {
                     Some(fleety_tools::config::ConfigEffect::NextConnection) => {
@@ -3809,7 +4086,7 @@ mod tests {
             "models": {}
         }"#;
         let rev = config_revision();
-        let (reply, _applied, _sensitive, providers_changed) =
+        let (reply, _applied, _sensitive, providers_changed, provider_audit) =
             apply_structured_changes(&rev, &[], Some(providers), true);
         match reply {
             ServerMsg::ConfigResult { ok, error, .. } => {
@@ -3818,7 +4095,76 @@ mod tests {
             other => panic!("unexpected reply {other:?}"),
         }
         assert!(providers_changed);
+        assert_eq!(provider_audit.len(), 1);
+        assert_eq!(provider_audit[0].provider, "p1");
+        assert_eq!(provider_audit[0].new_host.as_deref(), Some("x"));
+        assert!(!provider_audit[0].key_rotated);
         assert!(providers_path.exists(), "providers.toml written");
+
+        let rotated = r#"{
+            "providers": {
+                "p1": {
+                    "type": "api",
+                    "base_url": "https://new.example:9443/v1",
+                    "key": "new-secret-key"
+                }
+            },
+            "models": {}
+        }"#;
+        let revision = config_revision();
+        let (reply, _, _, changed, audit) =
+            apply_structured_changes(&revision, &[], Some(rotated), true);
+        assert!(matches!(reply, ServerMsg::ConfigResult { ok: true, .. }));
+        assert!(changed);
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].old_host.as_deref(), Some("x"));
+        assert_eq!(audit[0].new_host.as_deref(), Some("new.example:9443"));
+        assert!(audit[0].key_rotated);
+        let audit_json = serde_json::to_string(&audit).expect("serialize provider audit");
+        assert!(!audit_json.contains("new-secret-key"), "audit leaked key");
+
+        // Two editors applying the same revision concurrently cannot both win:
+        // the revision check and write share the Server transaction lease.
+        let concurrent_revision = config_revision();
+        let start = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let workers = ["one", "two"]
+            .into_iter()
+            .map(|name| {
+                let start = std::sync::Arc::clone(&start);
+                let revision = concurrent_revision.clone();
+                std::thread::spawn(move || {
+                    let payload = format!(
+                        r#"{{"providers":{{"{name}":{{"type":"api","base_url":"https://{name}.example/v1"}}}},"models":{{}}}}"#
+                    );
+                    start.wait();
+                    apply_structured_changes(&revision, &[], Some(&payload), true).0
+                })
+            })
+            .collect::<Vec<_>>();
+        start.wait();
+        let replies = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("config apply worker"))
+            .collect::<Vec<_>>();
+        let successful = replies
+            .iter()
+            .filter(|reply| matches!(reply, ServerMsg::ConfigResult { ok: true, .. }))
+            .count();
+        let conflicts = replies
+            .iter()
+            .filter(|reply| {
+                matches!(
+                    reply,
+                    ServerMsg::ConfigResult {
+                        ok: false,
+                        error: Some(error),
+                        ..
+                    } if error.kind == "conflict"
+                )
+            })
+            .count();
+        assert_eq!(successful, 1, "exactly one same-revision apply wins");
+        assert_eq!(conflicts, 1, "the other same-revision apply conflicts");
 
         // A single request may not span both owner files. Reject it before
         // touching either file so an I/O failure can never leave a half-apply.
@@ -3832,7 +4178,7 @@ mod tests {
             op: fleety_protocol::ChangeOp::Set,
             value: Some("after:8787".to_string()),
         }];
-        let (reply, applied, _, changed) =
+        let (reply, applied, _, changed, _) =
             apply_structured_changes(&rev, &mixed, Some(providers), true);
         match reply {
             ServerMsg::ConfigResult { ok, error, .. } => {
@@ -3855,7 +4201,8 @@ mod tests {
         // Malformed JSON is rejected without touching the file.
         let before = std::fs::read_to_string(&providers_path).expect("read");
         let rev = config_revision();
-        let (reply, _, _, changed) = apply_structured_changes(&rev, &[], Some("{not json"), true);
+        let (reply, _, _, changed, _) =
+            apply_structured_changes(&rev, &[], Some("{not json"), true);
         match reply {
             ServerMsg::ConfigResult { ok, .. } => assert!(!ok),
             other => panic!("unexpected reply {other:?}"),
@@ -3871,7 +4218,8 @@ mod tests {
         // nothing.
         let stale = config_revision();
         std::fs::write(&providers_path, "# hand edit").expect("write");
-        let (reply, _, _, changed) = apply_structured_changes(&stale, &[], Some(providers), true);
+        let (reply, _, _, changed, _) =
+            apply_structured_changes(&stale, &[], Some(providers), true);
         match reply {
             ServerMsg::ConfigResult { ok, error, .. } => {
                 assert!(!ok);
@@ -3883,7 +4231,7 @@ mod tests {
 
         // Auth-off server refuses a providers write-back (it mutates).
         let rev = config_revision();
-        let (reply, _, _, changed) = apply_structured_changes(&rev, &[], Some(providers), false);
+        let (reply, _, _, changed, _) = apply_structured_changes(&rev, &[], Some(providers), false);
         match reply {
             ServerMsg::ConfigResult { ok, error, .. } => {
                 assert!(!ok);
@@ -4318,8 +4666,10 @@ mod tests {
 
         // Server flat set → ok + Restart effect.
         match config_apply(ConfigTarget::Server, &s(&["set", "FLEETY_MODEL", "gpt-5"])) {
-            ServerMsg::ConfigResult { ok, effect, .. } => {
-                assert!(ok);
+            ServerMsg::ConfigResult {
+                ok, effect, error, ..
+            } => {
+                assert!(ok, "server config set failed: {error:?}");
                 assert_eq!(effect, Some(Effect::Restart));
             }
             other => panic!("expected ConfigResult, got {other:?}"),
@@ -4362,7 +4712,15 @@ mod tests {
         // Provider add → ok + NextConnection effect.
         match config_apply(
             ConfigTarget::Server,
-            &s(&["provider", "add", "p", "--type", "api", "--base-url", "u"]),
+            &s(&[
+                "provider",
+                "add",
+                "p",
+                "--type",
+                "api",
+                "--base-url",
+                "https://api.example.test/v1",
+            ]),
         ) {
             ServerMsg::ConfigResult { ok, effect, .. } => {
                 assert!(ok);
@@ -4397,6 +4755,11 @@ mod tests {
         std::env::set_var("FLEETY_CONFIG", dir.join("config.toml"));
         std::env::set_var("FLEETY_PROVIDERS", dir.join("providers.toml"));
         std::env::remove_var("FLEETY_TOKEN");
+        std::fs::write(
+            dir.join("providers.toml"),
+            "[providers.private-api]\ntype = \"api\"\nbase_url = \"https://api.example.test/v1\"\nkey = \"sk-snapshot-secret\"\n",
+        )
+        .expect("provider config");
 
         match build_config_snapshot() {
             ServerMsg::ConfigSnapshotResult {
@@ -4413,16 +4776,82 @@ mod tests {
                     .find(|e| e.key == "FLEETY_TOKEN")
                     .expect("token entry");
                 assert!(tok.secret && tok.value.is_empty(), "secret value omitted");
-                assert!(
-                    serde_json::from_str::<serde_json::Value>(&providers_json).is_ok(),
-                    "providers_json parses"
+                assert!(!providers_json.contains("sk-snapshot-secret"));
+                let value: serde_json::Value =
+                    serde_json::from_str(&providers_json).expect("providers_json parses");
+                assert_eq!(
+                    value.get("key_present"),
+                    Some(&serde_json::json!(["private-api"]))
                 );
+                assert!(value["providers"]["private-api"].get("key").is_none());
+
+                // Applying the redacted snapshot means Keep, not Clear. The key
+                // remains Server-owned and never needs to round-trip through CLI.
+                let (reply, _, _, changed, _) =
+                    apply_structured_changes(&revision, &[], Some(&providers_json), true);
+                assert!(matches!(reply, ServerMsg::ConfigResult { ok: true, .. }));
+                assert!(changed);
+                let stored =
+                    fleety_tools::providers_config::load_or_default(&dir.join("providers.toml"))
+                        .expect("stored providers");
+                assert_eq!(
+                    stored
+                        .provider("private-api")
+                        .and_then(|provider| provider.key.as_deref()),
+                    Some("sk-snapshot-secret")
+                );
+
+                // Clear is a separate, explicit intent. A redacted `None`
+                // alone can never remove the Server-owned secret.
+                let ServerMsg::ConfigSnapshotResult {
+                    revision: clear_revision,
+                    providers_json: clear_json,
+                    ..
+                } = build_config_snapshot()
+                else {
+                    panic!("expected refreshed snapshot");
+                };
+                let mut clear_value: serde_json::Value =
+                    serde_json::from_str(&clear_json).expect("clear snapshot parses");
+                clear_value
+                    .as_object_mut()
+                    .expect("object")
+                    .insert("clear_keys".into(), serde_json::json!(["private-api"]));
+                let clear_payload = serde_json::to_string(&clear_value).expect("clear payload");
+                let (reply, _, _, changed, _) =
+                    apply_structured_changes(&clear_revision, &[], Some(&clear_payload), true);
+                assert!(matches!(reply, ServerMsg::ConfigResult { ok: true, .. }));
+                assert!(changed);
+                let stored =
+                    fleety_tools::providers_config::load_or_default(&dir.join("providers.toml"))
+                        .expect("stored providers after clear");
+                assert!(stored
+                    .provider("private-api")
+                    .and_then(|provider| provider.key.as_ref())
+                    .is_none());
             }
             other => panic!("expected ConfigSnapshotResult, got {other:?}"),
         }
         std::env::remove_var("FLEETY_CONFIG");
         std::env::remove_var("FLEETY_PROVIDERS");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn auth_disabled_catalog_fails_before_provider_or_network_access() {
+        let reply = provider_model_list("private-api", false).await;
+        match reply {
+            ServerMsg::ProviderModelListResult {
+                provider,
+                model_ids,
+                error: Some(error),
+            } => {
+                assert_eq!(provider, "private-api");
+                assert!(model_ids.is_empty());
+                assert_eq!(error.kind, "unauthenticated");
+            }
+            other => panic!("expected credential gate error, got {other:?}"),
+        }
     }
 
     #[test]
@@ -4441,7 +4870,7 @@ mod tests {
         };
 
         // Stale base_revision → conflict, nothing applied.
-        let (r, applied, _, _) = apply_structured_changes(
+        let (r, applied, _, _, _) = apply_structured_changes(
             "stale:rev",
             &[set("FLEETY_POLICY", "require_approval")],
             None,
@@ -4454,7 +4883,7 @@ mod tests {
 
         // Correct revision + auth on → the Set applies (validated, atomic save).
         let rev = config_revision();
-        let (r, applied, _, _) = apply_structured_changes(
+        let (r, applied, _, _, _) = apply_structured_changes(
             &rev,
             &[set("FLEETY_POLICY", "require_approval")],
             None,
@@ -4471,7 +4900,7 @@ mod tests {
         );
 
         // Auth off + a mutating change → refused (unauthenticated).
-        let (r, _, _, _) = apply_structured_changes(
+        let (r, _, _, _, _) = apply_structured_changes(
             &config_revision(),
             &[set("FLEETY_TZ", "Asia/Taipei")],
             None,
@@ -4481,7 +4910,7 @@ mod tests {
             matches!(&r, ServerMsg::ConfigResult { ok: false, error: Some(e), .. } if e.kind == "unauthenticated")
         );
         // Auth off + a Keep-only apply (no mutation) → allowed no-op.
-        let (r, applied, _, _) = apply_structured_changes(
+        let (r, applied, _, _, _) = apply_structured_changes(
             &config_revision(),
             &[ConfigChange {
                 key: "FLEETY_TZ".into(),
@@ -4495,7 +4924,7 @@ mod tests {
         assert_eq!(applied, 0);
 
         // A sensitive key is reported for auditing.
-        let (_, _, sensitive, _) = apply_structured_changes(
+        let (_, _, sensitive, _, _) = apply_structured_changes(
             &config_revision(),
             &[set("FLEETY_MODEL_KEY", "sk-x")],
             None,
@@ -6969,5 +7398,24 @@ mod tests {
         assert!(auth.verify(&minted).is_some());
 
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn oauth_catalog_error_keeps_backend_detail_but_api_error_hides_endpoint_detail() {
+        let oauth = model_discovery_error_message(
+            "tingzhen-codex",
+            true,
+            "Codex model catalog returned HTTP 403: account is not eligible",
+        );
+        assert!(oauth.contains("HTTP 403"), "{oauth}");
+        assert!(oauth.contains("account is not eligible"), "{oauth}");
+
+        let api = model_discovery_error_message(
+            "custom",
+            false,
+            "request failed for https://user:secret@example.test/models?token=secret",
+        );
+        assert_eq!(api, "could not fetch models for provider 'custom'");
+        assert!(!api.contains("secret"));
     }
 }

@@ -1,66 +1,94 @@
 //! Cursor-aware single-line editor shared by the TUI input boxes.
 //!
-//! The cursor is a **char index** (not bytes, not columns); every mutation
-//! converts to a byte offset via `char_indices`, so UTF-8 boundaries can never
-//! be split (this crate is never-crash). Display math uses terminal columns
-//! (CJK fullwidth = 2), measured through ratatui's `Line::width` so we stay on
-//! the exact same unicode-width tables the renderer uses — without adding a
-//! direct dependency.
+//! The cursor is an **extended grapheme cluster index** (not bytes, Unicode
+//! scalars, or columns). Every mutation shares the same segmentation boundary,
+//! so combining marks, emoji modifiers, flags, and ZWJ families are never
+//! split. Display math uses terminal columns measured through ratatui's
+//! `Line::width`.
 
 use ratatui::text::Line;
+use unicode_segmentation::UnicodeSegmentation;
 
-/// Display width of one char in terminal columns (via ratatui, see module doc).
-fn ch_width(c: char) -> usize {
-    let mut buf = [0u8; 4];
-    Line::from(&*c.encode_utf8(&mut buf)).width()
+fn grapheme_width(grapheme: &str) -> usize {
+    Line::from(grapheme).width()
 }
 
 /// Single-line text buffer with a movable cursor.
 #[derive(Debug, Default, Clone)]
 pub struct LineEditor {
     text: String,
-    /// Cursor as a char index, 0..=char count (== count means "after the end").
+    /// Cursor as a grapheme index, 0..=grapheme count.
     cursor: usize,
 }
 
 impl LineEditor {
+    fn grapheme_count(&self) -> usize {
+        self.text.graphemes(true).count()
+    }
+
+    fn grapheme_offsets(&self) -> Vec<usize> {
+        self.text
+            .grapheme_indices(true)
+            .map(|(byte, _)| byte)
+            .chain(std::iter::once(self.text.len()))
+            .collect()
+    }
+
     /// Byte offset of the cursor (text.len() when the cursor is at the end).
     fn byte_offset(&self) -> usize {
         self.text
-            .char_indices()
+            .grapheme_indices(true)
             .nth(self.cursor)
-            .map(|(b, _)| b)
+            .map(|(byte, _)| byte)
             .unwrap_or(self.text.len())
+    }
+
+    /// Place the cursor at the first complete grapheme ending at or after a
+    /// byte position. Inserted combining/ZWJ content can merge with an adjacent
+    /// cluster, so simply adding a scalar count would create an interior cursor.
+    fn set_cursor_after_byte(&mut self, byte: usize) {
+        self.cursor = self
+            .text
+            .grapheme_indices(true)
+            .position(|(start, grapheme)| start + grapheme.len() >= byte)
+            .map(|index| index + 1)
+            .unwrap_or_else(|| self.grapheme_count());
     }
 
     pub fn insert(&mut self, c: char) {
         let b = self.byte_offset();
         self.text.insert(b, c);
-        self.cursor += 1;
+        self.set_cursor_after_byte(b + c.len_utf8());
     }
 
     /// Insert a whole string at the cursor (paste path).
     pub fn insert_str(&mut self, s: &str) {
+        if s.is_empty() {
+            return;
+        }
         let b = self.byte_offset();
         self.text.insert_str(b, s);
-        self.cursor += s.chars().count();
+        self.set_cursor_after_byte(b + s.len());
     }
 
-    /// Delete the char before the cursor.
+    /// Delete the grapheme before the cursor.
     pub fn backspace(&mut self) {
         if self.cursor == 0 {
             return;
         }
+        let offsets = self.grapheme_offsets();
+        let end = offsets[self.cursor];
+        let start = offsets[self.cursor - 1];
+        self.text.replace_range(start..end, "");
         self.cursor -= 1;
-        let b = self.byte_offset();
-        self.text.remove(b);
     }
 
-    /// Delete the char under the cursor.
+    /// Delete the grapheme under the cursor.
     pub fn delete(&mut self) {
-        let b = self.byte_offset();
-        if b < self.text.len() {
-            self.text.remove(b);
+        let offsets = self.grapheme_offsets();
+        if self.cursor + 1 < offsets.len() {
+            self.text
+                .replace_range(offsets[self.cursor]..offsets[self.cursor + 1], "");
         }
     }
 
@@ -69,7 +97,7 @@ impl LineEditor {
     }
 
     pub fn right(&mut self) {
-        if self.cursor < self.text.chars().count() {
+        if self.cursor < self.grapheme_count() {
             self.cursor += 1;
         }
     }
@@ -77,9 +105,9 @@ impl LineEditor {
     /// Move to the start of the current line (line-relative; on a single-line
     /// buffer this is the absolute start).
     pub fn home(&mut self) {
-        let chars: Vec<char> = self.text.chars().collect();
-        let mut i = self.cursor.min(chars.len());
-        while i > 0 && chars[i - 1] != '\n' {
+        let graphemes: Vec<&str> = self.text.graphemes(true).collect();
+        let mut i = self.cursor.min(graphemes.len());
+        while i > 0 && !graphemes[i - 1].contains('\n') {
             i -= 1;
         }
         self.cursor = i;
@@ -88,15 +116,15 @@ impl LineEditor {
     /// Move to the end of the current line (line-relative; on a single-line
     /// buffer this is the absolute end).
     pub fn end(&mut self) {
-        let chars: Vec<char> = self.text.chars().collect();
-        let mut i = self.cursor.min(chars.len());
-        while i < chars.len() && chars[i] != '\n' {
+        let graphemes: Vec<&str> = self.text.graphemes(true).collect();
+        let mut i = self.cursor.min(graphemes.len());
+        while i < graphemes.len() && !graphemes[i].contains('\n') {
             i += 1;
         }
         self.cursor = i;
     }
 
-    /// Insert a line break at the cursor (multi-line composition). Char-index
+    /// Insert a line break at the cursor (multi-line composition). Grapheme-index
     /// and UTF-8 boundary guarantees are the same as any other insert.
     pub fn insert_newline(&mut self) {
         self.insert('\n');
@@ -113,15 +141,15 @@ impl LineEditor {
     pub fn cursor_row_col(&self) -> (usize, usize) {
         let mut row = 0;
         let mut col = 0;
-        for (i, c) in self.text.chars().enumerate() {
+        for (i, grapheme) in self.text.graphemes(true).enumerate() {
             if i == self.cursor {
                 break;
             }
-            if c == '\n' {
+            if grapheme.contains('\n') {
                 row += 1;
                 col = 0;
             } else {
-                col += ch_width(c);
+                col += grapheme_width(grapheme);
             }
         }
         (row, col)
@@ -130,18 +158,18 @@ impl LineEditor {
     /// Place the cursor at (or just before) `target_col` display columns into
     /// `target_row`, clamped to the row's end. Used by `up`/`down`.
     fn set_cursor_row_col(&mut self, target_row: usize, target_col: usize) {
-        let chars: Vec<char> = self.text.chars().collect();
+        let graphemes: Vec<&str> = self.text.graphemes(true).collect();
         let mut i = 0;
         let mut row = 0;
-        while i < chars.len() && row < target_row {
-            if chars[i] == '\n' {
+        while i < graphemes.len() && row < target_row {
+            if graphemes[i].contains('\n') {
                 row += 1;
             }
             i += 1;
         }
         let mut col = 0;
-        while i < chars.len() && chars[i] != '\n' && col < target_col {
-            col += ch_width(chars[i]);
+        while i < graphemes.len() && !graphemes[i].contains('\n') && col < target_col {
+            col += grapheme_width(graphemes[i]);
             i += 1;
         }
         self.cursor = i;
@@ -167,12 +195,12 @@ impl LineEditor {
 
     /// Jump to the start of the previous word (whitespace-delimited).
     pub fn word_left(&mut self) {
-        let chars: Vec<char> = self.text.chars().collect();
-        let mut i = self.cursor.min(chars.len());
-        while i > 0 && chars[i - 1].is_whitespace() {
+        let graphemes: Vec<&str> = self.text.graphemes(true).collect();
+        let mut i = self.cursor.min(graphemes.len());
+        while i > 0 && graphemes[i - 1].chars().all(char::is_whitespace) {
             i -= 1;
         }
-        while i > 0 && !chars[i - 1].is_whitespace() {
+        while i > 0 && !graphemes[i - 1].chars().all(char::is_whitespace) {
             i -= 1;
         }
         self.cursor = i;
@@ -180,13 +208,13 @@ impl LineEditor {
 
     /// Jump past the current word to the start of the next (or the end).
     pub fn word_right(&mut self) {
-        let chars: Vec<char> = self.text.chars().collect();
-        let n = chars.len();
+        let graphemes: Vec<&str> = self.text.graphemes(true).collect();
+        let n = graphemes.len();
         let mut i = self.cursor.min(n);
-        while i < n && !chars[i].is_whitespace() {
+        while i < n && !graphemes[i].chars().all(char::is_whitespace) {
             i += 1;
         }
-        while i < n && chars[i].is_whitespace() {
+        while i < n && graphemes[i].chars().all(char::is_whitespace) {
             i += 1;
         }
         self.cursor = i;
@@ -200,7 +228,7 @@ impl LineEditor {
 
     /// Replace the content (prefill path); cursor moves to the end.
     pub fn set_text(&mut self, text: String) {
-        self.cursor = text.chars().count();
+        self.cursor = text.graphemes(true).count();
         self.text = text;
     }
 
@@ -221,36 +249,40 @@ impl LineEditor {
     /// callers that render the whole text after a prefix (config rows).
     #[allow(dead_code)]
     pub fn cursor_col(&self) -> usize {
-        self.text.chars().take(self.cursor).map(ch_width).sum()
+        self.text
+            .graphemes(true)
+            .take(self.cursor)
+            .map(grapheme_width)
+            .sum()
     }
 
     /// The slice of text to show in a box `width` columns wide, plus the
     /// cursor's column within that slice. When the text overflows, the window
     /// scrolls just enough to keep the cursor strictly inside (never on the
-    /// border), starting and ending on char boundaries so a fullwidth char is
-    /// never half-shown.
+    /// border), starting and ending on grapheme boundaries so a user-perceived
+    /// character is never half-shown.
     pub fn display_window(&self, width: usize) -> (&str, u16) {
         if width == 0 {
             return ("", 0);
         }
-        let chars: Vec<(usize, usize)> = self
+        let graphemes: Vec<(usize, usize)> = self
             .text
-            .char_indices()
-            .map(|(b, c)| (b, ch_width(c)))
+            .grapheme_indices(true)
+            .map(|(byte, grapheme)| (byte, grapheme_width(grapheme)))
             .collect();
-        let cursor_col: usize = chars.iter().take(self.cursor).map(|&(_, w)| w).sum();
-        let total: usize = chars.iter().map(|&(_, w)| w).sum();
+        let cursor_col: usize = graphemes.iter().take(self.cursor).map(|&(_, w)| w).sum();
+        let total: usize = graphemes.iter().map(|&(_, w)| w).sum();
         // `<` not `<=`: the cursor needs its own column when sitting past the
-        // last char.
+        // last grapheme.
         if total < width {
             return (&self.text, cursor_col as u16);
         }
         // Scroll right until the cursor column fits in [0, width-1].
         let min_start = cursor_col.saturating_sub(width - 1);
-        let mut start_idx = chars.len();
+        let mut start_idx = graphemes.len();
         let mut start_col = total;
         let mut acc = 0;
-        for (i, &(_, w)) in chars.iter().enumerate() {
+        for (i, &(_, w)) in graphemes.iter().enumerate() {
             if acc >= min_start {
                 start_idx = i;
                 start_col = acc;
@@ -258,21 +290,21 @@ impl LineEditor {
             }
             acc += w;
         }
-        // Fill the window with whole chars only.
+        // Fill the window with whole graphemes only.
         let mut end_idx = start_idx;
         let mut used = 0;
-        for &(_, w) in chars.iter().skip(start_idx) {
+        for &(_, w) in graphemes.iter().skip(start_idx) {
             if used + w > width {
                 break;
             }
             used += w;
             end_idx += 1;
         }
-        let start_b = chars
+        let start_b = graphemes
             .get(start_idx)
             .map(|&(b, _)| b)
             .unwrap_or(self.text.len());
-        let end_b = chars
+        let end_b = graphemes
             .get(end_idx)
             .map(|&(b, _)| b)
             .unwrap_or(self.text.len());
@@ -329,6 +361,47 @@ mod tests {
         e.right();
         e.insert('!');
         assert_eq!(e.text(), "ab!");
+    }
+
+    #[test]
+    fn extended_graphemes_move_and_delete_as_indivisible_user_characters() {
+        let mut e = ed("e\u{301}👍🏽👨‍👩‍👧‍👦🇹🇼");
+        e.backspace();
+        assert_eq!(e.text(), "e\u{301}👍🏽👨‍👩‍👧‍👦", "flag removed atomically");
+        e.left();
+        e.delete();
+        assert_eq!(e.text(), "e\u{301}👍🏽", "ZWJ family removed atomically");
+        e.backspace();
+        assert_eq!(e.text(), "e\u{301}", "skin-tone emoji removed atomically");
+        e.backspace();
+        assert!(e.text().is_empty(), "combining sequence removed atomically");
+    }
+
+    #[test]
+    fn grapheme_paste_navigation_and_window_share_the_same_boundaries() {
+        let mut e = ed("A🇹🇼B");
+        e.left();
+        e.left();
+        e.insert_str("e\u{301}👍🏽");
+        assert_eq!(e.text(), "Ae\u{301}👍🏽🇹🇼B");
+        e.left();
+        e.backspace();
+        assert_eq!(e.text(), "A👍🏽🇹🇼B", "combining grapheme deleted whole");
+        let (view, _) = e.display_window(4);
+        assert!(!view.starts_with('\u{301}'));
+        assert!(!view.contains('🏽') || view.contains("👍🏽"));
+    }
+
+    #[test]
+    fn multiline_grapheme_cursor_columns_use_rendered_cluster_width() {
+        let mut e = ed("e\u{301}x\n👍🏽界");
+        assert_eq!(e.cursor_row_col(), (1, 4));
+        e.home();
+        assert_eq!(e.cursor_row_col(), (1, 0));
+        e.up();
+        assert_eq!(e.cursor_row_col(), (0, 0));
+        e.end();
+        assert_eq!(e.cursor_row_col(), (0, 2));
     }
 
     #[test]

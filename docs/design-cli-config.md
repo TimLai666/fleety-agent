@@ -1,6 +1,6 @@
 # Fleety CLI 設定架構重新設計(定稿)
 
-_狀態:設計定稿並已實作。設定面板目前分為 Connection / CLI / Daemon / Server 四區，所有非 CLI 設定都經由擁有它的 runtime 寫入，不提供直接改檔 fallback。2026-07-13。_
+_狀態:設計定稿並已實作。共享 terminal workspace 的 Settings 分為 Connection / CLI / Daemon / Server / Providers & Models 五頁。CLI 只透過本機 CLI owner service 套用自身設定；Daemon、Server、Provider、Model、OAuth 一律送到擁有它的 runtime，不提供直接改檔 fallback。2026-07-17。_
 
 本檔是 CLI 設定架構的重新設計。經一輪多方案設計 + 一輪六角度紅隊(7 blocker /
 20 high)+ 與擁有者逐項拍板收斂而成。實作分兩階段(見 §10)。
@@ -33,10 +33,11 @@ _狀態:設計定稿並已實作。設定面板目前分為 Connection / CLI / D
 
 | 層 | 是什麼 | 單一真相來源 | 主要入口 |
 |---|---|---|---|
-| **Connection** | 連哪台 server + 認證(裝置端特有,本質不是設定旋鈕) | `connections.toml`(CLI+daemon 共用) | `fleety server …` / 互動面板 (1) 區 |
-| **CLI** | 這台裝置的 `fleety` 自己的行為(voice、顯示) | `config.toml` 的 `Cli` | `fleety config … --target cli` / 面板 (2) 區 |
-| **Daemon** | 這台裝置背景 `fleetyd` 的行為與 Shared 設定 | daemon 的 `config.toml` | `fleety config … --target daemon` / 面板 (3) 區，經 daemon tool bridge |
-| **Server** | 遠端那台 server 的所有設定(policy、addr、providers、models…) | server 那端的 registry + providers/models | `fleety config … --target server` / 面板 (4) 區 |
+| **Connection** | 連哪台 server + 認證(裝置端特有,本質不是設定旋鈕) | `connections.toml`(CLI+daemon 共用) | `fleety connection …` / Settings (1) |
+| **CLI** | 這台裝置的 `fleety` 自己的行為(voice、顯示) | `config.toml` 的 `Cli` | `fleety config … --owner cli` / Settings (2) |
+| **Daemon** | 這台裝置背景 `fleetyd` 的行為與 Shared 設定 | daemon 的 `config.toml` | `fleety config … --owner daemon` / Settings (3)，經 daemon tool bridge |
+| **Server** | 遠端那台 server 的一般設定(policy、addr…) | server 那端的 registry | `fleety config … --owner server` / Settings (4) |
+| **Providers & Models** | Provider、OAuth、模型 catalog 與 role | 目前連線 Server 的 provider service | `fleety provider …` / `fleety model …` / Settings (5) |
 
 「連哪台」不是 registry setting(它是指標/目標,還要能管多台切換);「這台 CLI 怎麼
 跑」和「server 怎麼跑」是兩台機器的兩份設定。三者各有唯一權威來源,結構上不重疊。
@@ -75,7 +76,7 @@ token = "…"
 
 維持現行 typed registry,但:
 - **移除 `FLEETY_AGENT_URL`**(連線層接手,消除優先序陷阱)。
-- 面板 CLI 區與 `config … --target cli` 只顯示 `Cli` scope。Shared 固定由 daemon 擁有。
+- Settings CLI 頁與 `config … --owner cli` 只顯示 `Cli` scope。Shared 固定由 daemon 擁有。
 - 每個 `Shared` 鍵定**單一權威來源**(見 M7),colocation(server+daemon 同機)時
   不再兩處各改一份。
 
@@ -91,7 +92,7 @@ base_url = "https://api.openai.com/v1"
 key      = "sk-…"                       # secret
 
 [providers.codex1]
-type = "oauth:codex"                   # oauth 型:token 由 fleety auth login codex1 產,per-provider
+type = "oauth:codex"                   # oauth 型:token 由 fleety provider login codex1 產,per-provider
 
 [providers.google1]
 type     = "api"
@@ -183,58 +184,75 @@ resolver):
 
 **連線管理(改連哪台 / 多台切換):**
 ```sh
-fleety server add <name> <url> [--label …] [--pair <code>] [--use]
-fleety server use <name>          # 切換 current(CLI+daemon 一起,見 M6)
-fleety server list | show [<name>] | current
-fleety server rename <old> <new> | remove <name> | set-url <name> <url>
-fleety init <url> [--name <name>] # = server add … --use 的 sugar(向後相容)
+fleety connection add <name> <url> [--label …] [--use]
+fleety connection use <name>          # 切換 current(CLI+daemon 一起,見 M6)
+fleety connection list | show [<name>]
+fleety connection rename <old> <new> | remove <name> | set-url <name> <url>
+fleety init <url> [--name <name>] # guided add + use
 fleety pair <code>                # 對 current profile 配對,token 寫 current profile
-fleety -s <name> <cmd> | --url <ws> <cmd>   # 單次覆寫,不改 current、不動 daemon
+fleety --profile <name> <cmd> | --server <ws> <cmd>   # 單次覆寫,不改 current、不動 daemon
 ```
 
 **本機 CLI 設定:**
 ```sh
-fleety config --target cli list | get <KEY> | set <KEY> <VALUE> | edit   # 只 Cli
-fleety config --target daemon list | get <KEY> | set <KEY> <VALUE>       # Daemon/Shared，送至 fleetyd
+fleety config --owner cli list | get <KEY> | set <KEY> <VALUE> | edit   # 只 Cli
+fleety config --owner daemon list | get <KEY> | set <KEY> <VALUE>       # Daemon/Shared，送至 fleetyd
 ```
 
 **Server 設定(遠端,對 current profile):**
 ```sh
 fleety config set <KEY> <VALUE> | get <KEY>                       # 依 key owner 自動路由
-fleety config provider add <name> --type api --base-url … --key …
-fleety config provider add <name> --type oauth:codex             # 再 fleety auth login <name>
-fleety config provider set|remove|list
-fleety config model set main  --member openai1/gpt-4o --member google1/gemini-2.5-pro --strategy failover
-fleety config model set cheap --member openai1/gpt-4o-mini
+fleety provider add <name> --type api --base-url … --key …
+fleety provider add <name> --type oauth:codex             # 再 fleety provider login <name>
+fleety provider edit|remove|list
+fleety model catalog <provider> --role main
+fleety model set main  --member openai1/gpt-4o --member google1/gemini-2.5-pro --strategy failover
+fleety model set cheap --member openai1/gpt-4o-mini
 ```
 
 **認證(per-provider,可擴展):**
 ```sh
-fleety auth login <provider> | status <provider> | logout <provider>   # codex1/codex2 各自,token per-provider
+fleety provider login <provider> | status <provider> | logout <provider>   # codex1/codex2 各自,token per-provider
 ```
 
 **daemon 連線(用 CLI 設,見 M6):**
 ```sh
-fleety server use <name>          # 同時設定 CLI 與本機 daemon(一台一個連線)
+fleety connection use <name>          # 同時設定 CLI 與本機 daemon(一台一個連線)
 # daemon 無互動,連線由 CLI 命令 / 面板設;env 對 daemon 是持久來源
 ```
 
+**相容 alias 與輸出契約:**
+
+| 舊拼法 | canonical |
+|---|---|
+| `fleety tui` | `fleety chat` |
+| `fleety server …` | `fleety connection …` |
+| `fleety auth login\|logout\|status …` | `fleety provider login\|logout\|status …` |
+| `fleety config provider\|model …` | `fleety provider\|model …` |
+| `fleety config --target …` | `fleety config --owner …` |
+
+這些 alias 在任何 I/O 前正規化成相同 typed command。`--json` 固定輸出
+`schema_version / ok / context / data / errors`。成功 exit 0，runtime/owner 失敗
+exit 1，usage 失敗 exit 2。多 owner read 即使部分失敗也保留已取得資料，human
+標示 `PARTIAL`，JSON 設 `ok:false` 並列出每個 owner error，process exit 1。
+Mutation 永遠只解析到一個 owner，失敗不直接改 owner 的設定檔。
+
 ---
 
-## 7. 互動全包面板(裸 `fleety config`,TTY 時;非 TTY 退回文字)
+## 7. 共享 terminal workspace 的 Settings
 
-一個 ratatui 面板,Tab 四區,**不用打 `--target`**。這是「一個入口設定任何東西」。
+裸 `fleety config` 在 TTY 直接開共享 workspace 的 Settings。Tab 在五個 owner-aware
+頁面移動,**不用打 `--owner`**。非 TTY 使用 generated help / 明確子命令。
 
-> 現行實作:裸 `fleety config` 先開**頂層選單**(Providers / Models / Settings),
-> 用選的再往下鑽 —— Providers/Models 進 provider 編輯器,編的是**連線那台 server**
-> 的 providers(snapshot → 編 → `ConfigApply`,不是本機檔),所以新增的 provider
-> 對 server 立即可見;新增 `oauth:codex` 直接進登入,選既有 oauth provider 按 `e`
-> 可登入/登出/換帳號。Settings 進下方這個四區面板。提示列常駐;Esc 回選單、q 離開。
-> 下方 mockup 即 Settings 那一層。
+> Provider/Model/OAuth 編輯的是**目前連線的 Server**，走 snapshot → stage →
+> `ConfigApply`，不是本機檔。新增 `oauth:codex` 可直接登入，既有 OAuth provider
+> 可登入、登出、換帳號。所有頁面共用 profile/identity/model header、notice 與 footer。
+> profile 切換若舊 profile 有 dirty remote state，必須先 Apply / Discard / Cancel；
+> 選擇成功持久化後才關閉舊 transport，並重新載入新 Server/Daemon snapshot。
 
 ```
 ┌─ fleety config ─────────────────────────────────────┐
-│  [1] Connection   [2] CLI   [3] Daemon   [4] Server  │  ← ←→ / Tab 切區
+│ [1] Connection [2] CLI [3] Daemon [4] Server [5] Providers & Models │
 ├──────────────────────────────────────────────────────┤
 │ (1) Connection                                       │
 │   這台 CLI 連 →  home-pi  ws://192.168.1.10:8787 ● 連線│  Enter=切換
@@ -248,8 +266,9 @@ fleety server use <name>          # 同時設定 CLI 與本機 daemon(一台一�
 │     傳輸(WS/SSE)    auto                              │
 │     顯示時區         Asia/Taipei                       │
 │                                                      │
-│ (3) Server — home-pi 上的設定                         │  拉自連線 server
+│ (4) Server — home-pi 上的一般設定                     │  拉自連線 server
 │   一般:policy=full_access  addr=…  tz=…              │  門鎖 key 標示需認證
+│ (5) Providers & Models — home-pi                     │
 │   Providers:                                         │
 │     openai1  api    api.openai.com   key=****         │  a 新增 e 編輯 d 刪
 │     codex1   codex  <帳號A>  ● 已登入                  │
@@ -259,7 +278,7 @@ fleety server use <name>          # 同時設定 CLI 與本機 daemon(一台一�
 └──────────────────────────────────────────────────────┘
 ```
 
-- **(3) Server 區的編輯經連線遠端套用**(Phase 2 的 protocol)。編輯 provider(`e`)
+- **(4) Server 與 (5) Providers & Models 的編輯都經連線遠端套用**。編輯 provider(`e`)
   依 `type` 顯示不同欄位:api 型預填 base_url+key(空 key 保留原值);`oauth:codex` 型
   不填欄位,改進**登入/登出/換帳號子選單**——因為登入是 async+開瀏覽器+搶終端,
   做法是存檔→離開全螢幕→對該 provider 跑 `auth login/logout`(換帳號=登出再登入)→
@@ -325,18 +344,19 @@ ClientMsg::ConfigApply { target, base_revision, changes: [ ConfigChange { key, o
 ## 10. 分兩階段(降風險,先出價值)— 兩階段皆已出貨(2026-07-10)
 
 **Phase 1(不動 wire,全 additive、可降級):**
-- `fleety-tools` 共用連線模組 + `connections.toml` + `fleety server …` 命令
+- `fleety-tools` 共用連線模組 + `connections.toml` + `fleety connection …` 命令
   + CLI/daemon 共用 resolver + 遷移 + `FLEETY_AGENT_URL` 移出 registry。
 - Provider/Model 兩層資料模型(member 屬性下沉、混族動態能力、參照完整性 validate)
   + `providers.toml` 遷移 + `FLEETY_MODEL_*` 降為 bootstrap seed。
 - 認證預設開(首次啟動引導)+ 「遠端寫入⇒認證必開」硬前置。
-- 本機 `config edit` scope 過濾(只 Cli)。
+- `fleety config open`（legacy `config edit` alias）統一進共享 Settings，依 owner
+  暫存後才 Apply，不再保留另一套直接寫檔 editor。
 - **交付**:G1(乾淨改連哪台、多台切換、無陷阱)+ 乾淨的 provider/model + 安全底線。
 
 **Phase 2(動 wire,交付互動全包):**
 - `ConfigSnapshot`/`ConfigApply` + revision 樂觀鎖 + 真原子 + 能力協商 + secret
   tri-state。
-- 互動全包面板(四區)+ 遠端互動 edit + 敏感 key 授權/告警/稽核 + 傳輸 wss 要求。
+- 共享 workspace Settings(五頁)+ 遠端互動 edit + 敏感 key 授權/告警/稽核 + 傳輸 wss 要求。
 - **交付**:G2(一個面板設定任何東西,含 server 全設定)。
 
 ---
