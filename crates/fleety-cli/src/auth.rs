@@ -607,8 +607,24 @@ fn copy_authorization_url(url: &str) -> std::result::Result<(), String> {
 }
 
 fn present_authorization(url: &str, no_browser: bool) -> Result<()> {
+    present_authorization_with(
+        url,
+        no_browser,
+        || open_browser(url),
+        copy_authorization_url,
+        std::io::stdout().lock(),
+    )
+}
+
+fn present_authorization_with(
+    url: &str,
+    no_browser: bool,
+    mut open: impl FnMut() -> std::result::Result<(), String>,
+    mut copy: impl FnMut(&str) -> std::result::Result<(), String>,
+    writer: impl Write,
+) -> Result<()> {
     let delivery = if no_browser {
-        match copy_authorization_url(url) {
+        match copy(url) {
             Ok(()) => AuthorizationDelivery::ClipboardCopied,
             Err(error) => {
                 tracing::debug!(%error, "clipboard unavailable for manual OAuth delivery");
@@ -616,9 +632,9 @@ fn present_authorization(url: &str, no_browser: bool) -> Result<()> {
             }
         }
     } else {
-        match open_browser(url) {
+        match open() {
             Ok(()) => AuthorizationDelivery::BrowserOpened,
-            Err(browser_error) => match copy_authorization_url(url) {
+            Err(browser_error) => match copy(url) {
                 Ok(()) => {
                     tracing::debug!(%browser_error, "browser launch failed; copied OAuth URL to clipboard");
                     AuthorizationDelivery::ClipboardCopied
@@ -631,7 +647,7 @@ fn present_authorization(url: &str, no_browser: bool) -> Result<()> {
             },
         }
     };
-    write_authorization_instructions(std::io::stdout().lock(), url, delivery)
+    write_authorization_instructions(writer, url, delivery)
         .map_err(|error| CoreError::Message(format!("write OAuth instructions: {error}")))
 }
 
@@ -978,18 +994,14 @@ mod tests {
 
     #[test]
     fn launcher_probe_accepts_success_or_a_still_running_launcher() {
-        assert!(confirm_launcher_started(
-            || Ok(Some(true)),
-            std::time::Duration::from_secs(1)
-        )
-        .is_ok());
+        assert!(
+            confirm_launcher_started(|| Ok(Some(true)), std::time::Duration::from_secs(1)).is_ok()
+        );
 
         let started = std::time::Instant::now();
-        assert!(confirm_launcher_started(
-            || Ok(None),
-            std::time::Duration::from_millis(20)
-        )
-        .is_ok());
+        assert!(
+            confirm_launcher_started(|| Ok(None), std::time::Duration::from_millis(20)).is_ok()
+        );
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 
@@ -1001,6 +1013,52 @@ mod tests {
         )
         .expect_err("poll errors must trigger safe fallback");
         assert!(error.contains("probe failed"), "{error}");
+    }
+
+    #[test]
+    fn immediate_nonzero_browser_launcher_uses_the_safe_clipboard_pipeline() {
+        let url = "https://auth.openai.com/oauth/authorize?state=STATE-SENTINEL&code_challenge=CHALLENGE-SENTINEL";
+        let launcher_calls = std::cell::Cell::new(0);
+        let probe_calls = std::cell::Cell::new(0);
+        let mut copied = None;
+        let mut output = Vec::new();
+        let started = std::time::Instant::now();
+
+        present_authorization_with(
+            url,
+            false,
+            || {
+                launcher_calls.set(launcher_calls.get() + 1);
+                confirm_launcher_started(
+                    || {
+                        probe_calls.set(probe_calls.get() + 1);
+                        Ok(Some(false))
+                    },
+                    std::time::Duration::from_secs(1),
+                )
+            },
+            |value| {
+                copied = Some(value.to_string());
+                Ok(())
+            },
+            &mut output,
+        )
+        .expect("clipboard fallback");
+
+        assert!(started.elapsed() < std::time::Duration::from_millis(200));
+        assert_eq!(launcher_calls.get(), 1);
+        assert_eq!(probe_calls.get(), 1);
+        assert_eq!(copied.as_deref(), Some(url));
+        let output = String::from_utf8(output).expect("UTF-8 output");
+        assert!(output.contains("copied to the clipboard"), "{output}");
+        for secret in [
+            "STATE-SENTINEL",
+            "CHALLENGE-SENTINEL",
+            "state=",
+            "code_challenge=",
+        ] {
+            assert!(!output.contains(secret), "leaked {secret}: {output}");
+        }
     }
 
     #[test]
@@ -1046,18 +1104,15 @@ mod tests {
         // State mismatch aborts.
         assert!(parse_callback(line, "other").is_err());
         // Missing code errors.
-        assert!(
-            parse_callback("GET /auth/callback?state=st-1 HTTP/1.1", "st-1").is_err()
-        );
-        assert!(
-            parse_callback("POST /auth/callback?code=x&state=st-1 HTTP/1.1", "st-1").is_err()
-        );
+        assert!(parse_callback("GET /auth/callback?state=st-1 HTTP/1.1", "st-1").is_err());
+        assert!(parse_callback("POST /auth/callback?code=x&state=st-1 HTTP/1.1", "st-1").is_err());
         assert!(parse_callback("GET /wrong?code=x&state=st-1 HTTP/1.1", "st-1").is_err());
     }
 
     #[test]
     fn parse_callback_decodes_form_urlencoded_code_and_state() {
-        let line = "GET /auth/callback?code=part%2Bone+two%20three&state=state+with%20spaces HTTP/1.1";
+        let line =
+            "GET /auth/callback?code=part%2Bone+two%20three&state=state+with%20spaces HTTP/1.1";
         assert_eq!(
             parse_callback(line, "state with spaces").expect("encoded callback should parse"),
             "part+one two three"
@@ -1067,8 +1122,7 @@ mod tests {
     #[test]
     fn parse_callback_rejects_malformed_or_non_utf8_encoding() {
         for encoded in ["%", "%2", "%GG", "%FF"] {
-            let line =
-                format!("GET /auth/callback?code={encoded}&state=expected HTTP/1.1");
+            let line = format!("GET /auth/callback?code={encoded}&state=expected HTTP/1.1");
             let message = parse_callback(&line, "expected")
                 .expect_err("invalid form encoding must fail closed")
                 .to_string();
@@ -1245,9 +1299,7 @@ mod tests {
         // Simulate the browser hitting the redirect URI.
         let h = std::thread::spawn(move || {
             let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
-            s.write_all(
-                b"GET /auth/callback?code=the-code&state=st-9 HTTP/1.1\r\n\r\n",
-            )
+            s.write_all(b"GET /auth/callback?code=the-code&state=st-9 HTTP/1.1\r\n\r\n")
                 .expect("write");
             let mut buf = [0u8; 256];
             let _ = s.read(&mut buf);
@@ -1281,12 +1333,9 @@ mod tests {
             }
         });
 
-        let code = wait_for_code_with_timeout(
-            &listener,
-            "expected",
-            std::time::Duration::from_secs(2),
-        )
-        .expect("valid callback after noise");
+        let code =
+            wait_for_code_with_timeout(&listener, "expected", std::time::Duration::from_secs(2))
+                .expect("valid callback after noise");
         assert_eq!(code, "real-code");
         h.join().expect("join");
     }
@@ -1296,12 +1345,9 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
         let h = std::thread::spawn(move || {
-            let mut stream =
-                std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+            let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
             stream
-                .write_all(
-                    b"GET /auth/callback?code=attacker&state=wrong HTTP/1.1\r\n\r\n",
-                )
+                .write_all(b"GET /auth/callback?code=attacker&state=wrong HTTP/1.1\r\n\r\n")
                 .expect("write");
             let mut response = String::new();
             stream.read_to_string(&mut response).expect("read response");

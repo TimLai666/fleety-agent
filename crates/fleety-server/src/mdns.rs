@@ -105,8 +105,8 @@ pub fn spawn_advertise(bind_addr: &str) {
     let instance = format!("fleety-{hostname}");
     let txt: &[(&str, &str)] = &[
         ("version", agent_core::VERSION),
-        // The persistent identity fingerprint: enrolled devices use it to
-        // re-find this exact server after an IP change (sticky healing).
+        // A public discovery hint for labeling/ordering explicit choices. This
+        // unsigned TXT value never authorizes credentials or endpoint changes.
         ("fp", crate::server_fingerprint()),
     ];
     let info = ServiceInfo::new(

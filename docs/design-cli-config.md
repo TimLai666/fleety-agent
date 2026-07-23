@@ -165,15 +165,15 @@ members = [
 持久來源只剩 `connections.toml.current`。`agent_url` 新解析(CLI 與 daemon 共用同一
 resolver):
 
-1. **單次覆寫**:`-s/--server <name>`(選一個既有 profile 跑這一次)或
-   `--url <ws-url>`(不具名單次直連)——本次呼叫、**不寫檔、不動 daemon**。
+1. **單次覆寫**:`--profile <name>`(選一個既有 profile 跑這一次)或
+   `-s/--server <ws-url>`(不具名單次直連)——本次呼叫、**不寫檔、不動 daemon**。
    (這是「CLI 臨時連別台看一眼」的正道,見 M6。)
 2. **env `FLEETY_AGENT_URL`**:保留為**唯一的臨時 env 覆寫**——永不寫檔、永不從
    `config.toml` seed;生效時 `server list`/`status` 頂部**醒目提示**「env 覆寫中,
    略過 profile <current>」。對背景 daemon,env 是 unit 檔裡的**持久**設定(見 M6)。
 3. `connections.toml.current` 的 `profile.url`。
-4. mDNS(短探測)——**但 enrolled 後 sticky pin,不再漂移**;絕不把某 profile 既有
-   token 送給與其 `fingerprint` 不符的 mDNS 解析 URL(補 M6 rogue-server 洞)。
+4. mDNS(短探測)——TXT `fingerprint` 只是不可信提示;automatic discovery
+   **一律不附 stored token**,credentialed endpoint 改變需明確重選並重新配對。
 5. `ws://127.0.0.1:8787`。
 
 「檔案存在但解析失敗」要**報錯**,不可靜默越過 current 去探索(補 M6)。
@@ -189,7 +189,7 @@ fleety connection use <name>          # 切換 current(CLI+daemon 一起,見 M6)
 fleety connection list | show [<name>]
 fleety connection rename <old> <new> | remove <name> | set-url <name> <url>
 fleety init <url> [--name <name>] # guided add + use
-fleety pair <code>                # 對 current profile 配對,token 寫 current profile
+fleety pair <code>                # 對 current 配對；--profile <name> 精確配對其他 profile
 fleety --profile <name> <cmd> | --server <ws> <cmd>   # 單次覆寫,不改 current、不動 daemon
 ```
 
@@ -326,8 +326,9 @@ ClientMsg::ConfigApply { target, base_revision, changes: [ ConfigChange { key, o
 
 - `config.json`(agent_url/token/device_id)→ `connections.toml`:建 `default`
   profile;`device_id` **以 config.json 既有值為準鎖定**(勿被 hostname 衍生覆蓋,
-  補 M7);url-less(靠 mDNS)記錄 → `profile.url` 留空讓 resolver 落 mDNS,勿硬填
-  localhost。`config.json` 改名 `.migrated` 保留備份,不刪。
+  補 M7);url-less記錄 → `profile.url` 留空且保留 token 供明確復原,但 resolver
+  不得把 token 交給 mDNS 結果或硬填 localhost。`config.json` 改名
+  `.migrated` 保留備份,不刪。
 - `providers.toml`(provider 綁 model)→ 新兩層:「同 `base_url`+`key` 只差 model」
   的舊 provider **去重合併**成單 provider 多 member(否則產出一堆重複 provider,正是
   要消滅的反模式);`stream`/`modalities`/`effort` 逐筆搬到對應 member,**搬不動要明確

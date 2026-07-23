@@ -533,10 +533,20 @@ impl Panel {
         match self.region {
             Region::Connection => {
                 // Edit = set the selected profile's url.
+                if let Err(error) = connection::validate_ws_url(&value) {
+                    self.status = format!("error: {}", error.report().message);
+                    return false;
+                }
                 if let Some(name) = self.profile_names().get(self.sel).cloned() {
                     if let Some(p) = self.conns.profiles.get_mut(&name) {
-                        p.url = value;
-                        self.status = format!("set url for '{name}' (s to save)");
+                        let cleared = connection::reselect_profile_endpoint(p, value);
+                        self.status = if cleared {
+                            format!(
+                                "set url for '{name}' and cleared its old credential (s to save, then re-pair)"
+                            )
+                        } else {
+                            format!("set url for '{name}' (s to save)")
+                        };
                         return false;
                     }
                 }
@@ -1812,6 +1822,12 @@ async fn run_settings(
         if app.status == "__save_conns__" {
             let pending = app.conns.clone();
             let baseline = app.persisted_conns.clone();
+            let needs_repair = pending.profiles.iter().any(|(name, edited)| {
+                baseline.profiles.get(name).is_some_and(|before| {
+                    edited.url != before.url
+                        && (before.token.is_some() || before.fingerprint.is_some())
+                })
+            });
             match connection::mutate(|live| {
                 for (name, edited) in &pending.profiles {
                     let Some(before) = baseline.profiles.get(name) else {
@@ -1830,14 +1846,19 @@ async fn run_settings(
                             "server profile '{name}' changed in another Fleety process; reopen Settings"
                         )));
                     }
-                    current.url = edited.url.clone();
+                    connection::reselect_profile_endpoint(current, edited.url.clone());
                 }
                 Ok(live.clone())
             }) {
                 Ok(saved) => {
                     app.persisted_conns = saved.clone();
                     app.conns = saved;
-                    app.status = "saved connections".to_string();
+                    app.status = if needs_repair {
+                        "saved connections; old credentials were cleared — re-pair the changed profile"
+                            .to_string()
+                    } else {
+                        "saved connections".to_string()
+                    };
                 }
                 Err(e) => {
                     app.status = format!("save failed: {}", e.report().message);
@@ -3612,6 +3633,43 @@ mod tests {
             Some(&"gpt-server".to_string())
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn connection_url_edit_clears_old_credential_before_repair() {
+        let mut connections = Connections {
+            current: Some("office".into()),
+            ..Default::default()
+        };
+        connections.profiles.insert(
+            "office".into(),
+            connection::Profile {
+                url: "ws://old.test:8787".into(),
+                token: Some("old-token".into()),
+                fingerprint: Some("old-pin".into()),
+                ..Default::default()
+            },
+        );
+        let mut panel = Panel::new(
+            connections,
+            fleety_tools::config::ConfigMap::new(),
+            RemoteRegionState::new(false, vec![], String::new()),
+            RemoteRegionState::new(false, vec![], String::new()),
+        );
+
+        assert!(!panel.commit_edit("http://wrong.test".into()));
+        let untouched = &panel.conns.profiles["office"];
+        assert_eq!(untouched.url, "ws://old.test:8787");
+        assert_eq!(untouched.token.as_deref(), Some("old-token"));
+        assert_eq!(untouched.fingerprint.as_deref(), Some("old-pin"));
+        assert!(panel.status.contains("ws:// or wss://"), "{}", panel.status);
+
+        assert!(!panel.commit_edit("ws://new.test:8787".into()));
+        let edited = &panel.conns.profiles["office"];
+        assert_eq!(edited.url, "ws://new.test:8787");
+        assert_eq!(edited.token, None);
+        assert_eq!(edited.fingerprint, None);
+        assert!(panel.status.contains("re-pair"), "{}", panel.status);
     }
 
     #[test]

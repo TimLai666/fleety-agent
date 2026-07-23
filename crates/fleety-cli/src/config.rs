@@ -231,8 +231,7 @@ async fn provider_edit_remote_loop(
         }
         let snapshot =
             crate::provider_service::load_snapshot(&mut tx, &mut rx, config_protocol).await?;
-        let mut revision = snapshot.revision;
-        let cfg = snapshot.config;
+        let (mut revision, editor_input) = provider_editor_input(snapshot);
 
         // Credential status is server-owned. A status failure is deliberately
         // non-fatal so the editor never turns an unavailable query into a false
@@ -245,7 +244,7 @@ async fn provider_edit_remote_loop(
             &mut tx,
             &mut rx,
             config_protocol,
-            &cfg,
+            &editor_input.config,
             now_secs,
         )
         .await;
@@ -261,7 +260,7 @@ async fn provider_edit_remote_loop(
         let catalog_server_fingerprint = server_fingerprint.clone();
         let outcome = tokio::task::block_in_place(|| {
             crate::provider_tui::run_with_saver_and_fetcher(
-                cfg,
+                editor_input,
                 |edited, clear_keys| {
                     handle.block_on(async {
                         let mut io = io.lock().await;
@@ -373,6 +372,18 @@ async fn provider_edit_remote_loop(
             }
         }
     }
+}
+
+fn provider_editor_input(
+    snapshot: crate::provider_service::ProviderSnapshot,
+) -> (String, crate::provider_tui::ProviderEditorInput) {
+    (
+        snapshot.revision,
+        crate::provider_tui::ProviderEditorInput {
+            config: snapshot.config,
+            key_present: snapshot.key_present,
+        },
+    )
 }
 
 async fn refresh_provider_revision(
@@ -567,6 +578,36 @@ mod tests {
         let outcome = provider_refresh_outcome(&mut revision, Ok("fresh-r2".into()));
         assert!(matches!(outcome, crate::provider_tui::SaveOutcome::Saved));
         assert_eq!(revision, "fresh-r2");
+    }
+
+    #[test]
+    fn provider_editor_input_preserves_snapshot_key_presence() {
+        let mut config = fleety_tools::providers_config::ProvidersConfig::default();
+        config.providers.insert(
+            "openai".into(),
+            fleety_tools::providers_config::Provider {
+                kind: "api".into(),
+                base_url: Some("https://api.example.test/v1".into()),
+                key: None,
+            },
+        );
+        let snapshot = crate::provider_service::ProviderSnapshot {
+            revision: "r1".into(),
+            entries: Vec::new(),
+            config,
+            key_present: std::collections::BTreeSet::from(["openai".to_string()]),
+        };
+
+        let (revision, input) = provider_editor_input(snapshot);
+
+        assert_eq!(revision, "r1");
+        assert!(input.key_present.contains("openai"));
+        assert!(input
+            .config
+            .provider("openai")
+            .expect("openai")
+            .key
+            .is_none());
     }
 
     #[test]

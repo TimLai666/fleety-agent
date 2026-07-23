@@ -124,6 +124,10 @@ Smoke tests use fake WebSocket owners to prove reads, writes, conflicts, profile
 - One workspace event stream owns all interactive terminal input, including OAuth return acknowledgement. Route/editor handoff is an acknowledged reader epoch barrier: the reader drains its terminal queue, advances the epoch, and only then allows the new route to accept keys.
 - Every human/TUI presentation boundary sanitizes terminal controls. Displayed endpoints remove userinfo, query, and fragment while raw identity and JSON semantic values remain unchanged.
 - The workspace remains usable when one remote owner is unavailable; unavailable routes show reason and remediation, while writes on them are disabled.
+- Automatic mDNS never borrows stored profile credentials: TXT fingerprints do not authorize sending a stored token or persisting a discovered credentialed endpoint change. Such changes require explicit reselect and re-pair unless a future transport adds cryptographic identity proof.
+- Reconnect control keeps one durable pending request until Daemon consumption, rejects a second unsettled request, and settles the consumed request exactly once only after `Welcome`, authentication, and saved-pin verification.
+- Structured `ConfigApply` uses one authentication gate before any Server or Device owner dispatch. With authentication disabled, Server rejects Provider or non-`Keep` mutations, Device rejects every apply because its owner persists even empty/all-`Keep` payloads, and Local retains its `invalid` response; a rejection emits no `RunTool`.
+- Provider snapshots preserve strictly parsed key-presence metadata through command and TUI views and render only `key=Set` or `key=Not set`; blank keys are invalid, and JSON adds structured boolean `data.providers[].key_present` state beside its compatibility output.
 
 ### Interface and data shape
 
@@ -132,6 +136,7 @@ Smoke tests use fake WebSocket owners to prove reads, writes, conflicts, profile
 - JSON output is `{ "schema_version": 1, "ok": bool, "context": {...}, "data": ..., "errors": [...] }`. Each error contains `owner`, `kind`, `message`, and optional `remediation`.
 - `WorkspaceState`, `OwnerState`, and route actions are pure state transitions; terminal and network loops consume emitted effects.
 - No on-disk schema change is required.
+- Reconnect control uses one append-only, nonce-addressed journal with `Submitted`／`Claimed`／`Settled` events. Submit, claim, settle, observe, reap, and Daemon-generation handoff share a short-lived cross-process lease; lock files are never reclaimed from elapsed time alone and each owner removes only its own token. Publisher timeout leaves the active nonce intact, a second request cannot append before terminal settlement is observed, and a torn final record is truncated before the next append. A failed append preserves an already-frozen failure decision for retry; an authenticated success becomes terminal only when its owner-locked append commits, otherwise the attempt freezes a failure after confirming no success committed. Exactly-once applies to the durable terminal result for one nonce, not to transport connection attempts.
 
 ### Failure modes
 
@@ -139,6 +144,9 @@ Smoke tests use fake WebSocket owners to prove reads, writes, conflicts, profile
 - Partial read: available data plus owner errors, exit 1, no fallback values.
 - Mutation failure or conflict: staged state retained, error visible until dismissed or retried, exit 1 for command mode.
 - Reconnect failure: old connection remains closed, remote owner states become Unavailable, local routes remain usable.
+- Reconnect settlement failure: stop, deferred restart, resolve, connect, authentication, identity mismatch, and the shared connect＋Hello＋`Welcome` deadline settle a typed failure; graceful exit retries until its frozen terminal result is durable, and other acknowledgement write failures retain retryable settlement state.
+- Discovery cannot prove identity: automatic mDNS does not inherit stored profile credentials and directs discovered credentialed endpoint changes to explicit re-pair instead of transparent healing.
+- Malformed Provider key-presence metadata rejects the snapshot with an actionable protocol error; it is never partially accepted.
 - Terminal too small: render one resize instruction and accept quit/help keys.
 
 ### Acceptance criteria
@@ -147,6 +155,12 @@ Smoke tests use fake WebSocket owners to prove reads, writes, conflicts, profile
 - Side-effect tests compare temp-home bytes before and after all help and failed remote mutations.
 - Protocol tests prove canonical and alias commands target the same owner and payload.
 - Recording-owner tests prove requested remote device IDs survive every Settings snapshot/apply/reload frame, and injected event tests prove stale route input and OAuth acknowledgement cannot create a second reader or unintended Apply.
+- Recording-owner auth tests prove an auth-disabled Device `ConfigApply` sends zero `RunTool` frames, while a pure owner matrix locks Server no-op, Device empty/all-`Keep`, Local, and auth-required behavior.
+- Deterministic reconnect tests cover caller timeout, duplicate request rejection, delayed consumption, `Welcome` delay, identity mismatch, stop/restart exits, acknowledgement write failure, and exactly-once settlement.
+- Resolver and CLI/Daemon connection tests prove automatic mDNS never carries a stored token and never persists a credentialed endpoint change from TXT metadata alone.
+- Provider command and headless TUI tests prove strict key-presence parsing, add／set／keep／clear transitions, production snapshot-to-editor wiring, structured JSON state, and `key=Set`／`key=Not set` parity without secret bytes.
+- OAuth delivery tests inject a browser process that exits non-zero immediately and prove the bounded launcher path reaches clipboard fallback without blocking.
+- Repository checks prove every generated Spectra archive instruction retains `.spectra/touched/<change>.json` until `spectra archive` succeeds, and protocol history documents config protocol v5.
 - Headless Settings/OAuth/notice render tests prove endpoint credentials and terminal controls are absent from human/TUI output while machine data remains semantically raw.
 - Headless TUI snapshots cover the size/state matrix and contain no replacement glyph `�` or clipped key instruction at supported sizes.
 - Full workspace tests, clippy with warnings denied, formatting, Spectra validation, and release build pass.
@@ -154,7 +168,7 @@ Smoke tests use fake WebSocket owners to prove reads, writes, conflicts, profile
 
 ### Scope boundaries
 
-In scope are the three binary parsers, Fleety command naming and output, the shared terminal workspace, settings/provider/model flows, owner routing presentation, diagnostics, completion, tests, and documentation. Out of scope are server agent behavior, tool registry UX, wire-level chat features, configuration file schemas, and automatic shell-file modification.
+In scope are the three binary parsers, Fleety command naming and output, the shared terminal workspace, settings/provider/model flows, owner routing and authentication enforcement, reconnect control, stored-profile credential policy for mDNS, diagnostics, completion, tests, and documentation. Out of scope are server agent behavior, tool registry UX, wire-level chat features, explicit `FLEETY_TOKEN` or `FLEETY_PAIRING_CODE` use without an explicit endpoint, configuration file schemas, automatic shell-file modification, and transparent endpoint healing without TLS or public-key identity proof.
 
 ## Risks / Trade-offs
 
@@ -165,6 +179,8 @@ In scope are the three binary parsers, Fleety command naming and output, the sha
 - [Risk] Applying dirty state before profile switch can change a server the user intended to leave → Require an explicit Apply／Discard／Cancel choice and display the old profile in the modal.
 - [Risk] Owner labels can expose endpoints in logs → Never print tokens or secrets; permit `--quiet`; JSON context contains endpoint but no credentials.
 - [Risk] Cross-platform terminals disagree on key events and width → Prefer broadly supported keys, use Unicode-width-aware layout, preserve textual command alternatives, and test Windows plus Unix CI.
+- [Risk] Removing TXT-based sticky healing adds a manual re-pair step after a credentialed Server address changes → Prefer explicit recovery over sending a stored credential to an identity that mDNS cannot prove; revisit only with cryptographic proof.
+- [Risk] A crash can leave a stale control or mutation lock → Never reclaim from elapsed time alone; report recoverable lock ownership now, and add an explicit owner-proven cleanup/status command before automating reclamation.
 
 ## Migration Plan
 

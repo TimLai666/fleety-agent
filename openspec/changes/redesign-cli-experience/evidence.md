@@ -585,6 +585,7 @@ Verification:
 - `cargo fmt --all -- --check` and `git diff --check HEAD`: passed.
 - `spectra analyze redesign-cli-experience`: Coverage, Consistency, Ambiguity, and Gaps are all Clean with zero findings.
 - `spectra validate redesign-cli-experience --strict`: valid.
+
 - `CARGO_BUILD_JOBS=1 cargo build --release --locked -p fleety-cli -p fleety-server -p fleety-daemon`: passed in 18m 15s.
 
 No real browser OAuth/OpenAI catalog request, hostile live LAN mDNS advertiser, or Windows SCM install/start/restart cycle was performed. Those paths have deterministic unit, fake-Server, child-process, and program-flow proof, not live external proof. Independent convergence review remains pending and task 5.3 stays open.
@@ -628,3 +629,170 @@ Verification:
 - `cargo test -p fleety-cli --test cli_smoke --locked`: 72 passed.
 - `cargo clippy --workspace --all-targets --locked -- -D warnings`: passed.
 - `cargo fmt --all -- --check`, `git diff --check`, `spectra analyze redesign-cli-experience --json`, and `spectra validate redesign-cli-experience`: passed; diff check emitted only checkout LF-to-CRLF notices.
+
+## 2026-07-23 — task 5.53 removes unsigned-TXT credential healing
+
+The shared resolver now treats mDNS TXT fingerprints only as discovery ordering hints. Automatic mDNS never borrows a stored profile token or profile provenance. A credentialed saved endpoint failure leaves the profile byte-identical and directs explicit selection and pairing instead of scanning, attaching its token, persisting a discovered URL, or reporting a heal. The CLI one-shot path and fleetyd reconnect path share that recovery contract.
+
+Explicit user-authored endpoint changes remain possible through `connection set-url`, Settings, and `init`. `set-url` and Settings validate `ws://` or `wss://` URLs before mutation, clear the old token and fingerprint, persist the requested URL, and require pairing before credentialed use. `init` requires a pairing code for a credentialed endpoint change, never sends the old token, and atomically replaces URL, token, and fingerprint only after the pairing response mints a new token. Invocation-only `--profile B pair <code>` repairs `B` without changing persisted current profile `A`.
+
+TDD proof:
+
+- Red resolver tests reproduced three unsafe contracts: copied TXT authorized URL healing, a matching discovery hint received the saved token, and a matching TXT fingerprint attached that token. The pre-fix `connection set-url` test also retained old credentials and lacked pairing guidance.
+- A follow-up red test proved an occupied URL-less `default` profile could still receive a rogue discovered `Welcome.token`; it failed before the owner-selection fix. Mdns, Default, and unowned Env targets may now create `default` only when the profile store is truly empty.
+- `cargo test -p fleety-tools --lib --locked -- --test-threads=1`: 213 passed. Two vacuous fixture-only healing assertions were removed; copied matching TXT now runs through the production resolver, and explicit endpoint reselection has a same/changed URL × none/token/pin/both boundary matrix.
+- `cargo test -p fleety-cli --bin fleety --locked -- --test-threads=1`: 271 passed.
+- `cargo test -p fleety-cli --test cli_smoke --locked -- --test-threads=1`: 78 passed, including copied-hint isolation through the resolver contract, byte-identical saved-profile failure, credential-free endpoint repair, invalid URL rejection before I/O, and non-current profile pairing.
+- `cargo test -p fleety-daemon --bin fleetyd --locked -- --test-threads=1`: 34 passed.
+- `cargo test -p fleety-daemon --test fleetyd_smoke --locked -- --test-threads=1`: 20 passed, including explicit repair guidance after reconnect transport failure.
+- `cargo clippy -p fleety-tools -p fleety-cli -p fleety-daemon --all-targets --locked -- -D warnings`, `cargo fmt --all -- --check`, and `git diff --check`: passed.
+- `spectra analyze redesign-cli-experience --json`: Coverage, Consistency, Ambiguity, and Gaps are all Clean with zero findings.
+- `spectra validate redesign-cli-experience --strict`: valid.
+
+No hostile live-LAN advertiser was used. Deterministic resolver, fake-Server, child-process, and byte-identity tests prove the stored-profile credential boundary. Automatic discovery can still establish an untrusted fresh control session, and caller-explicit `FLEETY_TOKEN` or `FLEETY_PAIRING_CODE` can still follow discovery; that broader operational-session boundary is recorded in `AGENTS.md` rather than silently expanding task 5.53.
+
+## 2026-07-23 — task 5.54 preserves non-secret Provider key state
+
+The CLI now parses `key_present` as a strict array of unique Provider-name strings, rejects missing, non-string, duplicate, unknown, and non-key-capable Provider metadata, and preserves the resulting set beside the redacted Provider graph. The shared Provider view, canonical human/JSON command renderer, file-backed compatibility renderer, and Provider TUI all use that sidecar to render API Providers as `key=Set` or `key=Not set`; OAuth Providers do not receive an API-key label.
+
+Provider add, set, endpoint-only Keep, clear, and remove mutations update the same presence set. A successful TUI save converts pending Set values into presence, clears every in-memory plaintext key, and keeps only the non-secret state for later edits. Conflict and transport failures retain the pending secret, dirty state, and deferred OAuth／quit action for an explicit retry. Server and saver errors are redacted against staged key values before either human or JSON rendering.
+
+TDD proof:
+
+- The pre-fix malformed-metadata fake Server test succeeded after receiving `["openai", 7]`; the strict parser made it fail closed. Additional fixtures cover missing or wrong containers, duplicates, unknown／invalid Provider names, and OAuth Providers. Hostile metadata names and a plaintext snapshot sentinel prove failure output does not echo Server-controlled secret material.
+- The pre-fix shared view and headless TUI omitted both key labels. The new fixtures use protocol-5-realistic redacted configs plus an independent presence set, so deriving state from `Provider.key` cannot satisfy them.
+- The shared transition test covers add-without-key → Not set, add-with-key／Set → Set, a fresh redacted snapshot plus endpoint-only mutation → preserved Set, API→OAuth → Not set without an invalid Clear intent, and Clear → Not set. The successful-save test proves plaintext pending Set values are removed from both editor and persisted snapshots; retry tests prove conflict and error do not consume a deferred OAuth action.
+- Fake Server CLI tests bind each Provider row to its own label in human output, compatibility `data.output`, and typed boolean `data.providers[].key_present`. Error-echo fixtures prove submitted, staged, and overlapping key bytes are absent from human, JSON, and TUI failure output.
+- A Server snapshot regression starts from a manually persisted blank key. Before validation the Server emitted `key_present`; the fixed emitter now rejects the invalid graph before serializing a snapshot, so `Set` always means a non-empty Server-owned key.
+
+Verification:
+
+- `cargo test -p fleety-tools --locked`: 216 unit, 3 smoke, and 1 doc test passed.
+- `cargo test -p fleety-cli --bin fleety --locked`: 277 passed.
+- `cargo test -p fleety-cli --test cli_smoke --locked`: 86 passed.
+- `cargo test -p fleety-server --bin fleety-server --locked`: 329 passed.
+- `cargo clippy -p fleety-tools -p fleety-cli -p fleety-server --all-targets --locked -- -D warnings`: passed at the workspace MSRV.
+- `cargo fmt --all -- --check` and `git diff --check`: passed.
+- `spectra analyze redesign-cli-experience --json`: Coverage, Consistency, Ambiguity, and Gaps are all Clean with zero findings.
+- `spectra validate redesign-cli-experience --strict`: valid.
+
+The Provider JSON schema keeps the existing envelope and compatibility `data.output`, and adds typed `data.providers` rows with a boolean `key_present` only for API Providers. Protocol frames were already protocol-5 compliant and did not change; the Server emitter now validates the graph before snapshot serialization. Daemon is not a Provider owner surface.
+
+## 2026-07-23 — task 5.55 preserves Spectra tracking until archive succeeds
+
+All four generated archive instructions now execute `spectra archive` before
+removing `.spectra/touched/<change>.json`. Their shared guarded block retains
+tracking and exits non-zero on archive failure; cleanup runs only in the success
+branch.
+
+TDD proof:
+
+- The new guard initially exited 3 because none of the four generated files
+  contained the safe archive block.
+- The guard extracts and executes each file's actual fenced shell block with a
+  deterministic fake `spectra`: exit 42 must retain tracking, while exit 0 must
+  remove it.
+- CI runs the guard on every push and pull request, so a later `spectra update`
+  that regenerates the unsafe order fails before build or test.
+
+Verification:
+
+- `bash scripts/check-spectra-archive-instructions.sh`: all four generated
+  instructions passed both failure-retention and success-cleanup fixtures.
+- `git diff --check`: passed.
+- `spectra analyze redesign-cli-experience --json`: Coverage, Consistency,
+  Ambiguity, and Gaps are all Clean with zero findings.
+- `spectra validate redesign-cli-experience --strict`: valid.
+
+## 2026-07-23 — task 5.57 covers immediate browser-launch failure end to end
+
+The OAuth delivery path now exposes an internal injection seam for the browser
+launcher, clipboard writer, and instruction output. Production still uses the
+platform launcher and system clipboard; the regression test drives the same
+delivery pipeline with a launcher whose bounded probe reports an immediate
+non-zero exit.
+
+TDD proof:
+
+- Before the injection seam existed, the new test failed to compile because
+  `present_authorization_with` did not exist.
+- The test runs the real bounded launcher probe, proves clipboard fallback
+  receives the exact full authorization URL, asserts the launcher and probe are
+  each invoked exactly once, and requires the whole pipeline to return within
+  200 ms.
+- Captured terminal output must identify the clipboard fallback while excluding
+  both OAuth sentinel values and the `state=`／`code_challenge=` query fields.
+
+Verification:
+
+- `cargo test -p fleety-cli --bin fleety --locked -- --test-threads=1`: 278
+  passed, 0 failed.
+- `cargo clippy -p fleety-cli --all-targets --locked -- -D warnings`: passed.
+- `cargo fmt --all -- --check` and `git diff --check`: passed.
+- `spectra analyze redesign-cli-experience --json`: Coverage, Consistency,
+  Ambiguity, and Gaps are all Clean with zero findings.
+- `spectra validate redesign-cli-experience --strict`: valid.
+
+## 2026-07-23 — task 5.56 records config protocol v5
+
+The protocol crate's top-level config history now records version 5 as the
+write-only Provider-key boundary. Snapshot and apply frame documentation use
+the same explicit vocabulary: `key_present` is non-secret metadata, omission is
+Keep, a non-empty value is Set, and `clear_keys` is Clear.
+
+TDD proof:
+
+- The new consistency test initially failed with `config protocol v5 history is
+  missing \`5\`` while the version constant was already 5.
+- The test locks `CONFIG_PROTOCOL_VERSION == 5`, checks the source-level history
+  for all v5 terms, and round-trips representative snapshot／apply payloads for
+  `key_present`, Keep, Set, and Clear.
+
+Verification:
+
+- `cargo test -p fleety-protocol --locked`: 26 passed.
+- `cargo fmt --all -- --check` and `git diff --check`: passed.
+- `spectra analyze redesign-cli-experience --json`: Coverage, Consistency,
+  Ambiguity, and Gaps are all Clean with zero findings.
+- `spectra validate redesign-cli-experience --strict`: valid.
+
+## 2026-07-23 — independent convergence review after tasks 5.51–5.57
+
+A fresh read-only Sol high review covered command IA, owner safety, Settings
+transactions, TUI input and accessibility, Provider／Model／OAuth boundaries,
+Daemon reconnect, Windows and cross-platform behavior, docs, protocol, and the
+complete worktree. It reported two High, six Medium, and one Low finding, so
+the clean-review streak remains zero.
+
+- High: automatic mDNS can turn an untrusted advertiser into an operational
+  fleetyd session, forward caller-explicit credentials, persist a rogue
+  `Welcome` token, and accept `RunTool`. The previous stored-credential fix
+  explicitly left this wider boundary open; task 5.58 now tracks it.
+- High: fleetyd logs PID／control ownership failures and continues into the
+  network loop, allowing multiple processes with the same device identity.
+  Task 5.59 requires fail-closed single ownership.
+- Medium: a settled reconnect for the same profile can satisfy a new caller;
+  reconnect success is published before a minted token is durable; profile
+  switch bypasses the per-owner refresh barrier; reconnect control lacks
+  version, process-start identity, and crash-durable publication; and a raw URL
+  borrows the first saved profile token with the same URL. Tasks 5.60–5.64
+  track these independently testable boundaries.
+- Medium: running a later Spectra task command regenerated all four unsafe
+  archive instructions. The CI guard correctly failed, so task 5.55 was
+  reopened and must be repaired only after the final Spectra state mutation.
+- Low: `docs/design-cli-config.md` described `--server` as a profile selector.
+  It now distinguishes `--profile <name>` from transient
+  `--server <ws-url>`.
+
+Two independent Sol high revalidation passes confirmed tasks 5.59–5.64.
+Task 5.58 was confirmed as a reachable security boundary rather than a task
+5.53 regression: the old change protected stored credentials but did not make
+automatic discovery safe for caller-explicit secrets or remote control.
+
+Reviewer verification passed workspace check and clippy, protocol 26,
+connection 29, CLI command 6, CLI unit 278, Server unit 329, Daemon unit 34,
+CLI smoke 86, and Daemon smoke 20. Fmt, full diff check, Spectra analyze, and
+strict validation also passed. It did not run the complete workspace test,
+release build, a Windows-native session, a hostile live LAN advertiser, or a
+real OAuth browser／clipboard flow; those remain required final gates or
+explicit live-environment limitations.

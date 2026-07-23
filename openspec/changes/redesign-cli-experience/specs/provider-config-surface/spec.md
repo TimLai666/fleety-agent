@@ -2,7 +2,7 @@
 
 ### Requirement: Provider, authentication, model catalog, and roles form one workflow
 
-The canonical Provider surface SHALL show each Provider's type, endpoint class, authentication state, catalog state, and bound roles. OAuth login, logout, and status SHALL be actions on a named Provider; model selection SHALL proceed through Provider selection, catalog load, model selection or manual ID, and role confirmation.
+The canonical Provider surface SHALL show each Provider's type, endpoint class, non-secret API-key state, authentication state, catalog state, and bound roles. API Providers SHALL render `key=Set` or `key=Not set` from strictly parsed snapshot metadata; `Set` means a non-empty key and blank keys SHALL be rejected. Malformed metadata SHALL fail the snapshot instead of being silently discarded. JSON Provider lists SHALL retain the existing `data.output` compatibility field and additionally expose each API Provider's state as boolean `data.providers[].key_present` without a secret value. OAuth login, logout, and status SHALL be actions on a named Provider; model selection SHALL proceed through Provider selection, catalog load, model selection or manual ID, and role confirmation.
 
 #### Scenario: OAuth provider status is visible before model selection
 
@@ -14,6 +14,12 @@ The canonical Provider surface SHALL show each Provider's type, endpoint class, 
 - **GIVEN** Provider `tingzhen-codex` has type `oauth:codex` and no stored credential
 - **WHEN** the user starts main-model selection
 - **THEN** the row shows Not signed in and Login, and no model-catalog request is sent until authentication succeeds
+
+#### Scenario: API key presence is visible without exposing the secret
+
+- **GIVEN** the Server snapshot reports key presence for API Provider `openai`
+- **WHEN** the user views `fleety provider list` or the Provider TUI
+- **THEN** human and TUI rows SHALL show `key=Set`, JSON SHALL report `"key_present": true` for `openai`, and no surface SHALL contain the key value
 
 ### Requirement: Model discovery failure has retry and manual recovery
 

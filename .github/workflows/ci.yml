@@ -40,6 +40,8 @@ jobs:
           go build -o "$GITHUB_WORKSPACE/sidecars/fleety-insyra/fleety-insyra" .
       - name: Format
         run: cargo fmt --all -- --check
+      - name: Guard Spectra archive tracking order
+        run: bash scripts/check-spectra-archive-instructions.sh
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Build

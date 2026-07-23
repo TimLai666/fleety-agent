@@ -307,6 +307,11 @@ pub fn validate(cfg: &ProvidersConfig) -> Result<()> {
                 p.kind
             )));
         }
+        if t.allows_key && p.key.as_deref().is_some_and(|key| key.trim().is_empty()) {
+            return Err(CoreError::Message(format!(
+                "provider '{name}' key must not be empty"
+            )));
+        }
     }
     for (role, pool) in &cfg.models {
         if !matches!(role.as_str(), "main" | "cheap") {

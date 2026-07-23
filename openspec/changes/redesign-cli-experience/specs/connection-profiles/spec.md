@@ -26,7 +26,7 @@ The workspace SHALL provide a profile picker that shows name, label, endpoint, c
 
 ### Requirement: Automatic discovery never borrows another profile's identity
 
-mDNS resolution SHALL use only the current profile's own fingerprint and token. A discovered Server owned by another saved profile SHALL require explicit selection before any stored credential is sent. Unowned discovery SHALL remain uncredentialed until pairing, and Daemon pin, heal, token-clear, and token-persist mutations SHALL target only the exact resolved owner profile.
+mDNS TXT metadata SHALL be treated as an untrusted discovery hint, not as Server identity proof. Automatic mDNS resolution SHALL never attach a stored token, even when an advertised fingerprint equals a saved fingerprint. A credentialed profile SHALL NOT adopt or persist an automatically discovered endpoint change until the user explicitly reselects and re-pairs that Server. Explicit `connection set-url` and Settings edits SHALL persist the user-authored URL only after clearing the old token and fingerprint; they SHALL remain uncredentialed until re-pairing succeeds. Re-pairing is an explicit credential-recovery action, not cryptographic endpoint identity proof. Daemon pin, token-clear, and token-persist mutations SHALL target only the exact explicitly selected owner profile.
 
 #### Scenario: current A cannot borrow pinned B
 
@@ -34,14 +34,26 @@ mDNS resolution SHALL use only the current profile's own fingerprint and token. 
 - **WHEN** automatic discovery sees `B`
 - **THEN** it SHALL NOT send `B`'s token as `A`, pin `B` onto `A`, or mutate either profile's identity implicitly
 
+#### Scenario: copied TXT fingerprint cannot receive a stored token
+
+- **GIVEN** profile `A` has a stored token and fingerprint at endpoint `old`, and an mDNS advertiser at endpoint `new` copies that fingerprint
+- **WHEN** automatic discovery or sticky recovery evaluates `new`
+- **THEN** it SHALL NOT send `A`'s token to `new`, persist `new`, or report the profile healed; the user SHALL be directed to explicitly reselect and re-pair
+
 ### Requirement: Persisted profile switching reconnects the active Daemon
 
-After `connection use` or an interactive persisted profile switch succeeds, the CLI SHALL notify the running local `fleetyd` through its owner control path. The Daemon SHALL close its old Server session, resolve the newly current profile, reconnect immediately, and acknowledge the request. Notification failure SHALL preserve the saved profile but report a recoverable incomplete state rather than claiming the switch is fully active.
+After `connection use` or an interactive persisted profile switch succeeds, the CLI SHALL notify the running local `fleetyd` through its owner control path. Each request SHALL remain durable through consumption until its terminal result is observed, SHALL NOT be silently overwritten by a later request, and SHALL receive exactly one durable success or failure settlement for its nonce; this does not promise exactly-once transport connection attempts. Success SHALL be settled only after the selected Server sends `Welcome`, authentication completes, its identity matches the saved pin, and the persisted owner snapshot still matches the resolved target at the atomic settlement boundary. Resolve, connect, `Hello`, authentication, identity, owner drift, stop, restart, and bounded-handshake failures SHALL settle failure. Notification failure SHALL preserve the saved profile but report a recoverable incomplete state rather than claiming the switch is fully active.
 
 #### Scenario: A to B updates every live owner view
 
 - **WHEN** the user changes current profile from `A` to `B`
 - **THEN** CLI Server state, Server snapshot, Daemon snapshot, and the running `fleetyd` session SHALL all resolve to `B` before the workflow reports a fully refreshed state
+
+#### Scenario: timed-out request is not overwritten
+
+- **GIVEN** the Daemon is busy with an inline tool and has not consumed reconnect request `r1`
+- **WHEN** the caller times out and another caller submits request `r2`
+- **THEN** `r1` SHALL remain durable, `r2` SHALL be rejected as already pending, and the Daemon SHALL later settle `r1` exactly once
 
 ### Requirement: Profile switching consumes one live leased target snapshot
 
@@ -52,3 +64,42 @@ The profile URL, token, and fingerprint used for reconnect SHALL be read togethe
 - **GIVEN** profile `B`'s token or fingerprint rotates while a switch is waiting for the connection lease
 - **WHEN** the switch acquires the lease
 - **THEN** its reconnect SHALL use the latest complete `B` target snapshot
+
+## MODIFIED Requirements
+
+### Requirement: Sticky connections heal by fingerprint when the address moves
+
+When connecting to a credentialed profile's saved URL fails, the client SHALL NOT treat an mDNS TXT fingerprint as identity proof, attach the stored token to a discovered endpoint, persist a discovered URL, or report the profile healed. The CLI one-shot path and Daemon reconnect loop SHALL preserve the saved profile and direct the user to explicitly reselect and re-pair. A successful saved connection SHALL proceed without a discovery scan. Transparent endpoint healing SHALL NOT return unless the transport supplies cryptographic Server identity proof.
+
+#### Scenario: the server moves to a new IP
+
+- **WHEN** the saved URL stops answering and a scan finds an advertiser with the pinned fingerprint at a new URL
+- **THEN** the profile SHALL remain unchanged, no stored token SHALL be sent to the advertiser, and the user SHALL be directed to explicitly reselect and re-pair
+
+##### Example: copied fingerprint at a new address
+
+- **GIVEN** profile `office` stores URL `ws://10.0.0.2:8787`, token `old-token`, and fingerprint `server-a`
+- **WHEN** `ws://10.0.0.9:8787` advertises TXT fingerprint `server-a` after the saved URL stops answering
+- **THEN** `office` SHALL retain its original URL and credential, and the new endpoint SHALL receive neither `old-token` nor a healed status
+
+#### Scenario: a different server on the LAN is never adopted
+
+- **WHEN** the saved URL stops answering and a scan finds only advertisers with different or absent fingerprints
+- **THEN** the profile SHALL remain unchanged, no stored token SHALL be sent to any advertiser, and the original failure plus explicit recovery guidance SHALL be reported
+
+##### Example: unrelated advertiser
+
+- **GIVEN** profile `office` is pinned to `server-a`
+- **WHEN** the saved URL stops answering and discovery returns only `server-b`
+- **THEN** `office` SHALL remain byte-identical and the failure SHALL direct `fleety --profile office pair <code>`
+
+#### Scenario: healthy connections never scan
+
+- **WHEN** the current profile's URL answers
+- **THEN** no discovery scan SHALL run and the saved connection SHALL proceed
+
+##### Example: saved endpoint remains reachable
+
+- **GIVEN** profile `office` has a reachable saved URL
+- **WHEN** a CLI one-shot command or Daemon reconnect uses `office`
+- **THEN** it SHALL connect to the saved URL without starting mDNS discovery or changing the profile

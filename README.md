@@ -153,7 +153,7 @@ updates, troubleshooting): [`docs/acp.md`](docs/acp.md).
 2. `FLEETY_AGENT_URL` (env, transient), else
 3. the current server profile in `~/.fleety/connections.toml` (set by
    `fleety connection use` / `fleety init`), else
-4. mDNS discovery on the LAN (a short 2 s probe; sticky once enrolled), else
+4. mDNS discovery on the LAN without borrowing stored profile credentials (a short 2 s probe), else
 5. the local default `ws://127.0.0.1:8787`.
 
 `FLEETY_AGENT_URL` never borrows credentials from a profile for a different
@@ -161,11 +161,11 @@ URL. Set `FLEETY_TOKEN` explicitly for a transient endpoint, or use a named
 profile. A transient endpoint also cannot overwrite or clear another profile's
 token or fingerprint.
 
-mDNS keeps the advertised Server fingerprint and prefers a match for the current
-profile's own pin even if another Server responds first. It never borrows a pin
-or token from another saved profile. An old token-only profile with no URL and no
-fingerprint cannot safely identify its Server, so Fleety withholds that token and
-requires pairing again.
+mDNS keeps the advertised Server fingerprint only as an untrusted selection
+hint. Automatic discovery never attaches a stored token or changes a
+credentialed profile. A token-only profile with no URL, or a saved endpoint that
+stops answering, requires explicit endpoint selection and re-pairing. Changing a
+profile URL clears its old token and fingerprint first.
 
 So on one machine bare `fleety` or `fleety chat` just works. For a remote server the easiest path
 is bare `fleety init` on a TTY: it scans the LAN, lists every announced server by

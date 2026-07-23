@@ -1569,50 +1569,55 @@ async fn serve(
                 changes,
                 providers_json,
             } => {
-                let reply = match target {
-                    fleety_protocol::ConfigTarget::Server => {
-                        let (reply, applied, sensitive, providers_changed, provider_audit) =
-                            apply_structured_changes(
+                let gate = structured_apply_gate(
+                    &target,
+                    &changes,
+                    providers_json.as_deref(),
+                    auth.required(),
+                );
+                let reply = match gate {
+                    StructuredApplyGate::InvalidLocal => local_structured_apply_error(),
+                    StructuredApplyGate::Denied => auth_disabled_structured_apply_error(),
+                    StructuredApplyGate::Continue => match target {
+                        fleety_protocol::ConfigTarget::Server => {
+                            let (reply, applied, sensitive, providers_changed, provider_audit) =
+                                apply_structured_changes(
+                                    &base_revision,
+                                    &changes,
+                                    providers_json.as_deref(),
+                                    auth.required(),
+                                );
+                            // Audit a successful mutation (with any sensitive keys),
+                            // like the ConfigExec path — the audit log is readable via
+                            // `fleety audit`, so record the keys (plus whether the
+                            // provider config changed), never their values.
+                            if applied > 0 || providers_changed {
+                                let event = agent_core::Event::ToolResult {
+                                    id: "config_apply".to_string(),
+                                    result: serde_json::json!({
+                                        "applied": applied,
+                                        "sensitive": sensitive,
+                                        "providers": providers_changed,
+                                        "provider_changes": provider_audit,
+                                    }),
+                                };
+                                let _ = storage.append_history(device_id, &event);
+                            }
+                            reply
+                        }
+                        fleety_protocol::ConfigTarget::Device(id) => {
+                            daemon_config_apply(
+                                hub,
+                                pending,
+                                &id,
                                 &base_revision,
                                 &changes,
                                 providers_json.as_deref(),
-                                auth.required(),
-                            );
-                        // Audit a successful mutation (with any sensitive keys),
-                        // like the ConfigExec path — the audit log is readable via
-                        // `fleety audit`, so record the keys (plus whether the
-                        // provider config changed), never their values.
-                        if applied > 0 || providers_changed {
-                            let event = agent_core::Event::ToolResult {
-                                id: "config_apply".to_string(),
-                                result: serde_json::json!({
-                                    "applied": applied,
-                                    "sensitive": sensitive,
-                                    "providers": providers_changed,
-                                    "provider_changes": provider_audit,
-                                }),
-                            };
-                            let _ = storage.append_history(device_id, &event);
+                            )
+                            .await
                         }
-                        reply
-                    }
-                    fleety_protocol::ConfigTarget::Local => config_err(
-                        "invalid",
-                        "local settings are applied by the CLI, not over the connection"
-                            .to_string(),
-                        None,
-                    ),
-                    fleety_protocol::ConfigTarget::Device(id) => {
-                        daemon_config_apply(
-                            hub,
-                            pending,
-                            &id,
-                            &base_revision,
-                            &changes,
-                            providers_json.as_deref(),
-                        )
-                        .await
-                    }
+                        fleety_protocol::ConfigTarget::Local => local_structured_apply_error(),
+                    },
                 };
                 emit(out, &reply)?;
             }
@@ -2241,6 +2246,10 @@ fn build_config_snapshot_unlocked() -> ServerMsg {
             return config_err(&report.kind, report.message, report.remediation);
         }
     };
+    if let Err(error) = fleety_tools::providers_config::validate(&providers) {
+        let report = error.report();
+        return config_err(&report.kind, report.message, report.remediation);
+    }
     let providers_json = match provider_snapshot_json(&providers) {
         Ok(json) => json,
         Err(e) => {
@@ -2295,6 +2304,65 @@ fn config_err(kind: &str, message: String, remediation: Option<String>) -> Serve
             remediation,
         }),
     }
+}
+
+fn server_structured_apply_mutates(
+    changes: &[fleety_protocol::ConfigChange],
+    providers_json: Option<&str>,
+) -> bool {
+    use fleety_protocol::ChangeOp;
+    providers_json.is_some()
+        || changes
+            .iter()
+            .any(|change| !matches!(change.op, ChangeOp::Keep))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StructuredApplyGate {
+    InvalidLocal,
+    Denied,
+    Continue,
+}
+
+/// Reject structured remote writes while the Server accepts unauthenticated
+/// connections. A Device apply is always a write boundary: fleetyd persists
+/// even an empty or Keep-only apply. Local applies retain their `invalid`
+/// response and never reach a remote owner.
+fn structured_apply_gate(
+    target: &fleety_protocol::ConfigTarget,
+    changes: &[fleety_protocol::ConfigChange],
+    providers_json: Option<&str>,
+    require_auth: bool,
+) -> StructuredApplyGate {
+    match target {
+        fleety_protocol::ConfigTarget::Local => StructuredApplyGate::InvalidLocal,
+        _ if require_auth => StructuredApplyGate::Continue,
+        fleety_protocol::ConfigTarget::Server
+            if server_structured_apply_mutates(changes, providers_json) =>
+        {
+            StructuredApplyGate::Denied
+        }
+        fleety_protocol::ConfigTarget::Server => StructuredApplyGate::Continue,
+        fleety_protocol::ConfigTarget::Device(_) => StructuredApplyGate::Denied,
+    }
+}
+
+fn local_structured_apply_error() -> ServerMsg {
+    config_err(
+        "invalid",
+        "local settings are applied by the CLI, not over the connection".to_string(),
+        None,
+    )
+}
+
+fn auth_disabled_structured_apply_error() -> ServerMsg {
+    config_err(
+        "unauthenticated",
+        "this server does not require authentication, so remote config changes are refused — \
+         enable auth before changing settings remotely"
+            .to_string(),
+        Some("set FLEETY_REQUIRE_AUTH=1 on the server and restart".to_string()),
+    )
 }
 
 const INTERNAL_CONFIG_TOOL: &str = "__fleety_internal_config";
@@ -2508,6 +2576,7 @@ fn apply_structured_changes_unlocked(
     Vec<ProviderMutationAudit>,
 ) {
     use fleety_protocol::ChangeOp;
+
     if base_revision != config_revision() {
         return (
             config_err(
@@ -2521,17 +2590,10 @@ fn apply_structured_changes_unlocked(
             vec![],
         );
     }
-    let mutates =
-        providers_json.is_some() || changes.iter().any(|c| !matches!(c.op, ChangeOp::Keep));
+    let mutates = server_structured_apply_mutates(changes, providers_json);
     if mutates && !require_auth {
         return (
-            config_err(
-                "unauthenticated",
-                "this server does not require authentication, so remote config changes are \
-                 refused — enable auth before changing settings remotely"
-                    .to_string(),
-                Some("set FLEETY_REQUIRE_AUTH=1 on the server and restart".to_string()),
-            ),
+            auth_disabled_structured_apply_error(),
             0,
             vec![],
             false,
@@ -4031,6 +4093,7 @@ async fn send_error_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::echo::EchoProvider;
     use agent_core::{Event, MockProvider, ModelResponse, Role as CoreRole, ToolCall, ToolSpec};
     use fleety_protocol::OriginContext;
     use tokio_tungstenite::MaybeTlsStream;
@@ -4741,6 +4804,41 @@ mod tests {
             }
             other => panic!("got {other:?}"),
         }
+
+        std::env::remove_var("FLEETY_CONFIG");
+        std::env::remove_var("FLEETY_PROVIDERS");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn structured_snapshot_rejects_blank_provider_keys() {
+        let dir = std::env::temp_dir().join(format!("fleety-snap-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        std::env::set_var("FLEETY_CONFIG", dir.join("config.toml"));
+        std::env::set_var("FLEETY_PROVIDERS", dir.join("providers.toml"));
+        std::env::remove_var("FLEETY_TOKEN");
+        std::fs::write(
+            dir.join("providers.toml"),
+            "[providers.private-api]\ntype = \"api\"\nbase_url = \"https://api.example.test/v1\"\nkey = \"   \"\n",
+        )
+        .expect("provider config");
+
+        let reply = build_config_snapshot();
+
+        let ServerMsg::ConfigResult {
+            ok: false,
+            error: Some(error),
+            ..
+        } = reply
+        else {
+            panic!("blank Provider key must reject the snapshot")
+        };
+        assert!(
+            error.message.contains("must not be empty"),
+            "{}",
+            error.message
+        );
 
         std::env::remove_var("FLEETY_CONFIG");
         std::env::remove_var("FLEETY_PROVIDERS");
@@ -6145,6 +6243,229 @@ mod tests {
             local_tools_json: None,
             hostname: None,
         }
+    }
+
+    #[test]
+    fn structured_apply_auth_gate_respects_owner_side_effects() {
+        use fleety_protocol::{ChangeOp, ConfigChange, ConfigTarget};
+
+        let keep = ConfigChange {
+            key: "FLEETY_TZ".to_string(),
+            op: ChangeOp::Keep,
+            value: None,
+        };
+        let set = ConfigChange {
+            key: "FLEETY_TZ".to_string(),
+            op: ChangeOp::Set,
+            value: Some("Asia/Taipei".to_string()),
+        };
+        let server = ConfigTarget::Server;
+        let device = ConfigTarget::Device("remote-B".to_string());
+        let local = ConfigTarget::Local;
+
+        assert_eq!(
+            structured_apply_gate(&server, &[], None, false),
+            StructuredApplyGate::Continue
+        );
+        assert_eq!(
+            structured_apply_gate(&server, std::slice::from_ref(&keep), None, false),
+            StructuredApplyGate::Continue
+        );
+        assert_eq!(
+            structured_apply_gate(&server, std::slice::from_ref(&set), None, false),
+            StructuredApplyGate::Denied
+        );
+        assert_eq!(
+            structured_apply_gate(&server, &[], Some(""), false),
+            StructuredApplyGate::Denied
+        );
+        assert_eq!(
+            structured_apply_gate(&device, &[], None, false),
+            StructuredApplyGate::Denied
+        );
+        assert_eq!(
+            structured_apply_gate(&device, &[keep], None, false),
+            StructuredApplyGate::Denied
+        );
+        assert_eq!(
+            structured_apply_gate(&local, std::slice::from_ref(&set), None, false),
+            StructuredApplyGate::InvalidLocal
+        );
+        assert_eq!(
+            structured_apply_gate(&server, std::slice::from_ref(&set), None, true),
+            StructuredApplyGate::Continue
+        );
+        assert_eq!(
+            structured_apply_gate(&device, &[set], None, true),
+            StructuredApplyGate::Continue
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn auth_disabled_device_config_apply_is_rejected_before_run_tool() {
+        struct EnvVarGuard {
+            key: &'static str,
+            previous: Option<std::ffi::OsString>,
+        }
+
+        impl EnvVarGuard {
+            fn set(key: &'static str, value: &std::path::Path) -> Self {
+                let previous = std::env::var_os(key);
+                std::env::set_var(key, value);
+                Self { key, previous }
+            }
+        }
+
+        impl Drop for EnvVarGuard {
+            fn drop(&mut self) {
+                if let Some(previous) = &self.previous {
+                    std::env::set_var(self.key, previous);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+
+        let home = std::env::temp_dir().join(format!(
+            "fleety-config-apply-auth-gate-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let workspace = home.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("create workspace");
+        let config_path = home.join("config.toml");
+        let config_before = b"# auth-gate server config sentinel\n";
+        std::fs::write(&config_path, config_before).expect("seed server config");
+        let _config_guard = EnvVarGuard::set("FLEETY_CONFIG", &config_path);
+        let storage = Arc::new(Storage::new(home.clone()));
+        let provider: Arc<dyn ModelProvider> = Arc::new(EchoProvider);
+        let hub = bridge::new_hub();
+        let pending = bridge::new_pending();
+        let handles = bridge::new_handles();
+        let auth = open_auth();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("listener address");
+        tokio::spawn({
+            let storage = Arc::clone(&storage);
+            let provider = Arc::clone(&provider);
+            let workspace = Arc::new(workspace);
+            let hub = Arc::clone(&hub);
+            let pending = Arc::clone(&pending);
+            let handles = Arc::clone(&handles);
+            let auth = Arc::clone(&auth);
+            async move {
+                for _ in 0..2 {
+                    let (stream, _) = listener.accept().await.expect("accept");
+                    let task = handle_conn(
+                        stream,
+                        Arc::clone(&storage),
+                        Arc::clone(&provider),
+                        Arc::clone(&workspace),
+                        Policy::FullAccess,
+                        Arc::clone(&hub),
+                        Arc::clone(&pending),
+                        Arc::clone(&handles),
+                        Arc::clone(&auth),
+                        bridge::new_device_tools(),
+                    );
+                    tokio::spawn(async move {
+                        let _ = task.await;
+                    });
+                }
+            }
+        });
+
+        let url = format!("ws://{addr}");
+        let (daemon_ws, _) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("daemon connect");
+        let (mut daemon_tx, mut daemon_rx) = daemon_ws.split();
+        send_client(
+            &mut daemon_tx,
+            &ClientMsg::Hello {
+                device_id: "remote-B".to_string(),
+                protocol: PROTOCOL_VERSION,
+                token: None,
+                pairing_code: None,
+                local_tools_json: Some(
+                    serde_json::to_string(&vec![agent_core::ToolSpec {
+                        name: "run_command".to_string(),
+                        description: "daemon marker".to_string(),
+                        parameters: serde_json::json!({}),
+                        risk: agent_core::RiskLevel::Mutate,
+                    }])
+                    .expect("tool specs"),
+                ),
+                hostname: None,
+            },
+        )
+        .await;
+        assert!(matches!(
+            recv_server(&mut daemon_rx).await,
+            Some(ServerMsg::Welcome { .. })
+        ));
+
+        let (user_ws, _) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("user connect");
+        let (mut user_tx, mut user_rx) = user_ws.split();
+        send_client(&mut user_tx, &hello("user")).await;
+        assert!(matches!(
+            recv_server(&mut user_rx).await,
+            Some(ServerMsg::Welcome { .. })
+        ));
+        send_client(
+            &mut user_tx,
+            &ClientMsg::ConfigApply {
+                target: fleety_protocol::ConfigTarget::Device("remote-B".to_string()),
+                base_revision: "r1".to_string(),
+                changes: vec![fleety_protocol::ConfigChange {
+                    key: "FLEETY_UPDATE_INTERVAL_SECS".to_string(),
+                    op: fleety_protocol::ChangeOp::Set,
+                    value: Some("60".to_string()),
+                }],
+                providers_json: None,
+            },
+        )
+        .await;
+
+        let reply = tokio::select! {
+            daemon_frame = recv_server(&mut daemon_rx) => {
+                panic!("auth-disabled ConfigApply reached the Daemon as {daemon_frame:?}")
+            }
+            user_frame = recv_server(&mut user_rx) => user_frame,
+        };
+        assert!(matches!(
+            reply,
+            Some(ServerMsg::ConfigResult {
+                ok: false,
+                error: Some(fleety_protocol::WireError {
+                    ref kind,
+                    remediation: Some(ref remediation),
+                    ..
+                }),
+                ..
+            }) if kind == "unauthenticated" && !remediation.trim().is_empty()
+        ));
+        assert_eq!(
+            std::fs::read(&config_path).expect("read server config"),
+            config_before,
+            "rejected Device mutation must not write Server configuration"
+        );
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                recv_server(&mut daemon_rx)
+            )
+            .await
+            .is_err(),
+            "rejected Device mutation must emit zero RunTool frames"
+        );
+
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]

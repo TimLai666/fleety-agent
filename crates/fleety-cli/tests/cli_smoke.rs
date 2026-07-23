@@ -136,6 +136,14 @@ fn doctor_snapshot(providers_json: &str) -> ServerMsg {
     }
 }
 
+fn raw_provider_snapshot(providers_json: &str) -> ServerMsg {
+    ServerMsg::ConfigSnapshotResult {
+        revision: "provider-revision".into(),
+        entries: Vec::new(),
+        providers_json: providers_json.into(),
+    }
+}
+
 fn start_ws_server(steps: Vec<Vec<ServerMsg>>) -> (String, mpsc::Receiver<Vec<ClientMsg>>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ws server");
     let addr = listener.local_addr().expect("local addr");
@@ -830,6 +838,22 @@ fn init_invalid_url_error_redacts_secrets_and_terminal_controls_before_io() {
     }
     assert!(stderr.contains("token=<redacted>"), "{stderr}");
     assert!(!home.0.join(".fleety").exists());
+
+    let userinfo = "ws://user:password@example.test:8787/path?token=SECOND";
+    let output = Command::new(env!("CARGO_BIN_EXE_fleety"))
+        .args(["init", userinfo])
+        .env("HOME", &home.0)
+        .env("USERPROFILE", &home.0)
+        .env_remove("FLEETY_AGENT_URL")
+        .output()
+        .expect("run init with credential-bearing WebSocket URL");
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr).expect("UTF-8 usage error");
+    for forbidden in ["password", "SECOND"] {
+        assert!(!stderr.contains(forbidden), "leaked {forbidden}: {stderr}");
+    }
+    assert!(stderr.contains("cannot contain credentials"), "{stderr}");
+    assert!(!home.0.join(".fleety").exists());
 }
 
 #[test]
@@ -1243,6 +1267,142 @@ fn init_and_pair_write_the_connection_profile() {
         conns.contains("pair-token"),
         "pair token landed on the current profile: {conns}"
     );
+}
+
+#[test]
+fn init_endpoint_change_requires_repair_and_never_sends_the_old_token() {
+    let home = TempHome::new("init-endpoint-change");
+    let fleety = home.0.join(".fleety");
+    std::fs::create_dir_all(&fleety).expect("fleety dir");
+    let connections_path = fleety.join("connections.toml");
+    std::fs::write(
+        &connections_path,
+        "current = \"office\"\n\n[profiles.office]\nurl = \"ws://old.test:8787\"\ntoken = \"old-secret\"\nfingerprint = \"old-pin\"\n",
+    )
+    .expect("write paired profile");
+    let before = std::fs::read(&connections_path).expect("read baseline");
+
+    let rejected = Command::new(env!("CARGO_BIN_EXE_fleety"))
+        .args(["init", "ws://new.test:8787", "--name", "office"])
+        .env("HOME", &home.0)
+        .env("USERPROFILE", &home.0)
+        .env_remove("FLEETY_AGENT_URL")
+        .output()
+        .expect("run unsafe endpoint change");
+    assert_eq!(rejected.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("--pairing-code <code>"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    assert_eq!(std::fs::read(&connections_path).unwrap(), before);
+
+    let reply = welcome_with_fingerprint_and_token("new-pin", Some("new-token"));
+    let (new_url, rx) = start_ws_server(vec![vec![reply]]);
+    let (output, received) = run_against_server(
+        &[
+            "init",
+            &new_url,
+            "--name",
+            "office",
+            "--pairing-code",
+            "PAIR-NEW",
+        ],
+        &new_url,
+        &home,
+        rx,
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(matches!(
+        received.first(),
+        Some(ClientMsg::Hello {
+            token: None,
+            pairing_code: Some(code),
+            ..
+        }) if code == "PAIR-NEW"
+    ));
+    let saved = std::fs::read_to_string(&connections_path).unwrap();
+    assert!(!saved.contains("old-secret"), "{saved}");
+    assert!(!saved.contains("old-pin"), "{saved}");
+    assert!(saved.contains("new-token"), "{saved}");
+    assert!(saved.contains("new-pin"), "{saved}");
+}
+
+#[test]
+fn profile_override_can_repair_a_non_current_reselected_endpoint() {
+    let home = TempHome::new("pair-non-current");
+    let reply = welcome_with_fingerprint_and_token("spare-pin", Some("spare-token"));
+    let (spare_url, rx) = start_ws_server(vec![vec![reply]]);
+    let fleety = home.0.join(".fleety");
+    std::fs::create_dir_all(&fleety).expect("fleety dir");
+    let connections_path = fleety.join("connections.toml");
+    std::fs::write(
+        &connections_path,
+        format!(
+            "current = \"office\"\n\n[profiles.office]\nurl = \"ws://office.test:8787\"\ntoken = \"office-token\"\n\n[profiles.spare]\nurl = \"{spare_url}\"\n"
+        ),
+    )
+    .expect("write profiles");
+
+    let (output, received) =
+        run_against_profile(&["--profile", "spare", "pair", "PAIR-SPARE"], &home, rx);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(matches!(
+        received.first(),
+        Some(ClientMsg::Hello {
+            token: None,
+            pairing_code: Some(code),
+            ..
+        }) if code == "PAIR-SPARE"
+    ));
+    let saved = std::fs::read_to_string(connections_path).unwrap();
+    assert!(saved.contains("current = \"office\""), "{saved}");
+    assert!(saved.contains("office-token"), "{saved}");
+    assert!(saved.contains("spare-token"), "{saved}");
+    assert!(saved.contains("spare-pin"), "{saved}");
+}
+
+#[test]
+fn saved_profile_failure_never_heals_or_mutates_and_directs_explicit_repair() {
+    let home = TempHome::new("saved-profile-no-heal");
+    let fleety = home.0.join(".fleety");
+    std::fs::create_dir_all(&fleety).expect("fleety dir");
+    let connections_path = fleety.join("connections.toml");
+    let unreachable = rejecting_ws_url();
+    std::fs::write(
+        &connections_path,
+        format!(
+            "current = \"office\"\n\n[profiles.office]\nurl = \"{unreachable}\"\ntoken = \"office-secret\"\nfingerprint = \"public-copyable-hint\"\n"
+        ),
+    )
+    .expect("write paired profile");
+    let before = std::fs::read(&connections_path).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_fleety"))
+        .args(["status"])
+        .env("HOME", &home.0)
+        .env("USERPROFILE", &home.0)
+        .env_remove("FLEETY_AGENT_URL")
+        .env_remove("FLEETY_MDNS_DISABLED")
+        .output()
+        .expect("run saved profile command");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--pairing-code <code>"), "{stderr}");
+    assert!(
+        stderr.contains("will not send the stored token or change the URL"),
+        "{stderr}"
+    );
+    assert_eq!(std::fs::read(&connections_path).unwrap(), before);
 }
 
 #[test]
@@ -2102,6 +2262,403 @@ fn canonical_provider_and_config_alias_send_the_same_server_request() {
         legacy_stdout.lines().skip(1).collect::<Vec<_>>()
     );
     assert_eq!(canonical_messages.get(1), legacy_messages.get(1));
+}
+
+#[test]
+fn provider_list_rejects_malformed_key_presence_metadata() {
+    let provider = r#""openai": {
+        "type": "api",
+        "base_url": "https://api.example.test/v1"
+    }"#;
+    let cases = [
+        (
+            "mixed-type",
+            format!(r#"{{"providers":{{{provider}}},"models":{{}},"key_present":["openai",7]}}"#),
+        ),
+        (
+            "missing",
+            format!(r#"{{"providers":{{{provider}}},"models":{{}}}}"#),
+        ),
+        (
+            "wrong-container",
+            format!(r#"{{"providers":{{{provider}}},"models":{{}},"key_present":"openai"}}"#),
+        ),
+        (
+            "duplicate",
+            format!(
+                r#"{{"providers":{{{provider}}},"models":{{}},"key_present":["openai","openai"]}}"#
+            ),
+        ),
+        (
+            "unknown",
+            format!(r#"{{"providers":{{{provider}}},"models":{{}},"key_present":["ghost"]}}"#),
+        ),
+    ];
+
+    for (case, providers_json) in cases {
+        let home = TempHome::new(&format!("provider-malformed-key-presence-{case}"));
+        let response = raw_provider_snapshot(&providers_json);
+        let (url, rx) = start_ws_server(vec![vec![doctor_welcome()], vec![response]]);
+
+        let (output, _) = run_against_server(&["provider", "list"], &url, &home, rx);
+
+        assert!(!output.status.success(), "{case}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("key metadata"), "{case}: {stderr}");
+    }
+}
+
+#[test]
+fn provider_list_rejects_plaintext_snapshot_without_echoing_the_secret() {
+    let home = TempHome::new("provider-plaintext-key-refusal");
+    let response = raw_provider_snapshot(
+        r#"{
+            "providers": {
+                "openai": {
+                    "type": "api",
+                    "base_url": "https://api.example.test/v1",
+                    "key": "snapshot-secret-must-not-render"
+                }
+            },
+            "models": {},
+            "key_present": ["openai"]
+        }"#,
+    );
+    let (url, rx) = start_ws_server(vec![vec![doctor_welcome()], vec![response]]);
+
+    let (output, _) = run_against_server(&["provider", "list"], &url, &home, rx);
+
+    assert!(!output.status.success());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("snapshot-secret-must-not-render"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("snapshot-secret-must-not-render"));
+}
+
+#[test]
+fn provider_list_rejects_duplicate_key_metadata_without_echoing_the_name() {
+    let secret = "metadata-secret-must-not-render";
+    let home = TempHome::new("provider-duplicate-key-metadata-redaction");
+    let response = raw_provider_snapshot(&format!(
+        r#"{{
+            "providers": {{
+                "{secret}": {{
+                    "type": "api",
+                    "base_url": "https://api.example.test/v1"
+                }}
+            }},
+            "models": {{}},
+            "key_present": ["{secret}", "{secret}"]
+        }}"#
+    ));
+    let (url, rx) = start_ws_server(vec![vec![doctor_welcome()], vec![response]]);
+
+    let (output, _) = run_against_server(&["provider", "list"], &url, &home, rx);
+
+    assert!(!output.status.success());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(secret));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(secret));
+}
+
+#[test]
+fn provider_list_rejects_invalid_key_metadata_name_without_echoing_it() {
+    let hostile_name = "../metadata-secret-must-not-render";
+    let home = TempHome::new("provider-invalid-key-metadata-name");
+    let response = raw_provider_snapshot(&format!(
+        r#"{{
+            "providers": {{
+                "{hostile_name}": {{
+                    "type": "api",
+                    "base_url": "https://api.example.test/v1"
+                }}
+            }},
+            "models": {{}},
+            "key_present": ["{hostile_name}"]
+        }}"#
+    ));
+    let (url, rx) = start_ws_server(vec![vec![doctor_welcome()], vec![response]]);
+
+    let (output, _) = run_against_server(&["provider", "list"], &url, &home, rx);
+
+    assert!(!output.status.success());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(hostile_name));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(hostile_name));
+}
+
+#[test]
+fn provider_list_rejects_key_presence_for_oauth_provider() {
+    let home = TempHome::new("provider-oauth-key-presence");
+    let response = raw_provider_snapshot(
+        r#"{
+            "providers": {
+                "codex": { "type": "oauth:codex" }
+            },
+            "models": {},
+            "key_present": ["codex"]
+        }"#,
+    );
+    let (url, rx) = start_ws_server(vec![vec![doctor_welcome()], vec![response]]);
+
+    let (output, _) = run_against_server(&["provider", "list"], &url, &home, rx);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("key metadata"), "{stderr}");
+}
+
+#[test]
+fn provider_list_human_and_json_report_key_presence_without_secret_bytes() {
+    fn run(args: &[&str], name: &str) -> std::process::Output {
+        let home = TempHome::new(name);
+        let response = raw_provider_snapshot(
+            r#"{
+                "providers": {
+                    "openai": {
+                        "type": "api",
+                        "base_url": "https://api.example.test/v1"
+                    },
+                    "other": {
+                        "type": "api",
+                        "base_url": "https://other.example.test/v1"
+                    }
+                },
+                "models": {},
+                "key_present": ["openai"]
+            }"#,
+        );
+        let (url, rx) = start_ws_server(vec![vec![doctor_welcome()], vec![response]]);
+        run_against_server(args, &url, &home, rx).0
+    }
+
+    let human = run(&["provider", "list"], "provider-key-state-human");
+    assert!(
+        human.status.success(),
+        "{}",
+        String::from_utf8_lossy(&human.stderr)
+    );
+    let human_stdout = String::from_utf8_lossy(&human.stdout);
+    let openai = human_stdout
+        .lines()
+        .find(|line| line.starts_with("openai:"))
+        .expect("openai row");
+    let other = human_stdout
+        .lines()
+        .find(|line| line.starts_with("other:"))
+        .expect("other row");
+    assert!(openai.contains("key=Set"), "{openai}");
+    assert!(other.contains("key=Not set"), "{other}");
+
+    let json = run(&["provider", "list", "--json"], "provider-key-state-json");
+    assert!(
+        json.status.success(),
+        "{}",
+        String::from_utf8_lossy(&json.stderr)
+    );
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&json.stdout).expect("Provider JSON envelope");
+    let output = envelope["data"]["output"]
+        .as_str()
+        .expect("Provider data.output");
+    let openai_json = output
+        .lines()
+        .find(|line| line.starts_with("openai:"))
+        .expect("JSON openai row");
+    let other_json = output
+        .lines()
+        .find(|line| line.starts_with("other:"))
+        .expect("JSON other row");
+    assert!(openai_json.contains("key=Set"), "{openai_json}");
+    assert!(other_json.contains("key=Not set"), "{other_json}");
+    let providers = envelope["data"]["providers"]
+        .as_array()
+        .expect("structured Provider rows");
+    let openai_data = providers
+        .iter()
+        .find(|provider| provider["name"] == "openai")
+        .expect("structured openai");
+    let other_data = providers
+        .iter()
+        .find(|provider| provider["name"] == "other")
+        .expect("structured other");
+    assert_eq!(openai_data["key_present"], true);
+    assert_eq!(other_data["key_present"], false);
+}
+
+#[test]
+fn provider_add_set_and_clear_send_explicit_secret_safe_transitions() {
+    fn run_mutation(
+        args: &[&str],
+        snapshot: &str,
+        name: &str,
+    ) -> (std::process::Output, Vec<ClientMsg>) {
+        let home = TempHome::new(name);
+        let response = raw_provider_snapshot(snapshot);
+        let (url, rx) = start_ws_server(vec![
+            vec![doctor_welcome()],
+            vec![response],
+            vec![ServerMsg::ConfigResult {
+                ok: true,
+                output: String::new(),
+                effect: None,
+                error: None,
+            }],
+        ]);
+        run_against_server(args, &url, &home, rx)
+    }
+
+    let empty = r#"{"providers":{},"models":{},"key_present":[]}"#;
+    let (added, add_messages) = run_mutation(
+        &[
+            "provider",
+            "add",
+            "openai",
+            "--type",
+            "api",
+            "--base-url",
+            "https://api.example.test/v1",
+            "--key",
+            "add-secret-must-not-render",
+        ],
+        empty,
+        "provider-add-key-transition",
+    );
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&added.stdout).contains("add-secret-must-not-render"));
+    assert!(!String::from_utf8_lossy(&added.stderr).contains("add-secret-must-not-render"));
+    let add_json = add_messages
+        .iter()
+        .find_map(|message| match message {
+            ClientMsg::ConfigApply {
+                providers_json: Some(json),
+                ..
+            } => Some(json),
+            _ => None,
+        })
+        .expect("add ConfigApply");
+    let add_value: serde_json::Value = serde_json::from_str(add_json).expect("add payload");
+    assert_eq!(
+        add_value["providers"]["openai"]["key"],
+        "add-secret-must-not-render"
+    );
+    assert_eq!(add_value["clear_keys"], serde_json::json!([]));
+
+    let configured = r#"{
+        "providers": {
+            "openai": {
+                "type": "api",
+                "base_url": "https://api.example.test/v1"
+            }
+        },
+        "models": {},
+        "key_present": ["openai"]
+    }"#;
+    let (kept, keep_messages) = run_mutation(
+        &[
+            "provider",
+            "set",
+            "openai",
+            "--base-url",
+            "https://other.example.test/v1",
+        ],
+        configured,
+        "provider-keep-key-transition",
+    );
+    assert!(
+        kept.status.success(),
+        "{}",
+        String::from_utf8_lossy(&kept.stderr)
+    );
+    let keep_json = keep_messages
+        .iter()
+        .find_map(|message| match message {
+            ClientMsg::ConfigApply {
+                providers_json: Some(json),
+                ..
+            } => Some(json),
+            _ => None,
+        })
+        .expect("keep ConfigApply");
+    let keep_value: serde_json::Value = serde_json::from_str(keep_json).expect("keep payload");
+    assert!(keep_value["providers"]["openai"].get("key").is_none());
+    assert_eq!(keep_value["clear_keys"], serde_json::json!([]));
+
+    let (cleared, clear_messages) = run_mutation(
+        &["provider", "set", "openai", "--clear-key"],
+        configured,
+        "provider-clear-key-transition",
+    );
+    assert!(
+        cleared.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cleared.stderr)
+    );
+    let clear_json = clear_messages
+        .iter()
+        .find_map(|message| match message {
+            ClientMsg::ConfigApply {
+                providers_json: Some(json),
+                ..
+            } => Some(json),
+            _ => None,
+        })
+        .expect("clear ConfigApply");
+    let clear_value: serde_json::Value = serde_json::from_str(clear_json).expect("clear payload");
+    assert!(clear_value["providers"]["openai"].get("key").is_none());
+    assert_eq!(clear_value["clear_keys"], serde_json::json!(["openai"]));
+}
+
+#[test]
+fn provider_mutation_error_cannot_echo_the_submitted_key_in_human_or_json_output() {
+    fn run(args: &[&str], name: &str) -> std::process::Output {
+        let home = TempHome::new(name);
+        let response = raw_provider_snapshot(r#"{"providers":{},"models":{},"key_present":[]}"#);
+        let echoed = "mutation-error-secret";
+        let (url, rx) = start_ws_server(vec![
+            vec![doctor_welcome()],
+            vec![response],
+            vec![ServerMsg::ConfigResult {
+                ok: false,
+                output: String::new(),
+                effect: None,
+                error: Some(fleety_protocol::WireError {
+                    kind: "rejected".into(),
+                    message: format!("Server rejected {echoed}"),
+                    remediation: Some(format!("Remove {echoed} and retry")),
+                }),
+            }],
+        ]);
+        let mut command = args.to_vec();
+        command.extend([
+            "provider",
+            "add",
+            "openai",
+            "--type",
+            "api",
+            "--base-url",
+            "https://api.example.test/v1",
+            "--key",
+            echoed,
+        ]);
+        run_against_server(&command, &url, &home, rx).0
+    }
+
+    for (prefix, name) in [
+        (Vec::<&str>::new(), "provider-error-human"),
+        (vec!["--json"], "provider-error-json"),
+    ] {
+        let output = run(&prefix, name);
+        assert!(!output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stdout.contains("mutation-error-secret"), "{stdout}");
+        assert!(!stderr.contains("mutation-error-secret"), "{stderr}");
+        assert!(
+            stdout.contains("<redacted>") || stderr.contains("<redacted>"),
+            "stdout={stdout}; stderr={stderr}"
+        );
+    }
 }
 
 #[test]

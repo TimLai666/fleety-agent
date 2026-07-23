@@ -43,6 +43,26 @@ The Server SHALL reject model-catalog operations before reading or using any sto
 - **WHEN** a client requests that Provider's model catalog
 - **THEN** the Server SHALL return an unauthenticated or auth-disabled error without contacting the Provider endpoint
 
+### Requirement: Structured configuration mutations require an authenticated owner boundary
+
+The Server SHALL apply one shared authentication gate to structured `ConfigApply` before dispatching to the Server or a selected Device owner. Local targets SHALL retain their `invalid` response. When Server authentication is disabled, a Server target SHALL reject Provider payloads and any non-`Keep` change, while a Device target SHALL reject every `ConfigApply`, including empty and all-`Keep` payloads because the Device owner persists every apply. Rejection SHALL return a typed actionable error and SHALL NOT write Server configuration, route `RunTool`, or otherwise contact a Daemon owner. When authentication is required, the existing authenticated connection and owner validation SHALL continue unchanged.
+
+#### Scenario: auth-disabled Device apply sends no owner frame
+
+- **GIVEN** Server authentication is disabled and device `remote-B` is connected
+- **WHEN** a client sends structured `ConfigApply` for `remote-B`
+- **THEN** the Server SHALL reject it before owner dispatch and the device SHALL receive zero `RunTool` frames
+
+#### Scenario: auth-disabled owner matrix preserves non-writing behavior
+
+- **GIVEN** Server authentication is disabled
+- **WHEN** a client applies an empty or all-`Keep` payload to the Server target
+- **THEN** the no-op SHALL continue without a write
+- **AND WHEN** the same payload targets a Device
+- **THEN** the Server SHALL reject it before owner dispatch
+- **AND WHEN** the payload targets Local
+- **THEN** the Server SHALL retain the `invalid` owner response
+
 ### Requirement: Provider and model mutations report activation timing
 
 A successful Provider or model mutation SHALL report `NextConnection`. Read-only Provider and model queries SHALL report no effect.

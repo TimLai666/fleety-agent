@@ -84,6 +84,53 @@ no Fleety crate). This file holds things that aren't derivable from the code.
   the archive from the main checkout's cwd; it then operates on the worktree copy
   correctly (verified: main checkout stays untouched).
 
+## Follow-ups
+
+### [2026-07-23] — Reconnect control needs an explicit version boundary
+
+- **Where:** `crates/fleety-daemon/src/main.rs`
+- **What:** The durable reconnect journal replaces the former request/ACK files,
+  but the ready record does not advertise which control protocol the running
+  Daemon understands. A mixed-version CLI and `fleetyd` can therefore disagree
+  about the files to read without a negotiated error. Ready publication also
+  lacks file/directory fsync and process-start identity, so a crash or PID reuse
+  can leave ownership unreadable or falsely live.
+- **Suggestion:** Version the ready/control contract and define migration or
+  explicit incompatibility behavior, durable publication, and PID-start proof
+  before the next release that can mix binary versions.
+- **Status:** pending
+
+### [2026-07-23] — Reconnect requests lack lifecycle operations
+
+- **Where:** `crates/fleety-daemon/src/main.rs`, `crates/fleety-cli`
+- **What:** A timed-out durable nonce remains authoritative until its result is
+  observed. Users cannot inspect it by nonce, cancel it, deliberately supersede
+  it, or rely on a documented retention/garbage-collection policy. Reconnect
+  and connection mutation locks also refuse unsafe elapsed-time reclamation, so
+  a crashed lock owner needs an explicit, owner-aware recovery command.
+- **Suggestion:** Design explicit status, cancel/supersede, retention, and owner
+  drift observability together with safe stale-lock inspection/cleanup so
+  recovery does not depend on retrying commands in a particular order.
+- **Status:** pending
+
+### [2026-07-23] — Automatic mDNS can still establish an untrusted control session
+
+- **Where:** `crates/fleety-tools/src/connection.rs`,
+  `crates/fleety-daemon/src/main.rs`
+- **What:** Automatic mDNS no longer receives stored profile credentials or
+  mutates credentialed endpoints, but a fresh/uncredentialed `fleetyd` can still
+  accept a `Welcome` and `RunTool` frames from the selected advertiser. An
+  explicit `FLEETY_TOKEN` or `FLEETY_PAIRING_CODE` without an explicit endpoint
+  can also follow automatic discovery. Pairing over an unauthenticated WebSocket
+  can exchange credentials but does not by itself prove endpoint identity
+  against an active relay. These are outside task 5.53's stored-token boundary,
+  but TXT metadata still cannot authenticate an operational control session.
+- **Suggestion:** Define whether automatic mDNS is picker-only or may establish
+  an unprivileged session. If picker-only, require an explicit URL/profile before
+  sending any token, pairing code, or accepting control frames; cover rogue
+  `Welcome`/`RunTool` and unsolicited token persistence in daemon smoke tests.
+- **Status:** pending
+
 ## Releasing
 
 **Before cutting a release, update the bundled Insyra — the library and the two

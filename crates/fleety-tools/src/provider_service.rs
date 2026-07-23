@@ -65,14 +65,31 @@ pub struct ProviderView {
     pub name: String,
     pub kind: String,
     pub endpoint: EndpointClass,
+    pub key: Option<ApiKeyState>,
     pub auth: AuthState,
     pub catalog: CatalogState,
     pub roles: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiKeyState {
+    Set,
+    NotSet,
+}
+
+impl ApiKeyState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Set => "Set",
+            Self::NotSet => "Not set",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderCommandOutcome {
     pub config: ProvidersConfig,
+    pub key_present: BTreeSet<String>,
     pub output: String,
     pub changed: bool,
     pub clear_keys: BTreeSet<String>,
@@ -145,10 +162,25 @@ pub fn set_provider(
             Some("Run `fleety provider list`"),
         )
     })?;
+    let next_kind = kind.unwrap_or_else(|| current.kind.clone());
+    let kind_changed = next_kind != current.kind;
+    let next_type = pc::provider_type(&next_kind);
     let next = Provider {
-        kind: kind.unwrap_or(current.kind),
-        base_url: base_url.or(current.base_url),
-        key: if clear_key { None } else { key.or(current.key) },
+        kind: next_kind,
+        base_url: base_url.or_else(|| {
+            (!kind_changed || next_type.is_some_and(|kind| kind.requires_base_url))
+                .then_some(current.base_url)
+                .flatten()
+        }),
+        key: if clear_key {
+            None
+        } else {
+            key.or_else(|| {
+                (!kind_changed || next_type.is_some_and(|kind| kind.allows_key))
+                    .then_some(current.key)
+                    .flatten()
+            })
+        },
     };
     validate_provider_input(
         name,
@@ -207,9 +239,11 @@ pub fn unset_model(config: &mut ProvidersConfig, role: &str) -> Result<(), Provi
 
 pub fn apply_command(
     current: &ProvidersConfig,
+    current_key_present: &BTreeSet<String>,
     command: ProviderCmd,
 ) -> Result<ProviderCommandOutcome, ProviderIssue> {
     let mut config = current.clone();
+    let mut key_present = current_key_present.clone();
     let mut clear_keys = BTreeSet::new();
     let (output, changed) = match command {
         ProviderCmd::ProviderAdd {
@@ -218,7 +252,13 @@ pub fn apply_command(
             base_url,
             key,
         } => {
+            let has_key = key.is_some();
             add_provider(&mut config, name.clone(), kind, base_url, key)?;
+            if has_key {
+                key_present.insert(name.clone());
+            } else {
+                key_present.remove(&name);
+            }
             (format!("Added Provider '{name}'"), true)
         }
         ProviderCmd::ProviderSet {
@@ -228,14 +268,26 @@ pub fn apply_command(
             key,
             clear_key,
         } => {
+            let sets_key = key.is_some();
             set_provider(&mut config, &name, kind, base_url, key, clear_key)?;
+            let allows_key = config
+                .providers
+                .get(&name)
+                .and_then(|provider| pc::provider_type(&provider.kind))
+                .is_some_and(|kind| kind.allows_key);
             if clear_key {
                 clear_keys.insert(name.clone());
+                key_present.remove(&name);
+            } else if !allows_key {
+                key_present.remove(&name);
+            } else if sets_key {
+                key_present.insert(name.clone());
             }
             (format!("Updated Provider '{name}'"), true)
         }
         ProviderCmd::ProviderRemove(name) => {
             remove_provider(&mut config, &name)?;
+            key_present.remove(&name);
             (format!("Removed Provider '{name}'"), true)
         }
         ProviderCmd::ProviderList => (String::new(), false),
@@ -256,6 +308,7 @@ pub fn apply_command(
     };
     Ok(ProviderCommandOutcome {
         config,
+        key_present,
         output,
         changed,
         clear_keys,
@@ -303,6 +356,7 @@ fn render_model_roles(
 
 pub fn provider_views(
     config: &ProvidersConfig,
+    key_present: &BTreeSet<String>,
     auth_states: &BTreeMap<String, AuthState>,
     config_protocol: u32,
 ) -> Vec<ProviderView> {
@@ -332,10 +386,22 @@ pub fn provider_views(
                 .filter(|(_, pool)| pool.members.iter().any(|member| member.provider == *name))
                 .map(|(role, _)| role.clone())
                 .collect();
+            let key = pc::provider_types()
+                .iter()
+                .find(|kind| kind.name.eq_ignore_ascii_case(&provider.kind))
+                .is_some_and(|kind| kind.allows_key)
+                .then(|| {
+                    if key_present.contains(name) {
+                        ApiKeyState::Set
+                    } else {
+                        ApiKeyState::NotSet
+                    }
+                });
             ProviderView {
                 name: name.clone(),
                 kind: provider.kind.clone(),
                 endpoint,
+                key,
                 catalog: catalog_gate(&provider.kind, &auth, config_protocol),
                 auth,
                 roles,
@@ -362,11 +428,16 @@ pub fn render_provider_views(views: &[ProviderView]) -> String {
     views
         .iter()
         .map(|view| {
+            let key = view
+                .key
+                .map(|state| format!(" · key={}", state.label()))
+                .unwrap_or_default();
             format!(
-                "{}: type={} · endpoint={} · auth={} · catalog={} · roles={}",
+                "{}: type={} · endpoint={}{} · auth={} · catalog={} · roles={}",
                 view.name,
                 view.kind,
                 view.endpoint.label(),
+                key,
                 view.auth.label(),
                 catalog_label(&view.catalog),
                 if view.roles.is_empty() {
@@ -586,6 +657,11 @@ mod tests {
         .expect_err("invalid add");
         assert_eq!(error, bad_endpoint);
         assert!(config.providers.is_empty(), "validation precedes mutation");
+
+        let blank_key =
+            validate_provider_input("safe", "api", Some("https://example.test/v1"), Some(""))
+                .expect_err("blank API key");
+        assert_eq!(blank_key.kind, "invalid_provider");
     }
 
     #[test]
@@ -608,7 +684,7 @@ mod tests {
             );
         }
         let auth = BTreeMap::from([("codex".into(), AuthState::NotSignedIn)]);
-        let views = provider_views(&config, &auth, 4);
+        let views = provider_views(&config, &BTreeSet::new(), &auth, 4);
         assert_eq!(views.len(), 1);
         assert_eq!(views[0].kind, "oauth:codex");
         assert_eq!(views[0].endpoint, EndpointClass::OpenAiHosted);
@@ -628,10 +704,122 @@ mod tests {
     }
 
     #[test]
+    fn api_provider_view_reports_non_secret_key_state() {
+        let mut config = ProvidersConfig::default();
+        config.providers.insert(
+            "openai".into(),
+            Provider {
+                kind: "api".into(),
+                base_url: Some("https://api.example.test/v1".into()),
+                key: None,
+            },
+        );
+        let views = provider_views(&config, &BTreeSet::new(), &BTreeMap::new(), 5);
+        let rendered = render_provider_views(&views);
+
+        assert!(rendered.contains("key=Not set"), "{rendered}");
+    }
+
+    #[test]
+    fn provider_commands_preserve_and_transition_key_presence_without_secret_output() {
+        let added = apply_command(
+            &ProvidersConfig::default(),
+            &BTreeSet::new(),
+            ProviderCmd::ProviderAdd {
+                name: "openai".into(),
+                kind: "api".into(),
+                base_url: Some("https://api.example.test/v1".into()),
+                key: None,
+            },
+        )
+        .expect("add without key");
+        assert!(!added.key_present.contains("openai"));
+
+        let added_with_key = apply_command(
+            &ProvidersConfig::default(),
+            &BTreeSet::new(),
+            ProviderCmd::ProviderAdd {
+                name: "keyed".into(),
+                kind: "api".into(),
+                base_url: Some("https://api.example.test/v1".into()),
+                key: Some("add-secret".into()),
+            },
+        )
+        .expect("add with key");
+        assert!(added_with_key.key_present.contains("keyed"));
+        assert!(!added_with_key.output.contains("add-secret"));
+
+        let set = apply_command(
+            &added.config,
+            &added.key_present,
+            ProviderCmd::ProviderSet {
+                name: "openai".into(),
+                kind: None,
+                base_url: None,
+                key: Some("transition-secret".into()),
+                clear_key: false,
+            },
+        )
+        .expect("set key");
+        assert!(set.key_present.contains("openai"));
+
+        let mut redacted_after_set = set.config.clone();
+        redacted_after_set
+            .providers
+            .get_mut("openai")
+            .expect("openai")
+            .key = None;
+        let kept = apply_command(
+            &redacted_after_set,
+            &BTreeSet::from(["openai".to_string()]),
+            ProviderCmd::ProviderSet {
+                name: "openai".into(),
+                kind: None,
+                base_url: Some("https://other.example.test/v1".into()),
+                key: None,
+                clear_key: false,
+            },
+        )
+        .expect("preserve key");
+        assert!(kept.key_present.contains("openai"));
+
+        let oauth = apply_command(
+            &redacted_after_set,
+            &BTreeSet::from(["openai".to_string()]),
+            ProviderCmd::ProviderSet {
+                name: "openai".into(),
+                kind: Some("oauth:codex".into()),
+                base_url: None,
+                key: None,
+                clear_key: false,
+            },
+        )
+        .expect("change to OAuth");
+        assert!(!oauth.key_present.contains("openai"));
+        assert!(oauth.clear_keys.is_empty());
+
+        let cleared = apply_command(
+            &kept.config,
+            &kept.key_present,
+            ProviderCmd::ProviderSet {
+                name: "openai".into(),
+                kind: None,
+                base_url: None,
+                key: None,
+                clear_key: true,
+            },
+        )
+        .expect("clear key");
+        assert!(!cleared.key_present.contains("openai"));
+        assert!(!cleared.output.contains("transition-secret"));
+    }
+
+    #[test]
     fn typed_command_mutates_snapshot_without_touching_files() {
         let current = ProvidersConfig::default();
         let outcome = apply_command(
             &current,
+            &BTreeSet::new(),
             ProviderCmd::ProviderAdd {
                 name: "codex".into(),
                 kind: "oauth:codex".into(),
@@ -658,6 +846,7 @@ mod tests {
         );
         let outcome = apply_command(
             &current,
+            &BTreeSet::from(["api".to_string()]),
             ProviderCmd::ProviderSet {
                 name: "api".into(),
                 kind: None,

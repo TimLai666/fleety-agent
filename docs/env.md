@@ -346,23 +346,21 @@ mDNS disabled, no TTY, or nothing found, it falls back to the explicit
 `fleety` CLI alongside `fleety-server`, so a server host can drive its own
 server this way out of the box.
 
-**Server identity + sticky healing.** Each server mints a persistent identity
+**Server identity + explicit endpoint recovery.** Each server mints a persistent identity
 fingerprint on first start (stored at `<agent home>/server-id`, stable across
 restarts and address changes) and advertises it in the mDNS TXT record (`fp`)
 and in `Welcome`. A device pins it when pairing and back-fills it on the next
 authenticated connection when the saved profile still has a URL. A legacy
 token-only, URL-less profile has neither an endpoint nor a pin to prove which
 LAN advertiser owns the token, so the token is withheld and that profile must be
-paired again instead of trusting the first mDNS response. Then, if the saved server URL stops answering, the CLI and fleetyd
-scan once and reconnect to the **same identity** at its new address — updating
-the saved profile automatically. Only an advertiser whose fingerprint exactly
-matches the pin is adopted; a different or absent fingerprint is ignored and the
-saved token is never sent to it, so the device never latches onto a different
-server on the LAN. Deleting `server-id` (or rebuilding the server) rotates the
-identity: pinned devices then warn "identity changed" and need a re-pair. The
-fingerprint is a plaintext identifier over the current `ws://` LAN transport — it
-prevents mix-ups and mistakes, not an active impersonator who could already
-sniff the token; TLS / challenge-based proof is a separate follow-up.
+paired again instead of trusting an mDNS response. If a saved URL stops answering,
+Fleety keeps the profile unchanged and directs the user to explicitly select the
+intended endpoint and re-pair. Changing a URL through `connection set-url` or
+Settings clears the old token and fingerprint before the next connection.
+The TXT fingerprint may help order or label discovery results, but it is public,
+unsigned metadata and never authorizes sending a stored token or changing a
+credentialed profile. Transparent address healing requires TLS or public-key
+identity proof.
 
 | Var | Default | Meaning |
 |---|---|---|
@@ -392,20 +390,20 @@ fleety connection add home ws://192.168.1.10:8787 --use   # add a profile + swit
 fleety connection use home           # switch the current server (CLI + this host's daemon)
 fleety connection list | show | rename | remove | set-url
 fleety init <ws-url>             # sugar for `server add … --use` + enroll
-fleety pair <code>               # enroll; the minted token is written to the current profile
+fleety pair <code>               # enroll current; add --profile <name> to repair another profile
 fleety --profile <name> <cmd> | --server <ws> <cmd>   # one-shot override; doesn't change current
 ```
 
 Resolution precedence: a one-shot `-s`/`--url` → the `FLEETY_AGENT_URL` env
-(transient, with no inherited token unless its URL equals the current profile) → the current profile's URL + token → mDNS (only until enrolled;
-sticky + fingerprint-guarded afterward) → `ws://127.0.0.1:8787`. `FLEETY_AGENT_URL`
+(transient, with no inherited token unless its URL equals the current profile) → the current profile's URL + token → mDNS discovery without stored profile credentials → `ws://127.0.0.1:8787`. `FLEETY_AGENT_URL`
 is **no longer a `config` key** — the connection target is managed here, not in
 `config.toml`. A legacy `config.json` / `fleetyd.token` is migrated once into
 `connections.toml` on first run (device_id preserved). The file is `0600`.
-When discovery is needed, clients collect the full probe window and prefer an
-advertiser matching the current profile's own fingerprint. Other saved profiles
-never participate in automatic selection. If the current profile has no matching
-pin, the first discovered result remains unowned and receives no stored token.
+When discovery is needed, clients collect the full probe window and may prefer
+an advertiser matching the current profile's fingerprint as an untrusted hint.
+Every automatic mDNS result remains unowned and receives no stored token. A
+URL-less credentialed current profile stops with explicit reselect/re-pair
+guidance instead of entering automatic discovery.
 
 ## Transport (WebSocket + SSE fallback)
 

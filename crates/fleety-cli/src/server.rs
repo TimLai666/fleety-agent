@@ -142,31 +142,7 @@ pub fn parse(args: &[String]) -> Result<Cmd> {
 /// Reject a url that is not a WebSocket url up front — the raw connect error a
 /// bad scheme would later cause is much harder to act on.
 fn check_ws_url(url: &str) -> Result<()> {
-    if url.chars().any(char::is_control) {
-        return Err(CoreError::Message(
-            "server url cannot contain terminal control characters".to_string(),
-        ));
-    }
-    let parsed = reqwest::Url::parse(url).map_err(|_| {
-        CoreError::Message("server url is invalid (e.g. ws://192.168.1.10:8787)".to_string())
-    })?;
-    if matches!(parsed.scheme(), "http" | "https") {
-        Err(CoreError::Message(
-            "server url is http(s) — use the WebSocket scheme (ws:// or wss://)".to_string(),
-        ))
-    } else if !matches!(parsed.scheme(), "ws" | "wss") || parsed.host_str().is_none() {
-        Err(CoreError::Message(
-            "server url must contain a host and use ws:// or wss:// (e.g. ws://192.168.1.10:8787)"
-                .to_string(),
-        ))
-    } else if !parsed.username().is_empty() || parsed.password().is_some() {
-        Err(CoreError::Message(
-            "server url cannot contain credentials; pair the profile to store authentication safely"
-                .to_string(),
-        ))
-    } else {
-        Ok(())
-    }
+    connection::validate_ws_url(url)
 }
 
 fn check_display_field(kind: &str, value: &str) -> Result<()> {
@@ -330,8 +306,15 @@ pub fn apply_at(path: &Path, cmd: Cmd, _env_url: Option<String>) -> Result<Strin
                 let Some(profile) = conns.profiles.get_mut(&name) else {
                     return Err(unknown_server(&name, conns));
                 };
-                profile.url = url;
-                Ok(format!("set url for server '{name}'"))
+                let cleared = connection::reselect_profile_endpoint(profile, url);
+                Ok(if cleared {
+                    format!(
+                        "set url for server '{name}'; cleared the old token and identity pin — \
+                         re-pair with `fleety --profile <name> pair <code>` before using this profile"
+                    )
+                } else {
+                    format!("set url for server '{name}'")
+                })
             })
         }
     }
@@ -682,12 +665,20 @@ mod tests {
             None,
         )
         .unwrap();
-        apply_at(
+        let mut paired = connection::load_at(&p).unwrap();
+        paired.profiles.get_mut("home").unwrap().token = Some("old-token".into());
+        paired.profiles.get_mut("home").unwrap().fingerprint = Some("old-pin".into());
+        connection::save_at(&p, &paired).unwrap();
+        let message = apply_at(
             &p,
             parse(&v(&["set-url", "home", "ws://new:9000"])).unwrap(),
             None,
         )
         .unwrap();
+        assert!(message.contains("re-pair"), "{message}");
+        let saved = connection::load_at(&p).unwrap();
+        assert_eq!(saved.profiles["home"].token, None);
+        assert_eq!(saved.profiles["home"].fingerprint, None);
         let show = apply_at(&p, Cmd::Show(Some("home".into())), None).unwrap();
         assert!(show.contains("ws://new:9000"), "{show}");
         let _ = std::fs::remove_file(&p);

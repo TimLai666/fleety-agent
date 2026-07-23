@@ -295,8 +295,8 @@ fn init_server_fingerprint(home: &std::path::Path) {
 
 /// Load the persisted server id, or mint and persist a new one. An unreadable
 /// or unwritable id file degrades to a per-run id with a warning — the server
-/// never fails to start over identity bookkeeping (but sticky healing on
-/// enrolled devices will not recognize a fingerprint that changes per run).
+/// never fails to start over identity bookkeeping (but enrolled devices will
+/// not recognize a fingerprint that changes per run).
 fn load_or_mint_server_id(path: &std::path::Path) -> String {
     if let Ok(existing) = std::fs::read_to_string(path) {
         let trimmed = existing.trim();
@@ -309,7 +309,7 @@ fn load_or_mint_server_id(path: &std::path::Path) -> String {
         let _ = std::fs::create_dir_all(parent);
     }
     if let Err(e) = std::fs::write(path, &id) {
-        tracing::warn!(path = %path.display(), error = %e, "could not persist the server identity id; using a per-run id (sticky healing will not survive restarts until this is writable)");
+        tracing::warn!(path = %path.display(), error = %e, "could not persist the server identity id; using a per-run id (client identity pins will change across restarts until this is writable)");
     }
     id
 }

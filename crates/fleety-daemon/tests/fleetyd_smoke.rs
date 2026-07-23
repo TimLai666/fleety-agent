@@ -76,6 +76,15 @@ fn start_ws_server(steps: Vec<Vec<ServerMsg>>) -> (String, mpsc::Receiver<Vec<Cl
     (format!("ws://{addr}"), rx)
 }
 
+fn rejecting_ws_url() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind rejecting server");
+    let addr = listener.local_addr().expect("rejecting server address");
+    thread::spawn(move || {
+        let _ = listener.accept();
+    });
+    format!("ws://{addr}")
+}
+
 fn start_held_ws_server(
     name: &'static str,
 ) -> (String, mpsc::Receiver<ClientMsg>, mpsc::Receiver<bool>) {
@@ -116,6 +125,58 @@ fn start_held_ws_server(
     (format!("ws://{addr}"), hello_rx, closed_rx)
 }
 
+fn start_gated_ws_server(
+    _name: &'static str,
+) -> (
+    String,
+    mpsc::Receiver<ClientMsg>,
+    mpsc::Sender<ServerMsg>,
+    mpsc::Receiver<bool>,
+) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind gated ws server");
+    let addr = listener.local_addr().expect("gated server address");
+    let (hello_tx, hello_rx) = mpsc::channel();
+    let (reply_tx, reply_rx) = mpsc::channel();
+    let (closed_tx, closed_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept gated websocket");
+        let mut ws = accept(stream).expect("upgrade gated websocket");
+        let frame = ws.read().expect("gated server hello");
+        let hello = serde_json::from_str::<ClientMsg>(frame.to_text().expect("hello text"))
+            .expect("parse gated hello");
+        hello_tx.send(hello).expect("publish gated hello");
+        let Ok(reply) = reply_rx.recv() else {
+            return;
+        };
+        ws.send(Message::Text(
+            serde_json::to_string(&reply).expect("serialize gated reply"),
+        ))
+        .expect("send gated reply");
+        let closed = loop {
+            match ws.read() {
+                Ok(Message::Close(_)) | Err(_) => break true,
+                Ok(_) => continue,
+            }
+        };
+        let _ = closed_tx.send(closed);
+    });
+    (format!("ws://{addr}"), hello_rx, reply_tx, closed_rx)
+}
+
+fn named_welcome(name: &str, fingerprint: Option<&str>) -> ServerMsg {
+    ServerMsg::Welcome {
+        session_id: format!("session-{name}"),
+        conversation_id: format!("conversation-{name}"),
+        protocol: PROTOCOL_VERSION,
+        server_version: String::new(),
+        audio_input: false,
+        config_protocol: 0,
+        server_fingerprint: fingerprint.map(String::from),
+        loopback_trusted: false,
+        token: None,
+    }
+}
+
 fn run_connected(
     home: &TempDir,
     root: &TempDir,
@@ -140,6 +201,163 @@ fn run_connected(
         .recv_timeout(Duration::from_secs(15))
         .expect("server frames");
     (child, received)
+}
+
+fn run_gated_reconnect(reply: Option<ServerMsg>, expected_fingerprint: Option<&str>) -> Output {
+    let seq = COMMAND_SEQ.fetch_add(1, Ordering::Relaxed);
+    let home = TempDir::new(&format!("gated-reconnect-{seq}"));
+    let root = TempDir::new(&format!("gated-reconnect-root-{seq}"));
+    let (url_a, hello_a, _closed_a) = start_held_ws_server("gated-a");
+    let (url_b, hello_b, reply_b, _closed_b) = start_gated_ws_server("gated-b");
+    let conns_path = home.0.join(".fleety").join("connections.toml");
+    std::fs::create_dir_all(conns_path.parent().expect("connections parent"))
+        .expect("create fleety dir");
+    let mut conns = fleety_tools::connection::Connections {
+        device_id: "daemon-smoke".into(),
+        current: Some("A".into()),
+        ..Default::default()
+    };
+    conns.profiles.insert(
+        "A".into(),
+        fleety_tools::connection::Profile {
+            url: url_a,
+            token: Some("token-a".into()),
+            ..Default::default()
+        },
+    );
+    conns.profiles.insert(
+        "B".into(),
+        fleety_tools::connection::Profile {
+            url: url_b,
+            token: Some("token-b".into()),
+            fingerprint: expected_fingerprint.map(String::from),
+            ..Default::default()
+        },
+    );
+    fleety_tools::connection::save_at(&conns_path, &conns).expect("seed gated profiles");
+
+    let child = Command::new(env!("CARGO_BIN_EXE_fleetyd"))
+        .env("HOME", &home.0)
+        .env("USERPROFILE", &home.0)
+        .env("FLEETY_CONNECTIONS", &conns_path)
+        .env("FLEETY_DEVICE_ID", "daemon-smoke")
+        .env("FLEETY_DEVICE_ROOT", &root.0)
+        .env("FLEETY_MDNS_DISABLED", "1")
+        .env_remove("FLEETY_AGENT_URL")
+        .env_remove("FLEETY_TOKEN")
+        .env_remove("FLEETY_PAIRING_CODE")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("run fleetyd on gated profile A");
+    let _child = ChildGuard(child);
+    hello_a
+        .recv_timeout(Duration::from_secs(15))
+        .expect("gated profile A hello");
+    let ready_path = home.0.join(".fleety").join("fleetyd.control-ready.json");
+    wait_until(|| ready_path.exists());
+    fleety_tools::connection::mutate_at(&conns_path, |live| {
+        live.current = Some("B".into());
+        Ok(())
+    })
+    .expect("switch gated profile to B");
+
+    let (output_tx, output_rx) = mpsc::channel();
+    let command_path = conns_path.clone();
+    let command_home = home.0.clone();
+    thread::spawn(move || {
+        let output = Command::new(env!("CARGO_BIN_EXE_fleetyd"))
+            .args(["reconnect", "--profile", "B"])
+            .env("HOME", &command_home)
+            .env("USERPROFILE", &command_home)
+            .env("FLEETY_CONNECTIONS", &command_path)
+            .output()
+            .expect("invoke gated reconnect");
+        output_tx.send(output).expect("publish reconnect output");
+    });
+    let hello = hello_b
+        .recv_timeout(Duration::from_secs(15))
+        .expect("gated profile B hello");
+    assert!(matches!(
+        hello,
+        ClientMsg::Hello { token, .. } if token.as_deref() == Some("token-b")
+    ));
+    assert!(
+        output_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+        "reconnect must not settle before the selected Server replies"
+    );
+    if let Some(reply) = reply {
+        reply_b.send(reply).expect("release gated Server reply");
+    }
+    output_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("reconnect terminal result")
+}
+
+fn run_unreachable_reconnect() -> Output {
+    let seq = COMMAND_SEQ.fetch_add(1, Ordering::Relaxed);
+    let home = TempDir::new(&format!("unreachable-reconnect-{seq}"));
+    let root = TempDir::new(&format!("unreachable-reconnect-root-{seq}"));
+    let (url_a, hello_a, _closed_a) = start_held_ws_server("unreachable-a");
+    let conns_path = home.0.join(".fleety").join("connections.toml");
+    std::fs::create_dir_all(conns_path.parent().expect("connections parent"))
+        .expect("create fleety dir");
+    let mut conns = fleety_tools::connection::Connections {
+        device_id: "daemon-smoke".into(),
+        current: Some("A".into()),
+        ..Default::default()
+    };
+    conns.profiles.insert(
+        "A".into(),
+        fleety_tools::connection::Profile {
+            url: url_a,
+            token: Some("token-a".into()),
+            ..Default::default()
+        },
+    );
+    conns.profiles.insert(
+        "B".into(),
+        fleety_tools::connection::Profile {
+            url: rejecting_ws_url(),
+            token: Some("token-b".into()),
+            fingerprint: Some("fingerprint-b".into()),
+            ..Default::default()
+        },
+    );
+    fleety_tools::connection::save_at(&conns_path, &conns).expect("seed unreachable profiles");
+    let child = Command::new(env!("CARGO_BIN_EXE_fleetyd"))
+        .env("HOME", &home.0)
+        .env("USERPROFILE", &home.0)
+        .env("FLEETY_CONNECTIONS", &conns_path)
+        .env("FLEETY_DEVICE_ID", "daemon-smoke")
+        .env("FLEETY_DEVICE_ROOT", &root.0)
+        .env("FLEETY_MDNS_DISABLED", "1")
+        .env_remove("FLEETY_AGENT_URL")
+        .env_remove("FLEETY_TOKEN")
+        .env_remove("FLEETY_PAIRING_CODE")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("run fleetyd on profile A");
+    let _child = ChildGuard(child);
+    hello_a
+        .recv_timeout(Duration::from_secs(15))
+        .expect("profile A hello");
+    let ready_path = home.0.join(".fleety").join("fleetyd.control-ready.json");
+    wait_until(|| ready_path.exists());
+    fleety_tools::connection::mutate_at(&conns_path, |live| {
+        live.current = Some("B".into());
+        Ok(())
+    })
+    .expect("switch unreachable profile to B");
+
+    Command::new(env!("CARGO_BIN_EXE_fleetyd"))
+        .args(["reconnect", "--profile", "B"])
+        .env("HOME", &home.0)
+        .env("USERPROFILE", &home.0)
+        .env("FLEETY_CONNECTIONS", &conns_path)
+        .output()
+        .expect("invoke unreachable reconnect")
 }
 
 fn wait_until(mut predicate: impl FnMut() -> bool) {
@@ -445,7 +663,7 @@ fn daemon_owner_reconnect_switches_live_session_from_a_to_b_immediately() {
         String::from_utf8_lossy(&reconnect.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&reconnect.stdout).contains("left the previous Server"),
+        String::from_utf8_lossy(&reconnect.stdout).contains("authenticated the selected profile"),
         "{}",
         String::from_utf8_lossy(&reconnect.stdout)
     );
@@ -462,6 +680,90 @@ fn daemon_owner_reconnect_switches_live_session_from_a_to_b_immediately() {
         second,
         ClientMsg::Hello { token, .. } if token.as_deref() == Some("token-b")
     ));
+}
+
+#[test]
+fn daemon_reconnect_waits_for_authenticated_welcome_before_success() {
+    let output = run_gated_reconnect(
+        Some(named_welcome("gated-b", Some("fingerprint-gated-b"))),
+        Some("fingerprint-gated-b"),
+    );
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("authenticated the selected profile"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn daemon_reconnect_rejects_authenticated_welcome_with_the_wrong_identity() {
+    let output = run_gated_reconnect(
+        Some(named_welcome("gated-b", Some("fingerprint-attacker"))),
+        Some("fingerprint-gated-b"),
+    );
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("identity did not match"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn daemon_reconnect_settles_authentication_rejection_as_failure() {
+    let output = run_gated_reconnect(
+        Some(ServerMsg::Error {
+            error: WireError {
+                kind: "unauthenticated".into(),
+                message: "token rejected".into(),
+                remediation: None,
+            },
+        }),
+        Some("fingerprint-gated-b"),
+    );
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("could not authenticate"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn daemon_reconnect_handshake_deadline_settles_failure_without_welcome() {
+    let output = run_gated_reconnect(None, Some("fingerprint-gated-b"));
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("handshake deadline"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn daemon_reconnect_settles_transport_connect_failure() {
+    let output = run_unreachable_reconnect();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("could not connect"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--pairing-code <code>"),
+        "fleetyd reconnect failure must direct explicit re-pair: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -578,4 +880,111 @@ fn daemon_executes_run_tool_frames_and_reports_errors() {
         }
         other => panic!("expected tool error, got {other:?}"),
     }
+}
+
+#[test]
+fn daemon_delayed_consume_preserves_first_reconnect_and_rejects_second() {
+    let home = TempDir::new("delayed-reconnect");
+    let root = TempDir::new("delayed-reconnect-root");
+    let blocking_command = if cfg!(windows) {
+        "ping -n 9 127.0.0.1 >NUL"
+    } else {
+        "sleep 8"
+    };
+    let (url_a, _frames_a) = start_ws_server(vec![
+        vec![
+            named_welcome("delayed-a", Some("fingerprint-delayed-a")),
+            ServerMsg::RunTool {
+                call_id: "blocking-tool".into(),
+                tool: "run_command".into(),
+                args_json: serde_json::json!({
+                    "command": blocking_command,
+                    "timeout_secs": 10
+                })
+                .to_string(),
+            },
+        ],
+        vec![],
+    ]);
+    let (url_b, hello_b, _closed_b) = start_held_ws_server("delayed-b");
+    let conns_path = home.0.join(".fleety").join("connections.toml");
+    std::fs::create_dir_all(conns_path.parent().expect("connections parent"))
+        .expect("create fleety dir");
+    let mut conns = fleety_tools::connection::Connections {
+        device_id: "daemon-smoke".into(),
+        current: Some("A".into()),
+        ..Default::default()
+    };
+    conns.profiles.insert(
+        "A".into(),
+        fleety_tools::connection::Profile {
+            url: url_a,
+            fingerprint: Some("fingerprint-delayed-a".into()),
+            ..Default::default()
+        },
+    );
+    conns.profiles.insert(
+        "B".into(),
+        fleety_tools::connection::Profile {
+            url: url_b,
+            fingerprint: Some("fingerprint-delayed-b".into()),
+            ..Default::default()
+        },
+    );
+    fleety_tools::connection::save_at(&conns_path, &conns).expect("seed delayed profiles");
+    let child = Command::new(env!("CARGO_BIN_EXE_fleetyd"))
+        .env("HOME", &home.0)
+        .env("USERPROFILE", &home.0)
+        .env("FLEETY_CONNECTIONS", &conns_path)
+        .env("FLEETY_DEVICE_ID", "daemon-smoke")
+        .env("FLEETY_DEVICE_ROOT", &root.0)
+        .env("FLEETY_MDNS_DISABLED", "1")
+        .env_remove("FLEETY_AGENT_URL")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("run delayed fleetyd");
+    let _child = ChildGuard(child);
+    let ready_path = home.0.join(".fleety").join("fleetyd.control-ready.json");
+    wait_until(|| ready_path.exists());
+    thread::sleep(Duration::from_millis(200));
+    fleety_tools::connection::mutate_at(&conns_path, |live| {
+        live.current = Some("B".into());
+        Ok(())
+    })
+    .expect("switch delayed profile");
+
+    let reconnect = || {
+        Command::new(env!("CARGO_BIN_EXE_fleetyd"))
+            .args(["reconnect", "--profile", "B"])
+            .env("HOME", &home.0)
+            .env("USERPROFILE", &home.0)
+            .env("FLEETY_CONNECTIONS", &conns_path)
+            .output()
+            .expect("invoke delayed reconnect")
+    };
+    let first = reconnect();
+    assert!(!first.status.success());
+    assert!(
+        String::from_utf8_lossy(&first.stderr).contains("remains durable"),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let second = reconnect();
+    assert!(!second.status.success());
+    assert!(
+        String::from_utf8_lossy(&second.stderr).contains("reconnect request"),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    hello_b
+        .recv_timeout(Duration::from_secs(10))
+        .expect("first durable request reaches profile B");
+    let observed = reconnect();
+    assert!(
+        observed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&observed.stderr)
+    );
 }

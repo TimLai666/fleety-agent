@@ -17,10 +17,33 @@ pub struct ProviderSnapshot {
     pub revision: String,
     pub entries: Vec<fleety_protocol::ConfigEntry>,
     pub config: ProvidersConfig,
+    pub key_present: BTreeSet<String>,
 }
 
 pub fn issue_from_wire(error: WireError) -> ProviderIssue {
     ProviderIssue::new(error.kind, error.message, error.remediation)
+}
+
+pub(crate) fn redact_provider_secrets(text: &str, config: &ProvidersConfig) -> String {
+    let mut secrets = config
+        .providers
+        .values()
+        .filter_map(|provider| provider.key.as_deref())
+        .filter(|key| !key.is_empty())
+        .collect::<Vec<_>>();
+    secrets.sort_unstable_by_key(|key| std::cmp::Reverse(key.len()));
+    secrets.dedup();
+    secrets.into_iter().fold(text.to_string(), |safe, key| {
+        safe.replace(key, "<redacted>")
+    })
+}
+
+fn redact_wire_provider_secrets(mut error: WireError, config: &ProvidersConfig) -> WireError {
+    error.message = redact_provider_secrets(&error.message, config);
+    error.remediation = error
+        .remediation
+        .map(|hint| redact_provider_secrets(&hint, config));
+    error
 }
 
 pub fn issue_as_error(issue: ProviderIssue) -> CoreError {
@@ -93,7 +116,7 @@ pub async fn load_snapshot(
                         "The Server returned an unreadable Provider snapshot: {error}"
                     ))
                 })?;
-            let key_present: BTreeSet<String> = value
+            let key_metadata = value
                 .get("key_present")
                 .and_then(serde_json::Value::as_array)
                 .ok_or_else(|| {
@@ -101,16 +124,35 @@ pub async fn load_snapshot(
                         "The Server returned an unsafe Provider snapshot without write-only key metadata; update or restart the Server"
                             .to_string(),
                     )
-                })?
-                .iter()
-                .filter_map(serde_json::Value::as_str)
-                .map(ToOwned::to_owned)
-                .collect();
+                })?;
+            let mut key_present = BTreeSet::new();
+            for (index, item) in key_metadata.iter().enumerate() {
+                let name = item.as_str().ok_or_else(|| {
+                    CoreError::Message(format!(
+                        "The Server returned malformed Provider key metadata at index {index}; expected a Provider name string"
+                    ))
+                })?;
+                if !key_present.insert(name.to_string()) {
+                    return Err(CoreError::Message(format!(
+                        "The Server returned duplicate Provider key metadata at index {index}; the snapshot was refused"
+                    )));
+                }
+            }
             let config: ProvidersConfig = serde_json::from_value(value).map_err(|error| {
                 CoreError::Message(format!(
                     "The Server returned an unreadable Provider snapshot: {error}"
                 ))
             })?;
+            if config
+                .providers
+                .keys()
+                .any(|name| !fleety_tools::providers_config::valid_provider_name(name))
+            {
+                return Err(CoreError::Message(
+                    "The Server returned malformed Provider key metadata with an invalid Provider name; the snapshot was refused"
+                        .to_string(),
+                ));
+            }
             if config
                 .providers
                 .values()
@@ -123,7 +165,13 @@ pub async fn load_snapshot(
             }
             if key_present
                 .iter()
-                .any(|name| !config.providers.contains_key(name))
+                .any(|name| match config.providers.get(name) {
+                    Some(provider) => !fleety_tools::providers_config::provider_types()
+                        .iter()
+                        .find(|kind| kind.name.eq_ignore_ascii_case(&provider.kind))
+                        .is_some_and(|kind| kind.allows_key),
+                    None => true,
+                })
             {
                 return Err(CoreError::Message(
                     "The Server returned inconsistent Provider key metadata; the snapshot was refused"
@@ -134,6 +182,7 @@ pub async fn load_snapshot(
                 revision,
                 entries,
                 config,
+                key_present,
             })
         }
         Some(ServerMsg::ConfigResult {
@@ -329,7 +378,9 @@ pub async fn apply_snapshot(
         Some(ServerMsg::ConfigResult {
             error: Some(error), ..
         })
-        | Some(ServerMsg::Error { error }) => Err(issue_from_wire(error)),
+        | Some(ServerMsg::Error { error }) => {
+            Err(issue_from_wire(redact_wire_provider_secrets(error, config)))
+        }
         reply => Err(unexpected(
             "a Provider configuration result",
             reply.as_ref(),
@@ -341,6 +392,25 @@ pub async fn apply_snapshot(
 mod tests {
     use super::*;
     use futures::{SinkExt, StreamExt};
+
+    #[test]
+    fn overlapping_provider_secrets_are_fully_redacted() {
+        let mut config = ProvidersConfig::default();
+        for (name, key) in [("a", "secret"), ("b", "secret-more")] {
+            config.providers.insert(
+                name.into(),
+                fleety_tools::providers_config::Provider {
+                    kind: "api".into(),
+                    base_url: Some("https://api.example.test/v1".into()),
+                    key: Some(key.into()),
+                },
+            );
+        }
+
+        let safe = redact_provider_secrets("Server echoed secret-more", &config);
+
+        assert_eq!(safe, "Server echoed <redacted>");
+    }
 
     fn issue(message: &str) -> ProviderIssue {
         ProviderIssue::new("catalog", message, Some("retry"))

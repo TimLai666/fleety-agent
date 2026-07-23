@@ -28,13 +28,20 @@ use crate::provider_service::{
 /// service, so command and TUI validation cannot diverge.
 pub struct ProviderEditor {
     cfg: ProvidersConfig,
+    key_present: BTreeSet<String>,
     clear_keys: BTreeSet<String>,
 }
 
 impl ProviderEditor {
+    #[cfg(test)]
     pub fn new(cfg: ProvidersConfig) -> Self {
+        Self::with_key_presence(cfg, BTreeSet::new())
+    }
+
+    pub fn with_key_presence(cfg: ProvidersConfig, key_present: BTreeSet<String>) -> Self {
         Self {
             cfg,
+            key_present,
             clear_keys: BTreeSet::new(),
         }
     }
@@ -53,7 +60,12 @@ impl ProviderEditor {
         base_url: Option<String>,
         key: Option<String>,
     ) -> std::result::Result<(), ProviderIssue> {
-        crate::provider_service::add_provider(&mut self.cfg, name, kind, base_url, key)
+        let sets_key = key.is_some();
+        crate::provider_service::add_provider(&mut self.cfg, name.clone(), kind, base_url, key)?;
+        if sets_key {
+            self.key_present.insert(name);
+        }
+        Ok(())
     }
 
     /// Upsert a provider: replace an existing entry (edit) or add a new one. No
@@ -76,8 +88,18 @@ impl ProviderEditor {
             key,
             false,
         )?;
-        if replaces_key {
+        let allows_key = self
+            .cfg
+            .providers
+            .get(&name)
+            .and_then(|provider| pc::provider_type(&provider.kind))
+            .is_some_and(|kind| kind.allows_key);
+        if !allows_key {
             self.clear_keys.remove(&name);
+            self.key_present.remove(&name);
+        } else if replaces_key {
+            self.clear_keys.remove(&name);
+            self.key_present.insert(name);
         }
         Ok(())
     }
@@ -105,6 +127,7 @@ impl ProviderEditor {
         }
         provider.key = None;
         self.clear_keys.insert(name.to_string());
+        self.key_present.remove(name);
         Ok(())
     }
 
@@ -113,6 +136,7 @@ impl ProviderEditor {
     pub fn remove_provider(&mut self, name: &str) -> std::result::Result<(), ProviderIssue> {
         crate::provider_service::remove_provider(&mut self.cfg, name)?;
         self.clear_keys.remove(name);
+        self.key_present.remove(name);
         Ok(())
     }
 
@@ -142,8 +166,19 @@ impl ProviderEditor {
         &self.clear_keys
     }
 
+    pub fn key_present(&self) -> &BTreeSet<String> {
+        &self.key_present
+    }
+
     fn finish_save(&mut self) {
+        for provider in self.cfg.providers.values_mut() {
+            provider.key = None;
+        }
         self.clear_keys.clear();
+    }
+
+    fn redact_secrets(&self, text: &str) -> String {
+        crate::provider_service::redact_provider_secrets(text, &self.cfg)
     }
 }
 
@@ -649,17 +684,24 @@ enum AfterSave {
 impl App {
     #[cfg(test)]
     fn new(cfg: ProvidersConfig) -> Self {
-        Self::with_auth_states(cfg, ProviderAuthStates::new(), "test-server".to_string(), 4)
+        Self::with_auth_states(
+            cfg,
+            BTreeSet::new(),
+            ProviderAuthStates::new(),
+            "test-server".to_string(),
+            4,
+        )
     }
 
     fn with_auth_states(
         cfg: ProvidersConfig,
+        key_present: BTreeSet<String>,
         auth_states: ProviderAuthStates,
         connection_id: String,
         config_protocol: u32,
     ) -> Self {
         Self {
-            ed: ProviderEditor::new(cfg.clone()),
+            ed: ProviderEditor::with_key_presence(cfg.clone(), key_present),
             persisted_cfg: cfg,
             sel: 0,
             mode: Mode::Browse,
@@ -733,8 +775,8 @@ impl App {
         let after_save = std::mem::replace(&mut self.after_save, AfterSave::Stay);
         match result {
             Ok(SaveOutcome::Saved) => {
-                self.persisted_cfg = self.ed.config().clone();
                 self.ed.finish_save();
+                self.persisted_cfg = self.ed.config().clone();
                 self.dirty = false;
                 self.conflict = None;
                 self.status = "saved".to_string();
@@ -748,8 +790,9 @@ impl App {
                 }
             }
             Ok(SaveOutcome::SavedRefreshRequired(reason)) => {
-                self.persisted_cfg = self.ed.config().clone();
+                let reason = self.ed.redact_secrets(&reason);
                 self.ed.finish_save();
+                self.persisted_cfg = self.ed.config().clone();
                 self.dirty = false;
                 self.refresh_required = true;
                 self.mode = Mode::Browse;
@@ -760,6 +803,8 @@ impl App {
                 );
             }
             Ok(SaveOutcome::Conflict(message)) => {
+                self.after_save = after_save;
+                let message = self.ed.redact_secrets(&message);
                 self.dirty = true;
                 self.mode = Mode::Browse;
                 self.auth_request = None;
@@ -767,10 +812,12 @@ impl App {
                 self.status = format!("save conflict: {message} — staged changes kept, not saved");
             }
             Err(error) => {
+                self.after_save = after_save;
                 self.dirty = true;
                 self.mode = Mode::Browse;
                 self.auth_request = None;
-                self.status = format!("save failed: {error} — staged changes kept, not saved");
+                let message = self.ed.redact_secrets(&error.report().message);
+                self.status = format!("save failed: {message} — staged changes kept, not saved");
             }
         }
     }
@@ -1440,15 +1487,24 @@ fn render(f: &mut Frame, app: &App) {
 
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from("Providers:"));
-    let provider_views = provider_views(&app.ed.cfg, &app.auth_states, app.config_protocol);
+    let provider_views = provider_views(
+        &app.ed.cfg,
+        app.ed.key_present(),
+        &app.auth_states,
+        app.config_protocol,
+    );
     for (i, provider) in provider_views.iter().enumerate() {
         let marker = if i == app.sel { "▶" } else { " " };
         let roles = provider.roles.join(",");
         lines.push(Line::from(crate::terminal_safe_text(&format!(
-            "{marker} {:<14} [{}] endpoint={} auth={} catalog={} roles={}",
+            "{marker} {:<14} [{}] endpoint={}{} auth={} catalog={} roles={}",
             provider.name,
             provider.kind,
             provider.endpoint.label(),
+            provider
+                .key
+                .map(|state| format!(" key={}", state.label()))
+                .unwrap_or_default(),
             provider.auth.label(),
             catalog_label(&provider.catalog),
             if roles.is_empty() { "(none)" } else { &roles },
@@ -1761,6 +1817,11 @@ pub struct EditorOutcome {
     pub auth_request: Option<AuthRequest>,
 }
 
+pub struct ProviderEditorInput {
+    pub config: ProvidersConfig,
+    pub key_present: BTreeSet<String>,
+}
+
 type CatalogFetchResult = std::result::Result<Vec<String>, ProviderIssue>;
 type ActiveCatalogFetch = (
     CatalogRequest,
@@ -1794,7 +1855,7 @@ fn cancel_hidden_catalog_fetch(app: &App, active_fetch: &mut Option<ActiveCatalo
 /// providers. The remote config editor uses this to keep every operation bound
 /// to its existing authenticated Server target.
 pub fn run_with_saver_and_fetcher(
-    cfg: ProvidersConfig,
+    initial: ProviderEditorInput,
     mut save: impl FnMut(&ProvidersConfig, &BTreeSet<String>) -> Result<SaveOutcome>,
     fetch_models: impl Fn(&CatalogRequest, std::sync::Arc<std::sync::atomic::AtomicBool>) -> CatalogFetchResult
         + Send
@@ -1809,7 +1870,13 @@ pub fn run_with_saver_and_fetcher(
     use std::sync::{mpsc, Arc};
     use std::time::Duration;
 
-    let mut app = App::with_auth_states(cfg, auth_states, connection_id, config_protocol);
+    let mut app = App::with_auth_states(
+        initial.config,
+        initial.key_present,
+        auth_states,
+        connection_id,
+        config_protocol,
+    );
     let fetch_models = Arc::new(fetch_models);
     let mut active_fetch: Option<ActiveCatalogFetch> = None;
     let mut terminal = ratatui::init();
@@ -1955,7 +2022,7 @@ mod tests {
         let mut states = ProviderAuthStates::new();
         states.insert("signed".into(), ProviderAuthState::SignedIn);
         states.insert("signed-out".into(), ProviderAuthState::NotSignedIn);
-        let app = App::with_auth_states(cfg, states, "test-server".into(), 4);
+        let app = App::with_auth_states(cfg, BTreeSet::new(), states, "test-server".into(), 4);
         let mut terminal = Terminal::new(TestBackend::new(100, 12)).expect("term");
         terminal.draw(|f| render(f, &app)).expect("draw");
         let content: String = terminal
@@ -1968,6 +2035,106 @@ mod tests {
         assert!(content.contains("Signed in"));
         assert!(content.contains("Not signed in"));
         assert!(content.contains("auth=Unavailable"));
+    }
+
+    #[test]
+    fn api_provider_rows_render_key_state_without_secret_bytes() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut cfg = ProvidersConfig::default();
+        cfg.providers.insert(
+            "without-key".into(),
+            pc::Provider {
+                kind: "api".into(),
+                base_url: Some("https://api.example.test/v1".into()),
+                key: None,
+            },
+        );
+        cfg.providers.insert(
+            "with-key".into(),
+            pc::Provider {
+                kind: "api".into(),
+                base_url: Some("https://api.example.test/v1".into()),
+                key: None,
+            },
+        );
+        let mut app = App::with_auth_states(
+            cfg,
+            BTreeSet::from(["with-key".to_string()]),
+            ProviderAuthStates::new(),
+            "test-server".into(),
+            5,
+        );
+        app.ed
+            .set_provider(
+                "with-key".into(),
+                "api".into(),
+                None,
+                Some("tui-secret-must-not-render".into()),
+            )
+            .expect("stage replacement key");
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).expect("term");
+        terminal.draw(|frame| render(frame, &app)).expect("draw");
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        assert!(content.contains("without-key"), "{content}");
+        assert!(content.contains("key=Not set"), "{content}");
+        assert!(content.contains("with-key"), "{content}");
+        assert!(content.contains("key=Set"), "{content}");
+        assert!(!content.contains("tui-secret-must-not-render"), "{content}");
+    }
+
+    #[test]
+    fn successful_save_converts_pending_key_to_presence_and_redacts_editor_state() {
+        let mut cfg = ProvidersConfig::default();
+        cfg.providers.insert(
+            "openai".into(),
+            pc::Provider {
+                kind: "api".into(),
+                base_url: Some("https://api.example.test/v1".into()),
+                key: None,
+            },
+        );
+        let mut app = App::with_auth_states(
+            cfg,
+            BTreeSet::new(),
+            ProviderAuthStates::new(),
+            "test-server".into(),
+            5,
+        );
+        app.ed
+            .set_provider(
+                "openai".into(),
+                "api".into(),
+                None,
+                Some("pending-secret".into()),
+            )
+            .expect("stage key");
+        assert!(app.ed.key_present().contains("openai"));
+
+        app.finish_save(Ok(SaveOutcome::Saved));
+
+        assert!(app.ed.key_present().contains("openai"));
+        assert!(app
+            .ed
+            .config()
+            .provider("openai")
+            .expect("openai")
+            .key
+            .is_none());
+        assert!(app
+            .persisted_cfg
+            .provider("openai")
+            .expect("persisted openai")
+            .key
+            .is_none());
     }
 
     #[test]
@@ -2327,6 +2494,33 @@ mod tests {
     }
 
     #[test]
+    fn changing_provider_type_clears_stale_key_presence() {
+        let mut config = ProvidersConfig::default();
+        config.providers.insert(
+            "p1".into(),
+            pc::Provider {
+                kind: "api".into(),
+                base_url: Some("https://old/v1".into()),
+                key: None,
+            },
+        );
+        let mut ed = ProviderEditor::with_key_presence(config, BTreeSet::from(["p1".to_string()]));
+
+        ed.set_provider("p1".into(), "oauth:codex".into(), None, None)
+            .expect("change to OAuth");
+        ed.finish_save();
+        ed.set_provider(
+            "p1".into(),
+            "api".into(),
+            Some("https://new/v1".into()),
+            None,
+        )
+        .expect("change back to API");
+
+        assert!(!ed.key_present().contains("p1"));
+    }
+
+    #[test]
     fn clear_key_action_stages_explicit_intent_and_requires_sensitive_confirmation() {
         let mut cfg = ProvidersConfig::default();
         cfg.providers.insert(
@@ -2506,6 +2700,56 @@ mod tests {
             assert!(!app.quit);
             assert!(app.auth_request.is_none());
             assert!(app.status.contains("staged"));
+
+            app.finish_save(Ok(SaveOutcome::Saved));
+
+            assert!(app.quit);
+            let request = app.auth_request.expect("OAuth action survives save retry");
+            assert_eq!(request.action, AuthAction::Login);
+        }
+    }
+
+    #[test]
+    fn save_results_cannot_echo_a_pending_provider_secret() {
+        for result in [
+            Err(CoreError::Message(
+                "Server echoed tui-save-error-secret".into(),
+            )),
+            Ok(SaveOutcome::Conflict(
+                "Server echoed tui-save-error-secret".into(),
+            )),
+            Ok(SaveOutcome::SavedRefreshRequired(
+                "Server echoed tui-save-error-secret".into(),
+            )),
+        ] {
+            let mut cfg = ProvidersConfig::default();
+            cfg.providers.insert(
+                "openai".into(),
+                pc::Provider {
+                    kind: "api".into(),
+                    base_url: Some("https://api.example.test/v1".into()),
+                    key: None,
+                },
+            );
+            let mut app = App::new(cfg);
+            app.ed
+                .set_provider(
+                    "openai".into(),
+                    "api".into(),
+                    None,
+                    Some("tui-save-error-secret".into()),
+                )
+                .expect("stage key");
+            app.dirty = true;
+
+            app.finish_save(result);
+
+            assert!(
+                !app.status.contains("tui-save-error-secret"),
+                "{}",
+                app.status
+            );
+            assert!(app.status.contains("<redacted>"), "{}", app.status);
         }
     }
 

@@ -1729,8 +1729,8 @@ pub fn parse_providers(args: &[String]) -> Result<ProviderCmd> {
 
 fn mask_key(key: &Option<String>) -> &'static str {
     match key {
-        Some(k) if !k.is_empty() => "********",
-        _ => "(none)",
+        Some(k) if !k.is_empty() => "Set",
+        _ => "Not set",
     }
 }
 
@@ -2667,6 +2667,57 @@ mod tests {
         assert_eq!(cfg.providers.len(), 2);
         assert_eq!(cfg.models.len(), 1);
         assert_eq!(cfg.model("main").unwrap().members.len(), 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn file_provider_list_uses_non_secret_key_state_labels() {
+        let path = std::env::temp_dir().join(format!(
+            "fleety-provider-key-state-{}.toml",
+            uuid::Uuid::new_v4()
+        ));
+        run_providers_at(
+            &path,
+            &v(&[
+                "provider",
+                "add",
+                "set-key",
+                "--type",
+                "api",
+                "--base-url",
+                "https://set.example.test/v1",
+                "--key",
+                "file-secret-must-not-render",
+            ]),
+        )
+        .expect("add set-key");
+        run_providers_at(
+            &path,
+            &v(&[
+                "provider",
+                "add",
+                "no-key",
+                "--type",
+                "api",
+                "--base-url",
+                "https://none.example.test/v1",
+            ]),
+        )
+        .expect("add no-key");
+
+        let output = run_providers_at(&path, &v(&["provider", "list"])).expect("list Providers");
+
+        let set_line = output
+            .lines()
+            .find(|line| line.contains("set-key"))
+            .expect("set-key row");
+        let no_key_line = output
+            .lines()
+            .find(|line| line.contains("no-key"))
+            .expect("no-key row");
+        assert!(set_line.contains("key=Set"), "{set_line}");
+        assert!(no_key_line.contains("key=Not set"), "{no_key_line}");
+        assert!(!output.contains("file-secret-must-not-render"), "{output}");
         let _ = std::fs::remove_file(&path);
     }
 

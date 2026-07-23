@@ -30,6 +30,7 @@ use fleety_tools::connection::{self, Resolved, Source, Target};
 
 const RECONNECT_ACK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 const RECONNECT_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+const RECONNECT_HANDSHAKE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
 fn control_nonce() -> String {
     static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -47,18 +48,53 @@ struct ControlReady {
     instance: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ReconnectRequest {
     instance: String,
     nonce: String,
     expected_profile: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ReconnectAck {
     nonce: String,
     accepted: bool,
     message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReconnectJournalEvent {
+    Submitted { request: ReconnectRequest },
+    Claimed { nonce: String },
+    Settled { ack: ReconnectAck },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReconnectPhase {
+    Submitted,
+    Claimed,
+    Settled(ReconnectAck),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReconnectJournalState {
+    request: ReconnectRequest,
+    phase: ReconnectPhase,
+}
+
+#[derive(Debug, Clone)]
+struct PendingReconnect {
+    request: ReconnectRequest,
+    decision: Option<ReconnectAck>,
+}
+
+impl PendingReconnect {
+    fn new(request: ReconnectRequest) -> Self {
+        Self {
+            request,
+            decision: None,
+        }
+    }
 }
 
 fn encode_ready(ready: &ControlReady) -> Vec<u8> {
@@ -75,44 +111,6 @@ fn parse_ready(bytes: &[u8]) -> Option<ControlReady> {
     })
 }
 
-fn encode_request(request: &ReconnectRequest) -> Vec<u8> {
-    serde_json::json!({
-        "instance": request.instance,
-        "nonce": request.nonce,
-        "expected_profile": request.expected_profile,
-    })
-    .to_string()
-    .into_bytes()
-}
-
-fn parse_request(bytes: &[u8]) -> Option<ReconnectRequest> {
-    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
-    Some(ReconnectRequest {
-        instance: value.get("instance")?.as_str()?.to_string(),
-        nonce: value.get("nonce")?.as_str()?.to_string(),
-        expected_profile: value.get("expected_profile")?.as_str()?.to_string(),
-    })
-}
-
-fn encode_ack(ack: &ReconnectAck) -> Vec<u8> {
-    serde_json::json!({
-        "nonce": ack.nonce,
-        "accepted": ack.accepted,
-        "message": ack.message,
-    })
-    .to_string()
-    .into_bytes()
-}
-
-fn parse_ack(bytes: &[u8]) -> Option<ReconnectAck> {
-    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
-    Some(ReconnectAck {
-        nonce: value.get("nonce")?.as_str()?.to_string(),
-        accepted: value.get("accepted")?.as_bool()?,
-        message: value.get("message")?.as_str()?.to_string(),
-    })
-}
-
 fn control_path(name: &str) -> std::path::PathBuf {
     connection::connections_path()
         .parent()
@@ -124,19 +122,189 @@ fn ready_path() -> std::path::PathBuf {
     control_path("fleetyd.control-ready.json")
 }
 
-fn reconnect_request_path() -> std::path::PathBuf {
-    control_path("fleetyd.reconnect-request.json")
-}
-
-fn reconnect_ack_path() -> std::path::PathBuf {
-    control_path("fleetyd.reconnect-ack.json")
+fn reconnect_journal_path() -> std::path::PathBuf {
+    control_path("fleetyd.reconnect-journal.jsonl")
 }
 
 fn reconnect_lock_path() -> std::path::PathBuf {
     control_path("fleetyd.reconnect.lock")
 }
 
-fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+fn reconnect_journal_error(message: impl Into<String>) -> agent_core::CoreError {
+    agent_core::CoreError::Message(format!(
+        "fleetyd reconnect journal is invalid: {}",
+        message.into()
+    ))
+}
+
+fn reconnect_event_from_value(value: &serde_json::Value) -> Result<ReconnectJournalEvent> {
+    let event = value
+        .get("event")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| reconnect_journal_error("event kind is missing"))?;
+    let nonce = || {
+        value
+            .get("nonce")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| reconnect_journal_error("event nonce is missing"))
+    };
+    match event {
+        "submitted" => Ok(ReconnectJournalEvent::Submitted {
+            request: ReconnectRequest {
+                instance: value
+                    .get("instance")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .ok_or_else(|| reconnect_journal_error("request instance is missing"))?,
+                nonce: nonce()?,
+                expected_profile: value
+                    .get("expected_profile")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .ok_or_else(|| {
+                        reconnect_journal_error("request expected_profile is missing")
+                    })?,
+            },
+        }),
+        "claimed" => Ok(ReconnectJournalEvent::Claimed { nonce: nonce()? }),
+        "settled" => Ok(ReconnectJournalEvent::Settled {
+            ack: ReconnectAck {
+                nonce: nonce()?,
+                accepted: value
+                    .get("accepted")
+                    .and_then(serde_json::Value::as_bool)
+                    .ok_or_else(|| {
+                        reconnect_journal_error("settlement accepted flag is missing")
+                    })?,
+                message: value
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .ok_or_else(|| reconnect_journal_error("settlement message is missing"))?,
+            },
+        }),
+        other => Err(reconnect_journal_error(format!(
+            "unknown event kind '{other}'"
+        ))),
+    }
+}
+
+fn reconnect_event_value(event: &ReconnectJournalEvent) -> serde_json::Value {
+    match event {
+        ReconnectJournalEvent::Submitted { request } => serde_json::json!({
+            "event": "submitted",
+            "instance": request.instance,
+            "nonce": request.nonce,
+            "expected_profile": request.expected_profile,
+        }),
+        ReconnectJournalEvent::Claimed { nonce } => serde_json::json!({
+            "event": "claimed",
+            "nonce": nonce,
+        }),
+        ReconnectJournalEvent::Settled { ack } => serde_json::json!({
+            "event": "settled",
+            "nonce": ack.nonce,
+            "accepted": ack.accepted,
+            "message": ack.message,
+        }),
+    }
+}
+
+fn load_reconnect_journal_at(path: &std::path::Path) -> Result<Option<ReconnectJournalState>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(agent_core::CoreError::Message(format!(
+                "cannot read fleetyd reconnect journal {}: {error}",
+                path.display()
+            )))
+        }
+    };
+    // A crash can leave only the final append torn. Ignore that uncommitted
+    // tail while reading; append_reconnect_event_at truncates it under the
+    // reconnect lease before writing the next complete record.
+    let complete_len = if bytes.last() == Some(&b'\n') {
+        bytes.len()
+    } else {
+        bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |index| index + 1)
+    };
+    let text = std::str::from_utf8(&bytes[..complete_len])
+        .map_err(|error| reconnect_journal_error(format!("not UTF-8: {error}")))?;
+    let mut state: Option<ReconnectJournalState> = None;
+    for (index, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = serde_json::from_str(line).map_err(|error| {
+            reconnect_journal_error(format!("line {} is not valid JSON: {error}", index + 1))
+        })?;
+        let event = reconnect_event_from_value(&value)?;
+        match event {
+            ReconnectJournalEvent::Submitted { request } => match &state {
+                None => {
+                    state = Some(ReconnectJournalState {
+                        request,
+                        phase: ReconnectPhase::Submitted,
+                    });
+                }
+                Some(existing)
+                    if existing.request == request
+                        && matches!(existing.phase, ReconnectPhase::Submitted) => {}
+                Some(_) => {
+                    return Err(reconnect_journal_error(
+                        "a second request was appended before the first was reaped",
+                    ))
+                }
+            },
+            ReconnectJournalEvent::Claimed { nonce } => {
+                let current = state
+                    .as_mut()
+                    .ok_or_else(|| reconnect_journal_error("claim precedes submission"))?;
+                if current.request.nonce != nonce {
+                    return Err(reconnect_journal_error(
+                        "claim nonce does not match request",
+                    ));
+                }
+                match current.phase {
+                    ReconnectPhase::Submitted => current.phase = ReconnectPhase::Claimed,
+                    ReconnectPhase::Claimed => {}
+                    ReconnectPhase::Settled(_) => {
+                        return Err(reconnect_journal_error("claim follows terminal settlement"))
+                    }
+                }
+            }
+            ReconnectJournalEvent::Settled { ack } => {
+                let current = state
+                    .as_mut()
+                    .ok_or_else(|| reconnect_journal_error("settlement precedes submission"))?;
+                if current.request.nonce != ack.nonce {
+                    return Err(reconnect_journal_error(
+                        "settlement nonce does not match request",
+                    ));
+                }
+                match &current.phase {
+                    ReconnectPhase::Submitted | ReconnectPhase::Claimed => {
+                        current.phase = ReconnectPhase::Settled(ack);
+                    }
+                    ReconnectPhase::Settled(existing) if existing == &ack => {}
+                    ReconnectPhase::Settled(_) => {
+                        return Err(reconnect_journal_error(
+                            "nonce has conflicting terminal settlements",
+                        ))
+                    }
+                }
+            }
+        }
+    }
+    Ok(state)
+}
+
+fn append_reconnect_event_at(path: &std::path::Path, event: &ReconnectJournalEvent) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| {
             agent_core::CoreError::Message(format!(
@@ -145,23 +313,317 @@ fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
             ))
         })?;
     }
-    let tmp = path.with_file_name(format!(".fleetyd-control-{}.tmp", control_nonce()));
-    std::fs::write(&tmp, bytes).map_err(|error| {
-        agent_core::CoreError::Message(format!(
-            "cannot write daemon control request {}: {error}",
-            tmp.display()
-        ))
-    })?;
-    if path.exists() {
-        let _ = std::fs::remove_file(path);
+    if let Ok(existing) = std::fs::read(path) {
+        if existing.last().is_some_and(|byte| *byte != b'\n') {
+            let complete_len = existing
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .map_or(0, |index| index + 1);
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .map_err(|error| {
+                    agent_core::CoreError::Message(format!(
+                        "cannot repair fleetyd reconnect journal {}: {error}",
+                        path.display()
+                    ))
+                })?;
+            file.set_len(complete_len as u64)
+                .and_then(|()| file.sync_all())
+                .map_err(|error| {
+                    agent_core::CoreError::Message(format!(
+                        "cannot make fleetyd reconnect journal repair durable {}: {error}",
+                        path.display()
+                    ))
+                })?;
+        }
     }
-    std::fs::rename(&tmp, path).map_err(|error| {
-        let _ = std::fs::remove_file(&tmp);
-        agent_core::CoreError::Message(format!(
-            "cannot publish daemon control request {}: {error}",
+    let mut bytes = reconnect_event_value(event).to_string().into_bytes();
+    bytes.push(b'\n');
+    let created = !path.exists();
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| {
+            agent_core::CoreError::Message(format!(
+                "cannot open fleetyd reconnect journal {}: {error}",
+                path.display()
+            ))
+        })?;
+    use std::io::Write;
+    let original_len = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+    let result = file.write_all(&bytes).and_then(|()| file.sync_all());
+    if let Err(error) = result {
+        let _ = file.set_len(original_len);
+        let _ = file.sync_all();
+        return Err(agent_core::CoreError::Message(format!(
+            "cannot make fleetyd reconnect journal event durable {}: {error}",
             path.display()
-        ))
+        )));
+    }
+    #[cfg(unix)]
+    if created {
+        let parent = path.parent().ok_or_else(|| {
+            agent_core::CoreError::Message(
+                "fleetyd reconnect journal has no parent directory".to_string(),
+            )
+        })?;
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| {
+                agent_core::CoreError::Message(format!(
+                    "cannot make fleetyd reconnect journal directory durable {}: {error}",
+                    parent.display()
+                ))
+            })?;
+    }
+    Ok(())
+}
+
+fn submit_reconnect_at(path: &std::path::Path, request: &ReconnectRequest) -> Result<()> {
+    if let Some(existing) = load_reconnect_journal_at(path)? {
+        let state = match &existing.phase {
+            ReconnectPhase::Submitted => "queued",
+            ReconnectPhase::Claimed => "being processed",
+            ReconnectPhase::Settled(_) => "settled but not yet observed",
+        };
+        return Err(agent_core::CoreError::Message(format!(
+            "fleetyd reconnect request '{}' is {state}; retry after its result is observed",
+            existing.request.nonce
+        )));
+    }
+    append_reconnect_event_at(
+        path,
+        &ReconnectJournalEvent::Submitted {
+            request: request.clone(),
+        },
+    )
+}
+
+fn claim_reconnect_at(path: &std::path::Path, instance: &str) -> Result<Option<ReconnectRequest>> {
+    let Some(state) = load_reconnect_journal_at(path)? else {
+        return Ok(None);
+    };
+    if state.request.instance != instance {
+        return Ok(None);
+    }
+    match state.phase {
+        ReconnectPhase::Submitted => {
+            append_reconnect_event_at(
+                path,
+                &ReconnectJournalEvent::Claimed {
+                    nonce: state.request.nonce.clone(),
+                },
+            )?;
+            Ok(Some(state.request))
+        }
+        ReconnectPhase::Claimed | ReconnectPhase::Settled(_) => Ok(None),
+    }
+}
+
+fn claim_reconnect(instance: &str) -> Result<Option<ReconnectRequest>> {
+    let journal = reconnect_journal_path();
+    if !journal.exists() {
+        return Ok(None);
+    }
+    let _lease = acquire_reconnect_lease()?;
+    claim_reconnect_at(&journal, instance)
+}
+
+fn decide_pending_reconnect(
+    pending: &mut Option<PendingReconnect>,
+    accepted: bool,
+    message: String,
+) {
+    let Some(pending) = pending.as_mut() else {
+        return;
+    };
+    if pending.decision.is_none() {
+        pending.decision = Some(ReconnectAck {
+            nonce: pending.request.nonce.clone(),
+            accepted,
+            message,
+        });
+    }
+}
+
+fn settle_pending_reconnect_at_with<F>(
+    path: &std::path::Path,
+    pending: &mut Option<PendingReconnect>,
+    append: F,
+) -> Result<bool>
+where
+    F: FnOnce(&std::path::Path, &ReconnectJournalEvent) -> Result<()>,
+{
+    let Some(decision) = pending
+        .as_ref()
+        .and_then(|pending| pending.decision.clone())
+    else {
+        return Ok(false);
+    };
+    append(
+        path,
+        &ReconnectJournalEvent::Settled {
+            ack: decision.clone(),
+        },
+    )?;
+    // A waiting caller may observe and reap the durable event immediately after
+    // the append returns. Re-reading here races that legitimate cleanup and can
+    // revive an already-observed decision into a journal without its Submitted
+    // event. A successful durable append is the settlement commit point.
+    pending.take();
+    Ok(true)
+}
+
+fn settle_pending_reconnect(pending: &mut Option<PendingReconnect>) -> Result<bool> {
+    let _lease = acquire_reconnect_lease()?;
+    settle_pending_reconnect_at_with(
+        &reconnect_journal_path(),
+        pending,
+        append_reconnect_event_at,
+    )
+}
+
+async fn settle_pending_reconnect_before_exit_with<F>(
+    pending: &mut Option<PendingReconnect>,
+    mut settle: F,
+) where
+    F: FnMut(&mut Option<PendingReconnect>) -> Result<bool>,
+{
+    while pending
+        .as_ref()
+        .is_some_and(|pending| pending.decision.is_some())
+    {
+        match settle(pending) {
+            Ok(_) => return,
+            Err(error) => {
+                tracing::warn!(
+                    report = ?error.report(),
+                    "cannot persist reconnect settlement during shutdown; will retry"
+                );
+                tokio::time::sleep(RECONNECT_POLL).await;
+            }
+        }
+    }
+}
+
+async fn settle_pending_reconnect_before_exit(pending: &mut Option<PendingReconnect>) {
+    settle_pending_reconnect_before_exit_with(pending, settle_pending_reconnect).await;
+}
+
+fn settle_authenticated_reconnect_with<F>(
+    target: &Resolved,
+    server_fingerprint: Option<&str>,
+    pending: &mut Option<PendingReconnect>,
+    append: F,
+) -> Result<bool>
+where
+    F: FnOnce(&std::path::Path, &ReconnectJournalEvent) -> Result<()>,
+{
+    let Some(expected_profile) = pending
+        .as_ref()
+        .map(|pending| pending.request.expected_profile.clone())
+    else {
+        return Ok(false);
+    };
+    connection::inspect_locked(|conns| {
+        let fingerprint = reconnect_target_fingerprint_in(conns, &expected_profile, target)?;
+        if fingerprint.as_deref() != server_fingerprint {
+            return Err(agent_core::CoreError::Message(format!(
+                "fleetyd authenticated profile '{expected_profile}', but its persisted owner snapshot changed before settlement"
+            )));
+        }
+        let decision = ReconnectAck {
+            nonce: pending
+                .as_ref()
+                .map(|pending| pending.request.nonce.clone())
+                .ok_or_else(|| reconnect_journal_error("authenticated request disappeared"))?,
+            accepted: true,
+            message: "fleetyd authenticated the selected profile and loaded its Server identity"
+                .to_string(),
+        };
+        let _lease = acquire_reconnect_lease()?;
+        match append(
+            &reconnect_journal_path(),
+            &ReconnectJournalEvent::Settled {
+                ack: decision.clone(),
+            },
+        ) {
+            Ok(()) => {
+                pending.take();
+                Ok(true)
+            }
+            Err(error) => {
+                let committed = load_reconnect_journal_at(&reconnect_journal_path())?
+                    .is_some_and(|state| {
+                        matches!(state.phase, ReconnectPhase::Settled(ref ack) if ack == &decision)
+                    });
+                if committed {
+                    pending.take();
+                    Ok(true)
+                } else {
+                    Err(error)
+                }
+            }
+        }
     })
+}
+
+fn settle_authenticated_reconnect(
+    target: &Resolved,
+    server_fingerprint: Option<&str>,
+    pending: &mut Option<PendingReconnect>,
+) -> Result<bool> {
+    settle_authenticated_reconnect_with(
+        target,
+        server_fingerprint,
+        pending,
+        append_reconnect_event_at,
+    )
+}
+
+fn recover_reconnect_for_instance_at(path: &std::path::Path, instance: &str) -> Result<()> {
+    let Some(state) = load_reconnect_journal_at(path)? else {
+        return Ok(());
+    };
+    if state.request.instance == instance || matches!(state.phase, ReconnectPhase::Settled(_)) {
+        return Ok(());
+    }
+    append_reconnect_event_at(
+        path,
+        &ReconnectJournalEvent::Settled {
+            ack: ReconnectAck {
+                nonce: state.request.nonce,
+                accepted: false,
+                message: "fleetyd restarted before the reconnect completed".to_string(),
+            },
+        },
+    )
+}
+
+fn reap_reconnect_journal_at(path: &std::path::Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {
+            #[cfg(unix)]
+            if let Some(parent) = path.parent() {
+                std::fs::File::open(parent)
+                    .and_then(|directory| directory.sync_all())
+                    .map_err(|error| {
+                        agent_core::CoreError::Message(format!(
+                            "reconnect result was reaped, but its directory was not durable {}: {error}",
+                            parent.display()
+                        ))
+                    })?;
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(agent_core::CoreError::Message(format!(
+            "reconnect result was observed, but its journal could not be reaped {}: {error}",
+            path.display()
+        ))),
+    }
 }
 
 struct ControlGuard {
@@ -174,6 +636,10 @@ impl ControlGuard {
             pid: std::process::id(),
             instance: control_nonce(),
         };
+        // Ready ownership, old-generation recovery, and publication are one
+        // generation handoff. Two starters must never inspect/remove ready
+        // outside the same reconnect lease.
+        let _reconnect_lease = acquire_reconnect_lease()?;
         let path = ready_path();
         if let Ok(bytes) = std::fs::read(&path) {
             if let Some(existing) = parse_ready(&bytes) {
@@ -204,11 +670,10 @@ impl ControlGuard {
                 ))
             })?;
         }
-        // Clear old-instance messages before making this instance discoverable.
-        // Publishing ready first would let a fast requester race this cleanup
-        // and lose a valid command before the daemon starts polling.
-        let _ = std::fs::remove_file(reconnect_request_path());
-        let _ = std::fs::remove_file(reconnect_ack_path());
+        // Serialize generation handoff with publishers: a request can bind to
+        // either the old owner (then recovery settles it) or this new owner,
+        // never to an unpublished generation between the two.
+        recover_reconnect_for_instance_at(&reconnect_journal_path(), &ready.instance)?;
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -229,35 +694,24 @@ impl ControlGuard {
         }
         Ok(Self { ready })
     }
-
-    fn read_request(&self) -> Option<ReconnectRequest> {
-        let bytes = std::fs::read(reconnect_request_path()).ok()?;
-        let request = parse_request(&bytes)?;
-        (request.instance == self.ready.instance).then_some(request)
-    }
-
-    fn acknowledge(&self, request: &ReconnectRequest, accepted: bool, message: String) {
-        let ack = ReconnectAck {
-            nonce: request.nonce.clone(),
-            accepted,
-            message,
-        };
-        let _ = atomic_write(&reconnect_ack_path(), &encode_ack(&ack));
-    }
 }
 
 struct ReconnectLease {
     path: std::path::PathBuf,
+    owner: String,
 }
 
 impl Drop for ReconnectLease {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        if std::fs::read_to_string(&self.path).is_ok_and(|owner| owner == self.owner) {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
 fn acquire_reconnect_lease() -> Result<ReconnectLease> {
     let path = reconnect_lock_path();
+    let owner = format!("{}:{}", std::process::id(), control_nonce());
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| {
             agent_core::CoreError::Message(format!(
@@ -273,20 +727,28 @@ fn acquire_reconnect_lease() -> Result<ReconnectLease> {
             .create_new(true)
             .open(&path)
         {
-            Ok(_) => return Ok(ReconnectLease { path }),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let stale = std::fs::metadata(&path)
-                    .and_then(|metadata| metadata.modified())
-                    .ok()
-                    .and_then(|modified| std::time::SystemTime::now().duration_since(modified).ok())
-                    .is_some_and(|age| age > std::time::Duration::from_secs(30));
-                if stale {
+            Ok(mut file) => {
+                use std::io::Write;
+                if let Err(error) = file
+                    .write_all(owner.as_bytes())
+                    .and_then(|()| file.sync_all())
+                {
                     let _ = std::fs::remove_file(&path);
-                    continue;
+                    return Err(agent_core::CoreError::Message(format!(
+                        "cannot publish fleetyd reconnect lock owner: {error}"
+                    )));
                 }
+                return Ok(ReconnectLease {
+                    path,
+                    owner: owner.clone(),
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 if started.elapsed() >= RECONNECT_ACK_WAIT {
                     return Err(agent_core::CoreError::Message(
-                        "another fleetyd reconnect request is still in progress; retry after it finishes"
+                        "fleetyd reconnect control is locked; retry after the active command \
+                         finishes, or remove the lock only after confirming its owner process \
+                         has exited"
                             .to_string(),
                     ));
                 }
@@ -309,7 +771,6 @@ impl Drop for ControlGuard {
             .is_some_and(|ready| ready.instance == self.ready.instance);
         if still_ours {
             let _ = std::fs::remove_file(ready_path());
-            let _ = std::fs::remove_file(reconnect_request_path());
         }
     }
 }
@@ -319,37 +780,66 @@ async fn wait_reconnect_request(control: Option<&ControlGuard>) -> ReconnectRequ
         return std::future::pending::<ReconnectRequest>().await;
     };
     loop {
-        if let Some(request) = control.read_request() {
-            let _ = std::fs::remove_file(reconnect_request_path());
-            if std::env::var("FLEETY_AGENT_URL").is_ok_and(|url| !url.is_empty()) {
-                control.acknowledge(
-                    &request,
+        match claim_reconnect(&control.ready.instance) {
+            Ok(Some(request)) => {
+                if std::env::var("FLEETY_AGENT_URL").is_ok_and(|url| !url.is_empty()) {
+                    let mut pending = Some(PendingReconnect::new(request));
+                    decide_pending_reconnect(
+                        &mut pending,
                     false,
                     "fleetyd is pinned by FLEETY_AGENT_URL and cannot follow a profile switch; unset the Daemon owner override, restart fleetyd, then retry"
                         .to_string(),
                 );
-                continue;
+                    while pending.is_some() {
+                        if let Err(error) = settle_pending_reconnect(&mut pending) {
+                            tracing::warn!(report = ?error.report(), "cannot persist reconnect rejection; will retry");
+                            tokio::time::sleep(RECONNECT_POLL).await;
+                        }
+                    }
+                    continue;
+                }
+                let current = connection::load().ok().and_then(|conns| conns.current);
+                if current.as_deref() == Some(request.expected_profile.as_str()) {
+                    return request;
+                }
+                let expected_profile = request.expected_profile.clone();
+                let mut pending = Some(PendingReconnect::new(request));
+                decide_pending_reconnect(
+                    &mut pending,
+                    false,
+                    format!(
+                        "requested profile '{}' is no longer current (current: {})",
+                        expected_profile,
+                        current.as_deref().unwrap_or("none")
+                    ),
+                );
+                while pending.is_some() {
+                    if let Err(error) = settle_pending_reconnect(&mut pending) {
+                        tracing::warn!(report = ?error.report(), "cannot persist reconnect rejection; will retry");
+                        tokio::time::sleep(RECONNECT_POLL).await;
+                    }
+                }
             }
-            let current = connection::load().ok().and_then(|conns| conns.current);
-            if current.as_deref() == Some(request.expected_profile.as_str()) {
-                return request;
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(report = ?error.report(), "cannot claim durable reconnect request");
             }
-            control.acknowledge(
-                &request,
-                false,
-                format!(
-                    "requested profile '{}' is no longer current (current: {})",
-                    request.expected_profile,
-                    current.as_deref().unwrap_or("none")
-                ),
-            );
         }
         tokio::time::sleep(RECONNECT_POLL).await;
     }
 }
 
 fn request_running_daemon_reconnect(expected_profile: &str) -> Result<String> {
-    let _lease = acquire_reconnect_lease()?;
+    request_running_daemon_reconnect_with_wait(expected_profile, RECONNECT_ACK_WAIT)
+}
+
+fn request_running_daemon_reconnect_with_wait(
+    expected_profile: &str,
+    wait: std::time::Duration,
+) -> Result<String> {
+    // Keep this lease only through ready-generation capture and submission.
+    // The Daemon needs the same lease to claim and settle the request.
+    let lease = acquire_reconnect_lease()?;
     let ready = match std::fs::read(ready_path()) {
         Ok(bytes) => parse_ready(&bytes).ok_or_else(|| {
             agent_core::CoreError::Message(
@@ -372,19 +862,64 @@ fn request_running_daemon_reconnect(expected_profile: &str) -> Result<String> {
         nonce: control_nonce(),
         expected_profile: expected_profile.to_string(),
     };
-    let _ = std::fs::remove_file(reconnect_ack_path());
-    atomic_write(&reconnect_request_path(), &encode_request(&request))?;
-
-    let deadline = std::time::Instant::now() + RECONNECT_ACK_WAIT;
-    while std::time::Instant::now() < deadline {
-        if let Ok(bytes) = std::fs::read(reconnect_ack_path()) {
-            if let Some(ack) = parse_ack(&bytes) {
-                if ack.nonce == request.nonce {
-                    let _ = std::fs::remove_file(reconnect_ack_path());
-                    return if ack.accepted {
-                        Ok(ack.message)
+    let journal = reconnect_journal_path();
+    if let Some(state) = load_reconnect_journal_at(&journal)? {
+        if let ReconnectPhase::Settled(ack) = state.phase {
+            reap_reconnect_journal_at(&journal)?;
+            if state.request.expected_profile != expected_profile {
+                return Err(agent_core::CoreError::Message(format!(
+                    "previous reconnect request '{}' for profile '{}' settled {}; profile \
+                     '{expected_profile}' was not submitted — retry now",
+                    state.request.nonce,
+                    state.request.expected_profile,
+                    if ack.accepted {
+                        "successfully"
                     } else {
-                        Err(agent_core::CoreError::Message(ack.message))
+                        "with failure"
+                    }
+                )));
+            }
+            return if ack.accepted {
+                Ok(ack.message)
+            } else {
+                Err(agent_core::CoreError::Message(ack.message))
+            };
+        }
+    }
+    submit_reconnect_at(&journal, &request)?;
+    drop(lease);
+
+    let deadline = std::time::Instant::now() + wait;
+    while std::time::Instant::now() < deadline {
+        if let Some(state) = load_reconnect_journal_at(&journal)? {
+            if state.request.nonce == request.nonce {
+                if let ReconnectPhase::Settled(observed_ack) = state.phase {
+                    let _observe_lease = acquire_reconnect_lease()?;
+                    if let Some(observed) = load_reconnect_journal_at(&journal)? {
+                        if observed.request.nonce == request.nonce {
+                            match observed.phase {
+                                ReconnectPhase::Settled(ref ack) if ack == &observed_ack => {}
+                                ReconnectPhase::Settled(_) => {
+                                    return Err(reconnect_journal_error(
+                                        "nonce changed terminal result while being observed",
+                                    ))
+                                }
+                                ReconnectPhase::Submitted | ReconnectPhase::Claimed => {
+                                    return Err(reconnect_journal_error(
+                                        "nonce regressed after terminal result was observed",
+                                    ))
+                                }
+                            }
+                            reap_reconnect_journal_at(&journal)?;
+                        }
+                    }
+                    // Another same-profile caller may have reaped this exact
+                    // result after our durable read. The result was still
+                    // observed; never turn that race into a false timeout.
+                    return if observed_ack.accepted {
+                        Ok(observed_ack.message)
+                    } else {
+                        Err(agent_core::CoreError::Message(observed_ack.message))
                     };
                 }
             }
@@ -392,8 +927,9 @@ fn request_running_daemon_reconnect(expected_profile: &str) -> Result<String> {
         std::thread::sleep(RECONNECT_POLL);
     }
     Err(agent_core::CoreError::Message(format!(
-        "profile '{expected_profile}' was saved, but running fleetyd did not finish reconnecting within {} seconds; the durable request remains queued — check `fleetyd status` and retry after the current device task finishes",
-        RECONNECT_ACK_WAIT.as_secs()
+        "profile '{expected_profile}' was saved, but running fleetyd did not finish reconnecting within {} seconds; request '{}' remains durable and a second request will be refused until it settles",
+        wait.as_secs(),
+        request.nonce
     )))
 }
 
@@ -409,7 +945,7 @@ fn target_profile_name(
         Source::Profile(name) | Source::OverrideProfile(name) => conns
             .profiles
             .get(name)
-            .filter(|profile| profile.url.is_empty() || profile.url == target.url)
+            .filter(|profile| profile.url == target.url)
             .map(|_| name.clone()),
         Source::OverrideUrl => conns
             .profiles
@@ -422,61 +958,64 @@ fn target_profile_name(
                 .get(name)
                 .filter(|profile| profile.url == target.url)
                 .map(|_| name.clone()),
-            None if allow_default => conns
-                .profiles
-                .get("default")
-                .map_or(true, |profile| {
-                    profile.url.is_empty() || profile.url == target.url
-                })
-                .then(|| "default".to_string()),
+            None if allow_default && conns.profiles.is_empty() => Some("default".to_string()),
             None => None,
         },
         Source::Mdns | Source::Default => match conns.current.as_ref() {
             // Unowned discovery must never be attached to an existing current
-            // profile. A trusted current-profile match is represented above as
-            // Source::Profile by the resolver.
+            // profile. Unsigned discovery never becomes Source::Profile.
             Some(_) => None,
-            None if allow_default => conns
-                .profiles
-                .get("default")
-                .map_or(true, |profile| {
-                    profile.url.is_empty() || profile.url == target.url
-                })
-                .then(|| "default".to_string()),
+            None if allow_default && conns.profiles.is_empty() => Some("default".to_string()),
             None => None,
         },
     }
 }
 
-/// Read the saved identity for the exact profile/url represented by a resolved
-/// target. This is checked after Welcome and before a reconnect request can be
-/// acknowledged as complete.
-fn expected_target_fingerprint(target: &Resolved) -> Option<String> {
-    let name = match &target.source {
-        Source::Profile(name) | Source::OverrideProfile(name) => name,
-        _ => return None,
-    };
-    connection::load()
-        .ok()?
-        .profiles
-        .get(name)
-        .filter(|profile| profile.url == target.url)?
-        .fingerprint
-        .clone()
+/// Confirm that the resolved target is still the exact persisted owner snapshot
+/// selected by this reconnect. Re-run this before terminal success so a later
+/// profile mutation cannot make one nonce acknowledge another owner.
+fn reconnect_target_fingerprint(
+    expected_profile: &str,
+    target: &Resolved,
+) -> Result<Option<String>> {
+    let conns = connection::load()?;
+    reconnect_target_fingerprint_in(&conns, expected_profile, target)
 }
 
-fn acknowledge_pending_reconnect(
-    control: Option<&ControlGuard>,
-    pending: &mut Option<ReconnectRequest>,
-    accepted: bool,
-    message: String,
-) {
-    let Some(request) = pending.take() else {
-        return;
+fn reconnect_target_fingerprint_in(
+    conns: &connection::Connections,
+    expected_profile: &str,
+    target: &Resolved,
+) -> Result<Option<String>> {
+    let source_profile = match &target.source {
+        Source::Profile(name) | Source::OverrideProfile(name) => name,
+        _ => {
+            return Err(agent_core::CoreError::Message(format!(
+                "reconnect profile '{expected_profile}' did not resolve to a persisted owner"
+            )))
+        }
     };
-    if let Some(control) = control {
-        control.acknowledge(&request, accepted, message);
+    if source_profile != expected_profile {
+        return Err(agent_core::CoreError::Message(format!(
+            "reconnect requested profile '{expected_profile}', but resolved profile '{source_profile}'"
+        )));
     }
+    if conns.current.as_deref() != Some(expected_profile) {
+        return Err(agent_core::CoreError::Message(format!(
+            "reconnect profile '{expected_profile}' is no longer current"
+        )));
+    }
+    let profile = conns.profiles.get(expected_profile).ok_or_else(|| {
+        agent_core::CoreError::Message(format!(
+            "reconnect profile '{expected_profile}' no longer exists"
+        ))
+    })?;
+    if profile.url != target.url || profile.token.as_deref() != target.token.as_deref() {
+        return Err(agent_core::CoreError::Message(format!(
+            "reconnect profile '{expected_profile}' changed while fleetyd was connecting"
+        )));
+    }
+    Ok(profile.fingerprint.clone())
 }
 
 /// Persist a freshly-minted token only onto the profile that owned the resolved
@@ -947,6 +1486,18 @@ fn resolve_target() -> Result<connection::Resolved> {
     })
 }
 
+fn reconnect_connect_error(target: &Resolved, cause: &str) -> String {
+    let cause = fleety_tools::transport::redact_urls_in_text(cause);
+    if matches!(
+        target.source,
+        Source::Profile(_) | Source::OverrideProfile(_)
+    ) {
+        format!("{cause}. {}", connection::explicit_repair_guidance())
+    } else {
+        cause
+    }
+}
+
 fn device_id() -> String {
     connection::load()
         .map(|c| c.effective_device_id())
@@ -1135,15 +1686,86 @@ async fn run(shutdown: Option<tokio::sync::watch::Receiver<bool>>) -> Result<()>
         }
     };
     let mut bo = backoff::Backoff::new();
-    let mut pending_reconnect: Option<ReconnectRequest> = None;
+    let mut pending_reconnect: Option<PendingReconnect> = None;
     loop {
+        if pending_reconnect
+            .as_ref()
+            .is_some_and(|pending| pending.decision.is_some())
+        {
+            match settle_pending_reconnect(&mut pending_reconnect) {
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(report = ?error.report(), "cannot persist reconnect settlement; will retry");
+                    tokio::time::sleep(RECONNECT_POLL).await;
+                    continue;
+                }
+            }
+        }
+        if let Some(expected) = pending_reconnect
+            .as_ref()
+            .map(|pending| pending.request.expected_profile.clone())
+        {
+            let current = connection::load().ok().and_then(|conns| conns.current);
+            if current.as_deref() != Some(expected.as_str()) {
+                decide_pending_reconnect(
+                    &mut pending_reconnect,
+                    false,
+                    format!(
+                        "requested profile '{expected}' is no longer current (current: {})",
+                        current.as_deref().unwrap_or("none")
+                    ),
+                );
+                continue;
+            }
+        }
         // Resolve the server (url + token) via the shared resolver over
         // connections.toml, honoring a persistent FLEETY_AGENT_URL env override.
         match resolve_target() {
             Ok(target) => {
                 // WebSocket first, SSE+POST fallback (unless overridden by env) —
                 // so a device behind a proxy that blocks the WS upgrade connects.
-                match fleety_tools::transport::connect(&target.url, target.token.as_deref()).await {
+                let reconnect_deadline = pending_reconnect
+                    .as_ref()
+                    .map(|_| tokio::time::Instant::now() + RECONNECT_HANDSHAKE_WAIT);
+                let connection = if let Some(deadline) = reconnect_deadline {
+                    tokio::select! {
+                        result = tokio::time::timeout_at(
+                            deadline,
+                            fleety_tools::transport::connect(&target.url, target.token.as_deref()),
+                        ) => match result {
+                            Ok(result) => result,
+                            Err(_) => {
+                                decide_pending_reconnect(
+                                    &mut pending_reconnect,
+                                    false,
+                                    format!(
+                                        "fleetyd could not establish and authenticate the selected profile before the reconnect deadline. {}",
+                                        connection::explicit_repair_guidance()
+                                    ),
+                                );
+                                continue;
+                            }
+                        },
+                        _ = wait_stop(shutdown.clone()) => {
+                            decide_pending_reconnect(
+                                &mut pending_reconnect,
+                                false,
+                                "fleetyd stopped before the reconnect completed".to_string(),
+                            );
+                            settle_pending_reconnect_before_exit(&mut pending_reconnect).await;
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    tokio::select! {
+                        result = fleety_tools::transport::connect(
+                            &target.url,
+                            target.token.as_deref(),
+                        ) => result,
+                        _ = wait_stop(shutdown.clone()) => return Ok(()),
+                    }
+                };
+                match connection {
                     Ok(conn) => {
                         bo.reset();
                         match serve(
@@ -1151,7 +1773,8 @@ async fn run(shutdown: Option<tokio::sync::watch::Receiver<bool>>) -> Result<()>
                             conn,
                             shutdown.clone(),
                             control.as_ref(),
-                            pending_reconnect.take(),
+                            &mut pending_reconnect,
+                            reconnect_deadline,
                         )
                         .await
                         {
@@ -1161,24 +1784,26 @@ async fn run(shutdown: Option<tokio::sync::watch::Receiver<bool>>) -> Result<()>
                             }
                             Outcome::Reconnect(request) => {
                                 tracing::info!(profile = %request.expected_profile, "profile changed; reconnecting immediately");
-                                pending_reconnect = Some(request);
+                                pending_reconnect = Some(PendingReconnect::new(request));
                                 bo.reset();
                                 continue;
                             }
                         }
                     }
                     Err(e) => {
-                        tracing::warn!(report = ?e.report(), "connect failed; will retry");
-                        if let (Some(control), Some(request)) =
-                            (control.as_ref(), pending_reconnect.take())
+                        let failure = reconnect_connect_error(&target, &e.report().message);
+                        tracing::warn!(message = %failure, "connect failed; will retry");
+                        if let Some(expected_profile) = pending_reconnect
+                            .as_ref()
+                            .map(|pending| pending.request.expected_profile.clone())
                         {
-                            control.acknowledge(
-                                &request,
+                            decide_pending_reconnect(
+                                &mut pending_reconnect,
                                 false,
                                 format!(
                                     "fleetyd left the previous Server, but could not connect to profile '{}': {}",
-                                    request.expected_profile,
-                                    fleety_tools::transport::redact_urls_in_text(&e.report().message)
+                                    expected_profile,
+                                    failure
                                 ),
                             );
                         }
@@ -1188,15 +1813,16 @@ async fn run(shutdown: Option<tokio::sync::watch::Receiver<bool>>) -> Result<()>
             Err(e) => {
                 tracing::warn!(report = ?e.report(),
                     "cannot resolve a server to connect to (is connections.toml valid?); will retry");
-                if let (Some(control), Some(request)) =
-                    (control.as_ref(), pending_reconnect.take())
+                if let Some(expected_profile) = pending_reconnect
+                    .as_ref()
+                    .map(|pending| pending.request.expected_profile.clone())
                 {
-                    control.acknowledge(
-                        &request,
+                    decide_pending_reconnect(
+                        &mut pending_reconnect,
                         false,
                         format!(
                             "fleetyd left the previous Server, but could not resolve profile '{}': {}",
-                            request.expected_profile,
+                            expected_profile,
                             e.report().message
                         ),
                     );
@@ -1209,12 +1835,18 @@ async fn run(shutdown: Option<tokio::sync::watch::Receiver<bool>>) -> Result<()>
         tokio::select! {
             _ = tokio::time::sleep(delay) => {}
             request = wait_reconnect_request(control.as_ref()) => {
-                pending_reconnect = Some(request);
+                pending_reconnect = Some(PendingReconnect::new(request));
                 bo.reset();
                 continue;
             }
             _ = wait_stop(shutdown.clone()) => {
                 tracing::info!("stop signal received during backoff; shutting down fleetyd");
+                decide_pending_reconnect(
+                    &mut pending_reconnect,
+                    false,
+                    "fleetyd stopped before the reconnect completed".to_string(),
+                );
+                settle_pending_reconnect_before_exit(&mut pending_reconnect).await;
                 return Ok(());
             }
         }
@@ -1270,12 +1902,31 @@ async fn serve(
     mut conn: fleety_tools::transport::Connection,
     shutdown: Option<tokio::sync::watch::Receiver<bool>>,
     control: Option<&ControlGuard>,
-    mut pending_reconnect: Option<ReconnectRequest>,
+    pending_reconnect: &mut Option<PendingReconnect>,
+    reconnect_deadline: Option<tokio::time::Instant>,
 ) -> Outcome {
     let url = &target.url;
     let pairing_code = std::env::var("FLEETY_PAIRING_CODE")
         .ok()
         .filter(|s| !s.is_empty());
+    let expected_reconnect_fingerprint = match pending_reconnect
+        .as_ref()
+        .map(|pending| reconnect_target_fingerprint(&pending.request.expected_profile, target))
+        .transpose()
+    {
+        Ok(fingerprint) => fingerprint.flatten(),
+        Err(error) => {
+            decide_pending_reconnect(
+                pending_reconnect,
+                false,
+                format!(
+                    "fleetyd could not bind the reconnect to the selected profile: {}",
+                    error.report().message
+                ),
+            );
+            return Outcome::Disconnected;
+        }
+    };
 
     let registry = ondevice::build_local_registry(&ondevice::device_root());
     // Advertise the on-device tool set so the agent knows what device_exec can
@@ -1293,22 +1944,60 @@ async fn serve(
         Ok(h) => h,
         Err(e) => {
             tracing::warn!(%e, "could not serialize hello; will reconnect");
-            acknowledge_pending_reconnect(
-                control,
-                &mut pending_reconnect,
+            decide_pending_reconnect(
+                pending_reconnect,
                 false,
                 "fleetyd could not prepare the new Server handshake".to_string(),
             );
             return Outcome::Disconnected;
         }
     };
-    if let Err(e) = conn.send_text(hello).await {
+    let hello_result = if let Some(deadline) = reconnect_deadline {
+        tokio::select! {
+            result = tokio::time::timeout_at(deadline, conn.send_text(hello)) => {
+                match result {
+                    Ok(result) => result,
+                    Err(_) => {
+                        decide_pending_reconnect(
+                            pending_reconnect,
+                            false,
+                            "fleetyd could not send Hello before the reconnect deadline"
+                                .to_string(),
+                        );
+                        conn.close().await;
+                        return Outcome::Disconnected;
+                    }
+                }
+            }
+            _ = wait_stop(shutdown.clone()) => {
+                decide_pending_reconnect(
+                    pending_reconnect,
+                    false,
+                    "fleetyd stopped before the reconnect completed".to_string(),
+                );
+                settle_pending_reconnect_before_exit(pending_reconnect).await;
+                conn.close().await;
+                return Outcome::Shutdown;
+            }
+        }
+    } else {
+        tokio::select! {
+            result = conn.send_text(hello) => result,
+            _ = wait_stop(shutdown.clone()) => {
+                conn.close().await;
+                return Outcome::Shutdown;
+            }
+        }
+    };
+    if let Err(e) = hello_result {
         tracing::warn!(report = ?e.report(), "send hello failed; will reconnect");
-        acknowledge_pending_reconnect(
-            control,
-            &mut pending_reconnect,
+        decide_pending_reconnect(
+            pending_reconnect,
             false,
-            format!("fleetyd could not start the new Server handshake: {}", e.report().message),
+            format!(
+                "fleetyd could not start the new Server handshake: {}",
+                e.report().message
+            ),
         );
         return Outcome::Disconnected;
     }
@@ -1327,11 +2016,32 @@ async fn serve(
     } else {
         None
     };
+    let mut welcome_deadline = pending_reconnect.as_ref().and(reconnect_deadline);
     loop {
+        if pending_reconnect
+            .as_ref()
+            .is_some_and(|pending| pending.decision.is_some())
+        {
+            match settle_pending_reconnect(pending_reconnect) {
+                Ok(true) => welcome_deadline = None,
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(report = ?error.report(), "cannot persist reconnect settlement; will retry");
+                    tokio::time::sleep(RECONNECT_POLL).await;
+                    continue;
+                }
+            }
+        }
         // Idle frame boundary: carry out a deferred self-restart (auto-update)
         // here so it never interrupts a tool that's mid-execution.
         if restart_due_at_idle() {
             tracing::info!("applying deferred restart now (idle); restarting service");
+            decide_pending_reconnect(
+                pending_reconnect,
+                false,
+                "fleetyd restarted before the reconnect completed".to_string(),
+            );
+            settle_pending_reconnect_before_exit(pending_reconnect).await;
             conn.close().await;
             if let Err(e) = service::restart() {
                 tracing::warn!(report = ?e.report(), "could not restart service for update");
@@ -1343,6 +2053,21 @@ async fn serve(
             request = wait_reconnect_request(control) => {
                 conn.close().await;
                 return Outcome::Reconnect(request);
+            }
+            _ = async {
+                match welcome_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                decide_pending_reconnect(
+                    pending_reconnect,
+                    false,
+                    "fleetyd reached the selected endpoint, but it did not complete Welcome before the handshake deadline"
+                        .to_string(),
+                );
+                conn.close().await;
+                return Outcome::Disconnected;
             }
             _ = async {
                 match presence_tick.as_mut() {
@@ -1361,6 +2086,12 @@ async fn serve(
             }
             _ = wait_stop(shutdown.clone()) => {
                 tracing::info!("stop signal received; closing and shutting down fleetyd");
+                decide_pending_reconnect(
+                    pending_reconnect,
+                    false,
+                    "fleetyd stopped before the reconnect completed".to_string(),
+                );
+                settle_pending_reconnect_before_exit(pending_reconnect).await;
                 conn.close().await;
                 return Outcome::Shutdown;
             }
@@ -1371,9 +2102,8 @@ async fn serve(
         };
         // Inner `None` = link closed or went dead (SSE half-open timeout) → reconnect.
         let Some(text) = frame else {
-            acknowledge_pending_reconnect(
-                control,
-                &mut pending_reconnect,
+            decide_pending_reconnect(
+                pending_reconnect,
                 false,
                 "fleetyd reached the selected endpoint, but it closed before Welcome".to_string(),
             );
@@ -1390,19 +2120,81 @@ async fn serve(
                 server_fingerprint,
                 ..
             } => {
-                let expected_fingerprint = expected_target_fingerprint(target);
-                if expected_fingerprint.as_deref().is_some_and(|expected| {
-                    server_fingerprint.as_deref() != Some(expected)
-                }) {
-                    acknowledge_pending_reconnect(
-                        control,
-                        &mut pending_reconnect,
+                if expected_reconnect_fingerprint
+                    .as_deref()
+                    .is_some_and(|expected| server_fingerprint.as_deref() != Some(expected))
+                {
+                    decide_pending_reconnect(
+                        pending_reconnect,
                         false,
                         "fleetyd reached the selected endpoint, but its Server identity did not match the saved profile"
                             .to_string(),
                     );
                     conn.close().await;
                     return Outcome::Disconnected;
+                }
+                // Pin (or back-fill) the authenticated endpoint's identity for
+                // future mismatch detection; never overwrite a different pin —
+                // that is an anomaly worth a warning.
+                if let Some(fp) = server_fingerprint.as_deref().filter(|f| !f.is_empty()) {
+                    match pin_target_fingerprint(target, fp) {
+                        Ok(Some(fleety_tools::connection::PinDecision::IdentityChanged)) => {
+                            tracing::warn!(
+                                "the server's identity fingerprint changed since it was pinned; \
+                                 keeping the old pin — re-pair this device if the server was \
+                                 intentionally rebuilt"
+                            );
+                            decide_pending_reconnect(
+                                pending_reconnect,
+                                false,
+                                "fleetyd reached the selected endpoint, but its Server identity changed"
+                                    .to_string(),
+                            );
+                            conn.close().await;
+                            return Outcome::Disconnected;
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(report = ?e.report(), "could not pin the server fingerprint");
+                            if pending_reconnect.is_some() {
+                                decide_pending_reconnect(
+                                    pending_reconnect,
+                                    false,
+                                    "fleetyd authenticated the selected endpoint, but could not persist its Server identity"
+                                        .to_string(),
+                                );
+                                conn.close().await;
+                                return Outcome::Disconnected;
+                            }
+                        }
+                    }
+                } else if pending_reconnect.is_some() {
+                    decide_pending_reconnect(
+                        pending_reconnect,
+                        false,
+                        "fleetyd authenticated the selected endpoint, but it did not provide a Server identity"
+                            .to_string(),
+                    );
+                    conn.close().await;
+                    return Outcome::Disconnected;
+                }
+                if pending_reconnect.is_some() {
+                    if let Err(error) = settle_authenticated_reconnect(
+                        target,
+                        server_fingerprint.as_deref(),
+                        pending_reconnect,
+                    ) {
+                        decide_pending_reconnect(
+                            pending_reconnect,
+                            false,
+                            format!(
+                                "fleetyd could not commit the authenticated reconnect result: {}",
+                                error.report().message
+                            ),
+                        );
+                        conn.close().await;
+                        return Outcome::Disconnected;
+                    }
                 }
                 if let Some(tok) = token {
                     match persist_token(target, &tok) {
@@ -1417,41 +2209,7 @@ async fn serve(
                         }
                     }
                 }
-                // Pin (or back-fill) the server's identity fingerprint so an IP
-                // change can heal to this exact server; never overwrite a
-                // different pin — that is an anomaly worth a warning.
-                if let Some(fp) = server_fingerprint.as_deref().filter(|f| !f.is_empty()) {
-                    match pin_target_fingerprint(target, fp) {
-                        Ok(Some(fleety_tools::connection::PinDecision::IdentityChanged)) => {
-                            tracing::warn!(
-                                "the server's identity fingerprint changed since it was pinned; \
-                                 keeping the old pin — re-pair this device if the server was \
-                                 intentionally rebuilt"
-                            );
-                            acknowledge_pending_reconnect(
-                                control,
-                                &mut pending_reconnect,
-                                false,
-                                "fleetyd reached the selected endpoint, but its Server identity changed"
-                                    .to_string(),
-                            );
-                            conn.close().await;
-                            return Outcome::Disconnected;
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            tracing::warn!(report = ?e.report(), "could not pin the server fingerprint");
-                        }
-                    }
-                }
                 tracing::info!(%session_id, "registered with agent");
-                acknowledge_pending_reconnect(
-                    control,
-                    &mut pending_reconnect,
-                    true,
-                    "fleetyd authenticated the selected profile and loaded its Server identity"
-                        .to_string(),
-                );
                 // Forward-only fleet convergence: match this host to the server's
                 // version when the server is newer (so a device that was offline
                 // during a `fleety update` catches up on reconnect).
@@ -1466,11 +2224,13 @@ async fn serve(
                 if let Err(e) = clear_target_token(target) {
                     tracing::warn!(report = ?e.report(), "could not clear the rejected token");
                 }
-                acknowledge_pending_reconnect(
-                    control,
-                    &mut pending_reconnect,
+                decide_pending_reconnect(
+                    pending_reconnect,
                     false,
-                    format!("fleetyd could not authenticate the selected profile: {}", error.message),
+                    format!(
+                        "fleetyd could not authenticate the selected profile: {}",
+                        error.message
+                    ),
                 );
                 return Outcome::Disconnected;
             }
@@ -1629,6 +2389,27 @@ mod tests {
     }
 
     #[test]
+    fn saved_profile_connect_failure_directs_explicit_repair_without_leaking_url_secrets() {
+        let target = Resolved {
+            url: "wss://host.test".into(),
+            token: Some("stored-token".into()),
+            source: Source::Profile("office".into()),
+        };
+        let message = reconnect_connect_error(
+            &target,
+            "connect wss://user:pass@host.test/x?token=SECRET#tail failed",
+        );
+        for secret in ["pass", "SECRET", "#tail", "stored-token"] {
+            assert!(!message.contains(secret), "leaked {secret}: {message}");
+        }
+        assert!(message.contains("--pairing-code <code>"), "{message}");
+        assert!(
+            message.contains("will not send the stored token"),
+            "{message}"
+        );
+    }
+
+    #[test]
     fn different_env_target_never_mutates_current_profile_a() {
         let _lock = ENV_LOCK.lock().expect("env lock");
         let _guard = EnvGuard::new("env-provenance");
@@ -1694,13 +2475,11 @@ mod tests {
             },
         );
         connection::save(&conns).expect("save A/B");
-        let target = connection::resolve(&conns, &Target::Current, None, None, || {
-            Some(connection::Discovered {
-                url: "ws://server-b:8787".to_string(),
-                fingerprint: Some("fp-b".to_string()),
-            })
-        })
-        .expect("resolve unowned B advertiser");
+        let target = Resolved {
+            url: "ws://server-b:8787".to_string(),
+            token: None,
+            source: Source::Mdns,
+        };
         assert_eq!(target.source, Source::Mdns);
         assert_eq!(target.token, None);
 
@@ -1716,23 +2495,20 @@ mod tests {
         assert_eq!(after.profiles["b"].token.as_deref(), Some("token-b"));
         assert_eq!(after.profiles["b"].fingerprint.as_deref(), Some("fp-b"));
 
-        // Auth rejection / reconnect cannot gradually convert this unowned B
-        // advertisement into A's provenance. The second Hello still has no
-        // token and no exact owner to clear or pin.
-        let second = connection::resolve(&after, &Target::Current, None, None, || {
+        // A credentialed current profile no longer enters automatic discovery
+        // on reconnect, even if copied TXT metadata matches another profile.
+        let error = connection::resolve(&after, &Target::Current, None, None, || {
             Some(connection::Discovered {
                 url: "ws://server-b:8787".to_string(),
                 fingerprint: Some("fp-b".to_string()),
             })
         })
-        .expect("resolve B advertiser again");
-        assert_eq!(second.source, Source::Mdns);
-        assert_eq!(second.token, None);
-        assert!(!clear_target_token(&second).expect("second rejection stays unowned"));
+        .expect_err("credentialed profile requires explicit recovery");
+        assert!(error.report().message.contains("--pairing-code <code>"));
     }
 
     #[test]
-    fn pinned_current_mdns_target_mutates_only_its_exact_profile() {
+    fn synthetic_mdns_profile_provenance_cannot_mutate_a_urlless_saved_profile() {
         let _lock = ENV_LOCK.lock().expect("env lock");
         let _guard = EnvGuard::new("mdns-owned-provenance");
         let mut conns = connection::Connections {
@@ -1764,10 +2540,10 @@ mod tests {
             source: Source::Profile("a".to_string()),
         };
 
-        assert!(persist_token(&target, "new-a").expect("persist A"));
+        assert!(!persist_token(&target, "new-a").expect("reject synthetic owner"));
         let after = connection::load().expect("reload A/B");
-        assert_eq!(after.profiles["a"].url, "ws://server-a:8787");
-        assert_eq!(after.profiles["a"].token.as_deref(), Some("new-a"));
+        assert!(after.profiles["a"].url.is_empty());
+        assert_eq!(after.profiles["a"].token.as_deref(), Some("old-a"));
         assert_eq!(after.profiles["b"].token.as_deref(), Some("token-b"));
         assert_eq!(after.profiles["b"].fingerprint.as_deref(), Some("fp-b"));
     }
@@ -1839,6 +2615,37 @@ mod tests {
         assert_eq!(default.url, "ws://server-a:8787");
         assert_eq!(default.token.as_deref(), Some("token-a"));
         assert_eq!(default.fingerprint.as_deref(), Some("fp-a"));
+    }
+
+    #[test]
+    fn urlless_occupied_default_never_accepts_a_discovered_token() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("urlless-occupied-default");
+        let mut conns = connection::Connections::default();
+        conns.profiles.insert(
+            "default".to_string(),
+            connection::Profile {
+                url: String::new(),
+                token: Some("legacy-token".to_string()),
+                fingerprint: Some("legacy-pin".to_string()),
+                ..Default::default()
+            },
+        );
+        connection::save(&conns).expect("save URL-less default");
+        let target = Resolved {
+            url: "ws://rogue-advertiser:8787".to_string(),
+            token: None,
+            source: Source::Mdns,
+        };
+
+        assert!(!persist_token(&target, "rogue-token").expect("skip persist"));
+
+        let after = connection::load().expect("reload default");
+        assert!(after.current.is_none());
+        let default = &after.profiles["default"];
+        assert!(default.url.is_empty());
+        assert_eq!(default.token.as_deref(), Some("legacy-token"));
+        assert_eq!(default.fingerprint.as_deref(), Some("legacy-pin"));
     }
 
     #[test]
@@ -1950,5 +2757,410 @@ mod tests {
         let first = device_id();
         assert!(!first.is_empty());
         assert_eq!(device_id(), first);
+    }
+
+    #[test]
+    fn reconnect_timeout_keeps_original_nonce_and_duplicate_cannot_replace_it() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("reconnect-timeout-duplicate");
+        let journal = reconnect_journal_path();
+        let ready = ControlReady {
+            pid: std::process::id(),
+            instance: "daemon-a".to_string(),
+        };
+        std::fs::create_dir_all(ready_path().parent().expect("control directory"))
+            .expect("create control directory");
+        std::fs::write(ready_path(), encode_ready(&ready)).expect("publish test control owner");
+
+        let timeout = request_running_daemon_reconnect_with_wait("B", std::time::Duration::ZERO)
+            .expect_err("caller should stop waiting without consuming the request");
+        assert!(timeout.report().message.contains("remains durable"));
+        let before = std::fs::read(&journal).expect("journal before duplicate");
+        let state = load_reconnect_journal_at(&journal)
+            .expect("load journal")
+            .expect("active journal");
+        let original_nonce = state.request.nonce.clone();
+        let error = request_running_daemon_reconnect_with_wait("C", std::time::Duration::ZERO)
+            .expect_err("an unsettled request must reject r2");
+
+        assert!(error.report().message.contains(&original_nonce));
+        assert_eq!(
+            std::fs::read(&journal).expect("journal after duplicate"),
+            before,
+            "duplicate submission must not replace or append after r1"
+        );
+        let state = load_reconnect_journal_at(&journal)
+            .expect("load journal")
+            .expect("active journal");
+        assert_eq!(state.request.nonce, original_nonce);
+        assert!(matches!(state.phase, ReconnectPhase::Submitted));
+    }
+
+    #[test]
+    fn reconnect_claim_is_durable_until_terminal_settlement() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("reconnect-delayed-consume");
+        let journal = reconnect_journal_path();
+        let request = ReconnectRequest {
+            instance: "daemon-a".to_string(),
+            nonce: "r1".to_string(),
+            expected_profile: "B".to_string(),
+        };
+        submit_reconnect_at(&journal, &request).expect("submit");
+
+        let claimed = claim_reconnect_at(&journal, "daemon-a")
+            .expect("claim")
+            .expect("request");
+
+        assert_eq!(claimed.nonce, "r1");
+        assert!(
+            journal.exists(),
+            "consume must not delete the durable request"
+        );
+        let state = load_reconnect_journal_at(&journal)
+            .expect("load journal")
+            .expect("active journal");
+        assert_eq!(state.request.nonce, "r1");
+        assert!(matches!(state.phase, ReconnectPhase::Claimed));
+    }
+
+    #[test]
+    fn reconnect_journal_recovers_only_a_torn_final_record() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("reconnect-torn-tail");
+        let journal = reconnect_journal_path();
+        let request = ReconnectRequest {
+            instance: "daemon-a".to_string(),
+            nonce: "nonce-a".to_string(),
+            expected_profile: "B".to_string(),
+        };
+        submit_reconnect_at(&journal, &request).expect("submit");
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&journal)
+            .expect("open journal")
+            .write_all(br#"{"event":"settled","nonce":"nonce-a""#)
+            .expect("write torn tail");
+
+        let state = load_reconnect_journal_at(&journal)
+            .expect("ignore torn final record")
+            .expect("submitted request");
+        assert!(matches!(state.phase, ReconnectPhase::Submitted));
+
+        append_reconnect_event_at(
+            &journal,
+            &ReconnectJournalEvent::Claimed {
+                nonce: "nonce-a".to_string(),
+            },
+        )
+        .expect("repair tail and append");
+        let state = load_reconnect_journal_at(&journal)
+            .expect("load repaired journal")
+            .expect("request");
+        assert!(matches!(state.phase, ReconnectPhase::Claimed));
+    }
+
+    #[test]
+    fn reconnect_lease_drop_never_deletes_a_successor_lock() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("reconnect-lease-owner");
+        let path = reconnect_lock_path();
+        std::fs::create_dir_all(path.parent().expect("control directory"))
+            .expect("create control directory");
+        std::fs::write(&path, "successor-owner").expect("publish successor");
+
+        drop(ReconnectLease {
+            path: path.clone(),
+            owner: "previous-owner".to_string(),
+        });
+
+        assert_eq!(
+            std::fs::read_to_string(path).expect("successor lock remains"),
+            "successor-owner"
+        );
+    }
+
+    #[test]
+    fn later_profile_request_cannot_mistake_an_older_settlement_for_its_own() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("reconnect-settlement-owner");
+        let journal = reconnect_journal_path();
+        let ready = ControlReady {
+            pid: std::process::id(),
+            instance: "daemon-a".to_string(),
+        };
+        std::fs::create_dir_all(ready_path().parent().expect("control directory"))
+            .expect("create control directory");
+        std::fs::write(ready_path(), encode_ready(&ready)).expect("publish test control owner");
+        let request = ReconnectRequest {
+            instance: "daemon-a".to_string(),
+            nonce: "r1".to_string(),
+            expected_profile: "B".to_string(),
+        };
+        submit_reconnect_at(&journal, &request).expect("submit B");
+        append_reconnect_event_at(
+            &journal,
+            &ReconnectJournalEvent::Settled {
+                ack: ReconnectAck {
+                    nonce: "r1".to_string(),
+                    accepted: true,
+                    message: "B connected".to_string(),
+                },
+            },
+        )
+        .expect("settle B");
+
+        let error = request_running_daemon_reconnect_with_wait("C", std::time::Duration::ZERO)
+            .expect_err("C must not inherit B's success");
+
+        assert!(error.report().message.contains("profile 'B'"));
+        assert!(error
+            .report()
+            .message
+            .contains("profile 'C' was not submitted"));
+        assert!(!journal.exists(), "observed settlement should be reaped");
+    }
+
+    #[test]
+    fn reconnect_settlement_write_failure_keeps_the_frozen_decision_for_retry() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("reconnect-settlement-retry");
+        let journal = reconnect_journal_path();
+        let request = ReconnectRequest {
+            instance: "daemon-a".to_string(),
+            nonce: "r1".to_string(),
+            expected_profile: "B".to_string(),
+        };
+        submit_reconnect_at(&journal, &request).expect("submit");
+        let request = claim_reconnect_at(&journal, "daemon-a")
+            .expect("claim")
+            .expect("request");
+        let mut pending = Some(PendingReconnect::new(request));
+        decide_pending_reconnect(
+            &mut pending,
+            false,
+            "fleetyd stopped before reconnect completed".to_string(),
+        );
+
+        let first = settle_pending_reconnect_at_with(&journal, &mut pending, |_, _| {
+            Err(agent_core::CoreError::Message(
+                "injected settlement write failure".to_string(),
+            ))
+        });
+        assert!(first.is_err());
+        let frozen = pending
+            .as_ref()
+            .and_then(|pending| pending.decision.as_ref())
+            .expect("decision remains retryable");
+        assert!(!frozen.accepted);
+        assert!(frozen.message.contains("stopped"));
+
+        settle_pending_reconnect_at_with(&journal, &mut pending, append_reconnect_event_at)
+            .expect("retry settlement");
+        assert!(pending.is_none());
+        let state = load_reconnect_journal_at(&journal)
+            .expect("load settled journal")
+            .expect("journal");
+        assert!(matches!(
+            state.phase,
+            ReconnectPhase::Settled(ReconnectAck {
+                accepted: false,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn graceful_exit_retries_a_failed_reconnect_settlement() {
+        let request = ReconnectRequest {
+            instance: "daemon-a".to_string(),
+            nonce: "nonce-a".to_string(),
+            expected_profile: "B".to_string(),
+        };
+        let mut pending = Some(PendingReconnect::new(request));
+        decide_pending_reconnect(
+            &mut pending,
+            false,
+            "fleetyd stopped before reconnect completed".to_string(),
+        );
+        let mut attempts = 0;
+
+        settle_pending_reconnect_before_exit_with(&mut pending, |pending| {
+            attempts += 1;
+            if attempts == 1 {
+                return Err(agent_core::CoreError::Message(
+                    "injected shutdown settlement failure".to_string(),
+                ));
+            }
+            pending.take();
+            Ok(true)
+        })
+        .await;
+
+        assert_eq!(attempts, 2);
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn reconnect_settlement_stays_complete_when_caller_reaps_the_observed_journal() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("reconnect-settlement-reaped");
+        let journal = reconnect_journal_path();
+        let request = ReconnectRequest {
+            instance: "daemon-a".to_string(),
+            nonce: "nonce-a".to_string(),
+            expected_profile: "B".to_string(),
+        };
+        submit_reconnect_at(&journal, &request).expect("submit");
+        let request = claim_reconnect_at(&journal, "daemon-a")
+            .expect("claim")
+            .expect("request");
+        let mut pending = Some(PendingReconnect::new(request));
+        decide_pending_reconnect(&mut pending, true, "connected".to_string());
+
+        let settled = settle_pending_reconnect_at_with(&journal, &mut pending, |path, event| {
+            append_reconnect_event_at(path, event)?;
+            std::fs::remove_file(path).expect("caller reaps observed settlement");
+            Ok(())
+        });
+
+        assert!(settled.expect("durable settlement"));
+        assert!(
+            pending.is_none(),
+            "a caller that already observed and reaped the result must not revive it"
+        );
+    }
+
+    #[test]
+    fn reconnect_restart_settles_the_previous_instance_once() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("reconnect-restart");
+        let journal = reconnect_journal_path();
+        let request = ReconnectRequest {
+            instance: "daemon-old".to_string(),
+            nonce: "r1".to_string(),
+            expected_profile: "B".to_string(),
+        };
+        submit_reconnect_at(&journal, &request).expect("submit");
+        claim_reconnect_at(&journal, "daemon-old")
+            .expect("claim")
+            .expect("request");
+
+        recover_reconnect_for_instance_at(&journal, "daemon-new").expect("recover");
+        recover_reconnect_for_instance_at(&journal, "daemon-new").expect("idempotent recover");
+
+        let state = load_reconnect_journal_at(&journal)
+            .expect("load journal")
+            .expect("journal");
+        assert_eq!(state.request.nonce, "r1");
+        assert!(matches!(
+            state.phase,
+            ReconnectPhase::Settled(ReconnectAck {
+                accepted: false,
+                ref message,
+                ..
+            }) if message.contains("restarted")
+        ));
+    }
+
+    #[test]
+    fn reconnect_owner_binding_rejects_target_drift_before_terminal_success() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("reconnect-owner-binding");
+        let mut conns = connection::Connections {
+            current: Some("B".to_string()),
+            ..Default::default()
+        };
+        conns.profiles.insert(
+            "B".to_string(),
+            connection::Profile {
+                url: "ws://server-b:8787".to_string(),
+                token: Some("token-b".to_string()),
+                fingerprint: Some("fingerprint-b".to_string()),
+                ..Default::default()
+            },
+        );
+        connection::save(&conns).expect("save B");
+        let target = Resolved {
+            url: "ws://server-b:8787".to_string(),
+            token: Some("token-b".to_string()),
+            source: Source::Profile("B".to_string()),
+        };
+
+        assert_eq!(
+            reconnect_target_fingerprint("B", &target)
+                .expect("owner binding")
+                .as_deref(),
+            Some("fingerprint-b")
+        );
+        connection::mutate(|live| {
+            live.profiles.get_mut("B").expect("profile B").url = "ws://server-c:8787".to_string();
+            Ok(())
+        })
+        .expect("drift target");
+        assert!(reconnect_target_fingerprint("B", &target).is_err());
+    }
+
+    #[test]
+    fn authenticated_reconnect_write_failure_never_freezes_uncommitted_success() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("reconnect-authenticated-write-failure");
+        let mut conns = connection::Connections {
+            current: Some("B".to_string()),
+            ..Default::default()
+        };
+        conns.profiles.insert(
+            "B".to_string(),
+            connection::Profile {
+                url: "ws://server-b:8787".to_string(),
+                token: Some("token-b".to_string()),
+                fingerprint: Some("fingerprint-b".to_string()),
+                ..Default::default()
+            },
+        );
+        connection::save(&conns).expect("save B");
+        let target = Resolved {
+            url: "ws://server-b:8787".to_string(),
+            token: Some("token-b".to_string()),
+            source: Source::Profile("B".to_string()),
+        };
+        let journal = reconnect_journal_path();
+        let request = ReconnectRequest {
+            instance: "daemon-a".to_string(),
+            nonce: "nonce-a".to_string(),
+            expected_profile: "B".to_string(),
+        };
+        submit_reconnect_at(&journal, &request).expect("submit");
+        let request = claim_reconnect_at(&journal, "daemon-a")
+            .expect("claim")
+            .expect("request");
+        let mut pending = Some(PendingReconnect::new(request));
+
+        let error = settle_authenticated_reconnect_with(
+            &target,
+            Some("fingerprint-b"),
+            &mut pending,
+            |_, _| {
+                Err(agent_core::CoreError::Message(
+                    "injected settlement failure".to_string(),
+                ))
+            },
+        )
+        .expect_err("first durable write fails");
+        assert!(error.report().message.contains("injected"));
+        assert!(
+            pending
+                .as_ref()
+                .is_some_and(|pending| pending.decision.is_none()),
+            "a success that was not durably committed is not terminal"
+        );
+        decide_pending_reconnect(&mut pending, false, "later failure".to_string());
+        let decision = pending
+            .as_ref()
+            .and_then(|pending| pending.decision.as_ref())
+            .expect("frozen decision");
+        assert!(!decision.accepted);
+        assert_eq!(decision.message, "later failure");
     }
 }

@@ -436,19 +436,15 @@ async fn main() -> std::process::ExitCode {
                 );
             }
             let name = name.unwrap_or_else(|| "default".to_string());
-            // Catch the common scheme mistakes before any network work — the
-            // raw connect error that would follow is much harder to act on.
-            if !url.starts_with("ws://") && !url.starts_with("wss://") {
-                let shown_url = terminal_safe_text(&url);
-                if url.starts_with("http://") || url.starts_with("https://") {
-                    eprintln!(
-                        "error: '{shown_url}' is an http(s) URL — the agent URL uses the WebSocket scheme"
-                    );
-                    eprintln!("hint: use ws:// (or wss:// behind TLS), e.g. ws://host:8787");
-                } else {
-                    eprintln!("error: '{shown_url}' is not a ws:// or wss:// URL");
-                    eprintln!("hint: e.g. fleety init ws://192.168.1.10:8787");
-                }
+            // Validate the same explicit endpoint contract used by set-url and
+            // Settings before any migration or network work.
+            if let Err(error) = connection::validate_ws_url(&url) {
+                eprintln!(
+                    "error: {} ({})",
+                    terminal_safe_text(&error.report().message),
+                    terminal_safe_endpoint(&url)
+                );
+                eprintln!("hint: e.g. fleety init ws://192.168.1.10:8787");
                 return std::process::ExitCode::from(2);
             }
             // Migrate only after the explicit endpoint has passed local syntax
@@ -2013,9 +2009,9 @@ fn resolve_target() -> Result<connection::Resolved> {
     // a local server on loopback over an mDNS advertisement. On the server host,
     // mDNS returns this box's own LAN IP, and a same-host connection to that LAN
     // IP is NOT loopback-trusted (it would demand pairing); 127.0.0.1 is. Plain
-    // The collecting mDNS path preserves advertised fingerprints and prefers a
-    // responder matching a stored pin, so an unrelated first response cannot
-    // steal selection or receive the pinned profile's token.
+    // The collecting mDNS path preserves advertised fingerprints as display /
+    // ordering hints only. Unsigned TXT data never grants profile provenance or
+    // a stored token.
     let r = connection::resolve(&conns, &over, env_url, env_token, || {
         prefer_loopback_discovery(
             || loopback_server_up(std::time::Duration::from_millis(300)),
@@ -2053,57 +2049,36 @@ fn resolve_target() -> Result<connection::Resolved> {
 /// Resolve + connect in one step: returns the split streams plus the resolved
 /// target (so callers can read its url/token). Every non-`init` connect site
 /// goes through here so they share one resolution (one mDNS probe, one token).
-/// When the sticky profile URL fails and the profile carries a pinned server
-/// fingerprint, one heal scan runs: an advertiser with the SAME fingerprint at
-/// a new address is adopted (persisted) and the connect retried once — any
-/// other advertiser is ignored and the original failure surfaces.
+/// A failed saved endpoint is never healed from unsigned mDNS TXT metadata.
+/// The user must explicitly select and re-pair the intended Server.
 async fn open(owner: &RemoteOwner) -> Result<(Tx, Rx, connection::Resolved)> {
-    let mut target = resolve_target()?;
+    let target = resolve_target()?;
     record_remote_context(&target, owner, None);
     match transport::connect(&target.url, target.token.as_deref()).await {
         Ok(ws) => {
             let (tx, rx) = ws.split();
             Ok((tx, rx, target))
         }
-        Err(e) => {
-            let profile = match &target.source {
-                connection::Source::Profile(name) | connection::Source::OverrideProfile(name) => {
-                    name
-                }
-                _ => return Err(e),
-            };
-            let Some(new_url) = connection::heal_profile(profile, &target.url) else {
-                return Err(e);
-            };
-            if !json_mode() && !quiet_mode() {
-                eprintln!("{}", profile_healing_notice(&target, &new_url));
-            }
-            target.url = new_url;
-            record_remote_context(&target, owner, None);
-            let (tx, rx) = transport::connect(&target.url, target.token.as_deref())
-                .await?
-                .split();
-            Ok((tx, rx, target))
-        }
+        Err(e) => match &target.source {
+            connection::Source::Profile(name) | connection::Source::OverrideProfile(name) => Err(
+                CoreError::Message(profile_recovery_error(name, &e.report().message)),
+            ),
+            _ => Err(e),
+        },
     }
 }
 
-fn profile_healing_notice(target: &connection::Resolved, new_url: &str) -> String {
-    let profile = match &target.source {
-        connection::Source::Profile(name) | connection::Source::OverrideProfile(name) => {
-            name.as_str()
-        }
-        _ => "current",
-    };
+fn profile_recovery_error(profile: &str, cause: &str) -> String {
     format!(
-        "server '{}' moved to {} (same identity fingerprint); reconnecting…",
+        "could not reach saved Server profile '{}': {}. {}",
         terminal_safe_field(profile),
-        terminal_safe_endpoint(new_url)
+        transport::redact_urls_in_text(cause),
+        connection::explicit_repair_guidance()
     )
 }
 
 /// The collecting scan + entry type live in `fleety_tools::connection` (shared
-/// with the daemon's sticky healing); the picker below is CLI-only.
+/// with the daemon's discovery); the picker below is CLI-only.
 use fleety_tools::connection::{discover_all_via_mdns, DiscoveredServer};
 
 /// The picker's parse of one input line: a 1-based pick mapped to its index,
@@ -2319,12 +2294,14 @@ fn hello(token: Option<String>, pairing_code: Option<String>) -> ClientMsg {
     }
 }
 
-/// `fleety pair <code>`: enroll this device against the current server; the
-/// minted token is written onto the current profile in connections.toml.
+/// `fleety pair <code>`: enroll against the current or explicitly overridden
+/// named profile; the minted token is written only to that exact profile.
 async fn pair(code: String) -> Result<()> {
     let target = resolve_target()?;
     let profile_name = match &target.source {
-        connection::Source::Profile(name) => name.clone(),
+        connection::Source::Profile(name) | connection::Source::OverrideProfile(name) => {
+            name.clone()
+        }
         _ => {
             return Err(CoreError::Message(
                 "pairing needs a named server profile so the credential has an unambiguous owner. Run `fleety init <ws-url> --name <name>`, then retry; no profile was modified"
@@ -2496,12 +2473,33 @@ async fn init(url: String, name: String, pairing_code: Option<String>) -> Result
     let initial = connection::load()?;
     let prior_profile = initial.profiles.get(&name).cloned();
     let initial_current = initial.current.clone();
-    let token = prior_profile
-        .as_ref()
-        .and_then(|profile| profile.token.clone());
-    let old_fingerprint = prior_profile
-        .as_ref()
-        .and_then(|profile| profile.fingerprint.clone());
+    let credentialed_endpoint_change = prior_profile.as_ref().is_some_and(|profile| {
+        profile.url != url
+            && profile
+                .token
+                .as_deref()
+                .is_some_and(|token| !token.is_empty())
+    });
+    if credentialed_endpoint_change && pairing_code.is_none() {
+        return Err(CoreError::Message(format!(
+            "server profile '{}' is paired to a different endpoint; changing it requires an explicit re-pair. Retry with `fleety init <ws-url> --name <profile> --pairing-code <code>`; the old token was not sent and connections.toml was not changed",
+            terminal_safe_field(&name)
+        )));
+    }
+    let token = (!credentialed_endpoint_change)
+        .then(|| {
+            prior_profile
+                .as_ref()
+                .and_then(|profile| profile.token.clone())
+        })
+        .flatten();
+    let old_fingerprint = (!credentialed_endpoint_change)
+        .then(|| {
+            prior_profile
+                .as_ref()
+                .and_then(|profile| profile.fingerprint.clone())
+        })
+        .flatten();
     let proposed_target = connection::Resolved {
         url: url.clone(),
         token: token.clone(),
@@ -2518,6 +2516,12 @@ async fn init(url: String, name: String, pairing_code: Option<String>) -> Result
             server_fingerprint,
             ..
         }) => {
+            if credentialed_endpoint_change && minted_token.is_none() {
+                return Err(CoreError::Message(
+                    "the selected Server did not complete re-pairing; the old token was not sent and connections.toml was not changed"
+                        .to_string(),
+                ));
+            }
             let observed_fingerprint = server_fingerprint.clone();
             if let Some(seen) = server_fingerprint.as_deref() {
                 if connection::tofu_pin_decision(old_fingerprint.as_deref(), seen)
@@ -2540,10 +2544,13 @@ async fn init(url: String, name: String, pairing_code: Option<String>) -> Result
                 }
                 let profile = live.profiles.entry(name.clone()).or_default();
                 profile.url = url.clone();
-                if let Some(minted) = minted_token.as_ref() {
+                if credentialed_endpoint_change {
+                    profile.token = minted_token.clone();
+                    profile.fingerprint = server_fingerprint.clone();
+                } else if let Some(minted) = minted_token.as_ref() {
                     profile.token = Some(minted.clone());
                 }
-                if old_fingerprint.is_none() {
+                if !credentialed_endpoint_change && old_fingerprint.is_none() {
                     profile.fingerprint = server_fingerprint.clone();
                 }
                 live.current = Some(name.clone());
@@ -3304,8 +3311,8 @@ fn hello_failure_message(reply: Option<&ServerMsg>) -> String {
 
 /// Trust-on-authenticated-connect: back-fill the current profile's server
 /// fingerprint from a successful Welcome (devices enrolled before fingerprints
-/// existed gain healing without re-pairing); warn — never overwrite — when the
-/// identity changed. Best-effort and quiet on the happy path.
+/// existed gain an identity pin without re-pairing); warn — never overwrite —
+/// when the identity changed. Best-effort and quiet on the happy path.
 fn tofu_pin(fingerprint: Option<&str>, target: &connection::Resolved) {
     let Some(fp) = fingerprint.filter(|f| !f.is_empty()) else {
         return;
@@ -3384,12 +3391,19 @@ async fn config_remote(target: ConfigTarget, args: &[String]) -> Result<()> {
         ConfigTarget::Local => "cli",
     };
     match config_remote_request(target, args).await? {
-        ConfigRequestResult::Success { output, effect } => {
+        ConfigRequestResult::Success {
+            output,
+            effect,
+            providers,
+        } => {
             if json_mode() {
                 let mut data = serde_json::json!({
                     "owner": owner_name,
                     "output": redact_urls_in_text(&output),
                 });
+                if let Some(providers) = providers {
+                    data["providers"] = provider_rows_value(&providers);
+                }
                 if let Some(effect) = effect_name(effect) {
                     data["effect"] = serde_json::Value::String(effect.to_string());
                 }
@@ -3419,8 +3433,60 @@ enum ConfigRequestResult {
     Success {
         output: String,
         effect: Option<Effect>,
+        providers: Option<Vec<ProviderJson>>,
     },
     Rejected(fleety_protocol::WireError),
+}
+
+#[derive(Debug)]
+struct ProviderJson {
+    name: String,
+    kind: String,
+    endpoint: String,
+    auth: String,
+    catalog: String,
+    roles: Vec<String>,
+    key_present: Option<bool>,
+}
+
+fn provider_views_json(
+    views: &[fleety_tools::provider_service::ProviderView],
+) -> Vec<ProviderJson> {
+    views
+        .iter()
+        .map(|view| ProviderJson {
+            name: view.name.clone(),
+            kind: view.kind.clone(),
+            endpoint: view.endpoint.label().to_string(),
+            auth: view.auth.label().to_string(),
+            catalog: crate::provider_service::catalog_label(&view.catalog).to_string(),
+            roles: view.roles.clone(),
+            key_present: view
+                .key
+                .map(|key| matches!(key, fleety_tools::provider_service::ApiKeyState::Set)),
+        })
+        .collect()
+}
+
+fn provider_rows_value(rows: &[ProviderJson]) -> serde_json::Value {
+    serde_json::Value::Array(
+        rows.iter()
+            .map(|row| {
+                let mut value = serde_json::json!({
+                    "name": row.name,
+                    "type": row.kind,
+                    "endpoint": row.endpoint,
+                    "auth": row.auth,
+                    "catalog": row.catalog,
+                    "roles": row.roles,
+                });
+                if let Some(key_present) = row.key_present {
+                    value["key_present"] = serde_json::Value::Bool(key_present);
+                }
+                value
+            })
+            .collect(),
+    )
 }
 
 fn effect_name(effect: Option<Effect>) -> Option<&'static str> {
@@ -3502,7 +3568,11 @@ async fn config_remote_request(
         let is_provider_list = matches!(command, fleety_tools::config::ProviderCmd::ProviderList);
         let snapshot =
             crate::provider_service::load_snapshot(&mut tx, &mut rx, config_protocol).await?;
-        let mut outcome = match crate::provider_service::apply_command(&snapshot.config, command) {
+        let mut outcome = match crate::provider_service::apply_command(
+            &snapshot.config,
+            &snapshot.key_present,
+            command,
+        ) {
             Ok(outcome) => outcome,
             Err(issue) => {
                 return Ok(ConfigRequestResult::Rejected(fleety_protocol::WireError {
@@ -3512,6 +3582,7 @@ async fn config_remote_request(
                 }))
             }
         };
+        let mut providers = None;
         if is_provider_list {
             let now_secs = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -3527,9 +3598,11 @@ async fn config_remote_request(
             .await;
             let views = crate::provider_service::provider_views(
                 &snapshot.config,
+                &snapshot.key_present,
                 &auth_states,
                 config_protocol,
             );
+            providers = Some(provider_views_json(&views));
             outcome.output = crate::provider_service::render_provider_views(&views);
         }
         if outcome.changed {
@@ -3552,6 +3625,7 @@ async fn config_remote_request(
         return Ok(ConfigRequestResult::Success {
             output: outcome.output,
             effect: outcome.changed.then_some(Effect::NextConnection),
+            providers,
         });
     }
     send(
@@ -3570,7 +3644,11 @@ async fn config_remote_request(
             error,
         }) => {
             if ok {
-                Ok(ConfigRequestResult::Success { output, effect })
+                Ok(ConfigRequestResult::Success {
+                    output,
+                    effect,
+                    providers: None,
+                })
             } else {
                 Ok(ConfigRequestResult::Rejected(error.unwrap_or(
                     fleety_protocol::WireError {
@@ -3667,11 +3745,18 @@ fn collect_config_owner_result(
         );
     }
     match result {
-        Ok(ConfigRequestResult::Success { output, effect }) => {
+        Ok(ConfigRequestResult::Success {
+            output,
+            effect,
+            providers,
+        }) => {
             data[owner] = serde_json::json!({
                 "output": output,
                 "effect": effect_name(effect),
             });
+            if let Some(providers) = providers {
+                data[owner]["providers"] = provider_rows_value(&providers);
+            }
             if !json_mode() {
                 if quiet_mode() {
                     let out = output.trim_end();
@@ -4615,7 +4700,7 @@ pub(crate) async fn recv(rx: &mut Rx) -> Result<Option<ServerMsg>> {
 #[cfg(test)]
 mod coverage_tests {
     use super::{
-        expand_long_option_equals, format_relative, format_uptime, profile_healing_notice,
+        expand_long_option_equals, format_relative, format_uptime, profile_recovery_error,
         truncate_preview,
     };
 
@@ -4674,17 +4759,10 @@ mod coverage_tests {
     }
 
     #[test]
-    fn profile_healing_notice_redacts_endpoint_and_sanitizes_profile() {
-        let target = fleety_tools::connection::Resolved {
-            url: "ws://old.test:8787".into(),
-            token: None,
-            source: fleety_tools::connection::Source::Profile(
-                "prod\u{1b}]52;c;STEAL\u{7}\r\nforged".into(),
-            ),
-        };
-        let notice = profile_healing_notice(
-            &target,
-            "wss://user:pass@new.test/x?token=SECRET#tail\u{1b}]52;c;STEAL\u{7}",
+    fn profile_recovery_error_redacts_cause_and_directs_explicit_repair() {
+        let notice = profile_recovery_error(
+            "prod\u{1b}]52;c;STEAL\u{7}\r\nforged",
+            "connect wss://user:pass@new.test/x?token=SECRET#tail failed",
         );
         for forbidden in ["pass", "SECRET", "#tail", "\u{1b}", "\u{7}", "\r", "\n"] {
             assert!(
@@ -4694,6 +4772,8 @@ mod coverage_tests {
         }
         assert!(notice.contains("prod\\u{1b}]52;c;STEAL\\u{7}\\r\\nforged"));
         assert!(notice.contains("wss://new.test/x?token=<redacted>"));
+        assert!(notice.contains("--pairing-code <code>"));
+        assert!(notice.contains("will not send the stored token or change the URL"));
     }
 
     #[test]

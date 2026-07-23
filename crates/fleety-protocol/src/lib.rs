@@ -17,8 +17,10 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// `ConfigApply`; `2` adds the credential frames (`CredentialPut`/`Status`/
 /// `Delete`); `3` makes those credential frames per-provider (they carry a
 /// `provider`, and a `codex-oauth` frame without one is rejected); `4` adds
-/// provider-specific model discovery. Additive — an older server omits it and
-/// the client sees `0`.
+/// provider-specific model discovery; `5` makes Provider keys write-only:
+/// snapshots expose only `key_present`, while apply uses an omitted key for
+/// Keep, a non-empty key for Set, and `clear_keys` for Clear. Additive — an
+/// older server omits it and the client sees `0`.
 pub const CONFIG_PROTOCOL_VERSION: u32 = 5;
 
 /// Wire form of an actionable error (mirrors `agent_core::ErrorReport`).
@@ -276,8 +278,9 @@ pub enum ClientMsg {
     /// update). `providers_json`, when present, writes back the structured
     /// provider config under the same revision lock. Since config protocol 5,
     /// snapshot keys are write-only: omitted keys mean Keep and newly supplied
-    /// values mean Set. Older servers must be rejected before a Provider snapshot
-    /// is requested. Reply: `ConfigResult`.
+    /// non-empty values mean Set; `providers_json.clear_keys` names explicit
+    /// Clear operations. Older servers must be rejected before a Provider
+    /// snapshot is requested. Reply: `ConfigResult`.
     ConfigApply {
         target: ConfigTarget,
         base_revision: String,
@@ -482,7 +485,8 @@ pub enum ServerMsg {
         entries: Vec<ConfigEntry>,
         /// JSON-encoded structured provider/model config. Provider key values are
         /// never included; config protocol 5 adds non-secret `key_present`
-        /// metadata and treats omitted keys as Keep on apply.
+        /// metadata. On apply, omitted keys mean Keep, non-empty values mean Set,
+        /// and `clear_keys` names explicit Clear operations.
         providers_json: String,
     },
     /// Reply to `CredentialPut` / `CredentialDelete`.
@@ -594,6 +598,62 @@ mod tests {
     }
 
     #[test]
+    fn config_protocol_history_v5_matches_write_only_provider_frames() {
+        assert_eq!(CONFIG_PROTOCOL_VERSION, 5);
+
+        let source = include_str!("lib.rs");
+        let history = source
+            .split("pub const CONFIG_PROTOCOL_VERSION")
+            .next()
+            .expect("config protocol history precedes the constant");
+        for required in ["`5`", "write-only", "`key_present`", "Keep", "Set", "Clear"] {
+            assert!(
+                history.contains(required),
+                "config protocol v5 history is missing {required}"
+            );
+        }
+
+        let snapshot = ServerMsg::ConfigSnapshotResult {
+            revision: "rev-v5".into(),
+            entries: vec![],
+            providers_json:
+                r#"{"providers":{"set":{"type":"api","base_url":"https://api.test/v1"}},"models":{},"key_present":["set"]}"#
+                    .into(),
+        };
+        let apply = ClientMsg::ConfigApply {
+            target: ConfigTarget::Server,
+            base_revision: "rev-v5".into(),
+            changes: vec![],
+            providers_json: Some(
+                r#"{"providers":{"keep":{"type":"api","base_url":"https://api.test/v1"},"set":{"type":"api","base_url":"https://api.test/v1","key":"write-only"},"clear":{"type":"api","base_url":"https://api.test/v1"}},"models":{},"clear_keys":["clear"]}"#
+                    .into(),
+            ),
+        };
+
+        let snapshot_frame = serde_json::to_value(snapshot).expect("snapshot");
+        let snapshot_providers: serde_json::Value = serde_json::from_str(
+            snapshot_frame["providers_json"]
+                .as_str()
+                .expect("snapshot json"),
+        )
+        .expect("snapshot providers");
+        assert_eq!(
+            snapshot_providers["key_present"],
+            serde_json::json!(["set"])
+        );
+        assert!(snapshot_providers["providers"]["set"].get("key").is_none());
+
+        let apply_frame = serde_json::to_value(apply).expect("apply");
+        let apply_providers: serde_json::Value =
+            serde_json::from_str(apply_frame["providers_json"].as_str().expect("apply json"))
+                .expect("apply providers");
+        assert!(apply_providers["providers"]["keep"].get("key").is_none());
+        assert_eq!(apply_providers["providers"]["set"]["key"], "write-only");
+        assert!(apply_providers["providers"]["clear"].get("key").is_none());
+        assert_eq!(apply_providers["clear_keys"], serde_json::json!(["clear"]));
+    }
+
+    #[test]
     fn structured_config_frames_roundtrip_and_tolerate_unknown() {
         // ConfigSnapshot / ConfigApply / ConfigSnapshotResult round-trip.
         let snap = ClientMsg::ConfigSnapshot {
@@ -639,7 +699,8 @@ mod tests {
             _ => panic!("not a config apply"),
         }
 
-        // A full provider write-back rides the same frame (config protocol 2).
+        // A full provider write-back rides the same frame (introduced in config
+        // protocol 2; write-only Keep/Set/Clear semantics require protocol 5).
         let apply_providers = ClientMsg::ConfigApply {
             target: ConfigTarget::Server,
             base_revision: "rev-1".into(),
