@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use agent_core::{CoreError, Result};
 use fleety_protocol::{ChangeOp, ClientMsg, ConfigChange, ConfigEntry, ConfigTarget, ServerMsg};
 use fleety_tools::connection::{self, Connections};
-use ratatui::crossterm::event::KeyCode;
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Paragraph};
@@ -108,6 +108,14 @@ enum ProfileSwitchResolution {
     Cancel,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProfileSwitchRetryAction {
+    PassThrough,
+    Waiting,
+    Retry,
+    Cancelled,
+}
+
 struct ProfileSwitchPrompt {
     old_profile: String,
     new_profile: String,
@@ -139,6 +147,7 @@ struct Panel {
     /// save before the run loop is allowed to replace the live transport.
     profile_switch_pending: Option<String>,
     profile_switch_discard_pending: bool,
+    profile_switch_retry_required: bool,
     profile_switch_prompt: Option<ProfileSwitchPrompt>,
     profile_switch_apply_now: bool,
     // CLI region.
@@ -245,6 +254,7 @@ impl Panel {
             active_endpoint,
             profile_switch_pending: None,
             profile_switch_discard_pending: false,
+            profile_switch_retry_required: false,
             profile_switch_prompt: None,
             profile_switch_apply_now: false,
             local,
@@ -278,7 +288,7 @@ impl Panel {
 
     fn activate_target(&mut self, target: &connection::Resolved) {
         self.active_profile = crate::workspace_profile_label(target);
-        self.active_endpoint = Some(target.url.clone());
+        self.active_endpoint = Some(target.url_owned());
     }
 
     /// Invalidate every piece of state tied to the previously connected
@@ -323,6 +333,7 @@ impl Panel {
     fn queue_profile_switch(&mut self, profile: &str, discard_after_persist: bool) {
         self.profile_switch_pending = Some(profile.to_string());
         self.profile_switch_discard_pending = discard_after_persist;
+        self.profile_switch_retry_required = false;
         self.profile_switch_prompt = None;
         self.profile_switch_apply_now = false;
         self.status = format!("saving profile selection '{profile}'…");
@@ -367,7 +378,47 @@ impl Panel {
                 self.profile_switch_prompt = None;
                 self.profile_switch_apply_now = false;
                 self.profile_switch_discard_pending = false;
+                self.profile_switch_retry_required = false;
                 self.status = "profile switch cancelled; staged changes retained".into();
+            }
+        }
+    }
+
+    fn resolve_profile_switch_retry(&mut self, key: KeyEvent) -> ProfileSwitchRetryAction {
+        if !self.profile_switch_retry_required {
+            return ProfileSwitchRetryAction::PassThrough;
+        }
+        if matches!(
+            key.code,
+            KeyCode::Char(character) if character.eq_ignore_ascii_case(&'c')
+        ) && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            return ProfileSwitchRetryAction::PassThrough;
+        }
+        if !key.modifiers.is_empty() {
+            self.status =
+                "profile selection remains pending; press r/Enter to retry or Esc/q to cancel"
+                    .into();
+            return ProfileSwitchRetryAction::Waiting;
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.profile_switch_pending = None;
+                self.profile_switch_discard_pending = false;
+                self.profile_switch_retry_required = false;
+                self.status = "profile switch cancelled; applied owner settings retained".into();
+                ProfileSwitchRetryAction::Cancelled
+            }
+            KeyCode::Enter | KeyCode::Char('r') => {
+                self.profile_switch_retry_required = false;
+                self.status = "retrying profile selection…".into();
+                ProfileSwitchRetryAction::Retry
+            }
+            _ => {
+                self.status =
+                    "profile selection remains pending; press r/Enter to retry or Esc/q to cancel"
+                        .into();
+                ProfileSwitchRetryAction::Waiting
             }
         }
     }
@@ -856,7 +907,7 @@ fn render_in_area(f: &mut Frame, p: &Panel, area: ratatui::layout::Rect) {
                     .conns
                     .profiles
                     .get(name)
-                    .map(|x| crate::terminal_safe_endpoint(&x.url))
+                    .map(connection_endpoint_label)
                     .unwrap_or_default();
                 let name = crate::terminal_safe_text(name);
                 lines.push(Line::from(format!("{marker}{cur} {name:<14} {url}")));
@@ -1016,6 +1067,14 @@ fn render_in_area(f: &mut Frame, p: &Panel, area: ratatui::layout::Rect) {
     };
     let footer = vec![Line::from(hints), Line::from(status_line)];
     f.render_widget(Paragraph::new(footer).block(Block::bordered()), chunks[2]);
+}
+
+fn connection_endpoint_label(profile: &connection::Profile) -> String {
+    if profile.url.is_empty() {
+        "(endpoint required — run `fleety init`)".to_string()
+    } else {
+        crate::terminal_safe_endpoint(&profile.url)
+    }
 }
 
 fn active_owner_error(panel: &Panel) -> Option<&crate::workspace::WorkspaceError> {
@@ -1184,13 +1243,13 @@ fn sync_active_target_context(
     fingerprint: Option<&str>,
 ) {
     if let Some(target) = target {
-        if workspace.context.endpoint.as_deref() != Some(target.url.as_str()) {
+        if workspace.context.endpoint.as_deref() != Some(target.url()) {
             workspace.context.provider = None;
             workspace.context.model = None;
             workspace.context.conversation_id = None;
         }
         workspace.context.profile = Some(crate::workspace_profile_label(target));
-        workspace.context.endpoint = Some(target.url.clone());
+        workspace.context.endpoint = Some(target.url_owned());
         workspace.context.server_identity = fingerprint.map(str::to_string);
     } else {
         workspace.context.server_identity = None;
@@ -1258,20 +1317,13 @@ fn has_local_profile(conns: &Connections, local_url: &str) -> bool {
 /// global current profile so the reconnect transaction cannot drift to a
 /// different server while awaiting network I/O.
 fn resolve_saved_profile(conns: &Connections, name: &str) -> Result<connection::Resolved> {
-    let profile = conns
-        .profiles
-        .get(name)
-        .ok_or_else(|| CoreError::Message(format!("server profile '{name}' no longer exists")))?;
-    if profile.url.is_empty() {
-        return Err(CoreError::Message(format!(
-            "server profile '{name}' has no url; set one before making it current"
-        )));
-    }
-    Ok(connection::Resolved {
-        url: profile.url.clone(),
-        token: profile.token.clone(),
-        source: connection::Source::Profile(name.to_string()),
-    })
+    connection::resolve(
+        conns,
+        &connection::Target::Named(name.to_string()),
+        None,
+        None,
+        || None,
+    )
 }
 
 /// Close and remove the previous panel transport before connecting one
@@ -1283,7 +1335,7 @@ async fn replace_profile_connection(
         fleety_tools::transport::Receiver,
     )>,
     target: &connection::Resolved,
-    expected_fingerprint: Option<&str>,
+    connections_path: &std::path::Path,
 ) -> Result<(
     (
         fleety_tools::transport::Sender,
@@ -1291,26 +1343,14 @@ async fn replace_profile_connection(
     ),
     u32,
     Option<String>,
+    connection::Resolved,
 )> {
     if let Some((mut tx, _)) = old.take() {
         tx.close().await;
     }
-    let (mut tx, rx, config_protocol, fingerprint) =
-        crate::connect_hello_for_auth_target(target).await?;
-    if let Some(expected) = expected_fingerprint {
-        if fingerprint.as_deref() != Some(expected) {
-            tx.close().await;
-            return Err(CoreError::Message(format!(
-                "server profile identity changed while switching; expected '{}', received '{}'",
-                crate::terminal_safe_field(expected),
-                fingerprint
-                    .as_deref()
-                    .map(crate::terminal_safe_field)
-                    .unwrap_or_else(|| "none".to_string())
-            )));
-        }
-    }
-    Ok(((tx, rx), config_protocol, fingerprint))
+    let (tx, rx, config_protocol, fingerprint, committed_target) =
+        crate::connect_hello_for_profile_switch_target(target, connections_path).await?;
+    Ok(((tx, rx), config_protocol, fingerprint, committed_target))
 }
 
 async fn apply_staged_before_profile_switch(
@@ -1319,6 +1359,7 @@ async fn apply_staged_before_profile_switch(
         fleety_tools::transport::Sender,
         fleety_tools::transport::Receiver,
     )>,
+    config_protocol: u32,
 ) -> bool {
     panel.profile_switch_apply_now = false;
     let Some(new_profile) = panel
@@ -1328,58 +1369,56 @@ async fn apply_staged_before_profile_switch(
     else {
         return false;
     };
+    if panel.daemon_refresh_required || panel.server_refresh_required {
+        let owner = if panel.daemon_refresh_required {
+            Region::Daemon
+        } else {
+            Region::Server
+        };
+        panel.status = format!(
+            "profile switch paused: {}",
+            Panel::refresh_required_message(owner)
+        );
+        return false;
+    }
     let Some((tx, rx)) = connection.as_mut() else {
         panel.status = "cannot apply staged changes: the current Server is unavailable".into();
         return false;
     };
     if !panel.daemon_staged.is_empty() {
         let changes = panel.daemon_staged.values().cloned().collect();
-        match apply_changes(
+        let outcome = apply_and_refresh(
             tx,
             rx,
             ConfigTarget::Device(panel.daemon_device_id.clone()),
             &panel.daemon_revision,
             changes,
+            config_protocol,
         )
-        .await
-        {
-            Ok(_) => {
-                panel.daemon_staged.clear();
-                panel.daemon_apply_error = None;
-            }
-            Err(error) => {
-                panel.daemon_apply_error = Some(crate::workspace::WorkspaceError {
-                    kind: error.kind,
-                    message: error.message.clone(),
-                    remediation: error.remediation,
-                });
-                panel.status = format!(
-                    "profile switch paused: Daemon apply failed: {}",
-                    error.message
-                );
-                return false;
-            }
+        .await;
+        let refreshed = matches!(&outcome, Ok(OwnerApplyRefresh::Refreshed { .. }));
+        panel.finish_remote_apply(Region::Daemon, outcome);
+        if !refreshed {
+            panel.status = format!("profile switch paused: {}", panel.status);
+            return false;
         }
     }
     if !panel.staged.is_empty() {
         let changes = panel.staged.values().cloned().collect();
-        match apply_changes(tx, rx, ConfigTarget::Server, &panel.revision, changes).await {
-            Ok(_) => {
-                panel.staged.clear();
-                panel.server_apply_error = None;
-            }
-            Err(error) => {
-                panel.server_apply_error = Some(crate::workspace::WorkspaceError {
-                    kind: error.kind,
-                    message: error.message.clone(),
-                    remediation: error.remediation,
-                });
-                panel.status = format!(
-                    "profile switch paused: Server apply failed: {}",
-                    error.message
-                );
-                return false;
-            }
+        let outcome = apply_and_refresh(
+            tx,
+            rx,
+            ConfigTarget::Server,
+            &panel.revision,
+            changes,
+            config_protocol,
+        )
+        .await;
+        let refreshed = matches!(&outcome, Ok(OwnerApplyRefresh::Refreshed { .. }));
+        panel.finish_remote_apply(Region::Server, outcome);
+        if !refreshed {
+            panel.status = format!("profile switch paused: {}", panel.status);
+            return false;
         }
     }
     panel.queue_profile_switch(&new_profile, false);
@@ -1392,12 +1431,14 @@ async fn commit_profile_switch(
         fleety_tools::transport::Sender,
         fleety_tools::transport::Receiver,
     )>,
+    config_protocol: &mut Option<u32>,
     active_target: &mut Option<connection::Resolved>,
     active_fingerprint: &mut Option<String>,
 ) {
     commit_profile_switch_at(
         panel,
         connection,
+        config_protocol,
         active_target,
         active_fingerprint,
         &connection::connections_path(),
@@ -1415,6 +1456,7 @@ async fn commit_profile_switch_at(
         fleety_tools::transport::Sender,
         fleety_tools::transport::Receiver,
     )>,
+    config_protocol: &mut Option<u32>,
     active_target: &mut Option<connection::Resolved>,
     active_fingerprint: &mut Option<String>,
     connections_path: &std::path::Path,
@@ -1437,37 +1479,45 @@ async fn commit_profile_switch_at(
         // held. Concurrent token/fingerprint rotation is legitimate and this
         // switch must reconnect with that live snapshot, not panel.conns.
         let target = resolve_saved_profile(live, &profile)?;
-        let expected_fingerprint = live
-            .profiles
-            .get(&profile)
-            .and_then(|profile| profile.fingerprint.clone());
         live.current = Some(profile.clone());
-        Ok((live.clone(), target, expected_fingerprint))
+        Ok((live.clone(), target))
     });
-    let (persisted, target, expected_fingerprint) = match persisted {
+    let (persisted, target) = match persisted {
         Ok(result) => result,
         Err(error) => {
             panel.conns.current = old_persisted_profile;
-            panel.profile_switch_pending = None;
-            panel.profile_switch_prompt = Some(ProfileSwitchPrompt {
-                old_profile: old_active_profile,
-                new_profile: profile,
-                selected: usize::from(panel.profile_switch_discard_pending),
-            });
-            panel.status = format!(
-                "profile selection was not saved: {} — staged changes retained",
-                error.report().message
-            );
+            if panel.daemon_staged.is_empty() && panel.staged.is_empty() {
+                panel.profile_switch_prompt = None;
+                panel.profile_switch_retry_required = true;
+                panel.status = format!(
+                    "profile selection was not saved: {} — profile selection remains pending; press r/Enter to retry or Esc/q to cancel",
+                    error.report().message
+                );
+            } else {
+                panel.profile_switch_pending = None;
+                panel.profile_switch_retry_required = false;
+                panel.profile_switch_prompt = Some(ProfileSwitchPrompt {
+                    old_profile: old_active_profile,
+                    new_profile: profile,
+                    selected: usize::from(panel.profile_switch_discard_pending),
+                });
+                panel.status = format!(
+                    "profile selection was not saved: {} — staged changes retained",
+                    error.report().message
+                );
+            }
             return;
         }
     };
     panel.persisted_conns = persisted.clone();
     panel.conns = persisted;
-
+    // Persistence changes the Daemon's authoritative owner immediately. Tell
+    // fleetyd to leave its old session even if the CLI's own B handshake later
+    // fails; otherwise disk/UI can say B while A keeps accepting control.
     let daemon_notice = match notify_daemon(&profile) {
         Ok(message) => message,
         Err(error) => format!(
-            "fleetyd notification failed: {}; profile is saved, run `fleetyd reconnect --profile {profile}`",
+            "fleetyd reconnect failed: {}; profile is saved, run `fleetyd reconnect --profile {profile}`",
             error.report().message
         ),
     };
@@ -1475,11 +1525,14 @@ async fn commit_profile_switch_at(
     let discarded = panel.profile_switch_discard_pending;
     panel.profile_switch_pending = None;
     panel.profile_switch_discard_pending = false;
+    panel.profile_switch_retry_required = false;
     panel.invalidate_remote_for_reconnect(&profile, discarded);
+    *config_protocol = None;
     *active_target = None;
     *active_fingerprint = None;
-    match replace_profile_connection(connection, &target, expected_fingerprint.as_deref()).await {
-        Ok((new_connection, protocol, fingerprint)) => {
+    match replace_profile_connection(connection, &target, connections_path).await {
+        Ok((new_connection, protocol, fingerprint, committed_target)) => {
+            *config_protocol = Some(protocol);
             let (mut new_tx, mut new_rx) = new_connection;
             let (server, daemon, notes) =
                 reload_remote_regions(&mut new_tx, &mut new_rx, protocol, &panel.daemon_device_id)
@@ -1491,7 +1544,7 @@ async fn commit_profile_switch_at(
             panel.daemon_entries = daemon.entries;
             panel.daemon_revision = daemon.revision;
             *connection = Some((new_tx, new_rx));
-            *active_target = Some(target);
+            *active_target = Some(committed_target);
             *active_fingerprint = fingerprint;
             panel.status = if notes.is_empty() {
                 format!(
@@ -1506,11 +1559,45 @@ async fn commit_profile_switch_at(
         }
         Err(error) => {
             panel.status = format!(
-                "selected profile '{profile}', but reconnect failed: {} — Server and Daemon are unavailable; the previous connection and snapshots were not reused; {daemon_notice}",
+                "selected profile '{profile}', but CLI reconnect failed: {} — Server and Daemon settings are unavailable; the previous CLI connection and snapshots were not reused; {daemon_notice}",
                 error.report().message,
             );
         }
     }
+}
+
+fn save_connection_url_edits_at(
+    path: &std::path::Path,
+    pending: &connection::Connections,
+    baseline: &connection::Connections,
+) -> Result<(connection::Connections, Option<String>)> {
+    connection::mutate_at(path, |live| {
+        let mut reconnect_profile = None;
+        for (name, edited) in &pending.profiles {
+            let Some(before) = baseline.profiles.get(name) else {
+                continue;
+            };
+            if edited.url == before.url {
+                continue;
+            }
+            let is_live_current = live.current.as_deref() == Some(name.as_str());
+            let current = live.profiles.get_mut(name).ok_or_else(|| {
+                CoreError::Message(format!(
+                    "server profile '{name}' was removed in another Fleety process"
+                ))
+            })?;
+            if current.url != before.url {
+                return Err(CoreError::Message(format!(
+                    "server profile '{name}' changed in another Fleety process; reopen Settings"
+                )));
+            }
+            connection::reselect_profile_endpoint(current, edited.url.clone());
+            if is_live_current {
+                reconnect_profile = Some(name.clone());
+            }
+        }
+        Ok((live.clone(), reconnect_profile))
+    })
 }
 
 /// `fleety config` (bare, on a TTY): a top-level menu — pick what to configure
@@ -1599,23 +1686,24 @@ async fn run_settings(
     // protocol. On any connection failure, the panel still opens for the CLI
     // + connection regions; the daemon and server regions report unavailable.
     let requested_target = crate::resolve_target()?;
-    let (mut conn, config_protocol, mut active_fingerprint) =
+    let (mut conn, mut config_protocol, mut active_fingerprint, mut active_target) =
         match crate::open_panel(&requested_target).await {
-            Ok((streams, cp, fingerprint)) => (Some(streams), Some(cp), fingerprint),
+            Ok((streams, cp, fingerprint, committed_target)) => {
+                (Some(streams), Some(cp), fingerprint, Some(committed_target))
+            }
             Err(e) => {
                 eprintln!(
                     "note: could not reach the server ({}) — the Daemon and Server regions are \
                      unavailable; the Connection and CLI regions still work.",
                     crate::terminal_safe_text(&e.report().message)
                 );
-                (None, None, None)
+                (None, None, None, Some(requested_target))
             }
         };
     // Invocation context remains the active identity even when its transport is
     // unavailable. Falling back to `conns.current` here would make
     // `--profile B config open` present and mutate profile A after a failed B
     // connection attempt.
-    let mut active_target = Some(requested_target);
     let mut server_supported = false;
     let mut entries: Vec<ConfigEntry> = Vec::new();
     let mut revision = String::new();
@@ -1745,6 +1833,20 @@ async fn run_settings(
         let Some(mut key) = input.recv().await else {
             break Ok(crate::workspace::SessionResult::Exit);
         };
+        if app.profile_switch_retry_required {
+            match app.resolve_profile_switch_retry(key) {
+                ProfileSwitchRetryAction::PassThrough => {}
+                ProfileSwitchRetryAction::Retry => {
+                    key = ratatui::crossterm::event::KeyEvent::new(
+                        KeyCode::Null,
+                        ratatui::crossterm::event::KeyModifiers::NONE,
+                    );
+                }
+                ProfileSwitchRetryAction::Cancelled | ProfileSwitchRetryAction::Waiting => {
+                    continue;
+                }
+            }
+        }
         if app.profile_switch_prompt.is_some() {
             on_key(&mut app, key.code);
             sync_workspace_from_panel(&mut workspace, &app);
@@ -1790,7 +1892,13 @@ async fn run_settings(
                     render_in_area(frame, &app, area);
                 });
             });
-            if !apply_staged_before_profile_switch(&mut app, &mut conn).await {
+            if !apply_staged_before_profile_switch(
+                &mut app,
+                &mut conn,
+                config_protocol.unwrap_or_default(),
+            )
+            .await
+            {
                 let error = app
                     .daemon_apply_error
                     .as_ref()
@@ -1807,6 +1915,7 @@ async fn run_settings(
             commit_profile_switch(
                 &mut app,
                 &mut conn,
+                &mut config_protocol,
                 &mut active_target,
                 &mut active_fingerprint,
             )
@@ -1828,36 +1937,33 @@ async fn run_settings(
                         && (before.token.is_some() || before.fingerprint.is_some())
                 })
             });
-            match connection::mutate(|live| {
-                for (name, edited) in &pending.profiles {
-                    let Some(before) = baseline.profiles.get(name) else {
-                        continue;
-                    };
-                    if edited.url == before.url {
-                        continue;
-                    }
-                    let current = live.profiles.get_mut(name).ok_or_else(|| {
-                        CoreError::Message(format!(
-                            "server profile '{name}' was removed in another Fleety process"
-                        ))
-                    })?;
-                    if current.url != before.url {
-                        return Err(CoreError::Message(format!(
-                            "server profile '{name}' changed in another Fleety process; reopen Settings"
-                        )));
-                    }
-                    connection::reselect_profile_endpoint(current, edited.url.clone());
-                }
-                Ok(live.clone())
-            }) {
-                Ok(saved) => {
+            match save_connection_url_edits_at(&connection::connections_path(), &pending, &baseline)
+            {
+                Ok((saved, reconnect_profile)) => {
                     app.persisted_conns = saved.clone();
                     app.conns = saved;
-                    app.status = if needs_repair {
+                    let base_status = if needs_repair {
                         "saved connections; old credentials were cleared — re-pair the changed profile"
                             .to_string()
                     } else {
                         "saved connections".to_string()
+                    };
+                    app.status = if let Some(profile) = reconnect_profile {
+                        conn = None;
+                        config_protocol = None;
+                        active_target = None;
+                        active_fingerprint = None;
+                        app.invalidate_remote_for_reconnect(&profile, false);
+                        match crate::server::notify_daemon_reconnect(&profile) {
+                            Ok(notice) if notice.is_empty() => base_status,
+                            Ok(notice) => format!("{base_status}; {notice}"),
+                            Err(error) => format!(
+                                "{base_status}; fleetyd notification failed: {} — run `fleetyd reconnect --profile {profile}`",
+                                error.report().message
+                            ),
+                        }
+                    } else {
+                        base_status
                     };
                 }
                 Err(e) => {
@@ -1986,9 +2092,13 @@ async fn pull_snapshot(
             revision, entries, ..
         }) => Ok((revision, entries)),
         Some(ServerMsg::Error { error }) => Err(CoreError::Provider(error.message)),
-        other => Err(CoreError::Provider(format!(
-            "expected a config snapshot, got {other:?}"
+        Some(other) => Err(CoreError::Provider(format!(
+            "expected a config snapshot, got {}",
+            crate::server_msg_kind(&other)
         ))),
+        None => Err(CoreError::Provider(
+            "the Server closed before returning a config snapshot".to_string(),
+        )),
     }
 }
 
@@ -2278,6 +2388,220 @@ mod tests {
         (format!("ws://{addr}"), requests_rx)
     }
 
+    #[derive(Clone, Copy)]
+    enum ProfileSwitchApplyScript {
+        ServerConflict,
+        DaemonRefreshFailure,
+        AllRefreshed,
+        ReloadThenServerApply,
+    }
+
+    async fn start_profile_switch_apply_server(
+        script: ProfileSwitchApplyScript,
+    ) -> (String, oneshot::Receiver<Vec<ClientMsg>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind profile switch apply server");
+        let addr = listener.local_addr().expect("profile switch apply address");
+        let (requests_tx, requests_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let (stream, _) = listener
+                .accept()
+                .await
+                .expect("accept profile switch apply connection");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("accept profile switch apply websocket");
+            let mut requests = Vec::new();
+            let mut server_snapshots = 0;
+            loop {
+                let frame = match tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    websocket.next(),
+                )
+                .await
+                {
+                    Ok(Some(Ok(frame))) => frame,
+                    _ => break,
+                };
+                let request: ClientMsg =
+                    serde_json::from_str(frame.to_text().expect("profile switch request is text"))
+                        .expect("parse profile switch request");
+                let response = match &request {
+                    ClientMsg::Hello { .. } => ServerMsg::Welcome {
+                        session_id: "profile-switch-session".into(),
+                        conversation_id: "profile-switch-conversation".into(),
+                        protocol: fleety_protocol::PROTOCOL_VERSION,
+                        server_version: String::new(),
+                        audio_input: false,
+                        config_protocol: fleety_protocol::CONFIG_PROTOCOL_VERSION,
+                        server_fingerprint: Some("fingerprint-a".into()),
+                        loopback_trusted: false,
+                        token: None,
+                    },
+                    ClientMsg::ConfigApply {
+                        target: ConfigTarget::Device(device),
+                        ..
+                    } => {
+                        assert_eq!(device, "remote-B");
+                        ServerMsg::ConfigResult {
+                            ok: true,
+                            output: "Daemon saved".into(),
+                            effect: None,
+                            error: None,
+                        }
+                    }
+                    ClientMsg::ConfigSnapshot {
+                        target: ConfigTarget::Device(device),
+                    } => {
+                        assert_eq!(device, "remote-B");
+                        match script {
+                            ProfileSwitchApplyScript::DaemonRefreshFailure => ServerMsg::Error {
+                                error: fleety_protocol::WireError {
+                                    kind: "snapshot_failed".into(),
+                                    message: "fresh Daemon snapshot unavailable".into(),
+                                    remediation: None,
+                                },
+                            },
+                            _ => ServerMsg::ConfigSnapshotResult {
+                                revision: if matches!(
+                                    script,
+                                    ProfileSwitchApplyScript::ReloadThenServerApply
+                                ) {
+                                    "daemon-r1"
+                                } else {
+                                    "daemon-r2"
+                                }
+                                .into(),
+                                entries: vec![entry(
+                                    "FLEETY_TZ",
+                                    if matches!(
+                                        script,
+                                        ProfileSwitchApplyScript::ReloadThenServerApply
+                                    ) {
+                                        "UTC"
+                                    } else {
+                                        "Asia/Taipei"
+                                    },
+                                    false,
+                                )],
+                                providers_json: String::new(),
+                            },
+                        }
+                    }
+                    ClientMsg::ConfigApply {
+                        target: ConfigTarget::Server,
+                        ..
+                    } => match script {
+                        ProfileSwitchApplyScript::ServerConflict => ServerMsg::ConfigResult {
+                            ok: false,
+                            output: String::new(),
+                            effect: None,
+                            error: Some(fleety_protocol::WireError {
+                                kind: "conflict".into(),
+                                message: "Server revision changed".into(),
+                                remediation: Some("Reload Server settings".into()),
+                            }),
+                        },
+                        _ => ServerMsg::ConfigResult {
+                            ok: true,
+                            output: "Server saved".into(),
+                            effect: None,
+                            error: None,
+                        },
+                    },
+                    ClientMsg::ConfigSnapshot {
+                        target: ConfigTarget::Server,
+                    } => {
+                        server_snapshots += 1;
+                        let initial_reload =
+                            matches!(script, ProfileSwitchApplyScript::ReloadThenServerApply)
+                                && server_snapshots == 1;
+                        ServerMsg::ConfigSnapshotResult {
+                            revision: if initial_reload {
+                                "server-r1"
+                            } else {
+                                "server-r2"
+                            }
+                            .into(),
+                            entries: vec![entry(
+                                "FLEETY_POLICY",
+                                if initial_reload {
+                                    "full_access"
+                                } else {
+                                    "require_approval"
+                                },
+                                false,
+                            )],
+                            providers_json: r#"{"key_present":[]}"#.into(),
+                        }
+                    }
+                    other => panic!("unexpected profile switch request: {other:?}"),
+                };
+                requests.push(request);
+                websocket
+                    .send(Message::Text(
+                        serde_json::to_string(&response)
+                            .expect("serialize profile switch response"),
+                    ))
+                    .await
+                    .expect("send profile switch response");
+                let expected_requests =
+                    if matches!(script, ProfileSwitchApplyScript::ReloadThenServerApply) {
+                        5
+                    } else {
+                        4
+                    };
+                if requests.len() == expected_requests {
+                    break;
+                }
+            }
+            let _ = requests_tx.send(requests);
+        });
+        (format!("ws://{addr}"), requests_rx)
+    }
+
+    fn dirty_two_owner_profile_switch_panel() -> Panel {
+        let mut panel = Panel::new(
+            Connections {
+                current: Some("A".into()),
+                ..Default::default()
+            },
+            fleety_tools::config::ConfigMap::new(),
+            RemoteRegionState::new(
+                true,
+                vec![entry("FLEETY_TZ", "UTC", false)],
+                "daemon-r1".into(),
+            ),
+            RemoteRegionState::new(
+                true,
+                vec![entry("FLEETY_POLICY", "full_access", false)],
+                "server-r1".into(),
+            ),
+        );
+        panel.active_profile = "A".into();
+        panel.daemon_device_id = "remote-B".into();
+        panel.daemon_staged.insert(
+            "FLEETY_TZ".into(),
+            ConfigChange {
+                key: "FLEETY_TZ".into(),
+                op: ChangeOp::Set,
+                value: Some("Asia/Taipei".into()),
+            },
+        );
+        panel.staged.insert(
+            "FLEETY_POLICY".into(),
+            ConfigChange {
+                key: "FLEETY_POLICY".into(),
+                op: ChangeOp::Set,
+                value: Some("require_approval".into()),
+            },
+        );
+        panel.request_profile_switch("B".into());
+        panel.resolve_profile_switch(ProfileSwitchResolution::Apply);
+        panel
+    }
+
     #[test]
     fn has_local_profile_matches_by_url() {
         let mut conns = Connections::default();
@@ -2477,11 +2801,11 @@ mod tests {
             RemoteRegionState::new(false, vec![], String::new()),
             RemoteRegionState::new(false, vec![], String::new()),
         );
-        let target = connection::Resolved {
-            url: "ws://b.test:8787".into(),
-            token: None,
-            source: connection::Source::Profile("B".into()),
-        };
+        let target = connection::Resolved::unowned(
+            "ws://b.test:8787".into(),
+            None,
+            connection::Source::Profile("B".into()),
+        );
         panel.activate_target(&target);
 
         assert!(!panel.daemon_supported);
@@ -2551,6 +2875,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn profile_selection_save_failure_after_apply_stays_pending_without_dirty_modal() {
+        let mut conns = Connections {
+            current: Some("A".into()),
+            ..Default::default()
+        };
+        conns.profiles.insert(
+            "A".into(),
+            connection::Profile {
+                url: "ws://a.test:8787".into(),
+                ..Default::default()
+            },
+        );
+        conns.profiles.insert(
+            "B".into(),
+            connection::Profile {
+                url: "ws://b.test:8787".into(),
+                ..Default::default()
+            },
+        );
+        let mut panel = Panel::new(
+            conns,
+            fleety_tools::config::ConfigMap::new(),
+            RemoteRegionState::new(
+                true,
+                vec![entry("FLEETY_TZ", "Asia/Taipei", false)],
+                "daemon-r2".into(),
+            ),
+            RemoteRegionState::new(
+                true,
+                vec![entry("FLEETY_POLICY", "require_approval", false)],
+                "server-r2".into(),
+            ),
+        );
+        panel.queue_profile_switch("B", false);
+        let blocked_path = std::env::temp_dir().join(format!(
+            "fleety-profile-switch-applied-blocked-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&blocked_path).expect("create blocking directory");
+        let mut connection = None;
+        let mut config_protocol = Some(fleety_protocol::CONFIG_PROTOCOL_VERSION);
+        let mut active_target = None;
+        let mut active_fingerprint = None;
+
+        commit_profile_switch_at(
+            &mut panel,
+            &mut connection,
+            &mut config_protocol,
+            &mut active_target,
+            &mut active_fingerprint,
+            &blocked_path,
+            |_| Ok("fleetyd test reconnect accepted".to_string()),
+        )
+        .await;
+
+        assert_eq!(panel.conns.current.as_deref(), Some("A"));
+        assert_eq!(panel.profile_switch_pending.as_deref(), Some("B"));
+        assert!(panel.profile_switch_prompt.is_none());
+        assert!(panel.daemon_staged.is_empty());
+        assert!(panel.staged.is_empty());
+        assert_eq!(panel.daemon_revision, "daemon-r2");
+        assert_eq!(panel.revision, "server-r2");
+        assert_eq!(
+            config_protocol,
+            Some(fleety_protocol::CONFIG_PROTOCOL_VERSION)
+        );
+        assert!(panel.status.contains("profile selection remains pending"));
+        assert!(!panel.status.contains("staged changes retained"));
+        assert!(panel.profile_switch_retry_required);
+
+        assert_eq!(
+            panel.resolve_profile_switch_retry(KeyEvent::new(
+                KeyCode::Char('r'),
+                KeyModifiers::CONTROL,
+            )),
+            ProfileSwitchRetryAction::Waiting
+        );
+        assert_eq!(
+            panel.resolve_profile_switch_retry(KeyEvent::new(
+                KeyCode::Char('q'),
+                KeyModifiers::CONTROL,
+            )),
+            ProfileSwitchRetryAction::Waiting
+        );
+        assert_eq!(
+            panel.resolve_profile_switch_retry(KeyEvent::new(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+            )),
+            ProfileSwitchRetryAction::PassThrough
+        );
+        assert_eq!(
+            panel.resolve_profile_switch_retry(KeyEvent::new(
+                KeyCode::Char('C'),
+                KeyModifiers::CONTROL,
+            )),
+            ProfileSwitchRetryAction::PassThrough
+        );
+        assert_eq!(
+            panel.resolve_profile_switch_retry(KeyEvent::new(
+                KeyCode::Char('C'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            )),
+            ProfileSwitchRetryAction::PassThrough
+        );
+        assert_eq!(panel.profile_switch_pending.as_deref(), Some("B"));
+        assert_eq!(
+            panel.resolve_profile_switch_retry(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            ProfileSwitchRetryAction::Cancelled
+        );
+        assert!(!panel.profile_switch_retry_required);
+        assert!(panel.profile_switch_pending.is_none());
+        commit_profile_switch_at(
+            &mut panel,
+            &mut connection,
+            &mut config_protocol,
+            &mut active_target,
+            &mut active_fingerprint,
+            &blocked_path,
+            |_| panic!("Esc cancellation must prevent profile persistence and reconnect"),
+        )
+        .await;
+        assert_eq!(panel.conns.current.as_deref(), Some("A"));
+        assert!(panel.status.contains("cancelled"));
+        std::fs::remove_dir(&blocked_path).expect("remove blocking directory");
+    }
+
+    #[tokio::test]
     async fn profile_switch_save_failure_keeps_old_profile_transport_and_staging() {
         let (old_url, old_closed) = start_close_observer().await;
         let old_transport = fleety_tools::transport::connect(&old_url, None)
@@ -2596,11 +3049,11 @@ mod tests {
         panel.request_profile_switch("B".into());
         panel.resolve_profile_switch(ProfileSwitchResolution::Discard);
         let expected_old_url = old_url.clone();
-        let mut active_target = Some(connection::Resolved {
-            url: old_url,
-            token: None,
-            source: connection::Source::Profile("A".into()),
-        });
+        let mut active_target = Some(connection::Resolved::unowned(
+            old_url,
+            None,
+            connection::Source::Profile("A".into()),
+        ));
         let mut active_fingerprint = Some("fingerprint-a".into());
         let blocked_path = std::env::temp_dir().join(format!(
             "fleety-profile-switch-blocked-{}-{}",
@@ -2608,10 +3061,12 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         std::fs::create_dir(&blocked_path).expect("create blocking directory");
+        let mut config_protocol = Some(4);
 
         commit_profile_switch_at(
             &mut panel,
             &mut old_connection,
+            &mut config_protocol,
             &mut active_target,
             &mut active_fingerprint,
             &blocked_path,
@@ -2624,10 +3079,11 @@ mod tests {
         assert!(panel.profile_switch_prompt.is_some());
         assert!(old_connection.is_some());
         assert_eq!(
-            active_target.as_ref().map(|target| target.url.as_str()),
+            active_target.as_ref().map(connection::Resolved::url),
             Some(expected_old_url.as_str())
         );
         assert_eq!(active_fingerprint.as_deref(), Some("fingerprint-a"));
+        assert_eq!(config_protocol, Some(4));
         assert!(panel.status.contains("staged changes retained"));
         let mut old_closed = old_closed;
         assert!(
@@ -2704,7 +3160,14 @@ mod tests {
         panel.request_profile_switch("B".into());
         panel.resolve_profile_switch(ProfileSwitchResolution::Apply);
 
-        assert!(!apply_staged_before_profile_switch(&mut panel, &mut connection).await);
+        assert!(
+            !apply_staged_before_profile_switch(
+                &mut panel,
+                &mut connection,
+                fleety_protocol::CONFIG_PROTOCOL_VERSION,
+            )
+            .await
+        );
 
         assert_eq!(panel.conns.current.as_deref(), Some("A"));
         assert!(panel.staged.contains_key("FLEETY_POLICY"));
@@ -2719,6 +3182,279 @@ mod tests {
         ));
         assert!(panel.status.contains("profile switch paused"));
         server.await.expect("apply failure server task");
+    }
+
+    #[tokio::test]
+    async fn profile_switch_refreshes_daemon_before_server_conflict() {
+        let (url, requests_received) =
+            start_profile_switch_apply_server(ProfileSwitchApplyScript::ServerConflict).await;
+        let transport = fleety_tools::transport::connect(&url, None)
+            .await
+            .expect("connect profile switch apply client");
+        let mut connection = Some(transport.split());
+        let mut panel = dirty_two_owner_profile_switch_panel();
+
+        assert!(
+            !apply_staged_before_profile_switch(
+                &mut panel,
+                &mut connection,
+                fleety_protocol::CONFIG_PROTOCOL_VERSION,
+            )
+            .await
+        );
+
+        assert_eq!(panel.conns.current.as_deref(), Some("A"));
+        assert!(panel.daemon_staged.is_empty());
+        assert_eq!(panel.daemon_revision, "daemon-r2");
+        assert_eq!(
+            panel
+                .daemon_entries
+                .iter()
+                .find(|entry| entry.key == "FLEETY_TZ")
+                .map(|entry| entry.value.as_str()),
+            Some("Asia/Taipei")
+        );
+        assert!(panel.daemon_apply_error.is_none());
+        assert!(panel.staged.contains_key("FLEETY_POLICY"));
+        assert_eq!(panel.revision, "server-r1");
+        assert!(matches!(
+            panel.server_apply_error.as_ref(),
+            Some(error) if error.kind == "conflict"
+        ));
+        assert!(panel.profile_switch_prompt.is_some());
+        assert!(panel.profile_switch_pending.is_none());
+        let requests = requests_received.await.expect("profile switch requests");
+        assert!(matches!(
+            requests.as_slice(),
+            [
+                ClientMsg::ConfigApply {
+                    target: ConfigTarget::Device(_),
+                    ..
+                },
+                ClientMsg::ConfigSnapshot {
+                    target: ConfigTarget::Device(_)
+                },
+                ClientMsg::ConfigApply {
+                    target: ConfigTarget::Server,
+                    ..
+                }
+            ]
+        ));
+    }
+
+    #[tokio::test]
+    async fn profile_switch_daemon_refresh_failure_sends_zero_server_apply() {
+        let (url, requests_received) =
+            start_profile_switch_apply_server(ProfileSwitchApplyScript::DaemonRefreshFailure).await;
+        let transport = fleety_tools::transport::connect(&url, None)
+            .await
+            .expect("connect profile switch apply client");
+        let mut connection = Some(transport.split());
+        let mut panel = dirty_two_owner_profile_switch_panel();
+
+        assert!(
+            !apply_staged_before_profile_switch(
+                &mut panel,
+                &mut connection,
+                fleety_protocol::CONFIG_PROTOCOL_VERSION,
+            )
+            .await
+        );
+
+        assert_eq!(panel.conns.current.as_deref(), Some("A"));
+        assert!(panel.daemon_staged.is_empty());
+        assert!(panel.daemon_refresh_required);
+        assert!(!panel.daemon_supported);
+        assert!(panel.daemon_revision.is_empty());
+        assert!(panel.daemon_entries.is_empty());
+        assert_eq!(
+            panel
+                .daemon_apply_error
+                .as_ref()
+                .map(|error| error.kind.as_str()),
+            Some("refresh_required")
+        );
+        assert!(panel.staged.contains_key("FLEETY_POLICY"));
+        assert!(panel.server_apply_error.is_none());
+        assert!(panel.profile_switch_prompt.is_some());
+        assert!(panel.profile_switch_pending.is_none());
+        panel.resolve_profile_switch(ProfileSwitchResolution::Apply);
+        assert!(
+            !apply_staged_before_profile_switch(
+                &mut panel,
+                &mut connection,
+                fleety_protocol::CONFIG_PROTOCOL_VERSION,
+            )
+            .await,
+            "retry must stay behind the failed Daemon refresh barrier"
+        );
+        let requests = requests_received.await.expect("profile switch requests");
+        assert!(matches!(
+            requests.as_slice(),
+            [
+                ClientMsg::ConfigApply {
+                    target: ConfigTarget::Device(_),
+                    ..
+                },
+                ClientMsg::ConfigSnapshot {
+                    target: ConfigTarget::Device(_)
+                }
+            ]
+        ));
+    }
+
+    #[tokio::test]
+    async fn profile_switch_queues_selection_only_after_both_owners_refresh() {
+        let (url, requests_received) =
+            start_profile_switch_apply_server(ProfileSwitchApplyScript::AllRefreshed).await;
+        let transport = fleety_tools::transport::connect(&url, None)
+            .await
+            .expect("connect profile switch apply client");
+        let mut connection = Some(transport.split());
+        let mut panel = dirty_two_owner_profile_switch_panel();
+
+        assert!(
+            apply_staged_before_profile_switch(
+                &mut panel,
+                &mut connection,
+                fleety_protocol::CONFIG_PROTOCOL_VERSION,
+            )
+            .await
+        );
+
+        assert_eq!(panel.conns.current.as_deref(), Some("A"));
+        assert!(panel.daemon_staged.is_empty());
+        assert_eq!(panel.daemon_revision, "daemon-r2");
+        assert!(panel.staged.is_empty());
+        assert_eq!(panel.revision, "server-r2");
+        assert!(panel.profile_switch_prompt.is_none());
+        assert_eq!(panel.profile_switch_pending.as_deref(), Some("B"));
+        let requests = requests_received.await.expect("profile switch requests");
+        assert!(matches!(
+            requests.as_slice(),
+            [
+                ClientMsg::ConfigApply {
+                    target: ConfigTarget::Device(_),
+                    ..
+                },
+                ClientMsg::ConfigSnapshot {
+                    target: ConfigTarget::Device(_)
+                },
+                ClientMsg::ConfigApply {
+                    target: ConfigTarget::Server,
+                    ..
+                },
+                ClientMsg::ConfigSnapshot {
+                    target: ConfigTarget::Server
+                }
+            ]
+        ));
+    }
+
+    #[tokio::test]
+    async fn profile_switch_updates_live_protocol_before_the_next_dirty_switch() {
+        let (new_url, requests_received) =
+            start_profile_switch_apply_server(ProfileSwitchApplyScript::ReloadThenServerApply)
+                .await;
+        let mut conns = Connections {
+            current: Some("A".into()),
+            ..Default::default()
+        };
+        conns.profiles.insert(
+            "A".into(),
+            connection::Profile {
+                url: "ws://127.0.0.1:9".into(),
+                ..Default::default()
+            },
+        );
+        conns.profiles.insert(
+            "B".into(),
+            connection::Profile {
+                url: new_url,
+                fingerprint: Some("fingerprint-a".into()),
+                ..Default::default()
+            },
+        );
+        let mut panel = Panel::new(
+            conns,
+            fleety_tools::config::ConfigMap::new(),
+            RemoteRegionState::new(false, vec![], String::new()),
+            RemoteRegionState::new(false, vec![], String::new()),
+        );
+        panel.daemon_device_id = "remote-B".into();
+        panel.request_profile_switch("B".into());
+        let path = std::env::temp_dir().join(format!(
+            "fleety-profile-switch-live-protocol-{}-{}.toml",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        connection::save_at(&path, &panel.persisted_conns).expect("seed old profile");
+        let mut connection = None;
+        let mut config_protocol = Some(1);
+        let mut active_target = None;
+        let mut active_fingerprint = None;
+
+        commit_profile_switch_at(
+            &mut panel,
+            &mut connection,
+            &mut config_protocol,
+            &mut active_target,
+            &mut active_fingerprint,
+            &path,
+            |_| Ok("fleetyd test reconnect accepted".to_string()),
+        )
+        .await;
+
+        assert_eq!(
+            config_protocol,
+            Some(fleety_protocol::CONFIG_PROTOCOL_VERSION)
+        );
+        assert_eq!(panel.revision, "server-r1");
+        panel.staged.insert(
+            "FLEETY_POLICY".into(),
+            ConfigChange {
+                key: "FLEETY_POLICY".into(),
+                op: ChangeOp::Set,
+                value: Some("require_approval".into()),
+            },
+        );
+        panel.request_profile_switch("A".into());
+        panel.resolve_profile_switch(ProfileSwitchResolution::Apply);
+
+        assert!(
+            apply_staged_before_profile_switch(
+                &mut panel,
+                &mut connection,
+                config_protocol.unwrap_or_default(),
+            )
+            .await
+        );
+        assert_eq!(panel.revision, "server-r2");
+        assert_eq!(panel.profile_switch_pending.as_deref(), Some("A"));
+        let requests = requests_received.await.expect("mixed protocol requests");
+        assert!(matches!(
+            requests.as_slice(),
+            [
+                ClientMsg::Hello { .. },
+                ClientMsg::ConfigSnapshot {
+                    target: ConfigTarget::Server
+                },
+                ClientMsg::ConfigSnapshot {
+                    target: ConfigTarget::Device(_)
+                },
+                ClientMsg::ConfigApply {
+                    target: ConfigTarget::Server,
+                    ..
+                },
+                ClientMsg::ConfigSnapshot {
+                    target: ConfigTarget::Server
+                }
+            ]
+        ));
+        if let Some((mut tx, _)) = connection.take() {
+            tx.close().await;
+        }
+        std::fs::remove_file(path).expect("remove mixed protocol fixture");
     }
 
     #[tokio::test]
@@ -2753,12 +3489,21 @@ mod tests {
         assert_eq!(panel.profile_switch_pending.as_deref(), Some("a"));
 
         let target = resolve_saved_profile(&conns, "a").expect("resolve profile A");
-        assert_eq!(target.url, new_url);
-        assert_eq!(target.token.as_deref(), Some("token-a"));
-        assert_eq!(target.source, connection::Source::Profile("a".into()));
+        assert_eq!(target.url(), new_url);
+        assert_eq!(target.token(), Some("token-a"));
+        assert_eq!(
+            target.source(),
+            &connection::Source::OverrideProfile("a".into())
+        );
+        let connections_path = std::env::temp_dir().join(format!(
+            "fleety-profile-switch-direct-{}-{}.toml",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        connection::save_at(&connections_path, &conns).expect("save direct switch profiles");
 
-        let ((mut new_tx, _new_rx), config_protocol, fingerprint) =
-            replace_profile_connection(&mut old_connection, &target, None)
+        let ((mut new_tx, _new_rx), config_protocol, fingerprint, _committed_target) =
+            replace_profile_connection(&mut old_connection, &target, &connections_path)
                 .await
                 .expect("switch to profile A");
 
@@ -2776,19 +3521,25 @@ mod tests {
             other => panic!("expected Hello for server A, got {other:?}"),
         }
         new_tx.close().await;
+        std::fs::remove_file(connections_path).expect("remove direct switch profiles");
     }
 
     #[tokio::test]
     async fn profile_switch_reloads_owner_snapshots() {
         let (url, requests_received) = start_snapshot_server(false).await;
-        let target = connection::Resolved {
+        let target = connection::Resolved::unowned(
             url,
-            token: Some("token-a".into()),
-            source: connection::Source::OverrideUrl,
-        };
+            Some("token-a".into()),
+            connection::Source::OverrideUrl,
+        );
         let mut old_connection = None;
-        let ((mut tx, mut rx), config_protocol, _fingerprint) =
-            replace_profile_connection(&mut old_connection, &target, None)
+        let unused_path = std::env::temp_dir().join(format!(
+            "fleety-profile-switch-unowned-{}-{}.toml",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let ((mut tx, mut rx), config_protocol, _fingerprint, _committed_target) =
+            replace_profile_connection(&mut old_connection, &target, &unused_path)
                 .await
                 .expect("connect profile A");
 
@@ -2869,16 +3620,18 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         connection::save_at(&path, &panel.persisted_conns).expect("seed persisted profile A");
-        let mut active_target = Some(connection::Resolved {
-            url: "ws://old.invalid".into(),
-            token: None,
-            source: connection::Source::Profile("A".into()),
-        });
+        let mut active_target = Some(connection::Resolved::unowned(
+            "ws://old.invalid".into(),
+            None,
+            connection::Source::Profile("A".into()),
+        ));
         let mut active_fingerprint = Some("old-fingerprint".into());
+        let mut config_protocol = Some(1);
 
         commit_profile_switch_at(
             &mut panel,
             &mut connection,
+            &mut config_protocol,
             &mut active_target,
             &mut active_fingerprint,
             &path,
@@ -2896,10 +3649,23 @@ mod tests {
         );
         assert!(connection.is_some());
         assert_eq!(
-            active_target.as_ref().map(|target| target.url.as_str()),
+            active_target.as_ref().map(connection::Resolved::url),
             Some(new_url.as_str())
         );
         assert_eq!(active_fingerprint.as_deref(), Some("fingerprint-a"));
+        assert_eq!(
+            connection::load_at(&path)
+                .expect("load pinned switched profile")
+                .profiles["B"]
+                .fingerprint
+                .as_deref(),
+            Some("fingerprint-a")
+        );
+        assert_eq!(
+            config_protocol,
+            Some(fleety_protocol::CONFIG_PROTOCOL_VERSION),
+            "the live transport protocol must replace the startup protocol"
+        );
         assert!(panel.server_supported);
         assert_eq!(panel.revision, "server-a-rev");
         assert_eq!(panel.entries[0].key, "FLEETY_POLICY");
@@ -2986,11 +3752,13 @@ mod tests {
         .expect("rotate credentials concurrently");
 
         let mut transport = None;
+        let mut config_protocol = None;
         let mut active_target = None;
         let mut active_fingerprint = None;
         commit_profile_switch_at(
             &mut panel,
             &mut transport,
+            &mut config_protocol,
             &mut active_target,
             &mut active_fingerprint,
             &path,
@@ -3004,10 +3772,12 @@ mod tests {
             Some("fingerprint-a")
         );
         assert_eq!(
-            active_target
-                .as_ref()
-                .and_then(|target| target.token.as_deref()),
+            active_target.as_ref().and_then(connection::Resolved::token),
             Some("rotated-token")
+        );
+        assert_eq!(
+            config_protocol,
+            Some(fleety_protocol::CONFIG_PROTOCOL_VERSION)
         );
         let requests = requests_received.await.expect("new profile requests");
         assert!(matches!(
@@ -3033,13 +3803,18 @@ mod tests {
             .expect("reserve unavailable address");
         let address = unavailable.local_addr().expect("unavailable address");
         drop(unavailable);
-        let target = connection::Resolved {
-            url: format!("ws://{address}"),
-            token: None,
-            source: connection::Source::Profile("a".into()),
-        };
+        let target = connection::Resolved::unowned(
+            format!("ws://{address}"),
+            None,
+            connection::Source::Profile("a".into()),
+        );
 
-        let result = replace_profile_connection(&mut old_connection, &target, None).await;
+        let unused_path = std::env::temp_dir().join(format!(
+            "fleety-profile-switch-failure-{}-{}.toml",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let result = replace_profile_connection(&mut old_connection, &target, &unused_path).await;
 
         assert!(result.is_err());
         assert!(old_connection.is_none());
@@ -3103,23 +3878,25 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         connection::save_at(&path, &panel.persisted_conns).expect("seed persisted profile A");
-        let mut active_target = Some(connection::Resolved {
-            url: "ws://old.invalid".into(),
-            token: None,
-            source: connection::Source::Profile("A".into()),
-        });
+        let mut active_target = Some(connection::Resolved::unowned(
+            "ws://old.invalid".into(),
+            None,
+            connection::Source::Profile("A".into()),
+        ));
         let mut active_fingerprint = Some("old-fingerprint".into());
+        let mut config_protocol = Some(fleety_protocol::CONFIG_PROTOCOL_VERSION);
+        let mut daemon_notified = false;
 
         commit_profile_switch_at(
             &mut panel,
             &mut connection,
+            &mut config_protocol,
             &mut active_target,
             &mut active_fingerprint,
             &path,
             |_| {
-                Err(CoreError::Message(
-                    "running daemon did not acknowledge".to_string(),
-                ))
+                daemon_notified = true;
+                Ok("unexpected notification".to_string())
             },
         )
         .await;
@@ -3135,6 +3912,7 @@ mod tests {
         assert!(connection.is_none());
         assert!(active_target.is_none());
         assert!(active_fingerprint.is_none());
+        assert!(config_protocol.is_none());
         assert!(!panel.server_supported);
         assert!(panel.entries.is_empty());
         assert!(panel.revision.is_empty());
@@ -3143,9 +3921,12 @@ mod tests {
         assert!(panel.daemon_revision.is_empty());
         assert!(panel
             .status
-            .contains("previous connection and snapshots were not reused"));
-        assert!(panel.status.contains("fleetyd notification failed"));
-        assert!(panel.status.contains("fleetyd reconnect --profile B"));
+            .contains("previous CLI connection and snapshots were not reused"));
+        assert!(
+            daemon_notified,
+            "persisting B must tell fleetyd to leave A even when the CLI handshake fails"
+        );
+        assert!(panel.status.contains("unexpected notification"));
         assert!(
             tokio::time::timeout(std::time::Duration::from_secs(2), old_closed)
                 .await
@@ -3544,6 +4325,14 @@ mod tests {
     }
 
     #[test]
+    fn connection_region_marks_urlless_profile_as_requiring_init() {
+        let label = connection_endpoint_label(&connection::Profile::default());
+        assert!(label.contains("endpoint required"), "{label}");
+        assert!(label.contains("fleety init"), "{label}");
+        assert!(!label.contains("mDNS"), "{label}");
+    }
+
+    #[test]
     fn cli_edit_is_staged_until_its_owner_is_applied() {
         let mut map = fleety_tools::config::ConfigMap::new();
         map.insert(
@@ -3670,6 +4459,52 @@ mod tests {
         assert_eq!(edited.token, None);
         assert_eq!(edited.fingerprint, None);
         assert!(panel.status.contains("re-pair"), "{}", panel.status);
+    }
+
+    #[test]
+    fn connection_url_save_uses_the_live_current_profile_for_reconnect() {
+        let path = std::env::temp_dir().join(format!(
+            "fleety-settings-live-current-{}.toml",
+            uuid::Uuid::new_v4()
+        ));
+        let mut baseline = Connections {
+            current: Some("A".into()),
+            ..Default::default()
+        };
+        baseline.profiles.insert(
+            "A".into(),
+            connection::Profile {
+                url: "ws://a.test:8787".into(),
+                ..Default::default()
+            },
+        );
+        baseline.profiles.insert(
+            "B".into(),
+            connection::Profile {
+                url: "ws://b-old.test:8787".into(),
+                token: Some("b-token".into()),
+                fingerprint: Some("b-pin".into()),
+                ..Default::default()
+            },
+        );
+        let mut pending = baseline.clone();
+        connection::reselect_profile_endpoint(
+            pending.profiles.get_mut("B").expect("pending B"),
+            "ws://b-new.test:8787".into(),
+        );
+        let mut live = baseline.clone();
+        live.current = Some("B".into());
+        connection::save_at(&path, &live).expect("seed concurrent current B");
+
+        let (saved, reconnect) =
+            save_connection_url_edits_at(&path, &pending, &baseline).expect("save B URL");
+
+        assert_eq!(reconnect.as_deref(), Some("B"));
+        assert_eq!(saved.current.as_deref(), Some("B"));
+        assert_eq!(saved.profiles["B"].url, "ws://b-new.test:8787");
+        assert_eq!(saved.profiles["B"].token, None);
+        assert_eq!(saved.profiles["B"].fingerprint, None);
+        std::fs::remove_file(path).expect("remove Settings fixture");
     }
 
     #[test]

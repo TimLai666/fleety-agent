@@ -149,9 +149,11 @@ is on `main`; see commit history for the exact change.
   (insyra path); served as a dedicated ws frame, not a tool.
 - **Graceful shutdown** — `tokio::signal::ctrl_c()` in server + fleetyd drains
   the hub / closes the WS cleanly.
-- **mDNS announce + discover** — server registers
-  `_fleety._tcp.local.`; CLI / fleetyd LAN-browse as the last fallback after
-  env var + saved config. `FLEETY_MDNS_DISABLED` opt-out.
+- **mDNS announce + explicit enrollment discovery** — server registers
+  `_fleety._tcp.local.`; CLI / fleetyd may LAN-browse when unconfigured, but a
+  candidate stays display-only until selected and paired through `fleety init`.
+  Saved explicit endpoints reconnect automatically. `FLEETY_MDNS_DISABLED`
+  opts out.
 - **Retention loop** — periodic GC of `backups/` (mtime > 7d) + rotation of
   `history.jsonl` past 32 MiB. `FLEETY_GC_DISABLED` opt-out.
 - **fleetyd self-update polling** — daily check against

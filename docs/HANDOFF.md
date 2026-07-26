@@ -70,13 +70,27 @@ git diff -- .agents/skills/spectra-archive/SKILL.md .claude/skills/spectra-archi
 
 這個 change 尚未完成：
 
-- 最新獨立 review：0 Critical / 4 High / 4 Medium / 3 Low
-- Clean review streak：0
+- Spectra 進度：77/79
+- 已完成 5.58：automatic mDNS 只負責探索／顯示；已儲存明確 endpoint 的 current profile 仍會自動連線
+- 已完成 5.59：fleetyd 必須先取得 reconnect-control owner 與適用的 service PID owner，失敗時在 poller、dependency、network 前非零退出
+- 已完成 5.60：每個 reconnect caller 只接收自己 nonce 的 settlement；舊 terminal result 先持久化成 nonce receipt，後續操作再提交新 nonce
+- 5.60 最新獨立複審：No findings；另修正 Windows receipt durability sync 必須使用可寫且不截斷的 handle
+- 已完成 5.61：reconnect success 只在 token／identity pin 對凍結 owner 耐久提交、journal 與 success proof 完成後可見；pre-`Welcome`／duplicate `Welcome`／空 minted token／pre-auth presence 全部 fail closed
+- 5.61 最新獨立複審：No findings；58 個 daemon unit tests、35 個 fleetyd smoke tests、Clippy、fmt、diff check 與 Spectra gates 全數通過
+- 已完成 5.62：Settings dirty profile switch 對每個 owner 都以 Apply 成功加 fresh snapshot 作為 barrier；半成功時保留 fresh revision，refresh 失敗時封鎖後續 owner，所有 owner 完成後才切換
+- 5.62 最新獨立複審：No findings；287 個 CLI unit tests、87 個 CLI smoke tests、workspace Clippy、fmt、diff check 與 Spectra gates 全數通過
+- 已完成 5.63：daemon reconnect ready/journal contract 已版本化；ready 以程序起始 token 加生命週期 OS lock 防止 PID reuse，publication 以 staged sync、rename、canonical flush 與目錄 sync 保證 crash durability，mixed old/new 或 unknown version 立即回 actionable incompatibility 或走明確 legacy journal 相容路徑
+- 5.63 最新獨立複審：No findings；64 個 daemon unit tests、35 個 fleetyd smoke tests、228 個 fleety-tools unit tests、完整 workspace tests、Clippy、fmt、diff check 與 Spectra gates 全數通過
+- 已完成 5.64：raw URL、ACP 與 daemon transport override 不再借用 saved credential；只有 resolver 凍結的 named/current profile generation 可寫回 token、TOFU pin 或 auth cleanup，pair/init 的 publication ambiguity 可依同 generation 安全重試，doctor 保持唯讀
+- 5.64 最新三個隔離複審：No findings；315 個 CLI unit tests、107 個 CLI smoke tests、69 個 daemon unit tests、41 個 fleetyd smoke tests、237 個 fleety-tools unit tests、329 個 Server unit tests、完整 workspace tests、Clippy、release build、fmt、diff check 與 Spectra gates 全數通過
+- 尚待處理：5.3、5.55
+- Windows 交叉編譯仍受本機缺少 MSVC C headers 阻擋於 `ring`；不得誤報成 Windows build 已通過
+- Clean review streak：3
 - Task 5.3 尚未完成
 - 尚未 archive
 - 尚未 release
 - 不可標記 goal complete
-- Worktree 可能有尚未編譯或測試的局部修改
+- Worktree 同時包含 5.58～5.64 與先前尚未提交的修改；不得 reset 或覆蓋
 - 之前有 workers 在 sandbox reset 後消失，因此必須以實際 diff 判斷修改內容
 
 # 已完成的基準工作
@@ -156,6 +170,9 @@ mDNS TXT fingerprint 不是可信的身份證明。現有流程可能在驗證 S
 安全政策：
 
 - Automatic mDNS discovery 永遠不得附帶 stored token
+- Automatic mDNS 只能探索與顯示，不得建立 operational target
+- 新的 LAN 候選必須明確選取、提供 pairing code，且收到新 token 後才能存成 current
+- 已儲存明確 endpoint 的 current profile 必須照常自動連線並跳過 mDNS
 - Credentialed sticky healing 不得只根據 TXT 自動更換 URL
 - Credentialed endpoint 改變必須要求使用者明確 reselect 或 re-pair
 - 若未來要支援透明 healing，必須有 TLS 或 public-key identity proof

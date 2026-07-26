@@ -11,7 +11,8 @@ Fleety 的功能已涵蓋聊天、連線、Provider、模型、OAuth、遠端設
 - 重做設定中心的資訊架構與狀態模型：依 Connection、CLI、Daemon、Server、Providers & Models 導覽，明示 loading、available、unavailable、dirty、applying、conflict 與 failed 狀態。
 - CLI、Daemon、Server 設定仍只由各自 owner 持久化。遠端 owner 不可用時，讀取彙總回傳部分結果與 owner 級錯誤；寫入硬失敗且永不 fallback 寫檔。
 - Profile 切換遇到 staged 變更時提供 Apply／Discard／Cancel，不再自動丟棄；連線成功後才重新載入 Server 與 Daemon snapshot。
-- 將 mDNS 限縮為不帶 stored credential 的 discovery hint；credentialed endpoint 改變需明確 reselect／re-pair，reconnect request則持久保存到Daemon消費並exactly-once回覆。
+- 將 mDNS 限縮為 discovery／selection surface：沒有明確 saved endpoint 時只列出候選，不得自動建立 operational session；已設定明確 endpoint 的 current profile仍自動連線。credentialed endpoint 改變需明確 reselect／re-pair，reconnect request則持久保存到Daemon消費並exactly-once回覆。
+- 將 raw `--server`／`--url`、`FLEETY_AGENT_URL` 與 ACP endpoint 限縮為真正 transient target：只使用明示 `FLEETY_TOKEN`，不得按 URL 借用或改寫任何 saved profile credential；stored token 只能由明確 named／current profile 取得。
 - 所有 structured configuration mutation在owner dispatch前共用認證gate，Provider command與TUI保留並顯示不含secret的key presence。
 - Provider、模型目錄與 OAuth 狀態整合成同一條旅程，畫面使用「connected Server」與 Provider 名稱，不再以 `providers.toml` 表達操作目的地。
 - 新增 `doctor` 與 shell completion，讓連線、版本、Daemon、Server、OAuth／Provider 狀態可被主動診斷，也讓命令可發現。
@@ -31,8 +32,8 @@ Fleety 的功能已涵蓋聊天、連線、Provider、模型、OAuth、遠端設
 - `interactive-chat-tui`: 納入共享 shell、連線 context、導覽與一致取消／退出行為。
 - `owner-routed-configuration`: 補充讀取彙總的部分可用語意與每次操作顯示實際 owner 的要求。
 - `connection-profiles`: canonical 命令改為 connection，並定義 TUI 中安全切換 profile 的互動。
-- `service-discovery`: 將 automatic mDNS 的 TXT fingerprint 限縮為排序 hint，任何結果都不得繼承 stored profile credential 或 owner provenance。
-- `device-enrollment`: guided／explicit init 遇到 credentialed profile 改址時不得沿用舊 token，必須重新 pairing 後才原子更新。
+- `service-discovery`: 將 automatic mDNS 限縮為候選收集與顯示；只有明確 saved endpoint可自動連線，任何廣播結果都不得自行成為 operational target或繼承 credential／owner provenance。
+- `device-enrollment`: guided／explicit init只有在使用者明確選取 endpoint後才可進入配對；credentialed profile改址不得沿用舊 token，必須重新 pairing 後才原子更新。
 - `provider-config-surface`: Provider、Model 與 OAuth 形成同一個使用者旅程，隱藏儲存檔實作細節。
 
 ## Impact

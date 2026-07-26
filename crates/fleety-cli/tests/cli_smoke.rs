@@ -25,6 +25,106 @@ fn run(args: &[&str]) -> std::process::Output {
         .expect("run fleety")
 }
 
+#[test]
+fn acp_install_accepts_editor_after_server_option_and_writes_the_validated_endpoint() {
+    let home = TempHome::new("acp-install-order");
+    let settings = home.0.join(".config/zed/settings.json");
+    let output = Command::new(env!("CARGO_BIN_EXE_fleety"))
+        .args(["acp", "install", "--server", "ws://127.0.0.1:8787", "zed"])
+        .env("HOME", &home.0)
+        .env("USERPROFILE", &home.0)
+        .output()
+        .expect("run acp install");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(settings).expect("Zed settings written"))
+            .expect("valid Zed settings");
+    assert_eq!(
+        value["agent_servers"]["Fleety"]["env"]["FLEETY_AGENT_URL"],
+        "ws://127.0.0.1:8787"
+    );
+}
+
+#[test]
+fn acp_install_rejects_an_invalid_endpoint_without_touching_zed_settings() {
+    let home = TempHome::new("acp-install-invalid");
+    let settings = home.0.join(".config/zed/settings.json");
+    std::fs::create_dir_all(settings.parent().expect("settings parent")).expect("settings dir");
+    std::fs::write(&settings, b"{\"theme\":\"keep\"}").expect("settings fixture");
+    let output = Command::new(env!("CARGO_BIN_EXE_fleety"))
+        .args(["acp", "install", "zed", "--server", "not-a-websocket"])
+        .env("HOME", &home.0)
+        .env("USERPROFILE", &home.0)
+        .output()
+        .expect("run invalid acp install");
+    assert!(!output.status.success());
+    assert_eq!(
+        std::fs::read(&settings).expect("unchanged settings"),
+        b"{\"theme\":\"keep\"}"
+    );
+}
+
+#[test]
+fn acp_install_rejects_a_fragment_without_touching_zed_settings() {
+    let home = TempHome::new("acp-install-fragment");
+    let settings = home.0.join(".config/zed/settings.json");
+    std::fs::create_dir_all(settings.parent().expect("settings parent")).expect("settings dir");
+    std::fs::write(&settings, b"{\"theme\":\"keep\"}").expect("settings fixture");
+    let output = Command::new(env!("CARGO_BIN_EXE_fleety"))
+        .args([
+            "acp",
+            "install",
+            "zed",
+            "--server",
+            "wss://example.test/ws#fragment",
+        ])
+        .env("HOME", &home.0)
+        .env("USERPROFILE", &home.0)
+        .output()
+        .expect("run fragment acp install");
+    assert!(!output.status.success());
+    assert_eq!(
+        std::fs::read(&settings).expect("unchanged settings"),
+        b"{\"theme\":\"keep\"}"
+    );
+}
+
+#[test]
+fn acp_install_rejects_an_empty_settings_base() {
+    let cwd = TempHome::new("acp-install-empty-home");
+    let output = Command::new(env!("CARGO_BIN_EXE_fleety"))
+        .args(["acp", "install", "zed"])
+        .current_dir(&cwd.0)
+        .env("HOME", "")
+        .env("USERPROFILE", "")
+        .output()
+        .expect("run empty-home acp install");
+    assert!(!output.status.success());
+    assert!(!cwd.0.join(".config/zed/settings.json").exists());
+}
+
+#[test]
+fn acp_install_unknown_editor_prints_generic_setup() {
+    let home = TempHome::new("acp-install-generic");
+    let output = Command::new(env!("CARGO_BIN_EXE_fleety"))
+        .args(["acp", "install", "neovim"])
+        .env("HOME", &home.0)
+        .env("USERPROFILE", &home.0)
+        .output()
+        .expect("run generic acp install");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("No built-in auto-config"));
+    assert!(!home.0.join(".config/zed/settings.json").exists());
+}
+
 fn rejecting_ws_url() -> String {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind rejecting server");
     let addr = listener.local_addr().expect("rejecting addr");
@@ -74,10 +174,21 @@ fn welcome(token: Option<&str>) -> ServerMsg {
         server_version: String::new(),
         audio_input: false,
         config_protocol: 0,
-        server_fingerprint: None,
+        server_fingerprint: Some("fingerprint-smoke".into()),
         loopback_trusted: false,
         token: token.map(String::from),
     }
+}
+
+fn welcome_without_fingerprint(token: Option<&str>) -> ServerMsg {
+    let mut reply = welcome(token);
+    if let ServerMsg::Welcome {
+        server_fingerprint, ..
+    } = &mut reply
+    {
+        *server_fingerprint = None;
+    }
+    reply
 }
 
 fn welcome_with_fingerprint(fingerprint: &str) -> ServerMsg {
@@ -153,9 +264,16 @@ fn start_ws_server(steps: Vec<Vec<ServerMsg>>) -> (String, mpsc::Receiver<Vec<Cl
         let mut ws = accept(stream).expect("accept websocket");
         let mut received = Vec::new();
         for responses in steps {
-            let frame = ws.read().expect("client frame");
-            let text = frame.to_text().expect("text frame");
-            received.push(serde_json::from_str::<ClientMsg>(text).expect("client msg"));
+            let Ok(frame) = ws.read() else {
+                break;
+            };
+            let Ok(text) = frame.to_text() else {
+                break;
+            };
+            let Ok(message) = serde_json::from_str::<ClientMsg>(text) else {
+                break;
+            };
+            received.push(message);
             for response in responses {
                 ws.send(Message::Text(
                     serde_json::to_string(&response).expect("server msg"),
@@ -766,7 +884,35 @@ fn doctor_offline_environment_fails_with_remediation_and_no_writes() {
 }
 
 #[test]
-fn doctor_redacts_endpoint_credentials_from_json_and_errors() {
+fn doctor_keeps_a_pre_generation_current_profile_byte_identical() {
+    let home = TempHome::new("doctor-legacy-current");
+    let fleety = home.0.join(".fleety");
+    std::fs::create_dir_all(&fleety).expect("create fleety home");
+    let connections = fleety.join("connections.toml");
+    let url = rejecting_ws_url();
+    let legacy =
+        format!("current = \"home\"\n\n[profiles.home]\nurl = \"{url}\"\ntoken = \"saved\"\n");
+    std::fs::write(&connections, legacy.as_bytes()).expect("seed pre-generation profile");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_fleety"))
+        .args(["doctor", "--json"])
+        .env_remove("FLEETY_AGENT_URL")
+        .env_remove("FLEETY_TOKEN")
+        .env("HOME", &home.0)
+        .env("USERPROFILE", &home.0)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run doctor against legacy profile");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        std::fs::read(&connections).expect("read unchanged profile"),
+        legacy.as_bytes()
+    );
+}
+
+#[test]
+fn doctor_rejects_endpoint_credentials_before_network_without_echoing_them() {
     let home = TempHome::new("doctor-secret-endpoint");
     let output = Command::new(env!("CARGO_BIN_EXE_fleety"))
         .args([
@@ -781,16 +927,63 @@ fn doctor_redacts_endpoint_credentials_from_json_and_errors() {
         .output()
         .expect("run doctor with credential-bearing URL");
 
-    assert_eq!(output.status.code(), Some(1));
-    let rendered = String::from_utf8(output.stdout).expect("UTF-8 JSON");
+    assert_eq!(output.status.code(), Some(2));
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(!rendered.contains("SUPERSECRET"), "{rendered}");
     assert!(!rendered.contains("QUERYSECRET"), "{rendered}");
     assert!(!rendered.contains("user@"), "{rendered}");
-    let value: serde_json::Value = serde_json::from_str(&rendered).expect("doctor envelope");
-    assert_eq!(
-        value["context"]["endpoint"],
-        "ws://127.0.0.1:1/?token=<redacted>&view=<redacted>"
-    );
+    assert!(rendered.contains("valid ws:// or wss:// URL"), "{rendered}");
+    assert!(!home.0.join(".fleety").exists());
+}
+
+#[test]
+fn fragment_endpoint_is_rejected_before_doctor() {
+    let home = TempHome::new("doctor-fragment-endpoint");
+    let output = Command::new(env!("CARGO_BIN_EXE_fleety"))
+        .args([
+            "--server",
+            "wss://example.test/ws#fragment-secret",
+            "doctor",
+        ])
+        .env("HOME", &home.0)
+        .env("USERPROFILE", &home.0)
+        .output()
+        .expect("run doctor with fragment URL");
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("fragment-secret"), "{stderr}");
+    assert!(!home.0.join(".fleety").exists());
+}
+
+#[test]
+fn invalid_env_endpoint_is_rejected_before_legacy_migration() {
+    let home = TempHome::new("invalid-env-before-migration");
+    let fleety = home.0.join(".fleety");
+    std::fs::create_dir_all(&fleety).expect("legacy fleety dir");
+    let legacy = fleety.join("config.json");
+    std::fs::write(
+        &legacy,
+        br#"{"agent_url":"ws://legacy.test:8787","token":"legacy-token"}"#,
+    )
+    .expect("legacy config");
+    let before = std::fs::read(&legacy).expect("legacy bytes");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_fleety"))
+        .arg("status")
+        .env("HOME", &home.0)
+        .env("USERPROFILE", &home.0)
+        .env("FLEETY_AGENT_URL", "wss://example.test/ws#fragment")
+        .output()
+        .expect("run invalid env status");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(std::fs::read(&legacy).expect("legacy preserved"), before);
+    assert!(!fleety.join("config.json.migrated").exists());
+    assert!(!fleety.join("connections.toml").exists());
 }
 
 #[test]
@@ -901,18 +1094,18 @@ fn doctor_endpoint_keeps_unicode_path_and_redacted_query_keys() {
 }
 
 #[test]
-fn doctor_transport_errors_redact_parenthesized_and_ipv6_endpoints() {
+fn doctor_transport_errors_redact_parenthesized_and_ipv6_query_values() {
     for (name, endpoint, secrets, expected) in [
         (
             "parenthesized",
-            "ws://user:PASSSECRET@127.0.0.1:1/path(foo)?token=SSESECRET",
-            ["PASSSECRET", "SSESECRET"],
+            "ws://127.0.0.1:1/path(foo)?token=SSESECRET",
+            ["SSESECRET"],
             "ws://127.0.0.1:1/path(foo)?token=<redacted>",
         ),
         (
             "ipv6",
-            "ws://user:PASSV6@[::1]:1/?token=SSEV6",
-            ["PASSV6", "SSEV6"],
+            "ws://[::1]:1/?token=SSEV6",
+            ["SSEV6"],
             "ws://[::1]:1/?token=<redacted>",
         ),
     ] {
@@ -1270,6 +1463,99 @@ fn init_and_pair_write_the_connection_profile() {
 }
 
 #[test]
+fn pair_rejects_blank_tokens_and_missing_server_identity_without_mutation() {
+    for (case, reply) in [
+        (
+            "blank-token",
+            welcome_with_fingerprint_and_token("pair-fingerprint", Some(" \t ")),
+        ),
+        (
+            "missing-fingerprint",
+            welcome_without_fingerprint(Some("minted-token")),
+        ),
+    ] {
+        let home = TempHome::new(&format!("pair-invalid-welcome-{case}"));
+        let (url, rx) = start_ws_server(vec![vec![reply]]);
+        let connections = home.0.join(".fleety").join("connections.toml");
+        std::fs::create_dir_all(connections.parent().expect("connections parent"))
+            .expect("create Fleety home");
+        std::fs::write(
+            &connections,
+            format!(
+                "current = \"office\"\n\n\
+                 [profiles.office]\nurl = \"{url}\"\ntoken = \"old-token\"\nfingerprint = \"pair-fingerprint\"\ngeneration = \"pair-generation\"\n"
+            ),
+        )
+        .expect("seed paired profile");
+        let before = std::fs::read(&connections).expect("read profile before pair");
+
+        let (output, _) = run_against_profile(&["pair", "PAIR-CODE"], &home, rx);
+        assert_eq!(output.status.code(), Some(1), "{case}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("no credential was saved"),
+            "{case}: {stderr}"
+        );
+        assert_eq!(
+            std::fs::read(&connections).expect("read profile after rejected pair"),
+            before,
+            "{case} must not mutate the durable profile"
+        );
+    }
+}
+
+#[test]
+fn init_with_pairing_code_requires_a_minted_token_before_persisting() {
+    let home = TempHome::new("init-pairing-without-token");
+    let connections_path = home.0.join(".fleety").join("connections.toml");
+    let (url, rx) = start_ws_server(vec![vec![welcome_with_fingerprint("rogue-fingerprint")]]);
+
+    let (output, received) =
+        run_against_server(&["init", &url, "--pairing-code", "PAIR-1"], &url, &home, rx);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(matches!(
+        received.first(),
+        Some(ClientMsg::Hello {
+            pairing_code: Some(code),
+            ..
+        }) if code == "PAIR-1"
+    ));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("did not complete pairing"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !connections_path.exists(),
+        "a Welcome without a minted token must not persist the selected endpoint"
+    );
+}
+
+#[test]
+fn init_with_pairing_code_requires_server_identity_before_persisting() {
+    let home = TempHome::new("init-pairing-without-identity");
+    let connections_path = home.0.join(".fleety").join("connections.toml");
+    let (url, rx) = start_ws_server(vec![vec![welcome_without_fingerprint(Some(
+        "minted-token",
+    ))]]);
+
+    let (output, _) =
+        run_against_server(&["init", &url, "--pairing-code", "PAIR-1"], &url, &home, rx);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("identity"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !connections_path.exists(),
+        "a paired Welcome without Server identity must not persist the endpoint"
+    );
+}
+
+#[test]
 fn init_endpoint_change_requires_repair_and_never_sends_the_old_token() {
     let home = TempHome::new("init-endpoint-change");
     let fleety = home.0.join(".fleety");
@@ -1371,6 +1657,92 @@ fn profile_override_can_repair_a_non_current_reselected_endpoint() {
 }
 
 #[test]
+fn pair_same_url_replaces_old_token_and_identity_without_sending_them() {
+    let home = TempHome::new("pair-same-url-rebuilt");
+    let reply = welcome_with_fingerprint_and_token("new-pin", Some("new-token"));
+    let (url, rx) = start_ws_server(vec![vec![reply]]);
+    let fleety = home.0.join(".fleety");
+    std::fs::create_dir_all(&fleety).expect("fleety dir");
+    let connections_path = fleety.join("connections.toml");
+    std::fs::write(
+        &connections_path,
+        format!(
+            "current = \"office\"\n\n[profiles.office]\nurl = \"{url}\"\ntoken = \"old-token\"\nfingerprint = \"old-pin\"\n"
+        ),
+    )
+    .expect("write old pairing");
+
+    let (output, received) = run_against_profile(&["pair", "PAIR-REBUILD"], &home, rx);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(matches!(
+        received.first(),
+        Some(ClientMsg::Hello {
+            token: None,
+            pairing_code: Some(code),
+            ..
+        }) if code == "PAIR-REBUILD"
+    ));
+    let saved = std::fs::read_to_string(connections_path).expect("read repaired profile");
+    assert!(!saved.contains("old-token"), "{saved}");
+    assert!(!saved.contains("old-pin"), "{saved}");
+    assert!(saved.contains("new-token"), "{saved}");
+    assert!(saved.contains("new-pin"), "{saved}");
+}
+
+#[test]
+fn init_same_url_with_pairing_code_replaces_old_identity_without_sending_token() {
+    let home = TempHome::new("init-same-url-rebuilt");
+    let reply = welcome_with_fingerprint_and_token("new-pin", Some("new-token"));
+    let (url, rx) = start_ws_server(vec![vec![reply]]);
+    let fleety = home.0.join(".fleety");
+    std::fs::create_dir_all(&fleety).expect("fleety dir");
+    let connections_path = fleety.join("connections.toml");
+    std::fs::write(
+        &connections_path,
+        format!(
+            "current = \"office\"\n\n[profiles.office]\nurl = \"{url}\"\ntoken = \"old-token\"\nfingerprint = \"old-pin\"\n"
+        ),
+    )
+    .expect("write old pairing");
+
+    let (output, received) = run_against_server(
+        &[
+            "init",
+            &url,
+            "--name",
+            "office",
+            "--pairing-code",
+            "PAIR-REBUILD",
+        ],
+        &url,
+        &home,
+        rx,
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(matches!(
+        received.first(),
+        Some(ClientMsg::Hello {
+            token: None,
+            pairing_code: Some(code),
+            ..
+        }) if code == "PAIR-REBUILD"
+    ));
+    let saved = std::fs::read_to_string(connections_path).expect("read repaired profile");
+    assert!(!saved.contains("old-token"), "{saved}");
+    assert!(!saved.contains("old-pin"), "{saved}");
+    assert!(saved.contains("new-token"), "{saved}");
+    assert!(saved.contains("new-pin"), "{saved}");
+}
+
+#[test]
 fn saved_profile_failure_never_heals_or_mutates_and_directs_explicit_repair() {
     let home = TempHome::new("saved-profile-no-heal");
     let fleety = home.0.join(".fleety");
@@ -1380,7 +1752,7 @@ fn saved_profile_failure_never_heals_or_mutates_and_directs_explicit_repair() {
     std::fs::write(
         &connections_path,
         format!(
-            "current = \"office\"\n\n[profiles.office]\nurl = \"{unreachable}\"\ntoken = \"office-secret\"\nfingerprint = \"public-copyable-hint\"\n"
+            "current = \"office\"\n\n[profiles.office]\nurl = \"{unreachable}\"\ntoken = \"office-secret\"\nfingerprint = \"public-copyable-hint\"\ngeneration = \"failure-generation\"\n"
         ),
     )
     .expect("write paired profile");
@@ -1464,10 +1836,16 @@ fn server_commands_manage_connection_profiles() {
     );
     assert!(list_s.contains("work"), "list shows every server: {list_s}");
 
-    // Removing the current server without --force is rejected (non-zero exit).
+    // Removing the current server is rejected, even with --force.
     let rm = run_srv(&["server", "remove", "home"]);
-    assert!(!rm.status.success(), "remove current must need --force");
-    assert!(String::from_utf8_lossy(&rm.stderr).contains("--force"));
+    assert!(!rm.status.success(), "remove current must require a switch");
+    assert!(String::from_utf8_lossy(&rm.stderr).contains("explicitly switch"));
+    let forced = run_srv(&["server", "remove", "home", "--force"]);
+    assert!(
+        !forced.status.success(),
+        "--force must not choose a replacement"
+    );
+    assert!(String::from_utf8_lossy(&forced.stderr).contains("never chooses"));
 
     // After switching away, removing the former current succeeds.
     run_srv(&["server", "use", "work"]);
@@ -1631,6 +2009,52 @@ fn profile_override_queries_b_without_changing_current_a() {
 }
 
 #[test]
+fn durable_profile_rejects_unusable_server_identity_before_control() {
+    for (case, reply) in [
+        ("missing", welcome_without_fingerprint(None)),
+        ("whitespace", welcome_with_fingerprint(" \t ")),
+        ("mismatch", welcome_with_fingerprint("fp-attacker")),
+    ] {
+        let home = TempHome::new(&format!("durable-identity-{case}"));
+        let (url, rx) = start_ws_server(vec![
+            vec![reply],
+            vec![ServerMsg::ServerStatusResult {
+                version: "must-not-be-requested".into(),
+                uptime_secs: 1,
+                connected_devices: 0,
+                device_ids_json: "[]".into(),
+                extra_json: None,
+            }],
+        ]);
+        let connections = home.0.join(".fleety").join("connections.toml");
+        std::fs::create_dir_all(connections.parent().expect("connections parent"))
+            .expect("create Fleety home");
+        std::fs::write(
+            &connections,
+            format!(
+                "device_id = \"identity-test\"\ncurrent = \"A\"\n\n\
+                 [profiles.A]\nurl = \"{url}\"\ntoken = \"token-a\"\nfingerprint = \"fp-a\"\ngeneration = \"identity-generation\"\n"
+            ),
+        )
+        .expect("seed pinned profile");
+        let before = std::fs::read(&connections).expect("read profile before handshake");
+
+        let (output, received) = run_against_profile(&["status"], &home, rx);
+
+        assert!(!output.status.success(), "{case} identity was accepted");
+        assert!(
+            matches!(received.as_slice(), [ClientMsg::Hello { .. }]),
+            "{case} identity received post-Welcome control: {received:?}"
+        );
+        assert_eq!(
+            std::fs::read(&connections).expect("read profile after handshake"),
+            before,
+            "{case} identity mutated the durable owner"
+        );
+    }
+}
+
+#[test]
 fn status_json_is_one_semantic_secret_free_envelope() {
     let home = TempHome::new("status-json");
     let (url, rx) = start_ws_server(vec![
@@ -1683,6 +2107,251 @@ fn status_json_is_one_semantic_secret_free_envelope() {
         received.first(),
         Some(ClientMsg::Hello { token: Some(token), .. }) if token == "json-secret-token"
     ));
+}
+
+#[test]
+fn raw_server_and_url_overrides_send_only_the_explicit_token() {
+    for (case, current, flag, explicit_token, expected_token) in [
+        ("server-none", "A", "--server", None, None),
+        ("url-none", "B", "--url", None, None),
+        ("server-empty", "A", "--server", Some(""), None),
+        (
+            "server-explicit",
+            "B",
+            "--server",
+            Some("caller-token"),
+            Some("caller-token"),
+        ),
+    ] {
+        let home = TempHome::new(&format!("raw-provenance-{case}"));
+        let (url, rx) = start_ws_server(vec![
+            vec![welcome_with_fingerprint("raw-server")],
+            vec![ServerMsg::ServerStatusResult {
+                version: "raw-version".into(),
+                uptime_secs: 1,
+                connected_devices: 0,
+                device_ids_json: "[]".into(),
+                extra_json: None,
+            }],
+        ]);
+        let connections = home.0.join(".fleety").join("connections.toml");
+        std::fs::create_dir_all(connections.parent().expect("connections parent"))
+            .expect("create Fleety home");
+        std::fs::write(
+            &connections,
+            format!(
+                "current = \"{current}\"\n\n\
+                 [profiles.A]\nurl = \"{url}\"\ntoken = \"token-a\"\n\n\
+                 [profiles.B]\nurl = \"{url}\"\ntoken = \"token-b\"\n"
+            ),
+        )
+        .expect("seed same-URL profiles");
+        let before = std::fs::read(&connections).expect("read profiles before raw command");
+
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fleety"));
+        command
+            .args(["status", flag, url.as_str()])
+            .env("HOME", &home.0)
+            .env("USERPROFILE", &home.0)
+            .env("FLEETY_DEVICE_ID", "raw-provenance")
+            .env_remove("FLEETY_AGENT_URL")
+            .env_remove("FLEETY_TOKEN")
+            .stdin(std::process::Stdio::null());
+        if let Some(token) = explicit_token {
+            command.env("FLEETY_TOKEN", token);
+        }
+        let output = command.output().expect("run raw override status");
+        let received = rx
+            .recv_timeout(Duration::from_secs(15))
+            .expect("capture raw override frames");
+
+        assert!(
+            output.status.success(),
+            "{}: {}",
+            case,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(matches!(
+            received.first(),
+            Some(ClientMsg::Hello { token, .. }) if token.as_deref() == expected_token
+        ));
+        assert_eq!(
+            std::fs::read(&connections).expect("read profiles after raw command"),
+            before,
+            "raw override must not pin or otherwise mutate a URL-matched profile"
+        );
+    }
+}
+
+#[test]
+fn raw_override_never_sends_a_server_token_loaded_from_config() {
+    let home = TempHome::new("raw-config-token-provenance");
+    let (url, rx) = start_ws_server(vec![
+        vec![welcome_with_fingerprint("raw-server")],
+        vec![ServerMsg::ServerStatusResult {
+            version: "raw-version".into(),
+            uptime_secs: 1,
+            connected_devices: 0,
+            device_ids_json: "[]".into(),
+            extra_json: None,
+        }],
+    ]);
+    let fleety = home.0.join(".fleety");
+    std::fs::create_dir_all(&fleety).expect("create Fleety home");
+    std::fs::write(
+        fleety.join("config.toml"),
+        "[server]\nFLEETY_TOKEN = \"bootstrap-admin-secret\"\n",
+    )
+    .expect("seed Server-owned bootstrap token");
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_fleety"));
+    let output = command
+        .args(["status", "--server", url.as_str()])
+        .env("HOME", &home.0)
+        .env("USERPROFILE", &home.0)
+        .env("FLEETY_DEVICE_ID", "raw-config-token-provenance")
+        .env_remove("FLEETY_AGENT_URL")
+        .env_remove("FLEETY_TOKEN")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run raw override status");
+    let received = rx
+        .recv_timeout(Duration::from_secs(15))
+        .expect("capture raw override frames");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        matches!(received.first(), Some(ClientMsg::Hello { token: None, .. })),
+        "a persisted Server bootstrap token must never become caller-explicit client input"
+    );
+}
+
+#[test]
+fn raw_auth_rejection_explains_the_transient_credential_boundary() {
+    let home = TempHome::new("raw-auth-guidance");
+    let (url, rx) = start_ws_server(vec![vec![ServerMsg::Error {
+        error: WireError {
+            kind: "unauthenticated".into(),
+            message: "token rejected".into(),
+            remediation: None,
+        },
+    }]]);
+    let connections = home.0.join(".fleety").join("connections.toml");
+    std::fs::create_dir_all(connections.parent().expect("connections parent"))
+        .expect("create Fleety home");
+    std::fs::write(
+        &connections,
+        format!(
+            "current = \"A\"\n\n\
+             [profiles.A]\nurl = \"{url}\"\ntoken = \"saved-token\"\n"
+        ),
+    )
+    .expect("seed same-URL saved profile");
+    let before = std::fs::read(&connections).expect("read profiles before rejection");
+
+    let (output, received) = run_against_profile(&["status", "--server", url.as_str()], &home, rx);
+    assert!(!output.status.success());
+    assert!(matches!(
+        received.first(),
+        Some(ClientMsg::Hello { token: None, .. })
+    ));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("FLEETY_TOKEN"), "{stderr}");
+    assert!(stderr.contains("fleety init <ws-url>"), "{stderr}");
+    assert!(!stderr.contains("`fleety pair <code>`"), "{stderr}");
+    assert_eq!(
+        std::fs::read(&connections).expect("read profiles after rejection"),
+        before
+    );
+}
+
+#[test]
+fn generic_acp_install_uses_the_saved_current_profile_by_default() {
+    let home = TempHome::new("acp-install-current-profile");
+    let output = Command::new(env!("CARGO_BIN_EXE_fleety"))
+        .args(["acp", "install"])
+        .env("HOME", &home.0)
+        .env("USERPROFILE", &home.0)
+        .output()
+        .expect("print generic ACP setup");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("FLEETY_AGENT_URL="), "{stdout}");
+    assert!(stdout.contains("saved current profile"), "{stdout}");
+}
+
+#[test]
+fn acp_environment_endpoint_does_not_borrow_a_same_url_profile_token() {
+    for (case, current, explicit_token, expected_token) in [
+        ("none", "A", None, None),
+        ("explicit", "B", Some("caller-token"), Some("caller-token")),
+    ] {
+        let home = TempHome::new(&format!("acp-raw-provenance-{case}"));
+        let (url, rx) = start_ws_server(vec![
+            vec![welcome_with_fingerprint("acp-transient")],
+            vec![ServerMsg::Done {
+                conversation_id: "acp-transient".into(),
+            }],
+        ]);
+        let connections = home.0.join(".fleety").join("connections.toml");
+        std::fs::create_dir_all(connections.parent().expect("connections parent"))
+            .expect("create Fleety home");
+        std::fs::write(
+            &connections,
+            format!(
+                "current = \"{current}\"\n\n\
+                 [profiles.A]\nurl = \"{url}\"\ntoken = \"token-a\"\n\n\
+                 [profiles.B]\nurl = \"{url}\"\ntoken = \"token-b\"\n"
+            ),
+        )
+        .expect("seed ACP same-URL profiles");
+        let before = std::fs::read(&connections).expect("read ACP profiles before");
+
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fleety"));
+        command
+            .arg("acp")
+            .env("HOME", &home.0)
+            .env("USERPROFILE", &home.0)
+            .env("FLEETY_AGENT_URL", &url)
+            .env_remove("FLEETY_TOKEN")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        if let Some(token) = explicit_token {
+            command.env("FLEETY_TOKEN", token);
+        }
+        let mut child = command.spawn().expect("run ACP adapter");
+        let mut stdin = child.stdin.take().expect("ACP stdin");
+        std::io::Write::write_all(
+            &mut stdin,
+            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"session/prompt\",\"params\":{\"sessionId\":\"acp-transient\",\"prompt\":[{\"type\":\"text\",\"text\":\"hello\"}]}}\n",
+        )
+        .expect("write ACP prompt");
+        drop(stdin);
+        let output = child.wait_with_output().expect("collect ACP output");
+        let received = rx
+            .recv_timeout(Duration::from_secs(15))
+            .expect("capture ACP frames");
+
+        assert!(
+            output.status.success(),
+            "{case}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(matches!(
+            received.first(),
+            Some(ClientMsg::Hello { token, .. }) if token.as_deref() == expected_token
+        ));
+        assert_eq!(
+            std::fs::read(&connections).expect("read ACP profiles after"),
+            before,
+            "{case}"
+        );
+    }
 }
 
 #[test]
@@ -2829,6 +3498,67 @@ fn ask_sends_user_message_and_prints_assistant() {
 }
 
 #[test]
+fn ask_rejects_duplicate_welcome_before_accepting_more_server_output() {
+    let home = TempHome::new("ask-duplicate-welcome");
+    let (url, rx) = start_ws_server(vec![
+        vec![welcome(None)],
+        vec![
+            welcome(None),
+            ServerMsg::Assistant {
+                conversation_id: "c1".into(),
+                text: "must-not-be-accepted".into(),
+                seq: 7,
+                speech: None,
+                attention: None,
+            },
+            ServerMsg::Done {
+                conversation_id: "c1".into(),
+            },
+        ],
+    ]);
+
+    let (output, _) = run_against_server(&["ask", "hello"], &url, &home, rx);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("must-not-be-accepted"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("duplicate Welcome"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn resume_rejects_duplicate_welcome_before_accepting_replay() {
+    let home = TempHome::new("resume-duplicate-welcome");
+    let (url, rx) = start_ws_server(vec![
+        vec![welcome(None)],
+        vec![
+            welcome(None),
+            ServerMsg::Replay {
+                conversation_id: "c1".into(),
+                seq: 3,
+                role: "assistant".into(),
+                content: "must-not-be-accepted".into(),
+            },
+            ServerMsg::Done {
+                conversation_id: "c1".into(),
+            },
+        ],
+    ]);
+
+    let (output, _) = run_against_server(&["resume", "c1"], &url, &home, rx);
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("must-not-be-accepted"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("duplicate Welcome"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn assistant_and_approval_human_output_cannot_inject_terminal_controls() {
     let home = TempHome::new("ask-terminal-safe");
     let hostile = "wss://u:p@host/x?token=SECRET#tail\u{1b}]52;c;STEAL\u{7}\rnext";
@@ -3708,7 +4438,9 @@ fn init_pair_and_ask_report_unexpected_server_frames() {
     assert!(add.status.success());
     let (output, _) = run_against_profile(&["pair", "PAIR-2"], &home, rx);
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("server returned no token"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("empty token or no identity fingerprint")
+    );
 }
 
 #[test]

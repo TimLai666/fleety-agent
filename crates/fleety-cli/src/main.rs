@@ -373,9 +373,18 @@ async fn main() -> std::process::ExitCode {
     }
     // Seed env from ~/.fleety/config.toml so client settings (e.g. transport mode)
     // set via `fleety config` apply; an explicit env var still wins.
-    fleety_tools::config::seed_env_from_config(&fleety_tools::config::load(
-        &fleety_tools::config::config_path(),
-    ));
+    fleety_tools::config::seed_env_from_config(
+        &fleety_tools::config::load(&fleety_tools::config::config_path()),
+        fleety_tools::config::CLI_SCOPES,
+    );
+    if let Some(url) = std::env::var("FLEETY_AGENT_URL")
+        .ok()
+        .filter(|url| !url.is_empty())
+    {
+        if let Err(error) = connection::validate_ws_url(&url) {
+            return fail(error);
+        }
+    }
     // `init` defers migration until its explicit URL has passed local syntax
     // validation. Other already-validated commands retain the one-time legacy
     // migration before they resolve a connection.
@@ -661,23 +670,39 @@ async fn main() -> std::process::ExitCode {
             if args.get(2).is_none() {
                 done(async { acp::run_resolved(resolve_target()?).await }.await)
             } else if args.get(2).map(String::as_str) == Some("install") {
-                let server = args
-                    .iter()
-                    .position(|a| a == "--server")
-                    .and_then(|i| args.get(i + 1))
-                    .cloned();
+                let mut server = None;
+                let mut target = None;
+                let mut invalid = false;
+                let mut index = 3;
+                while index < args.len() {
+                    match args[index].as_str() {
+                        "--server" if server.is_none() => {
+                            let Some(value) = args.get(index + 1) else {
+                                invalid = true;
+                                break;
+                            };
+                            if value.starts_with("--") {
+                                invalid = true;
+                                break;
+                            }
+                            server = Some(value.clone());
+                            index += 2;
+                        }
+                        editor if !editor.starts_with('-') && target.is_none() => {
+                            target = Some(args[index].clone());
+                            index += 1;
+                        }
+                        _ => {
+                            invalid = true;
+                            break;
+                        }
+                    }
+                }
                 // `fleety acp install [<editor>]` — <editor> (e.g. `zed`) auto-
                 // configures that editor; with none, print the generic setup that
                 // works with any ACP-capable editor.
-                let target = args.get(3).filter(|a| !a.starts_with("--")).cloned();
-                let known = args[3..].iter().all(|arg| {
-                    arg == "zed" || arg == "--server" || server.as_deref() == Some(arg.as_str())
-                });
-                let invalid = !known
-                    || args.iter().filter(|arg| *arg == "--server").count() > 1
-                    || (args.iter().any(|arg| arg == "--server") && server.is_none());
                 if invalid {
-                    usage("usage: fleety acp install [zed] [--server <url>]")
+                    usage("usage: fleety acp install [editor] [--server <url>]")
                 } else {
                     done(acp::install(target, server))
                 }
@@ -686,10 +711,10 @@ async fn main() -> std::process::ExitCode {
                 Some("help" | "--help" | "-h")
             ) && args.len() == 3
             {
-                println!("usage: fleety acp [install [zed] [--server <url>]]");
+                println!("usage: fleety acp [install [editor] [--server <url>]]");
                 std::process::ExitCode::SUCCESS
             } else {
-                usage("usage: fleety acp [install [zed] [--server <url>]]")
+                usage("usage: fleety acp [install [editor] [--server <url>]]")
             }
         }
         Some("pair") if args.len() == 3 => done(pair(args[2].clone()).await),
@@ -775,7 +800,7 @@ async fn model_catalog(args: &[String]) -> Result<()> {
         _ => {}
     }
     let selection = crate::provider_service::ModelSelection::loading(
-        target.url,
+        target.url(),
         provider.clone(),
         role.clone(),
     );
@@ -975,7 +1000,7 @@ async fn update_all() -> Result<()> {
 
     // Self-heal any already-installed ACP agent configs (e.g. Zed) so they point
     // at this binary — in case the path changed or the `acp` invocation evolved.
-    acp::refresh_installed(None);
+    acp::refresh_installed(None)?;
     Ok(())
 }
 
@@ -1117,7 +1142,7 @@ async fn run_tui(session: workspace::WorkspaceSession) -> Result<workspace::Sess
             )));
         }
     };
-    let token = target.token.clone();
+    let token = target.token_owned();
     send(&mut tx, &hello(token.clone(), None)).await?;
 
     // Chat is not considered connected until the authenticated Welcome has
@@ -1147,8 +1172,8 @@ async fn run_tui(session: workspace::WorkspaceSession) -> Result<workspace::Sess
             )));
         }
     };
+    verify_and_pin_welcome_identity(welcome.server_identity.as_deref(), &target)?;
     maybe_converge_cli(&welcome.server_version).await;
-    tofu_pin(welcome.server_identity.as_deref(), &target);
     let server_identity = welcome.server_identity.clone();
     let (provider, model) =
         load_chat_model_context(&mut tx, &mut rx, welcome.config_protocol).await;
@@ -1157,7 +1182,7 @@ async fn run_tui(session: workspace::WorkspaceSession) -> Result<workspace::Sess
         &mut chat_transport,
         workspace::ChatTransportContext {
             profile: workspace_profile_label(&target),
-            endpoint: target.url.clone(),
+            endpoint: target.url_owned(),
             server_identity: server_identity.clone(),
             server_version: (!welcome.server_version.is_empty())
                 .then_some(welcome.server_version.clone()),
@@ -1527,6 +1552,14 @@ async fn run_tui(session: workspace::WorkspaceSession) -> Result<workspace::Sess
                             ));
                         }
                     }
+                    Ok(ServerMsg::Welcome { .. }) => {
+                        app.turn_in_flight = false;
+                        app.status =
+                            "The Server sent a duplicate Welcome after authentication; the connection was closed."
+                                .to_string();
+                        app.should_quit = true;
+                        workspace.reduce(workspace::Action::AuthenticationRequired);
+                    }
                     _ => {}
                 },
                 None => {
@@ -1588,9 +1621,9 @@ async fn reconnect_chat_once(
     conversation_id: Option<String>,
     after_seq: u64,
 ) -> std::result::Result<(Tx, Rx, workspace::ChatTransportContext), ChatReconnectError> {
-    let connection = transport::connect(&target.url, target.token.as_deref()).await?;
+    let connection = transport::connect(target.url(), target.token()).await?;
     let (mut tx, mut rx) = connection.split();
-    send(&mut tx, &hello(target.token.clone(), None)).await?;
+    send(&mut tx, &hello(target.token_owned(), None)).await?;
     let welcome = receive_chat_welcome(&mut rx).await?;
     if welcome.server_identity.as_deref() != expected_identity {
         let _ = tx.close().await;
@@ -1610,7 +1643,7 @@ async fn reconnect_chat_once(
     }
     let context = workspace::ChatTransportContext {
         profile: workspace_profile_label(target),
-        endpoint: target.url.clone(),
+        endpoint: target.url_owned(),
         server_identity: welcome.server_identity,
         server_version: (!welcome.server_version.is_empty()).then_some(welcome.server_version),
         provider,
@@ -1981,10 +2014,7 @@ fn validate_invocation_target(target: &Target) -> std::result::Result<(), String
     let Target::Url(value) = target else {
         return Ok(());
     };
-    let valid = !value.chars().any(char::is_control)
-        && reqwest::Url::parse(value)
-            .is_ok_and(|url| matches!(url.scheme(), "ws" | "wss") && url.host_str().is_some());
-    if valid {
+    if connection::validate_ws_url(value).is_ok() {
         Ok(())
     } else {
         Err(
@@ -1997,14 +2027,19 @@ fn validate_invocation_target(target: &Target) -> std::result::Result<(), String
 /// Resolve which server (url + token) this command connects to, via the shared
 /// [`connection::resolve`] over `connections.toml`, honoring the per-invocation
 /// override and the `FLEETY_AGENT_URL`/`FLEETY_TOKEN` env vars. Prints a one-line
-/// hint when an env override is in effect, when it discovered a server on the
-/// LAN, or when it fell through to the localhost default — so a fresh machine
-/// gets a next step instead of a bare connection error.
-fn resolve_target() -> Result<connection::Resolved> {
-    let conns = connection::load()?;
+/// hint when an env override is in effect, when a local loopback server is
+/// detected, or when it falls through to the localhost default. An mDNS
+/// candidate returns guided-init selection instead of a connection target.
+fn resolve_target_with_mode(upgrade_generation: bool) -> Result<connection::Resolved> {
     let over = OVERRIDE.get().cloned().unwrap_or(Target::Current);
-    let env_url = std::env::var("FLEETY_AGENT_URL").ok();
+    let env_url = std::env::var("FLEETY_AGENT_URL")
+        .ok()
+        .filter(|url| !url.is_empty());
     let env_token = std::env::var("FLEETY_TOKEN").ok();
+    if upgrade_generation {
+        connection::ensure_resolvable_profile_generation(&over, env_url.is_some())?;
+    }
+    let conns = connection::load()?;
     // Discovery step (only reached with no override/env/sticky profile): prefer
     // a local server on loopback over an mDNS advertisement. On the server host,
     // mDNS returns this box's own LAN IP, and a same-host connection to that LAN
@@ -2013,30 +2048,27 @@ fn resolve_target() -> Result<connection::Resolved> {
     // ordering hints only. Unsigned TXT data never grants profile provenance or
     // a stored token.
     let r = connection::resolve(&conns, &over, env_url, env_token, || {
-        prefer_loopback_discovery(
+        connection::prefer_trusted_local_candidate(
             || loopback_server_up(std::time::Duration::from_millis(300)),
             || connection::discover_for_connections(&conns, std::time::Duration::from_secs(2)),
         )
     })?;
     if !json_mode() && !quiet_mode() {
-        match &r.source {
+        match r.source() {
             connection::Source::Env => {
                 eprintln!(
                     "note: FLEETY_AGENT_URL overrides the current server ({})",
-                    redact_endpoint(&r.url)
+                    redact_endpoint(r.url())
                 )
             }
-            connection::Source::Mdns if r.url == local_server_url() => eprintln!(
+            connection::Source::Local => eprintln!(
                 "using this host's local server ({}) — same-host trusted, no pairing needed",
-                redact_endpoint(&r.url)
+                redact_endpoint(r.url())
             ),
-            connection::Source::Mdns => {
-                eprintln!("discovered agent on the LAN: {}", redact_endpoint(&r.url))
-            }
             connection::Source::Default => eprintln!(
                 "no server configured and none found on the LAN — trying the local default \
                  {} (point at one with `fleety init <ws-url>`)",
-                redact_endpoint(&r.url)
+                redact_endpoint(r.url())
             ),
             connection::Source::OverrideProfile(_)
             | connection::Source::OverrideUrl
@@ -2046,20 +2078,28 @@ fn resolve_target() -> Result<connection::Resolved> {
     Ok(r)
 }
 
+fn resolve_target() -> Result<connection::Resolved> {
+    resolve_target_with_mode(true)
+}
+
+fn resolve_target_read_only() -> Result<connection::Resolved> {
+    resolve_target_with_mode(false).map(connection::Resolved::into_read_only)
+}
+
 /// Resolve + connect in one step: returns the split streams plus the resolved
 /// target (so callers can read its url/token). Every non-`init` connect site
-/// goes through here so they share one resolution (one mDNS probe, one token).
+/// goes through here so they share one resolution and one token decision.
 /// A failed saved endpoint is never healed from unsigned mDNS TXT metadata.
 /// The user must explicitly select and re-pair the intended Server.
 async fn open(owner: &RemoteOwner) -> Result<(Tx, Rx, connection::Resolved)> {
     let target = resolve_target()?;
     record_remote_context(&target, owner, None);
-    match transport::connect(&target.url, target.token.as_deref()).await {
+    match transport::connect(target.url(), target.token()).await {
         Ok(ws) => {
             let (tx, rx) = ws.split();
             Ok((tx, rx, target))
         }
-        Err(e) => match &target.source {
+        Err(e) => match target.source() {
             connection::Source::Profile(name) | connection::Source::OverrideProfile(name) => Err(
                 CoreError::Message(profile_recovery_error(name, &e.report().message)),
             ),
@@ -2143,31 +2183,8 @@ pub(crate) fn local_server_url() -> String {
 /// no local server returns fast (connection refused is immediate, not the full
 /// timeout). Returns the loopback URL when up, else `None`.
 fn loopback_server_up(timeout: std::time::Duration) -> Option<String> {
-    use std::net::ToSocketAddrs;
     let url = local_server_url();
-    let addr = url.strip_prefix("ws://")?.to_socket_addrs().ok()?.next()?;
-    std::net::TcpStream::connect_timeout(&addr, timeout).ok()?;
-    Some(url)
-}
-
-/// Co-located discovery preference: a local server on loopback wins over an mDNS
-/// advertisement. The same host connecting to its own LAN IP — what mDNS returns
-/// — is NOT loopback-trusted and would have to pair, whereas `127.0.0.1` is
-/// same-host trusted (no pairing). Pure over the two injected probes so the
-/// precedence is unit-testable; the loopback probe runs first and mDNS only when
-/// it finds nothing.
-fn prefer_loopback_discovery(
-    loopback: impl FnOnce() -> Option<String>,
-    mdns: impl FnOnce() -> Option<connection::Discovered>,
-) -> Option<connection::Discovered> {
-    if let Some(url) = loopback() {
-        // Loopback is same-host trusted, so it never carries/needs a token.
-        return Some(connection::Discovered {
-            url,
-            fingerprint: None,
-        });
-    }
-    mdns()
+    connection::trusted_local_server_up(&url, timeout)
 }
 
 /// Probe the local server: connect on loopback with a short timeout and read a
@@ -2208,9 +2225,62 @@ fn read_prompt_line() -> String {
     line
 }
 
+fn guided_pairing_code(
+    is_local: bool,
+    exact_profile_is_paired: bool,
+    input: &str,
+) -> Result<Option<String>> {
+    if is_local || exact_profile_is_paired {
+        return Ok(None);
+    }
+    let code = input.trim();
+    if code.is_empty() {
+        return Err(CoreError::Message(
+            "pairing code is required before a LAN-discovered server can be saved or used; \
+             mint one with `fleety pair-code` on an already-paired device — no connection \
+             was made and connections.toml was not changed"
+                .to_string(),
+        ));
+    }
+    Ok(Some(code.to_string()))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InitSelection {
+    Explicit,
+    GuidedLocal,
+    GuidedLan,
+}
+
+fn validate_guided_pairing(
+    selection: InitSelection,
+    conns: &connection::Connections,
+    profile_name: &str,
+    url: &str,
+    pairing_code: Option<&str>,
+) -> Result<()> {
+    if selection != InitSelection::GuidedLan {
+        return Ok(());
+    }
+    let exact_profile_is_paired = conns.profiles.get(profile_name).is_some_and(|saved| {
+        saved.url == url
+            && saved
+                .token
+                .as_deref()
+                .is_some_and(|token| !token.is_empty())
+    });
+    guided_pairing_code(
+        false,
+        exact_profile_is_paired,
+        pairing_code.unwrap_or_default(),
+    )
+    .map(|_| ())
+}
+
 /// Guided first-run `fleety init` (no URL, on a TTY): scan the LAN, pick a
-/// server from a numbered list, save it as the current profile, and offer to
-/// pair right away. Falls back to the usage guidance when nothing is found.
+/// server from a numbered list, and pair a LAN selection before saving it as
+/// current. Same-host loopback and an exact already-paired profile are exempt.
+/// Falls back to the usage guidance when nothing is found.
 async fn init_interactive(name_override: Option<String>) -> Result<()> {
     // Probe the local server first (loopback, short timeout): a same-host server
     // needs no pairing and should be the default pick.
@@ -2254,17 +2324,31 @@ async fn init_interactive(name_override: Option<String>) -> Result<()> {
     let chosen = found[picked].clone();
     let is_local = chosen.url == local_url;
     let profile = name_override.unwrap_or_else(|| chosen.name.clone());
-    let pairing_code = if is_local {
-        None
+    let exact_profile_is_paired = connection::load()?
+        .profiles
+        .get(&profile)
+        .is_some_and(|saved| {
+            saved.url == chosen.url
+                && saved
+                    .token
+                    .as_deref()
+                    .is_some_and(|token| !token.is_empty())
+        });
+    let pairing_code = if is_local || exact_profile_is_paired {
+        guided_pairing_code(is_local, exact_profile_is_paired, "")?
     } else {
         eprint!(
-            "Pairing code — mint one with `fleety pair-code` on an already-paired device \
-             (Enter only if this profile is already paired): "
+            "Pairing code required — mint one with `fleety pair-code` on an \
+             already-paired device: "
         );
-        let code = read_prompt_line().trim().to_string();
-        (!code.is_empty()).then_some(code)
+        guided_pairing_code(false, false, &read_prompt_line())?
     };
-    init(chosen.url.clone(), profile.clone(), pairing_code).await?;
+    let selection = if is_local {
+        InitSelection::GuidedLocal
+    } else {
+        InitSelection::GuidedLan
+    };
+    init_selected(chosen.url.clone(), profile.clone(), pairing_code, selection).await?;
     println!(
         "Using verified server '{}' ({}).",
         terminal_safe_text(&profile),
@@ -2296,38 +2380,144 @@ fn hello(token: Option<String>, pairing_code: Option<String>) -> ClientMsg {
 
 /// `fleety pair <code>`: enroll against the current or explicitly overridden
 /// named profile; the minted token is written only to that exact profile.
+struct ProfilePublicationRecovery {
+    initial_error: CoreError,
+    committed: connection::Resolved,
+}
+
+fn finish_profile_publication(
+    profile_name: &str,
+    operation: &str,
+    recovery: Option<ProfilePublicationRecovery>,
+    notify_daemon: bool,
+) -> Result<()> {
+    finish_profile_publication_with(
+        profile_name,
+        operation,
+        recovery,
+        notify_daemon,
+        connection::sync_resolved_profile_publication,
+        crate::server::notify_daemon_reconnect,
+    )
+}
+
+fn finish_profile_publication_with<S, N>(
+    profile_name: &str,
+    operation: &str,
+    recovery: Option<ProfilePublicationRecovery>,
+    notify_daemon: bool,
+    sync_publication: S,
+    notify_reconnect: N,
+) -> Result<()>
+where
+    S: FnOnce(&connection::Resolved) -> Result<()>,
+    N: FnOnce(&str) -> Result<String>,
+{
+    let durability_error = recovery.and_then(|recovery| {
+        sync_publication(&recovery.committed).err().map(|retry| {
+            CoreError::Message(format!(
+                "{operation} changed profile '{profile_name}', but connections.toml publication is not confirmed durable after retry: {} (initial failure: {})",
+                retry.report().message,
+                recovery.initial_error.report().message
+            ))
+        })
+    });
+    let notification_error = if notify_daemon {
+        match notify_reconnect(profile_name) {
+            Ok(notice) => {
+                if !notice.is_empty() {
+                    println!("{}", terminal_safe_multiline(&notice));
+                }
+                None
+            }
+            Err(error) => Some(error),
+        }
+    } else {
+        None
+    };
+    match (durability_error, notification_error) {
+        (None, None) => Ok(()),
+        (Some(durability), None) => Err(CoreError::Message(format!(
+            "{} The committed credential became visible before the failure, but its profile generation may since have been replaced. Do not reuse the pairing code. After storage is healthy, run `fleetyd reconnect --profile {}`.",
+            durability.report().message,
+            terminal_safe_field(profile_name)
+        ))),
+        (None, Some(notification)) => Err(CoreError::Message(format!(
+            "{operation} changed profile '{}', but fleetyd was not notified: {} — run `fleetyd reconnect --profile {}`",
+            terminal_safe_field(profile_name),
+            notification.report().message,
+            terminal_safe_field(profile_name)
+        ))),
+        (Some(durability), Some(notification)) => Err(CoreError::Message(format!(
+            "{} The committed credential became visible before the failure, but its profile generation may since have been replaced; fleetyd was also not notified: {}. Do not reuse the pairing code; after storage is healthy, run `fleetyd reconnect --profile {}`.",
+            durability.report().message,
+            notification.report().message,
+            terminal_safe_field(profile_name)
+        ))),
+    }
+}
+
 async fn pair(code: String) -> Result<()> {
     let target = resolve_target()?;
-    let profile_name = match &target.source {
+    let profile_name = match target.source() {
         connection::Source::Profile(name) | connection::Source::OverrideProfile(name) => {
             name.clone()
         }
         _ => {
             return Err(CoreError::Message(
-                "pairing needs a named server profile so the credential has an unambiguous owner. Run `fleety init <ws-url> --name <name>`, then retry; no profile was modified"
+                "pairing needs a named server profile so the credential has an unambiguous owner. Run `fleety init <ws-url> --name <name> --pairing-code <code>`; no profile was modified"
                     .to_string(),
             ))
         }
     };
-    let (mut tx, mut rx) = transport::connect(&target.url, target.token.as_deref())
-        .await?
-        .split();
-    let url = target.url.clone();
+    // `pair` is an explicit credential-recovery action. Never authenticate it
+    // with the old saved token: a still-valid token would make the Server skip
+    // redeeming the code, and a rebuilt Server must be able to replace its old
+    // identity under the resolver-frozen owner generation.
+    let (mut tx, mut rx) = transport::connect(target.url(), None).await?.split();
+    let url = target.url_owned();
     print_remote_context(&target, &RemoteOwner::Server, None);
-    send(&mut tx, &hello(target.token.clone(), Some(code))).await?;
+    send(&mut tx, &hello(None, Some(code))).await?;
     let result = match recv(&mut rx).await? {
         Some(ServerMsg::Welcome {
             token: Some(tok),
-            server_fingerprint,
+            server_fingerprint: Some(server_fingerprint),
             ..
-        }) => {
-            connection::store_profile_pairing(
+        }) if !tok.trim().is_empty() && !server_fingerprint.trim().is_empty() => {
+            let (recovery, notify_daemon) =
+                match connection::store_resolved_profile_pairing_recoverable(
+                    &target,
+                    &tok,
+                    &server_fingerprint,
+                )? {
+                    connection::CredentialCommit::Durable {
+                        profile_is_current,
+                        ..
+                    } => (None, profile_is_current),
+                    connection::CredentialCommit::PublishedNotDurable {
+                        committed,
+                        error,
+                        profile_is_current,
+                        ..
+                    } => (
+                        Some(ProfilePublicationRecovery {
+                            initial_error: error,
+                            committed,
+                        }),
+                        profile_is_current,
+                    ),
+                };
+            finish_profile_publication(
                 &profile_name,
-                &url,
-                &tok,
-                server_fingerprint.as_deref(),
+                "pairing",
+                recovery,
+                notify_daemon,
             )?;
-            print_remote_context(&target, &RemoteOwner::Server, server_fingerprint.as_deref());
+            print_remote_context(
+                &target,
+                &RemoteOwner::Server,
+                Some(server_fingerprint.as_str()),
+            );
             println!(
                 "✓ paired with Server at {}; token saved to profile '{}'",
                 terminal_safe_endpoint(&url),
@@ -2335,8 +2525,9 @@ async fn pair(code: String) -> Result<()> {
             );
             Ok(())
         }
-        Some(ServerMsg::Welcome { token: None, .. }) => Err(CoreError::Message(
-            "server returned no token (is it running with FLEETY_REQUIRE_AUTH=1?)".to_string(),
+        Some(ServerMsg::Welcome { .. }) => Err(CoreError::Message(
+            "the Server returned an empty token or no identity fingerprint; no credential was saved"
+                .to_string(),
         )),
         Some(ServerMsg::Error { error }) => Err(CoreError::Provider(format!(
             "pairing failed: {}",
@@ -2376,16 +2567,20 @@ async fn pair_code() -> Result<()> {
              server host), or use the code printed at the server's first run",
             error.message
         ))),
-        other => Err(CoreError::Provider(format!(
-            "expected a pairing-code reply, got {other:?}"
+        Some(other) => Err(CoreError::Provider(format!(
+            "expected a pairing-code reply, got {}",
+            server_msg_kind(&other)
         ))),
+        None => Err(CoreError::Provider(
+            "the Server closed before returning a pairing code".to_string(),
+        )),
     }
 }
 
 /// The wire tag of a server frame (`"assistant"`, `"done"`, …) for human-readable
 /// messages — read from the serde `type` tag, never the Debug form (which would
 /// dump the internal type's fields).
-fn server_msg_kind(msg: &ServerMsg) -> String {
+pub(crate) fn server_msg_kind(msg: &ServerMsg) -> String {
     serde_json::to_value(msg)
         .ok()
         .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_string))
@@ -2467,10 +2662,21 @@ fn parse_ask_args(args: &[String]) -> Result<(String, Vec<(PathBuf, &'static str
 /// --use` plus enrollment. Records/updates the named profile (default `default`),
 /// makes it current, connects, and registers this device.
 async fn init(url: String, name: String, pairing_code: Option<String>) -> Result<()> {
+    init_selected(url, name, pairing_code, InitSelection::Explicit).await
+}
+
+async fn init_selected(
+    url: String,
+    name: String,
+    pairing_code: Option<String>,
+    selection: InitSelection,
+) -> Result<()> {
     // Build the proposed state in memory. Nothing is persisted until this exact
     // endpoint returns a valid Welcome (and, when supplied, redeems the pairing
     // code), so a typo or unreachable server cannot poison current selection.
+    let pairing_attempted = pairing_code.is_some();
     let initial = connection::load()?;
+    validate_guided_pairing(selection, &initial, &name, &url, pairing_code.as_deref())?;
     let prior_profile = initial.profiles.get(&name).cloned();
     let initial_current = initial.current.clone();
     let credentialed_endpoint_change = prior_profile.as_ref().is_some_and(|profile| {
@@ -2486,39 +2692,52 @@ async fn init(url: String, name: String, pairing_code: Option<String>) -> Result
             terminal_safe_field(&name)
         )));
     }
-    let token = (!credentialed_endpoint_change)
+    let token = (!credentialed_endpoint_change && !pairing_attempted)
         .then(|| {
             prior_profile
                 .as_ref()
                 .and_then(|profile| profile.token.clone())
         })
         .flatten();
-    let old_fingerprint = (!credentialed_endpoint_change)
+    let old_fingerprint = (!credentialed_endpoint_change && !pairing_attempted)
         .then(|| {
             prior_profile
                 .as_ref()
                 .and_then(|profile| profile.fingerprint.clone())
         })
         .flatten();
-    let proposed_target = connection::Resolved {
-        url: url.clone(),
-        token: token.clone(),
-        source: connection::Source::OverrideProfile(name.clone()),
-    };
+    let proposed_target = connection::Resolved::unowned(
+        url.clone(),
+        token.clone(),
+        connection::Source::OverrideProfile(name.clone()),
+    );
     print_remote_context(&proposed_target, &RemoteOwner::Server, None);
     let (mut tx, mut rx) = transport::connect(&url, token.as_deref()).await?.split();
 
     send(&mut tx, &hello(token, pairing_code)).await?;
-    match recv(&mut rx).await? {
+    let recovery = match recv(&mut rx).await? {
         Some(ServerMsg::Welcome {
             session_id,
             token: minted_token,
             server_fingerprint,
             ..
         }) => {
-            if credentialed_endpoint_change && minted_token.is_none() {
+            if (credentialed_endpoint_change || pairing_attempted)
+                && !minted_token
+                    .as_deref()
+                    .is_some_and(|token| !token.trim().is_empty())
+            {
                 return Err(CoreError::Message(
-                    "the selected Server did not complete re-pairing; the old token was not sent and connections.toml was not changed"
+                    "the selected Server did not complete pairing because Welcome contained no non-empty newly minted token; connections.toml was not changed"
+                        .to_string(),
+                ));
+            }
+            if !server_fingerprint
+                .as_deref()
+                .is_some_and(|fingerprint| !fingerprint.trim().is_empty())
+            {
+                return Err(CoreError::Message(
+                    "the selected Server did not complete enrollment because Welcome contained no usable identity fingerprint; connections.toml was not changed"
                         .to_string(),
                 ));
             }
@@ -2532,8 +2751,10 @@ async fn init(url: String, name: String, pairing_code: Option<String>) -> Result
                     )));
                 }
             }
-            connection::mutate(|live| {
-                if live.current != initial_current || live.profiles.get(&name) != prior_profile.as_ref() {
+            let commit = connection::mutate_recoverable(|live| {
+                if live.current != initial_current
+                    || live.profiles.get(&name) != prior_profile.as_ref()
+                {
                     return Err(CoreError::Message(
                         "connection profiles changed while init was connecting; nothing was overwritten — retry init"
                             .to_string(),
@@ -2544,23 +2765,36 @@ async fn init(url: String, name: String, pairing_code: Option<String>) -> Result
                 }
                 let profile = live.profiles.entry(name.clone()).or_default();
                 profile.url = url.clone();
-                if credentialed_endpoint_change {
+                if credentialed_endpoint_change || pairing_attempted {
                     profile.token = minted_token.clone();
                     profile.fingerprint = server_fingerprint.clone();
                 } else if let Some(minted) = minted_token.as_ref() {
                     profile.token = Some(minted.clone());
                 }
-                if !credentialed_endpoint_change && old_fingerprint.is_none() {
+                if !credentialed_endpoint_change && !pairing_attempted && old_fingerprint.is_none() {
                     profile.fingerprint = server_fingerprint.clone();
                 }
+                if profile.generation.trim().is_empty() {
+                    profile.generation = uuid::Uuid::new_v4().to_string();
+                }
                 live.current = Some(name.clone());
-                Ok(())
+                connection::resolve(live, &Target::Current, None, None, || None)
             })?;
-            let connected = connection::Resolved {
-                url: url.clone(),
-                token: None,
-                source: connection::Source::Profile(name.clone()),
+            let recovery = match commit {
+                connection::MutationCommit::Durable(_) => None,
+                connection::MutationCommit::PublishedNotDurable {
+                    value: committed,
+                    error,
+                } => Some(ProfilePublicationRecovery {
+                    initial_error: error,
+                    committed,
+                }),
             };
+            let connected = connection::Resolved::unowned(
+                url.clone(),
+                None,
+                connection::Source::Profile(name.clone()),
+            );
             print_remote_context(
                 &connected,
                 &RemoteOwner::Server,
@@ -2573,6 +2807,7 @@ async fn init(url: String, name: String, pairing_code: Option<String>) -> Result
                 terminal_safe_field(&name),
                 terminal_safe_field(&session_id)
             );
+            recovery
         }
         Some(ServerMsg::Error { error }) => {
             return Err(CoreError::Message(format!(
@@ -2580,11 +2815,20 @@ async fn init(url: String, name: String, pairing_code: Option<String>) -> Result
                 error.message
             )))
         }
-        other => return Err(CoreError::Provider(format!(
-            "unexpected reply during init: {other:?}; connections.toml was not changed"
-        ))),
-    }
+        Some(other) => {
+            return Err(CoreError::Provider(format!(
+                "unexpected {} reply during init; connections.toml was not changed",
+                server_msg_kind(&other)
+            )))
+        }
+        None => {
+            return Err(CoreError::Provider(
+                "the Server closed during init; connections.toml was not changed".to_string(),
+            ))
+        }
+    };
     let _ = tx.close().await;
+    finish_profile_publication(&name, "init", recovery, true)?;
     Ok(())
 }
 
@@ -2654,18 +2898,23 @@ fn guess_mime(path: &Path, kind: &str) -> String {
 async fn ask(text: String, attachments: Vec<WireAttachment>) -> Result<()> {
     let (mut tx, mut rx, target) = open(&RemoteOwner::Server).await?;
 
-    send(&mut tx, &hello(target.token.clone(), None)).await?;
+    send(&mut tx, &hello(target.token_owned(), None)).await?;
     match recv(&mut rx).await? {
         Some(ServerMsg::Welcome {
             server_version,
             server_fingerprint,
             ..
         }) => {
+            verify_and_pin_welcome_identity(server_fingerprint.as_deref(), &target)?;
             maybe_converge_cli(&server_version).await;
-            tofu_pin(server_fingerprint.as_deref(), &target);
             eprint_remote_context(&target, &RemoteOwner::Server, server_fingerprint.as_deref());
         }
-        other => return Err(CoreError::Message(hello_failure_message(other.as_ref()))),
+        other => {
+            return Err(CoreError::Message(hello_failure_message_for_target(
+                other.as_ref(),
+                &target,
+            )))
+        }
     }
 
     send(
@@ -2743,8 +2992,13 @@ async fn ask(text: String, attachments: Vec<WireAttachment>) -> Result<()> {
                 };
                 send(&mut tx, &decision).await?;
             }
-            Some(ServerMsg::Welcome { .. })
-            | Some(ServerMsg::Replay { .. })
+            Some(ServerMsg::Welcome { .. }) => {
+                return Err(CoreError::Message(
+                    "the Server sent a duplicate Welcome after authentication; the connection was closed"
+                        .to_string(),
+                ));
+            }
+            Some(ServerMsg::Replay { .. })
             | Some(ServerMsg::AssistantDelta { .. })
             | Some(ServerMsg::AuditListResult { .. })
             | Some(ServerMsg::AuditShowResult { .. })
@@ -2790,7 +3044,7 @@ fn capture_voice_text() -> Option<String> {
 async fn voice_chat() -> Result<()> {
     let (mut tx, mut rx, target) = open(&RemoteOwner::Server).await?;
 
-    send(&mut tx, &hello(target.token.clone(), None)).await?;
+    send(&mut tx, &hello(target.token_owned(), None)).await?;
     let (conversation, audio_input) = match recv(&mut rx).await? {
         Some(ServerMsg::Welcome {
             server_version,
@@ -2799,12 +3053,17 @@ async fn voice_chat() -> Result<()> {
             server_fingerprint,
             ..
         }) => {
+            verify_and_pin_welcome_identity(server_fingerprint.as_deref(), &target)?;
             maybe_converge_cli(&server_version).await;
-            tofu_pin(server_fingerprint.as_deref(), &target);
             print_remote_context(&target, &RemoteOwner::Server, server_fingerprint.as_deref());
             (conversation_id, audio_input)
         }
-        other => return Err(CoreError::Message(hello_failure_message(other.as_ref()))),
+        other => {
+            return Err(CoreError::Message(hello_failure_message_for_target(
+                other.as_ref(),
+                &target,
+            )))
+        }
     };
     // Decide once: send audio to an audio-capable model, else transcribe locally.
     let voice_mode = voice::voice_mode(audio_input, voice::voice_audio_setting());
@@ -2891,6 +3150,12 @@ async fn voice_chat() -> Result<()> {
                     }
                 }
                 Some(ServerMsg::Done { .. }) => break,
+                Some(ServerMsg::Welcome { .. }) => {
+                    return Err(CoreError::Message(
+                        "the Server sent a duplicate Welcome after authentication; the voice session was closed"
+                            .to_string(),
+                    ))
+                }
                 None => {
                     return Err(CoreError::Provider(
                         "connection closed before the voice turn completed".to_string(),
@@ -2932,18 +3197,23 @@ async fn voice_chat() -> Result<()> {
 async fn resume(conversation_id: String, after_seq: u64) -> Result<()> {
     let (mut tx, mut rx, target) = open(&RemoteOwner::Server).await?;
 
-    send(&mut tx, &hello(target.token.clone(), None)).await?;
+    send(&mut tx, &hello(target.token_owned(), None)).await?;
     match recv(&mut rx).await? {
         Some(ServerMsg::Welcome {
             server_version,
             server_fingerprint,
             ..
         }) => {
+            verify_and_pin_welcome_identity(server_fingerprint.as_deref(), &target)?;
             maybe_converge_cli(&server_version).await;
-            tofu_pin(server_fingerprint.as_deref(), &target);
             print_remote_context(&target, &RemoteOwner::Server, server_fingerprint.as_deref());
         }
-        other => return Err(CoreError::Message(hello_failure_message(other.as_ref()))),
+        other => {
+            return Err(CoreError::Message(hello_failure_message_for_target(
+                other.as_ref(),
+                &target,
+            )))
+        }
     }
 
     send(
@@ -2964,6 +3234,12 @@ async fn resume(conversation_id: String, after_seq: u64) -> Result<()> {
                 terminal_safe_field(&content)
             ),
             Some(ServerMsg::Done { .. }) => break,
+            Some(ServerMsg::Welcome { .. }) => {
+                return Err(CoreError::Message(
+                    "the Server sent a duplicate Welcome after authentication; the resume session was closed"
+                        .to_string(),
+                ))
+            }
             None => {
                 return Err(CoreError::Provider(
                     "connection closed before resume completed".to_string(),
@@ -3082,25 +3358,25 @@ impl RemoteOwner {
 }
 
 fn profile_label(target: &connection::Resolved) -> String {
-    match &target.source {
+    match target.source() {
         connection::Source::Profile(name) | connection::Source::OverrideProfile(name) => {
             format!("profile '{name}'")
         }
         connection::Source::OverrideUrl => "transient URL override".to_string(),
         connection::Source::Env => "environment override".to_string(),
-        connection::Source::Mdns => "discovered Server".to_string(),
+        connection::Source::Local => "this host's local Server".to_string(),
         connection::Source::Default => "default Server".to_string(),
     }
 }
 
 pub(crate) fn workspace_profile_label(target: &connection::Resolved) -> String {
-    match &target.source {
+    match target.source() {
         connection::Source::Profile(name) | connection::Source::OverrideProfile(name) => {
             name.clone()
         }
         connection::Source::OverrideUrl => "transient URL".into(),
         connection::Source::Env => "environment".into(),
-        connection::Source::Mdns => "discovered".into(),
+        connection::Source::Local => "local".into(),
         connection::Source::Default => "default".into(),
     }
 }
@@ -3187,7 +3463,7 @@ fn remote_context(
         "context: {}; owner: {}; endpoint: {}",
         terminal_safe_field(&profile_label(target)),
         terminal_safe_field(&owner.label()),
-        terminal_safe_field(&redact_endpoint(&target.url))
+        terminal_safe_field(&redact_endpoint(target.url()))
     );
     if let Some(identity) = server_identity.filter(|identity| !identity.is_empty()) {
         context.push_str("; server identity: ");
@@ -3225,13 +3501,13 @@ fn record_remote_context(
     owner: &RemoteOwner,
     server_identity: Option<&str>,
 ) {
-    let (profile, source) = match &target.source {
+    let (profile, source) = match target.source() {
         connection::Source::Profile(name) | connection::Source::OverrideProfile(name) => {
             (serde_json::Value::String(name.clone()), "profile")
         }
         connection::Source::OverrideUrl => (serde_json::Value::Null, "transient_url"),
         connection::Source::Env => (serde_json::Value::Null, "environment"),
-        connection::Source::Mdns => (serde_json::Value::Null, "discovery"),
+        connection::Source::Local => (serde_json::Value::Null, "local"),
         connection::Source::Default => (serde_json::Value::Null, "default"),
     };
     let (owner_name, device_id) = match owner {
@@ -3243,7 +3519,7 @@ fn record_remote_context(
         "source": source,
         "owner": owner_name,
         "device_id": device_id,
-        "endpoint": redact_endpoint(&target.url),
+        "endpoint": redact_endpoint(target.url()),
         "server_identity": server_identity,
     }));
 }
@@ -3269,7 +3545,7 @@ async fn connect_hello_for_owner(
     owner: RemoteOwner,
 ) -> Result<(Tx, Rx, u32, connection::Resolved)> {
     let (mut tx, mut rx, target) = open(&owner).await?;
-    send(&mut tx, &hello(target.token.clone(), None)).await?;
+    send(&mut tx, &hello(target.token_owned(), None)).await?;
     match recv(&mut rx).await? {
         Some(ServerMsg::Welcome {
             server_version,
@@ -3277,12 +3553,15 @@ async fn connect_hello_for_owner(
             config_protocol,
             ..
         }) => {
+            verify_and_pin_welcome_identity(server_fingerprint.as_deref(), &target)?;
             maybe_converge_cli(&server_version).await;
-            tofu_pin(server_fingerprint.as_deref(), &target);
             print_remote_context(&target, &owner, server_fingerprint.as_deref());
             Ok((tx, rx, config_protocol, target))
         }
-        other => Err(CoreError::Message(hello_failure_message(other.as_ref()))),
+        other => Err(CoreError::Message(hello_failure_message_for_target(
+            other.as_ref(),
+            &target,
+        ))),
     }
 }
 
@@ -3309,28 +3588,78 @@ fn hello_failure_message(reply: Option<&ServerMsg>) -> String {
     }
 }
 
-/// Trust-on-authenticated-connect: back-fill the current profile's server
-/// fingerprint from a successful Welcome (devices enrolled before fingerprints
-/// existed gain an identity pin without re-pairing); warn — never overwrite —
-/// when the identity changed. Best-effort and quiet on the happy path.
-fn tofu_pin(fingerprint: Option<&str>, target: &connection::Resolved) {
-    let Some(fp) = fingerprint.filter(|f| !f.is_empty()) else {
-        return;
-    };
-    let name = match &target.source {
-        connection::Source::Profile(name) | connection::Source::OverrideProfile(name) => name,
-        _ => return,
-    };
-    match connection::pin_profile_fingerprint(name, &target.url, fp) {
-        Ok(connection::PinDecision::IdentityChanged) => eprintln!(
-            "warning: the server's identity fingerprint changed since it was pinned; keeping \
-             the old pin — re-pair (`fleety init` / `fleety pair`) if the server was \
-             intentionally rebuilt"
-        ),
-        Err(error) if !quiet_mode() && !json_mode() => {
-            eprintln!("warning: {}", terminal_safe_text(&error.report().message));
+fn hello_failure_message_for_target(
+    reply: Option<&ServerMsg>,
+    target: &connection::Resolved,
+) -> String {
+    if !matches!(
+        reply,
+        Some(ServerMsg::Error { error }) if is_auth_rejection(&error.kind)
+    ) {
+        return hello_failure_message(reply);
+    }
+    if target.sent_caller_explicit_token() {
+        return "the Server rejected the caller-explicit FLEETY_TOKEN — unset or correct FLEETY_TOKEN; it overrides saved profile credentials for this process"
+            .to_string();
+    }
+    match target.source() {
+        connection::Source::OverrideUrl | connection::Source::Env => {
+            "the transient Server rejected authentication — set a non-empty FLEETY_TOKEN for this endpoint, or save and pair it with `fleety init <ws-url> --name <profile>`; raw URL overrides never use or update saved profile credentials"
+                .to_string()
         }
-        _ => {}
+        connection::Source::Profile(name) | connection::Source::OverrideProfile(name) => format!(
+            "not paired with profile '{}' — run `fleety --profile {} pair <code>` (mint a code with `fleety pair-code` on the Server host)",
+            terminal_safe_field(name),
+            terminal_safe_field(name)
+        ),
+        connection::Source::Local | connection::Source::Default => {
+            "not paired with this Server — save and pair it with `fleety init <ws-url> --name <profile>` (mint a code with `fleety pair-code` on the Server host)"
+                .to_string()
+        }
+    }
+}
+
+/// A durable profile does not become operational until Welcome supplies the
+/// exact resolver-bound Server identity. Raw/environment targets have no
+/// durable identity capability and therefore cannot pin or mutate a profile.
+fn verify_and_pin_welcome_identity(
+    fingerprint: Option<&str>,
+    target: &connection::Resolved,
+) -> Result<connection::Resolved> {
+    if !target.has_profile_owner() {
+        return Ok(target.clone());
+    }
+    let fingerprint = fingerprint
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            CoreError::Message(
+                "the selected saved profile requires a non-empty Server identity; re-pair the intended Server before sending control requests"
+                    .to_string(),
+            )
+        })?;
+    let (decision, committed) =
+        connection::pin_resolved_profile_fingerprint_and_refresh(target, fingerprint)?;
+    match decision {
+        connection::PinDecision::Pin => {
+            if let Some(profile) = committed.profile_owner_name() {
+                if connection::load()?.current.as_deref() == Some(profile) {
+                    if let Err(error) = crate::server::notify_daemon_reconnect(profile) {
+                        eprintln!(
+                            "warning: the Server identity was pinned to current profile '{}', but fleetyd could not refresh that owner generation: {} — run `fleetyd reconnect --profile {}`",
+                            terminal_safe_field(profile),
+                            terminal_safe_text(&error.report().message),
+                            terminal_safe_field(profile)
+                        );
+                    }
+                }
+            }
+            Ok(committed)
+        }
+        connection::PinDecision::AlreadyPinned => Ok(committed),
+        connection::PinDecision::IdentityChanged => Err(CoreError::Message(
+            "the Server identity does not match the selected saved profile; no control request was sent — re-pair only if the Server was intentionally rebuilt"
+                .to_string(),
+        )),
     }
 }
 
@@ -3351,20 +3680,26 @@ pub(crate) async fn connect_hello_for_auth_transaction(
 ) -> Result<(Tx, Rx, u32, connection::Resolved, Option<String>)> {
     let target = resolve_target()?;
     record_remote_context(&target, &RemoteOwner::Server, None);
-    let (tx, rx, config_protocol, fingerprint) = connect_hello_for_auth_target(&target).await?;
-    print_remote_context(&target, &RemoteOwner::Server, fingerprint.as_deref());
-    Ok((tx, rx, config_protocol, target, fingerprint))
+    let (tx, rx, config_protocol, fingerprint, committed_target) =
+        connect_hello_for_auth_target_refreshed(&target).await?;
+    print_remote_context(
+        &committed_target,
+        &RemoteOwner::Server,
+        fingerprint.as_deref(),
+    );
+    Ok((tx, rx, config_protocol, committed_target, fingerprint))
 }
 
 /// Connect to one immutable target snapshot. This deliberately does not
 /// re-resolve current profile or mDNS, so a browser wait cannot redirect a
 /// credential to another server.
-pub(crate) async fn connect_hello_for_auth_target(
+async fn connect_hello_for_auth_target_inner(
     target: &connection::Resolved,
-) -> Result<(Tx, Rx, u32, Option<String>)> {
-    let ws = transport::connect(&target.url, target.token.as_deref()).await?;
+    verify_identity: bool,
+) -> Result<(Tx, Rx, u32, Option<String>, String, connection::Resolved)> {
+    let ws = transport::connect(target.url(), target.token()).await?;
     let (mut tx, mut rx) = ws.split();
-    send(&mut tx, &hello(target.token.clone(), None)).await?;
+    send(&mut tx, &hello(target.token_owned(), None)).await?;
     match recv(&mut rx).await? {
         Some(ServerMsg::Welcome {
             server_version,
@@ -3372,12 +3707,101 @@ pub(crate) async fn connect_hello_for_auth_target(
             server_fingerprint,
             ..
         }) => {
-            maybe_converge_cli(&server_version).await;
-            tofu_pin(server_fingerprint.as_deref(), target);
-            Ok((tx, rx, config_protocol, server_fingerprint))
+            let committed_target = if verify_identity {
+                verify_and_pin_welcome_identity(server_fingerprint.as_deref(), target)?
+            } else {
+                target.clone()
+            };
+            Ok((
+                tx,
+                rx,
+                config_protocol,
+                server_fingerprint,
+                server_version,
+                committed_target,
+            ))
         }
-        other => Err(CoreError::Message(hello_failure_message(other.as_ref()))),
+        other => Err(CoreError::Message(hello_failure_message_for_target(
+            other.as_ref(),
+            target,
+        ))),
     }
+}
+
+pub(crate) async fn connect_hello_for_auth_target(
+    target: &connection::Resolved,
+) -> Result<(Tx, Rx, u32, Option<String>)> {
+    let (tx, rx, config_protocol, fingerprint, server_version, _) =
+        connect_hello_for_auth_target_inner(target, true).await?;
+    maybe_converge_cli(&server_version).await;
+    Ok((tx, rx, config_protocol, fingerprint))
+}
+
+pub(crate) async fn connect_hello_for_auth_target_refreshed(
+    target: &connection::Resolved,
+) -> Result<(Tx, Rx, u32, Option<String>, connection::Resolved)> {
+    let (tx, rx, config_protocol, fingerprint, server_version, committed_target) =
+        connect_hello_for_auth_target_inner(target, true).await?;
+    maybe_converge_cli(&server_version).await;
+    Ok((tx, rx, config_protocol, fingerprint, committed_target))
+}
+
+/// Reconnect a Settings profile without mutating credential storage. The
+/// profile switch transaction already holds the exact live profile snapshot,
+/// so the Welcome identity must match its existing durable pin.
+pub(crate) async fn connect_hello_for_profile_switch_target(
+    target: &connection::Resolved,
+    connections_path: &std::path::Path,
+) -> Result<(Tx, Rx, u32, Option<String>, connection::Resolved)> {
+    connect_hello_for_profile_switch_target_with_timeout(
+        target,
+        connections_path,
+        std::time::Duration::from_secs(10),
+    )
+    .await
+}
+
+async fn connect_hello_for_profile_switch_target_with_timeout(
+    target: &connection::Resolved,
+    connections_path: &std::path::Path,
+    timeout: std::time::Duration,
+) -> Result<(Tx, Rx, u32, Option<String>, connection::Resolved)> {
+    let (mut tx, rx, config_protocol, fingerprint, server_version, _) =
+        tokio::time::timeout(timeout, connect_hello_for_auth_target_inner(target, false))
+            .await
+            .map_err(|_| {
+                CoreError::Message(
+                    "timed out waiting for the selected Server to authenticate the Settings connection; the profile was saved but fleetyd was not notified"
+                        .to_string(),
+                )
+            })??;
+    let committed_target = if target.has_profile_owner() {
+        let seen = fingerprint
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                CoreError::Message(
+                    "the selected saved profile requires a non-empty Server identity; re-pair it before switching"
+                        .to_string(),
+                )
+            })?;
+        if target
+            .profile_owner_fingerprint()
+            .is_some_and(|expected| expected != seen)
+        {
+            tx.close().await;
+            return Err(CoreError::Message(format!(
+                "server profile identity changed while switching; expected '{}', received '{}'",
+                terminal_safe_field(target.profile_owner_fingerprint().unwrap_or_default()),
+                terminal_safe_field(seen)
+            )));
+        }
+        connection::store_resolved_profile_credentials_at(connections_path, target, None, seen)?.1
+    } else {
+        target.clone()
+    };
+    maybe_converge_cli(&server_version).await;
+    Ok((tx, rx, config_protocol, fingerprint, committed_target))
 }
 
 /// Manage a remote (server / device) host's config over the connection: connect,
@@ -3660,9 +4084,13 @@ async fn config_remote_request(
             }
         }
         Some(ServerMsg::Error { error }) => Ok(ConfigRequestResult::Rejected(error)),
-        other => Err(CoreError::Provider(format!(
-            "expected a config result, got {other:?}"
+        Some(other) => Err(CoreError::Provider(format!(
+            "expected a config result, got {}",
+            server_msg_kind(&other)
         ))),
+        None => Err(CoreError::Provider(
+            "the Server closed before returning a config result".to_string(),
+        )),
     }
 }
 
@@ -3869,7 +4297,15 @@ async fn conversations(limit: Option<u32>) -> Result<()> {
             }
         }
         Some(ServerMsg::Error { error }) => return Err(CoreError::Message(error.message)),
-        other => return Err(CoreError::Provider(format!("unexpected reply: {other:?}"))),
+        other => {
+            return Err(CoreError::Provider(format!(
+                "unexpected reply: {}",
+                other
+                    .as_ref()
+                    .map(server_msg_kind)
+                    .unwrap_or_else(|| "connection closed".to_string())
+            )))
+        }
     }
     let _ = tx.close().await;
     Ok(())
@@ -3918,7 +4354,15 @@ async fn audit_list(limit: Option<u32>) -> Result<()> {
             }
         }
         Some(ServerMsg::Error { error }) => return Err(CoreError::Message(error.message)),
-        other => return Err(CoreError::Provider(format!("unexpected reply: {other:?}"))),
+        other => {
+            return Err(CoreError::Provider(format!(
+                "unexpected reply: {}",
+                other
+                    .as_ref()
+                    .map(server_msg_kind)
+                    .unwrap_or_else(|| "connection closed".to_string())
+            )))
+        }
     }
     let _ = tx.close().await;
     Ok(())
@@ -3946,7 +4390,15 @@ async fn audit_show(index: u64) -> Result<()> {
             );
         }
         Some(ServerMsg::Error { error }) => return Err(CoreError::Message(error.message)),
-        other => return Err(CoreError::Provider(format!("unexpected reply: {other:?}"))),
+        other => {
+            return Err(CoreError::Provider(format!(
+                "unexpected reply: {}",
+                other
+                    .as_ref()
+                    .map(server_msg_kind)
+                    .unwrap_or_else(|| "connection closed".to_string())
+            )))
+        }
     }
     let _ = tx.close().await;
     Ok(())
@@ -3986,7 +4438,15 @@ async fn rollback_list() -> Result<()> {
             }
         }
         Some(ServerMsg::Error { error }) => return Err(CoreError::Message(error.message)),
-        other => return Err(CoreError::Provider(format!("unexpected reply: {other:?}"))),
+        other => {
+            return Err(CoreError::Provider(format!(
+                "unexpected reply: {}",
+                other
+                    .as_ref()
+                    .map(server_msg_kind)
+                    .unwrap_or_else(|| "connection closed".to_string())
+            )))
+        }
     }
     let _ = tx.close().await;
     Ok(())
@@ -4074,7 +4534,7 @@ async fn doctor() -> std::process::ExitCode {
         daemon_remediation,
     ));
 
-    match resolve_target() {
+    match resolve_target_read_only() {
         Ok(target) => {
             record_remote_context(&target, &RemoteOwner::Server, None);
             checks.push(DoctorCheck::new(
@@ -4083,7 +4543,7 @@ async fn doctor() -> std::process::ExitCode {
                 format!(
                     "{} -> {}",
                     profile_label(&target),
-                    redact_endpoint(&target.url)
+                    redact_endpoint(target.url())
                 ),
                 None::<String>,
             ));
@@ -4222,9 +4682,9 @@ fn add_unchecked_remote_checks(checks: &mut Vec<DoctorCheck>) {
 }
 
 async fn doctor_remote(target: &connection::Resolved, checks: &mut Vec<DoctorCheck>) -> Result<()> {
-    let ws = transport::connect(&target.url, target.token.as_deref()).await?;
+    let ws = transport::connect(target.url(), target.token()).await?;
     let (mut tx, mut rx) = ws.split();
-    send(&mut tx, &hello(target.token.clone(), None)).await?;
+    send(&mut tx, &hello(target.token_owned(), None)).await?;
     let (server_version, config_protocol, server_fingerprint) = match recv(&mut rx).await? {
         Some(ServerMsg::Welcome {
             server_version,
@@ -4232,8 +4692,14 @@ async fn doctor_remote(target: &connection::Resolved, checks: &mut Vec<DoctorChe
             server_fingerprint,
             ..
         }) => (server_version, config_protocol, server_fingerprint),
-        other => return Err(CoreError::Message(hello_failure_message(other.as_ref()))),
+        other => {
+            return Err(CoreError::Message(hello_failure_message_for_target(
+                other.as_ref(),
+                target,
+            )))
+        }
     };
+    verify_welcome_identity_read_only(server_fingerprint.as_deref(), target)?;
     record_remote_context(target, &RemoteOwner::Server, server_fingerprint.as_deref());
     let identity = server_fingerprint.as_deref().unwrap_or("not advertised");
     let version = if server_version.is_empty() {
@@ -4340,6 +4806,33 @@ async fn doctor_remote(target: &connection::Resolved, checks: &mut Vec<DoctorChe
     }
     let _ = tx.close().await;
     Ok(())
+}
+
+fn verify_welcome_identity_read_only(
+    fingerprint: Option<&str>,
+    target: &connection::Resolved,
+) -> Result<()> {
+    if !target.has_profile_identity_expectation() {
+        return Ok(());
+    }
+    let fingerprint = fingerprint
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            CoreError::Message(
+                "the selected saved profile requires a non-empty Server identity".to_string(),
+            )
+        })?;
+    match connection::tofu_pin_decision(target.profile_owner_fingerprint(), fingerprint) {
+        connection::PinDecision::AlreadyPinned => Ok(()),
+        connection::PinDecision::Pin => Err(CoreError::Message(
+            "the Server identity is not pinned yet; run an explicit pairing flow before relying on this profile"
+                .to_string(),
+        )),
+        connection::PinDecision::IdentityChanged => Err(CoreError::Message(
+            "the Server identity does not match the selected saved profile; re-pair only if the Server was intentionally rebuilt"
+                .to_string(),
+        )),
+    }
 }
 
 async fn inspect_server_configuration(
@@ -4524,7 +5017,7 @@ async fn status() -> Result<()> {
         println!("  daemon:         {daemon_status}");
     }
     let (mut tx, mut rx, _, target) = connect_hello_for_owner(RemoteOwner::Server).await?;
-    let server_url = redact_endpoint(&target.url);
+    let server_url = redact_endpoint(target.url());
     if !json_mode() {
         println!();
     }
@@ -4597,7 +5090,15 @@ async fn status() -> Result<()> {
             }
         }
         Some(ServerMsg::Error { error }) => return Err(CoreError::Message(error.message)),
-        other => return Err(CoreError::Provider(format!("unexpected reply: {other:?}"))),
+        other => {
+            return Err(CoreError::Provider(format!(
+                "unexpected reply: {}",
+                other
+                    .as_ref()
+                    .map(server_msg_kind)
+                    .unwrap_or_else(|| "connection closed".to_string())
+            )))
+        }
     }
     let _ = tx.close().await;
     Ok(())
@@ -4642,7 +5143,15 @@ async fn rollback_apply(backup_id: String) -> Result<()> {
             }
         }
         Some(ServerMsg::Error { error }) => return Err(CoreError::Message(error.message)),
-        other => return Err(CoreError::Provider(format!("unexpected reply: {other:?}"))),
+        other => {
+            return Err(CoreError::Provider(format!(
+                "unexpected reply: {}",
+                other
+                    .as_ref()
+                    .map(server_msg_kind)
+                    .unwrap_or_else(|| "connection closed".to_string())
+            )))
+        }
     }
     let _ = tx.close().await;
     Ok(())
@@ -4659,25 +5168,25 @@ fn rollback_owner() -> RemoteOwner {
 /// Used by the interactive config panel to decide the Server region path.
 pub(crate) async fn open_panel(
     target: &connection::Resolved,
-) -> Result<((Tx, Rx), u32, Option<String>)> {
-    let (mut tx, mut rx) = transport::connect(&target.url, target.token.as_deref())
-        .await?
-        .split();
-    send(&mut tx, &hello(target.token.clone(), None)).await?;
-    let (config_protocol, server_fingerprint) = match recv(&mut rx).await? {
-        Some(ServerMsg::Welcome {
-            server_version,
-            config_protocol,
-            server_fingerprint,
-            ..
-        }) => {
-            maybe_converge_cli(&server_version).await;
-            tofu_pin(server_fingerprint.as_deref(), target);
-            (config_protocol, server_fingerprint)
-        }
-        other => return Err(CoreError::Message(hello_failure_message(other.as_ref()))),
-    };
-    Ok(((tx, rx), config_protocol, server_fingerprint))
+) -> Result<((Tx, Rx), u32, Option<String>, connection::Resolved)> {
+    open_panel_with_timeout(target, std::time::Duration::from_secs(10)).await
+}
+
+async fn open_panel_with_timeout(
+    target: &connection::Resolved,
+    timeout: std::time::Duration,
+) -> Result<((Tx, Rx), u32, Option<String>, connection::Resolved)> {
+    let (tx, rx, config_protocol, fingerprint, server_version, committed_target) =
+        tokio::time::timeout(timeout, connect_hello_for_auth_target_inner(target, true))
+            .await
+            .map_err(|_| {
+                CoreError::Message(
+                    "timed out waiting for the Server to authenticate the Settings connection"
+                        .to_string(),
+                )
+            })??;
+    maybe_converge_cli(&server_version).await;
+    Ok(((tx, rx), config_protocol, fingerprint, committed_target))
 }
 
 pub(crate) async fn send(tx: &mut Tx, msg: &ClientMsg) -> Result<()> {
@@ -5011,11 +5520,11 @@ mod tests {
     #[tokio::test]
     async fn chat_reconnect_validates_identity_then_resumes_without_touching_draft() {
         let (url, requests) = start_chat_reconnect_server("server-b").await;
-        let target = connection::Resolved {
-            url: url.clone(),
-            token: Some("token-b".into()),
-            source: connection::Source::Profile("B".into()),
-        };
+        let target = connection::Resolved::unowned(
+            url.clone(),
+            Some("token-b".into()),
+            connection::Source::Profile("B".into()),
+        );
         let mut app = tui::App::new("offline");
         app.input.set_text("first\n草稿".into());
         app.input.left();
@@ -5060,11 +5569,8 @@ mod tests {
     #[tokio::test]
     async fn chat_reconnect_identity_change_refuses_resume() {
         let (url, requests) = start_chat_reconnect_server("impostor").await;
-        let target = connection::Resolved {
-            url,
-            token: None,
-            source: connection::Source::Profile("B".into()),
-        };
+        let target =
+            connection::Resolved::unowned(url, None, connection::Source::Profile("B".into()));
         let mut app = tui::App::new("offline");
         app.last_conversation_id = Some("conversation-a".into());
         app.last_seq = 42;
@@ -5141,6 +5647,68 @@ mod tests {
     }
 
     #[test]
+    fn guided_lan_pairing_is_required_unless_exact_profile_is_already_paired() {
+        assert_eq!(
+            guided_pairing_code(true, false, "").expect("local"),
+            None,
+            "same-host loopback is pairing-exempt"
+        );
+        assert_eq!(
+            guided_pairing_code(false, true, "").expect("saved credential"),
+            None,
+            "an exact saved credential may be reused"
+        );
+        let error = guided_pairing_code(false, false, "")
+            .expect_err("a new LAN candidate cannot skip pairing");
+        assert!(error.report().message.contains("pairing code"));
+        assert_eq!(
+            guided_pairing_code(false, false, " PAIR-1 ").expect("pairing code"),
+            Some("PAIR-1".to_string())
+        );
+    }
+
+    #[test]
+    fn guided_lan_pairing_exemption_is_revalidated_from_the_connect_snapshot() {
+        let mut conns = connection::Connections::default();
+        conns.profiles.insert(
+            "office".into(),
+            connection::Profile {
+                url: "ws://office:8787".into(),
+                token: Some("saved-token".into()),
+                ..Default::default()
+            },
+        );
+        validate_guided_pairing(
+            InitSelection::GuidedLan,
+            &conns,
+            "office",
+            "ws://office:8787",
+            None,
+        )
+        .expect("exact saved credential");
+
+        conns.profiles.get_mut("office").expect("office").token = None;
+        validate_guided_pairing(
+            InitSelection::GuidedLan,
+            &conns,
+            "office",
+            "ws://office:8787",
+            None,
+        )
+        .expect_err("a cleared token revokes the exemption");
+
+        conns.profiles.remove("office");
+        validate_guided_pairing(
+            InitSelection::GuidedLan,
+            &conns,
+            "office",
+            "ws://office:8787",
+            None,
+        )
+        .expect_err("a removed profile revokes the exemption");
+    }
+
+    #[test]
     fn invocation_selector_distinguishes_profiles_urls_and_command_arguments() {
         let args = |items: &[&str]| items.iter().map(|item| item.to_string()).collect();
 
@@ -5187,11 +5755,11 @@ mod tests {
 
     #[test]
     fn remote_context_escapes_terminal_controls_without_corrupting_unicode() {
-        let target = connection::Resolved {
-            url: "ws://host/\u{1b}[31m\nnext".into(),
-            token: Some("must-never-render".into()),
-            source: connection::Source::OverrideProfile("工作\rA".into()),
-        };
+        let target = connection::Resolved::unowned(
+            "ws://host/\u{1b}[31m\nnext".into(),
+            Some("must-never-render".into()),
+            connection::Source::OverrideProfile("工作\rA".into()),
+        );
         let rendered = remote_context(
             &target,
             &RemoteOwner::Daemon("裝置\t1".into()),
@@ -5283,6 +5851,16 @@ mod tests {
         });
         let m = hello_failure_message(other.as_ref());
         assert!(m.contains("unexpected reply") && !m.contains("conversation_id"));
+
+        let raw = connection::Resolved::unowned(
+            "ws://same:8787".into(),
+            None,
+            connection::Source::OverrideUrl,
+        );
+        let m = hello_failure_message_for_target(err("unauthenticated", "nope").as_ref(), &raw);
+        assert!(m.contains("FLEETY_TOKEN"), "{m}");
+        assert!(m.contains("fleety init <ws-url>"), "{m}");
+        assert!(!m.contains("`fleety pair <code>`"), "{m}");
     }
 
     #[test]
@@ -5308,15 +5886,22 @@ mod tests {
         // A local server on loopback is preferred even when mDNS also finds a
         // LAN advertiser (the same-host box's own outward IP) — loopback is
         // trusted, the LAN IP would demand pairing.
-        let r = prefer_loopback_discovery(|| Some(lb.clone()), || Some(discovered()));
-        assert_eq!(r.unwrap().url, lb);
+        let r =
+            connection::prefer_trusted_local_candidate(|| Some(lb.clone()), || Some(discovered()));
+        assert!(matches!(
+            r,
+            Some(connection::ResolutionCandidate::TrustedLocal(_))
+        ));
         // No local server → fall through to the mDNS advertiser.
-        let r = prefer_loopback_discovery(|| None, || Some(discovered()));
-        let r = r.unwrap();
-        assert_eq!(r.url, lan);
-        assert_eq!(r.fingerprint.as_deref(), Some("fp-lan"));
+        let r = connection::prefer_trusted_local_candidate(|| None, || Some(discovered()));
+        assert!(matches!(
+            r,
+            Some(connection::ResolutionCandidate::Mdns(ref candidate))
+                if candidate.url == lan
+                    && candidate.fingerprint.as_deref() == Some("fp-lan")
+        ));
         // Neither → None, so resolution proceeds to the localhost default.
-        let r = prefer_loopback_discovery(|| None, || None);
+        let r = connection::prefer_trusted_local_candidate(|| None, || None);
         assert!(r.is_none());
     }
 
@@ -5400,7 +5985,7 @@ mod tests {
         std::env::set_var("FLEETY_MDNS_DISABLED", "1");
 
         // Nothing configured → the localhost default.
-        assert_eq!(resolve_target().unwrap().url, connection::DEFAULT_URL);
+        assert_eq!(resolve_target().unwrap().url(), connection::DEFAULT_URL);
 
         // A current profile in connections.toml → its url.
         let mut conns = connection::Connections::default();
@@ -5413,11 +5998,52 @@ mod tests {
         );
         conns.current = Some("home".to_string());
         connection::save(&conns).expect("save connections");
-        assert_eq!(resolve_target().unwrap().url, "ws://cfg");
+        assert_eq!(resolve_target().unwrap().url(), "ws://cfg");
 
         // The env override wins over the current profile.
         std::env::set_var("FLEETY_AGENT_URL", "ws://env");
-        assert_eq!(resolve_target().unwrap().url, "ws://env");
+        assert_eq!(resolve_target().unwrap().url(), "ws://env");
+    }
+
+    #[test]
+    fn empty_environment_url_upgrades_and_resolves_the_legacy_current_profile() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let guard = EnvGuard::new("empty-agent-url");
+        std::env::set_var("FLEETY_AGENT_URL", "");
+        let path = guard.temp_home.join(".fleety").join("connections.toml");
+        std::fs::create_dir_all(path.parent().unwrap()).expect("create connections directory");
+        std::fs::write(
+            &path,
+            "current = \"home\"\n\n[profiles.home]\nurl = \"ws://cfg:8787\"\ntoken = \"token\"\n",
+        )
+        .expect("seed legacy profile");
+
+        let target = resolve_target().expect("empty environment URL is unset");
+
+        assert_eq!(target.url(), "ws://cfg:8787");
+        assert!(target.has_profile_owner());
+        assert!(
+            !connection::load().expect("load upgraded profile").profiles["home"]
+                .generation
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn read_only_resolution_never_upgrades_or_grants_profile_authority() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let guard = EnvGuard::new("read-only-resolve");
+        let path = guard.temp_home.join(".fleety").join("connections.toml");
+        std::fs::create_dir_all(path.parent().unwrap()).expect("create connections directory");
+        let legacy =
+            b"current = \"home\"\n\n[profiles.home]\nurl = \"ws://cfg:8787\"\ntoken = \"token\"\n";
+        std::fs::write(&path, legacy).expect("seed legacy profile");
+
+        let target = resolve_target_read_only().expect("resolve diagnostics target");
+
+        assert_eq!(target.url(), "ws://cfg:8787");
+        assert!(!target.has_profile_owner());
+        assert_eq!(std::fs::read(path).expect("read unchanged profile"), legacy);
     }
 
     #[test]
@@ -5444,18 +6070,145 @@ mod tests {
             },
         );
         connection::save(&conns).expect("seed profiles");
-        let target = connection::Resolved {
-            url: "ws://b:8787".to_string(),
-            token: None,
-            source: connection::Source::OverrideProfile("b".to_string()),
-        };
+        let target = connection::resolve(
+            &conns,
+            &connection::Target::Named("b".to_string()),
+            None,
+            None,
+            || None,
+        )
+        .expect("resolve B with owner capability");
 
-        tofu_pin(Some("fp-b"), &target);
+        let committed = verify_and_pin_welcome_identity(Some("fp-b"), &target).expect("pin B");
+        verify_and_pin_welcome_identity(Some("fp-b"), &committed)
+            .expect("the refreshed owner must survive a second authenticated connection");
 
         let after = connection::load().expect("reload profiles");
         assert_eq!(after.current.as_deref(), Some("a"));
         assert_eq!(after.profiles["a"].fingerprint.as_deref(), Some("fp-a"));
         assert_eq!(after.profiles["b"].fingerprint.as_deref(), Some("fp-b"));
+    }
+
+    #[test]
+    fn doctor_identity_check_never_pins_an_unpinned_profile() {
+        let mut conns = connection::Connections {
+            current: Some("office".to_string()),
+            ..connection::Connections::default()
+        };
+        conns.profiles.insert(
+            "office".to_string(),
+            connection::Profile {
+                url: "ws://office.test:8787".to_string(),
+                ..connection::Profile::default()
+            },
+        );
+        let target = connection::resolve(&conns, &connection::Target::Current, None, None, || None)
+            .expect("resolve unpinned profile")
+            .into_read_only();
+
+        let error = verify_welcome_identity_read_only(Some("observed-pin"), &target)
+            .expect_err("doctor must not perform TOFU")
+            .to_string();
+        assert!(error.contains("not pinned yet"), "{error}");
+        assert!(!target.has_profile_owner());
+        assert!(target.has_profile_identity_expectation());
+        assert_eq!(target.profile_owner_fingerprint(), None);
+    }
+
+    #[test]
+    fn doctor_read_only_target_rejects_a_mismatched_saved_identity() {
+        let mut conns = connection::Connections {
+            current: Some("office".to_string()),
+            ..connection::Connections::default()
+        };
+        conns.profiles.insert(
+            "office".to_string(),
+            connection::Profile {
+                url: "ws://office.test:8787".to_string(),
+                fingerprint: Some("saved-pin".to_string()),
+                ..connection::Profile::default()
+            },
+        );
+        let target = connection::resolve(&conns, &connection::Target::Current, None, None, || None)
+            .expect("resolve pinned profile")
+            .into_read_only();
+
+        let error = verify_welcome_identity_read_only(Some("other-pin"), &target)
+            .expect_err("doctor must reject identity drift")
+            .to_string();
+
+        assert!(error.contains("does not match"), "{error}");
+        assert!(!target.has_profile_owner());
+        assert_eq!(target.profile_owner_fingerprint(), Some("saved-pin"));
+    }
+
+    #[tokio::test]
+    async fn settings_profile_switch_handshake_is_bounded_for_a_silent_server() {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind silent Settings server");
+        let address = listener.local_addr().expect("silent Settings address");
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept Settings connection");
+            let mut socket =
+                tokio_tungstenite::tungstenite::accept(stream).expect("accept websocket");
+            let _ = socket.read();
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        });
+        let target = connection::Resolved::unowned(
+            format!("ws://{address}"),
+            None,
+            connection::Source::OverrideUrl,
+        );
+        let path =
+            std::env::temp_dir().join(format!("fleety-settings-{}.toml", uuid::Uuid::new_v4()));
+
+        let result = connect_hello_for_profile_switch_target_with_timeout(
+            &target,
+            &path,
+            std::time::Duration::from_millis(20),
+        )
+        .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("silent Settings server must time out"),
+        };
+        assert!(
+            error.report().message.contains("timed out waiting"),
+            "{}",
+            error.report().message
+        );
+        server.join().expect("silent server thread");
+    }
+
+    #[tokio::test]
+    async fn initial_settings_handshake_is_bounded_for_a_silent_server() {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind silent Settings server");
+        let address = listener.local_addr().expect("silent Settings address");
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept Settings connection");
+            let mut socket =
+                tokio_tungstenite::tungstenite::accept(stream).expect("accept websocket");
+            let _ = socket.read();
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        });
+        let target = connection::Resolved::unowned(
+            format!("ws://{address}"),
+            None,
+            connection::Source::OverrideUrl,
+        );
+
+        let result = open_panel_with_timeout(&target, std::time::Duration::from_millis(20)).await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("silent initial Settings server must time out"),
+        };
+        assert!(
+            error.report().message.contains("timed out waiting"),
+            "{}",
+            error.report().message
+        );
+        server.join().expect("silent server thread");
     }
 
     #[test]
@@ -5539,5 +6292,79 @@ mod tests {
             conversation_id: "c1".to_string(),
         };
         assert_eq!(server_msg_kind(&done), "done");
+        let duplicate = ServerMsg::Welcome {
+            session_id: "session".to_string(),
+            conversation_id: "conversation".to_string(),
+            protocol: PROTOCOL_VERSION,
+            server_version: String::new(),
+            audio_input: false,
+            config_protocol: 0,
+            server_fingerprint: Some("fingerprint".to_string()),
+            loopback_trusted: false,
+            token: Some("bearer-must-not-leak".to_string()),
+        };
+        let kind = server_msg_kind(&duplicate);
+        assert_eq!(kind, "welcome");
+        assert!(!kind.contains("bearer-must-not-leak"));
+    }
+
+    #[test]
+    fn visible_pairing_commit_retries_sync_and_notifies_daemon_before_failing() {
+        let notified = std::cell::Cell::new(false);
+        let committed = connection::Resolved::unowned(
+            "ws://home:8787".to_string(),
+            None,
+            connection::Source::Profile("home".to_string()),
+        );
+        let error = finish_profile_publication_with(
+            "home",
+            "pairing",
+            Some(ProfilePublicationRecovery {
+                initial_error: CoreError::Message("initial publication failure".to_string()),
+                committed,
+            }),
+            true,
+            |_| Err(CoreError::Message("retry publication failure".to_string())),
+            |profile| {
+                assert_eq!(profile, "home");
+                notified.set(true);
+                Err(CoreError::Message("daemon unavailable".to_string()))
+            },
+        )
+        .expect_err("partial publication and notification must remain incomplete");
+
+        assert!(notified.get(), "daemon notification must not be skipped");
+        let message = error.report().message;
+        assert!(message.contains("became visible"));
+        assert!(message.contains("may since have been replaced"));
+        assert!(message.contains("Do not reuse the pairing code"));
+        assert!(message.contains("fleetyd was also not notified"));
+    }
+
+    #[test]
+    fn visible_init_commit_becomes_success_after_sync_retry_and_notification() {
+        let notified = std::cell::Cell::new(false);
+        let committed = connection::Resolved::unowned(
+            "ws://home:8787".to_string(),
+            None,
+            connection::Source::Profile("home".to_string()),
+        );
+        finish_profile_publication_with(
+            "home",
+            "init",
+            Some(ProfilePublicationRecovery {
+                initial_error: CoreError::Message("initial publication failure".to_string()),
+                committed,
+            }),
+            true,
+            |_| Ok(()),
+            |profile| {
+                assert_eq!(profile, "home");
+                notified.set(true);
+                Ok(String::new())
+            },
+        )
+        .expect("successful retry makes the complete generation durable");
+        assert!(notified.get());
     }
 }

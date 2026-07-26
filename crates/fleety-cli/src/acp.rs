@@ -176,21 +176,18 @@ pub fn load_session_result() -> Value {
 pub fn zed_settings_path() -> Option<std::path::PathBuf> {
     #[cfg(windows)]
     {
-        std::env::var("APPDATA").ok().map(|p| {
-            std::path::PathBuf::from(p)
-                .join("Zed")
-                .join("settings.json")
-        })
+        absolute_env_path(std::env::var_os("APPDATA")).map(|p| p.join("Zed").join("settings.json"))
     }
     #[cfg(not(windows))]
     {
-        std::env::var("HOME").ok().map(|p| {
-            std::path::PathBuf::from(p)
-                .join(".config")
-                .join("zed")
-                .join("settings.json")
-        })
+        absolute_env_path(std::env::var_os("HOME"))
+            .map(|p| p.join(".config").join("zed").join("settings.json"))
     }
+}
+
+fn absolute_env_path(value: Option<std::ffi::OsString>) -> Option<std::path::PathBuf> {
+    let path = std::path::PathBuf::from(value?);
+    (!path.as_os_str().is_empty() && path.is_absolute()).then_some(path)
 }
 
 /// The Zed `agent_servers` entry that launches this binary as a custom ACP agent.
@@ -234,7 +231,29 @@ pub fn merge_zed_settings(
         .as_object_mut()
         .ok_or_else(|| "`agent_servers` is not a JSON object".to_string())?;
     let updated = servers.contains_key("Fleety");
-    servers.insert("Fleety".to_string(), fleety_agent_entry(command, server));
+    let mut preserved_env = servers
+        .get("Fleety")
+        .and_then(|entry| entry.get("env"))
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let previous_server = preserved_env
+        .get("FLEETY_AGENT_URL")
+        .and_then(Value::as_str);
+    if server.is_none() || previous_server != server {
+        preserved_env.remove("FLEETY_TOKEN");
+    }
+    match server {
+        Some(server) => {
+            preserved_env.insert("FLEETY_AGENT_URL".to_string(), json!(server));
+        }
+        None => {
+            preserved_env.remove("FLEETY_AGENT_URL");
+        }
+    }
+    let mut entry = fleety_agent_entry(command, None);
+    entry["env"] = Value::Object(preserved_env);
+    servers.insert("Fleety".to_string(), entry);
     let pretty = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
     Ok((pretty, updated))
 }
@@ -242,38 +261,87 @@ pub fn merge_zed_settings(
 /// Re-point any *already-installed* ACP agent configs at the current binary, for
 /// `fleety update` to call. This self-heals a changed binary path or an evolved
 /// `acp` invocation. It NEVER newly installs — only editors already set up for
-/// Fleety are touched; missing or unparseable (JSONC) configs are left alone.
-pub fn refresh_installed(server: Option<&str>) {
+/// Fleety are touched; a missing config is a no-op, while unreadable or invalid
+/// existing settings are reported so `fleety update` cannot claim completion.
+pub fn refresh_installed(server: Option<&str>) -> agent_core::Result<()> {
+    use agent_core::CoreError;
+
     let Some(path) = zed_settings_path() else {
-        return;
+        return Err(CoreError::Message(
+            "cannot locate Zed settings because the platform settings base is missing or not an absolute path; Fleety update is incomplete"
+                .to_string(),
+        ));
     };
-    let Ok(existing) = std::fs::read_to_string(&path) else {
-        return; // not configured here
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(existing) => existing,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(CoreError::Message(format!(
+            "cannot read the installed Zed settings at {}: {error}; Fleety update is incomplete",
+            path.display()
+        )))
+        }
     };
-    if let Some(merged) = refresh_zed_settings(&existing, &current_exe_str(), server) {
-        match atomic_replace(&path, merged.as_bytes()) {
-            Ok(()) => println!(
-                "Refreshed the Fleety ACP agent in Zed ({}).",
+    if let Some(merged) = refresh_zed_settings(&existing, &current_exe_str(), server)
+        .map_err(|error| {
+            CoreError::Message(format!(
+                "cannot safely refresh the installed Zed settings at {}: {error}; Fleety update is incomplete",
                 path.display()
-            ),
-            Err(e) => eprintln!(
-                "Could not refresh the Fleety ACP agent in Zed ({}): {e}",
-                path.display()
-            ),
+            ))
+        })?
+    {
+        let publication =
+            atomic_replace_if_unchanged(&path, Some(existing.as_bytes()), merged.as_bytes())
+                .map_err(|error| {
+                CoreError::Message(format!(
+                    "cannot replace the installed Zed settings at {}: {error}; Fleety update is incomplete",
+                    path.display()
+                ))
+            })?;
+        println!(
+            "Refreshed the Fleety ACP agent in Zed ({}).",
+            crate::terminal_safe_text(&path.display().to_string())
+        );
+        if let AtomicPublication::PublishedWithCleanupWarning(warning) = publication {
+            eprintln!(
+                "warning: Zed settings were refreshed, but cleanup is incomplete: {}",
+                crate::terminal_safe_text(&warning)
+            );
         }
     }
+    Ok(())
 }
 
 /// Pure refresh decision for Zed: return the updated JSON only when a Fleety entry
-/// is already present AND re-pointing it at `command` changes something. Returns
-/// `None` when Fleety isn't installed, the file is unparseable (JSONC), or nothing
-/// would change — so a refresh never newly-installs or rewrites needlessly.
-pub fn refresh_zed_settings(existing: &str, command: &str, server: Option<&str>) -> Option<String> {
-    let mut root = serde_json::from_str::<Value>(existing).ok()?;
-    let entry = root
-        .get_mut("agent_servers")?
-        .get_mut("Fleety")?
-        .as_object_mut()?;
+/// is already present AND re-pointing it at `command` changes something.
+/// Invalid existing JSON is an error; an absent Fleety entry or unchanged entry
+/// returns `Ok(None)` so refresh never newly installs or rewrites needlessly.
+pub fn refresh_zed_settings(
+    existing: &str,
+    command: &str,
+    server: Option<&str>,
+) -> std::result::Result<Option<String>, String> {
+    let mut root = serde_json::from_str::<Value>(existing).map_err(|error| error.to_string())?;
+    let Some(entry) = root
+        .get_mut("agent_servers")
+        .and_then(|servers| servers.get_mut("Fleety"))
+    else {
+        return Ok(None);
+    };
+    let entry = entry
+        .as_object_mut()
+        .ok_or_else(|| "the installed Fleety ACP entry is not a JSON object".to_string())?;
+    if let Some(existing_server) = entry
+        .get("env")
+        .and_then(Value::as_object)
+        .and_then(|env| env.get("FLEETY_AGENT_URL"))
+    {
+        let existing_server = existing_server.as_str().ok_or_else(|| {
+            "the installed Fleety ACP FLEETY_AGENT_URL is not a string".to_string()
+        })?;
+        fleety_tools::connection::validate_ws_url(existing_server)
+            .map_err(|error| error.report().message)?;
+    }
     let mut changed = entry.get("command").and_then(Value::as_str) != Some(command);
     if changed {
         entry.insert("command".to_string(), json!(command));
@@ -282,16 +350,22 @@ pub fn refresh_zed_settings(existing: &str, command: &str, server: Option<&str>)
         let env = entry
             .entry("env")
             .or_insert_with(|| json!({}))
-            .as_object_mut()?;
+            .as_object_mut()
+            .ok_or_else(|| "the installed Fleety ACP env is not a JSON object".to_string())?;
+        if env.get("FLEETY_AGENT_URL").and_then(Value::as_str) != Some(server) {
+            env.remove("FLEETY_TOKEN");
+        }
         if env.get("FLEETY_AGENT_URL").and_then(Value::as_str) != Some(server) {
             env.insert("FLEETY_AGENT_URL".to_string(), json!(server));
             changed = true;
         }
     }
     if !changed {
-        return None;
+        return Ok(None);
     }
-    serde_json::to_string_pretty(&root).ok()
+    serde_json::to_string_pretty(&root)
+        .map(Some)
+        .map_err(|error| error.to_string())
 }
 
 /// Replace a settings file through a uniquely named temporary file in the same
@@ -302,10 +376,283 @@ fn atomic_replace(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()
     atomic_replace_with(path, contents, |_| Ok(()))
 }
 
+fn atomic_replace_if_unchanged(
+    path: &std::path::Path,
+    expected: Option<&[u8]>,
+    contents: &[u8],
+) -> std::io::Result<AtomicPublication> {
+    atomic_replace_if_unchanged_with(path, expected, contents, |_| Ok(()))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AtomicPublication {
+    Clean,
+    PublishedWithCleanupWarning(String),
+}
+
+fn atomic_replace_if_unchanged_with(
+    path: &std::path::Path,
+    expected: Option<&[u8]>,
+    contents: &[u8],
+    after_displace: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
+) -> std::io::Result<AtomicPublication> {
+    atomic_replace_if_unchanged_with_cleanup(
+        path,
+        expected,
+        contents,
+        after_displace,
+        |candidate| std::fs::remove_file(candidate),
+    )
+}
+
+fn atomic_replace_if_unchanged_with_cleanup(
+    path: &std::path::Path,
+    expected: Option<&[u8]>,
+    contents: &[u8],
+    after_displace: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
+    cleanup: impl FnMut(&std::path::Path) -> std::io::Result<()>,
+) -> std::io::Result<AtomicPublication> {
+    atomic_replace_if_unchanged_with_hooks(
+        path,
+        expected,
+        contents,
+        after_displace,
+        set_private_file_permissions,
+        cleanup,
+    )
+}
+
+fn atomic_replace_if_unchanged_with_hooks(
+    path: &std::path::Path,
+    expected: Option<&[u8]>,
+    contents: &[u8],
+    after_displace: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
+    set_permissions: impl FnOnce(&std::fs::File) -> std::io::Result<()>,
+    mut cleanup: impl FnMut(&std::path::Path) -> std::io::Result<()>,
+) -> std::io::Result<AtomicPublication> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let tmp = parent.join(format!(".fleety-zed-{}.tmp", uuid::Uuid::new_v4()));
+    let recovery = parent.join(format!(".fleety-zed-{}.recovery", uuid::Uuid::new_v4()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&tmp)?;
+    if let Err(error) = set_permissions(&file) {
+        drop(file);
+        return Err(cleanup_temp_or_report(error, &tmp, &mut cleanup));
+    }
+    if let Err(error) = file.write_all(contents).and_then(|()| file.sync_all()) {
+        drop(file);
+        return Err(cleanup_temp_or_report(error, &tmp, &mut cleanup));
+    }
+    drop(file);
+
+    let displaced = if let Some(expected) = expected {
+        match std::fs::rename(path, &recovery) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(cleanup_temp_or_report(
+                    std::io::Error::other(
+                        "settings changed while Fleety was preparing the update; retry",
+                    ),
+                    &tmp,
+                    &mut cleanup,
+                ));
+            }
+            Err(error) => {
+                return Err(cleanup_temp_or_report(error, &tmp, &mut cleanup));
+            }
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(error) =
+                std::fs::set_permissions(&recovery, std::fs::Permissions::from_mode(0o600))
+            {
+                let error = restore_displaced_or_report(error, &recovery, path);
+                return Err(cleanup_temp_or_report(error, &tmp, &mut cleanup));
+            }
+        }
+        let actual = match std::fs::read(&recovery) {
+            Ok(actual) => actual,
+            Err(error) => {
+                let error = restore_displaced_or_report(error, &recovery, path);
+                return Err(cleanup_temp_or_report(error, &tmp, &mut cleanup));
+            }
+        };
+        if actual.as_slice() != expected {
+            let error = restore_displaced_or_report(
+                std::io::Error::other(
+                    "settings changed while Fleety was preparing the update; retry",
+                ),
+                &recovery,
+                path,
+            );
+            return Err(cleanup_temp_or_report(error, &tmp, &mut cleanup));
+        }
+        Some(recovery.as_path())
+    } else {
+        None
+    };
+
+    if let Err(error) = after_displace(displaced.unwrap_or(tmp.as_path())) {
+        if path.exists() {
+            let error = if displaced.is_some() {
+                std::io::Error::other(format!(
+                    "{error}; the displaced settings remain as a recovery copy at {}",
+                    recovery.display()
+                ))
+            } else {
+                std::io::Error::other(format!(
+                    "{error}; settings appeared while Fleety was preparing the update"
+                ))
+            };
+            return Err(cleanup_temp_or_report(error, &tmp, &mut cleanup));
+        }
+        if displaced.is_some() {
+            let error = restore_displaced_or_report(error, &recovery, path);
+            return Err(cleanup_temp_or_report(error, &tmp, &mut cleanup));
+        }
+        return Err(cleanup_temp_or_report(error, &tmp, &mut cleanup));
+    }
+
+    if let Err(error) = std::fs::hard_link(&tmp, path) {
+        let path_was_recreated = path.exists();
+        if !path_was_recreated && displaced.is_some() {
+            let error = restore_displaced_or_report(error, &recovery, path);
+            return Err(cleanup_temp_or_report(error, &tmp, &mut cleanup));
+        }
+        let error = if path_was_recreated {
+            if displaced.is_some() {
+                std::io::Error::other(format!(
+                    "settings changed during no-clobber publication: {error}; the displaced settings remain as a recovery copy at {}",
+                    recovery.display()
+                ))
+            } else {
+                std::io::Error::other(format!(
+                    "settings appeared during no-clobber publication: {error}; the new file was preserved"
+                ))
+            }
+        } else {
+            error
+        };
+        return Err(cleanup_temp_or_report(error, &tmp, &mut cleanup));
+    }
+    let mut cleanup_failures = Vec::new();
+    if let Err(error) = cleanup(&tmp) {
+        cleanup_failures.push(format!("{} ({error})", tmp.display()));
+    }
+    if displaced.is_some() {
+        if let Err(error) = cleanup(&recovery) {
+            cleanup_failures.push(format!("{} ({error})", recovery.display()));
+        }
+    }
+    if cleanup_failures.is_empty() {
+        Ok(AtomicPublication::Clean)
+    } else {
+        Ok(AtomicPublication::PublishedWithCleanupWarning(format!(
+            "the new settings are active; remove the retained private file(s) after closing Zed: {}",
+            cleanup_failures.join(", ")
+        )))
+    }
+}
+
+fn set_private_file_permissions(file: &std::fs::File) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        Ok(())
+    }
+}
+
+fn cleanup_temp_or_report(
+    original: std::io::Error,
+    tmp: &std::path::Path,
+    cleanup: &mut impl FnMut(&std::path::Path) -> std::io::Result<()>,
+) -> std::io::Error {
+    match cleanup(tmp) {
+        Ok(()) => original,
+        Err(error) => std::io::Error::other(format!(
+            "{original}; a private temporary settings file could not be removed and remains at {}: {error}",
+            tmp.display()
+        )),
+    }
+}
+
+enum DisplacedRestore {
+    Clean,
+    RetainedRecovery(std::io::Error),
+}
+
+fn restore_displaced_no_clobber_with_cleanup(
+    recovery: &std::path::Path,
+    path: &std::path::Path,
+    cleanup: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
+) -> std::io::Result<DisplacedRestore> {
+    std::fs::hard_link(recovery, path)?;
+    Ok(match cleanup(recovery) {
+        Ok(()) => DisplacedRestore::Clean,
+        Err(error) => DisplacedRestore::RetainedRecovery(error),
+    })
+}
+
+fn restore_displaced_or_report(
+    original: std::io::Error,
+    recovery: &std::path::Path,
+    path: &std::path::Path,
+) -> std::io::Error {
+    restore_displaced_or_report_with_cleanup(original, recovery, path, |candidate| {
+        std::fs::remove_file(candidate)
+    })
+}
+
+fn restore_displaced_or_report_with_cleanup(
+    original: std::io::Error,
+    recovery: &std::path::Path,
+    path: &std::path::Path,
+    cleanup: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
+) -> std::io::Error {
+    match restore_displaced_no_clobber_with_cleanup(recovery, path, cleanup) {
+        Ok(DisplacedRestore::Clean) => original,
+        Ok(DisplacedRestore::RetainedRecovery(cleanup)) => std::io::Error::other(format!(
+            "{original}; canonical settings were restored, but recovery cleanup failed, so the retained copy remains at {}: {cleanup}",
+            recovery.display()
+        )),
+        Err(restore) => std::io::Error::other(format!(
+            "{original}; canonical settings could not be restored, so the displaced bytes remain at {}: {restore}",
+            recovery.display()
+        )),
+    }
+}
+
 fn atomic_replace_with(
     path: &std::path::Path,
     contents: &[u8],
     before_replace: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    atomic_replace_with_cleanup(path, contents, before_replace, |candidate| {
+        std::fs::remove_file(candidate)
+    })
+}
+
+fn atomic_replace_with_cleanup(
+    path: &std::path::Path,
+    contents: &[u8],
+    before_replace: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
+    mut cleanup: impl FnMut(&std::path::Path) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     let parent = path
         .parent()
@@ -314,19 +661,69 @@ fn atomic_replace_with(
     std::fs::create_dir_all(parent)?;
     let tmp = parent.join(format!(".fleety-zed-{}.tmp", uuid::Uuid::new_v4()));
     let result = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
         file.write_all(contents)?;
         file.sync_all()?;
         before_replace(&tmp)?;
         std::fs::rename(&tmp, path)
     })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
+    if let Err(error) = result {
+        return Err(cleanup_temp_or_report(error, &tmp, &mut cleanup));
     }
-    result
+    Ok(())
+}
+
+fn update_zed_settings_file(
+    path: &std::path::Path,
+    command: &str,
+    server: Option<&str>,
+) -> std::result::Result<ZedSettingsUpdate, String> {
+    let (existing, expected) = match std::fs::read_to_string(path) {
+        Ok(existing) => {
+            let expected = Some(existing.as_bytes().to_vec());
+            (existing, expected)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (String::new(), None),
+        Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
+    };
+    let (merged, updated) = merge_zed_settings(&existing, command, server)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+    }
+    if !existing.trim().is_empty() {
+        let backup = path.with_extension("json.bak");
+        atomic_replace(&backup, existing.as_bytes())
+            .map_err(|error| format!("cannot back up {}: {error}", backup.display()))?;
+    }
+    let publication = atomic_replace_if_unchanged(path, expected.as_deref(), merged.as_bytes())
+        .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+    let cleanup_warning = match publication {
+        AtomicPublication::Clean => None,
+        AtomicPublication::PublishedWithCleanupWarning(warning) => Some(warning),
+    };
+    Ok(ZedSettingsUpdate {
+        updated,
+        cleanup_warning,
+    })
+}
+
+#[derive(Debug)]
+struct ZedSettingsUpdate {
+    updated: bool,
+    cleanup_warning: Option<String>,
 }
 
 /// This binary's path, for launching it as an ACP agent.
@@ -341,6 +738,9 @@ fn current_exe_str() -> String {
 /// launch details that work with any ACP-capable client (Zed, JetBrains, neovim,
 /// Emacs, …), since ACP is a shared protocol, not Zed-specific.
 pub fn install(target: Option<String>, server: Option<String>) -> agent_core::Result<()> {
+    if let Some(server) = server.as_deref() {
+        fleety_tools::connection::validate_ws_url(server)?;
+    }
     match target.as_deref().map(str::to_ascii_lowercase).as_deref() {
         Some("zed") => install_zed(server),
         Some(other) => {
@@ -365,11 +765,19 @@ fn print_generic(server: Option<&str>) {
     println!("    command: {}", crate::terminal_safe_text(&cmd));
     println!("    args:    [\"acp\"]");
     match server {
-        Some(s) => println!(
-            "    env:     FLEETY_AGENT_URL={}\n",
-            crate::terminal_safe_endpoint(s)
+        Some(s) => {
+            println!(
+                "    env:     FLEETY_AGENT_URL={}",
+                crate::terminal_safe_endpoint(s)
+            );
+            println!(
+                "             This endpoint is transient. Add a non-empty FLEETY_TOKEN for authentication,\n\
+                 or omit FLEETY_AGENT_URL to use the saved current profile.\n"
+            );
+        }
+        None => println!(
+            "    env:     (none — uses the saved current profile, then the trusted local default)\n"
         ),
-        None => println!("    env:     FLEETY_AGENT_URL=ws://127.0.0.1:8787   (or your server)\n"),
     }
     println!("Auto-configure a supported editor:");
     println!("    fleety acp install zed [--server ws://host:8787]\n");
@@ -395,31 +803,49 @@ pub fn install_zed(server: Option<String>) -> agent_core::Result<()> {
             "Could not locate Zed's settings.json. Add this to it manually:\n\n{}",
             crate::terminal_safe_multiline(&snippet)
         );
-        return Ok(());
+        return Err(CoreError::Message(
+            "Zed settings were not changed because the platform settings base is missing or not an absolute path"
+                .to_string(),
+        ));
     };
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
-    match merge_zed_settings(&existing, &command, server.as_deref()) {
-        Ok((merged, updated)) => {
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            if !existing.trim().is_empty() {
-                let _ = std::fs::write(path.with_extension("json.bak"), &existing);
-            }
-            atomic_replace(&path, merged.as_bytes())
-                .map_err(|e| CoreError::Message(format!("cannot write {}: {e}", path.display())))?;
-            let verb = if updated { "Updated" } else { "Configured" };
+    match update_zed_settings_file(&path, &command, server.as_deref()) {
+        Ok(update) => {
+            let verb = if update.updated {
+                "Updated"
+            } else {
+                "Configured"
+            };
             println!(
                 "{verb} the Fleety agent in Zed at {}.\nRestart Zed, then pick \"Fleety\" in the agent panel.\n\
-                 (Agent binary: {command})",
-                path.display()
+                 (Agent binary: {})",
+                crate::terminal_safe_text(&path.display().to_string()),
+                crate::terminal_safe_text(&command)
             );
+            if server.is_some() {
+                println!(
+                    "The configured FLEETY_AGENT_URL is transient. Add a non-empty FLEETY_TOKEN to Zed's Fleety environment for authentication, or reinstall without --server to use the saved current profile."
+                );
+            } else {
+                println!("ACP will use Fleety's saved current profile when Zed starts the agent.");
+            }
+            if let Some(warning) = update.cleanup_warning {
+                eprintln!(
+                    "warning: Zed settings were updated, but cleanup is incomplete: {}",
+                    crate::terminal_safe_text(&warning)
+                );
+            }
         }
         Err(e) => {
             println!(
-                "Couldn't safely edit {} ({e}).\nAdd this to your Zed settings.json manually:\n\n{snippet}",
-                path.display()
+                "Couldn't safely edit {} ({}).\nAdd this to your Zed settings.json manually:\n\n{}",
+                crate::terminal_safe_text(&path.display().to_string()),
+                crate::terminal_safe_text(&e),
+                crate::terminal_safe_multiline(&snippet),
             );
+            return Err(CoreError::Message(format!(
+                "Zed settings were not changed: {}",
+                crate::terminal_safe_text(&e)
+            )));
         }
     }
     Ok(())
@@ -809,8 +1235,74 @@ fn hello_json(token: Option<&str>, local_tools_json: Option<String>) -> serde_js
 /// forwarded to the server as a CancelTurn frame on the turn's connection.
 /// Generic over the editor-input reader (stdin in production, in-memory in
 /// tests).
+const ACP_WELCOME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const ACP_CANCEL_WELCOME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const ACP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const ACP_CANCEL_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+async fn connect_websocket(
+    target: &fleety_tools::connection::Resolved,
+    timeout: std::time::Duration,
+) -> agent_core::Result<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+> {
+    use agent_core::CoreError;
+
+    let endpoint = crate::terminal_safe_endpoint(target.url());
+    tokio::time::timeout(timeout, tokio_tungstenite::connect_async(target.url()))
+        .await
+        .map_err(|_| CoreError::Provider(format!("timed out connecting to {endpoint}")))?
+        .map(|(websocket, _)| websocket)
+        .map_err(|error| {
+            CoreError::Provider(format!(
+                "cannot connect to {endpoint}: {}",
+                crate::terminal_safe_text(&error.to_string())
+            ))
+        })
+}
+
+async fn receive_authenticated_welcome<S, E>(
+    rx: &mut S,
+    target: &fleety_tools::connection::Resolved,
+    timeout: std::time::Duration,
+) -> agent_core::Result<fleety_tools::connection::Resolved>
+where
+    S: futures::Stream<Item = Result<tokio_tungstenite::tungstenite::Message, E>> + Unpin,
+    E: std::fmt::Display,
+{
+    use agent_core::CoreError;
+    use futures::StreamExt;
+
+    let frame = tokio::time::timeout(timeout, rx.next())
+        .await
+        .map_err(|_| {
+            CoreError::Message(
+                "timed out waiting for the Server to authenticate the ACP session".to_string(),
+            )
+        })?
+        .ok_or_else(|| {
+            CoreError::Message(
+                "the Server closed before authenticating the ACP session".to_string(),
+            )
+        })?
+        .map_err(|error| CoreError::Provider(format!("receive Welcome: {error}")))?;
+    let welcome = frame
+        .to_text()
+        .ok()
+        .and_then(|text| serde_json::from_str::<fleety_protocol::ServerMsg>(text).ok());
+    match welcome {
+        Some(fleety_protocol::ServerMsg::Welcome {
+            server_fingerprint, ..
+        }) => crate::verify_and_pin_welcome_identity(server_fingerprint.as_deref(), target),
+        other => Err(CoreError::Message(crate::hello_failure_message_for_target(
+            other.as_ref(),
+            target,
+        ))),
+    }
+}
+
 struct WsBridge<R> {
-    target: fleety_tools::connection::Resolved,
+    target: std::sync::Mutex<fleety_tools::connection::Resolved>,
     cwds: tokio::sync::Mutex<std::collections::HashMap<String, Option<String>>>,
     /// Sessions whose current turn the editor cancelled (`session/cancel`).
     /// Set when a cancel is seen, consumed by `take_cancelled`, reset when a
@@ -832,7 +1324,7 @@ impl<R: tokio::io::AsyncBufRead + Unpin + Send> WsBridge<R> {
         reader: std::sync::Arc<tokio::sync::Mutex<R>>,
     ) -> Self {
         Self {
-            target,
+            target: std::sync::Mutex::new(target),
             cwds: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             cancelled: std::sync::Mutex::new(std::collections::HashSet::new()),
             caps: std::sync::Mutex::new(EditorCapabilities::default()),
@@ -1004,11 +1496,12 @@ impl<R: tokio::io::AsyncBufRead + Unpin + Send> WsBridge<R> {
             c.remove(conversation);
         }
 
-        let (ws, _) = tokio_tungstenite::connect_async(&self.target.url)
-            .await
-            .map_err(|e| {
-                CoreError::Provider(format!("cannot connect to {}: {e}", self.target.url))
-            })?;
+        let target = self
+            .target
+            .lock()
+            .map_err(|_| CoreError::Message("ACP connection state is unavailable".to_string()))?
+            .clone();
+        let ws = connect_websocket(&target, ACP_CONNECT_TIMEOUT).await?;
         let (mut tx, mut rx) = ws.split();
         // Advertise the editor-backed tools gated by what the editor supports, so
         // the server offers the agent `editor_*` tools routed back to us.
@@ -1022,11 +1515,19 @@ impl<R: tokio::io::AsyncBufRead + Unpin + Send> WsBridge<R> {
         } else {
             serde_json::to_string(&editor_specs).ok()
         };
-        let hello = hello_json(self.target.token.as_deref(), local_tools_json)
+        let hello = hello_json(target.token(), local_tools_json)
             .map_err(|e| CoreError::Message(format!("serialize hello: {e}")))?;
         tx.send(WsMessage::Text(hello))
             .await
             .map_err(|e| CoreError::Provider(format!("send hello: {e}")))?;
+
+        let committed_target =
+            receive_authenticated_welcome(&mut rx, &target, ACP_WELCOME_TIMEOUT).await?;
+        *self
+            .target
+            .lock()
+            .map_err(|_| CoreError::Message("ACP connection state is unavailable".to_string()))? =
+            committed_target;
 
         let outbound = if resume {
             serde_json::to_string(&fleety_protocol::ClientMsg::Resume {
@@ -1119,19 +1620,64 @@ impl<R: tokio::io::AsyncBufRead + Unpin + Send> WsBridge<R> {
                 Some(rx.next().await)
             };
             let Some(next) = server_frame else { continue };
-            let Some(frame) = next else { break }; // server closed the socket
-            let Ok(frame) = frame else { break };
-            if !frame.is_text() {
+            let Some(frame) = next else {
+                return Err(CoreError::Message(
+                    "the Server disconnected before completing the ACP turn".to_string(),
+                ));
+            };
+            let frame =
+                frame.map_err(|error| CoreError::Provider(format!("receive ACP turn: {error}")))?;
+            if frame.is_ping() || frame.is_pong() {
                 continue;
             }
-            let Ok(text) = frame.to_text() else { continue };
-            let Ok(msg) = serde_json::from_str::<fleety_protocol::ServerMsg>(text) else {
-                continue;
-            };
+            if frame.is_close() {
+                return Err(CoreError::Message(
+                    "the Server disconnected before completing the ACP turn".to_string(),
+                ));
+            }
+            if !frame.is_text() {
+                return Err(CoreError::Message(
+                    "the Server sent an unsupported WebSocket frame during the ACP turn"
+                        .to_string(),
+                ));
+            }
+            let text = frame.to_text().map_err(|_| {
+                CoreError::Message("the Server sent invalid text during the ACP turn".to_string())
+            })?;
+            let msg = serde_json::from_str::<fleety_protocol::ServerMsg>(text).map_err(|_| {
+                CoreError::Message(
+                    "the Server sent a malformed protocol message during the ACP turn".to_string(),
+                )
+            })?;
             match msg {
-                fleety_protocol::ServerMsg::Assistant { text, .. } => chunks.push(text),
-                fleety_protocol::ServerMsg::Replay { content, .. } => chunks.push(content),
-                fleety_protocol::ServerMsg::Done { .. } => break,
+                fleety_protocol::ServerMsg::Welcome { .. } => {
+                    return Err(CoreError::Message(
+                        "the Server sent a duplicate Welcome; the ACP session was closed"
+                            .to_string(),
+                    ))
+                }
+                fleety_protocol::ServerMsg::Assistant {
+                    conversation_id,
+                    text,
+                    ..
+                } if conversation_id == conversation => chunks.push(text),
+                fleety_protocol::ServerMsg::Replay {
+                    conversation_id,
+                    content,
+                    ..
+                } if conversation_id == conversation => chunks.push(content),
+                fleety_protocol::ServerMsg::Done { conversation_id }
+                    if conversation_id == conversation =>
+                {
+                    break;
+                }
+                fleety_protocol::ServerMsg::Assistant { .. }
+                | fleety_protocol::ServerMsg::Replay { .. }
+                | fleety_protocol::ServerMsg::Done { .. } => {
+                    return Err(CoreError::Message(
+                        "the Server sent an ACP reply for a different conversation".to_string(),
+                    ))
+                }
                 fleety_protocol::ServerMsg::Error { error } => {
                     return Err(CoreError::Message(error.message))
                 }
@@ -1158,9 +1704,12 @@ impl<R: tokio::io::AsyncBufRead + Unpin + Send> WsBridge<R> {
                             },
                         },
                     };
-                    if let Ok(t) = serde_json::to_string(&reply) {
-                        let _ = tx.send(WsMessage::Text(t)).await;
-                    }
+                    let text = serde_json::to_string(&reply).map_err(|error| {
+                        CoreError::Message(format!("serialize tool reply: {error}"))
+                    })?;
+                    tx.send(WsMessage::Text(text)).await.map_err(|error| {
+                        CoreError::Provider(format!("send tool reply: {error}"))
+                    })?;
                 }
                 // The server wants approval for a tool: ask the editor via ACP
                 // session/request_permission, then relay the user's choice back.
@@ -1187,9 +1736,12 @@ impl<R: tokio::io::AsyncBufRead + Unpin + Send> WsBridge<R> {
                     } else {
                         fleety_protocol::ClientMsg::Deny { approval_id }
                     };
-                    if let Ok(t) = serde_json::to_string(&reply) {
-                        let _ = tx.send(WsMessage::Text(t)).await;
-                    }
+                    let text = serde_json::to_string(&reply).map_err(|error| {
+                        CoreError::Message(format!("serialize approval reply: {error}"))
+                    })?;
+                    tx.send(WsMessage::Text(text)).await.map_err(|error| {
+                        CoreError::Provider(format!("send approval reply: {error}"))
+                    })?;
                 }
                 _ => {}
             }
@@ -1231,18 +1783,38 @@ impl<R: tokio::io::AsyncBufRead + Unpin + Send> AcpBridge for WsBridge<R> {
         // there is no live turn connection here: best-effort send CancelTurn
         // on a short-lived one — an idle server ignores it silently, by
         // design. A cancel never fails the adapter.
-        let Ok((ws, _)) = tokio_tungstenite::connect_async(&self.target.url).await else {
-            tracing::warn!(url = %self.target.url, "acp: cancel: server unreachable; nothing to cancel");
-            return;
+        let target = match self.target.lock() {
+            Ok(target) => target.clone(),
+            Err(_) => return,
         };
-        let (mut tx, _rx) = ws.split();
+        let ws = match connect_websocket(&target, ACP_CANCEL_CONNECT_TIMEOUT).await {
+            Ok(websocket) => websocket,
+            Err(error) => {
+                tracing::warn!(
+                    endpoint = %crate::terminal_safe_endpoint(target.url()),
+                    error = %crate::terminal_safe_text(&error.report().message),
+                    "acp: cancel: server unreachable; nothing to cancel"
+                );
+                return;
+            }
+        };
+        let (mut tx, mut rx) = ws.split();
         let conversation_id = (!session_id.is_empty()).then(|| session_id.to_string());
         if let (Ok(hello), Ok(cancel)) = (
-            hello_json(self.target.token.as_deref(), None),
+            hello_json(target.token(), None),
             serde_json::to_string(&fleety_protocol::ClientMsg::CancelTurn { conversation_id }),
         ) {
-            let _ = tx.send(WsMessage::Text(hello)).await;
-            let _ = tx.send(WsMessage::Text(cancel)).await;
+            if tx.send(WsMessage::Text(hello)).await.is_ok() {
+                let authenticated =
+                    receive_authenticated_welcome(&mut rx, &target, ACP_CANCEL_WELCOME_TIMEOUT)
+                        .await;
+                if let Ok(committed_target) = authenticated {
+                    if let Ok(mut stored) = self.target.lock() {
+                        *stored = committed_target;
+                    }
+                    let _ = tx.send(WsMessage::Text(cancel)).await;
+                }
+            }
         }
         let _ = tx.close().await;
     }
@@ -1533,6 +2105,52 @@ mod tests {
             "other agents preserved"
         );
 
+        let with_token = r#"{"agent_servers":{"Fleety":{"type":"custom","command":"/old/fleety","args":["acp"],"env":{"FLEETY_AGENT_URL":"ws://old","FLEETY_TOKEN":"keep-token","EDITOR_FLAG":"keep"}}}}"#;
+        let (out, updated) =
+            merge_zed_settings(with_token, "/updated/fleety", Some("ws://new")).expect("merge");
+        assert!(updated);
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert!(
+            v["agent_servers"]["Fleety"]["env"]
+                .get("FLEETY_TOKEN")
+                .is_none(),
+            "changing endpoint must clear its bound token"
+        );
+        assert_eq!(v["agent_servers"]["Fleety"]["env"]["EDITOR_FLAG"], "keep");
+        assert_eq!(
+            v["agent_servers"]["Fleety"]["env"]["FLEETY_AGENT_URL"],
+            "ws://new"
+        );
+
+        let same_endpoint = r#"{"agent_servers":{"Fleety":{"type":"custom","command":"/old/fleety","args":["acp"],"env":{"FLEETY_AGENT_URL":"ws://same","FLEETY_TOKEN":"same-token","EDITOR_FLAG":"keep"}}}}"#;
+        let (out, _) =
+            merge_zed_settings(same_endpoint, "/updated/fleety", Some("ws://same")).expect("merge");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            v["agent_servers"]["Fleety"]["env"]["FLEETY_TOKEN"], "same-token",
+            "reinstalling the same transient endpoint keeps its explicit token"
+        );
+
+        let (out, _) = merge_zed_settings(same_endpoint, "/updated/fleety", None).expect("merge");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert!(
+            v["agent_servers"]["Fleety"]["env"]
+                .get("FLEETY_TOKEN")
+                .is_none(),
+            "returning to saved-profile resolution must remove the raw endpoint token"
+        );
+        let token_without_endpoint = r#"{"agent_servers":{"Fleety":{"type":"custom","command":"/old/fleety","args":["acp"],"env":{"FLEETY_TOKEN":"orphaned-token","EDITOR_FLAG":"keep"}}}}"#;
+        let (out, _) =
+            merge_zed_settings(token_without_endpoint, "/updated/fleety", None).expect("merge");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert!(
+            v["agent_servers"]["Fleety"]["env"]
+                .get("FLEETY_TOKEN")
+                .is_none(),
+            "saved-profile mode must clear a token that has no endpoint binding"
+        );
+        assert_eq!(v["agent_servers"]["Fleety"]["env"]["EDITOR_FLAG"], "keep");
+
         // JSONC with comments is refused (never clobbered).
         assert!(
             merge_zed_settings("// my settings\n{\"theme\":\"dark\"}", "/bin/fleety", None)
@@ -1558,26 +2176,38 @@ mod tests {
     fn refresh_only_repoints_when_already_installed() {
         // Not installed → no refresh (never newly installs).
         assert_eq!(
-            refresh_zed_settings(r#"{"theme":"dark"}"#, "/bin/fleety", None),
+            refresh_zed_settings(r#"{"theme":"dark"}"#, "/bin/fleety", None).unwrap(),
             None
         );
-        assert_eq!(refresh_zed_settings("", "/bin/fleety", None), None);
-        // Unparseable (JSONC) → no refresh (never clobbers).
-        assert_eq!(refresh_zed_settings("// c\n{}", "/bin/fleety", None), None);
+        assert!(refresh_zed_settings("", "/bin/fleety", None).is_err());
+        // Unparseable (JSONC) is reported so update cannot claim completion.
+        assert!(refresh_zed_settings("// c\n{}", "/bin/fleety", None).is_err());
+        let invalid_endpoint = r#"{"agent_servers":{"Fleety":{"type":"custom","command":"/old/fleety","args":["acp"],"env":{"FLEETY_AGENT_URL":"wss://example.test/ws#fragment"}}}}"#;
+        assert!(
+            refresh_zed_settings(invalid_endpoint, "/new/fleety", None).is_err(),
+            "update must not preserve an endpoint that current Fleety would refuse"
+        );
 
         // Installed at an old path → refresh re-points it at the current binary.
         let old = r#"{"agent_servers":{"Fleety":{"type":"custom","command":"/old/fleety","args":["acp"],"env":{}}}}"#;
-        let refreshed = refresh_zed_settings(old, "/new/fleety", None).expect("should refresh");
+        let refreshed = refresh_zed_settings(old, "/new/fleety", None)
+            .expect("valid settings")
+            .expect("should refresh");
         let v: Value = serde_json::from_str(&refreshed).unwrap();
         assert_eq!(v["agent_servers"]["Fleety"]["command"], "/new/fleety");
 
         // Already pointing at the current binary → nothing changes → no rewrite.
-        assert_eq!(refresh_zed_settings(&refreshed, "/new/fleety", None), None);
+        assert_eq!(
+            refresh_zed_settings(&refreshed, "/new/fleety", None).unwrap(),
+            None
+        );
 
         // A path-only refresh preserves the complete installed entry except
         // for `command`, including its server binding and editor-specific env.
-        let bound = r#"{"agent_servers":{"Fleety":{"type":"custom","command":"/old/fleety","args":["acp","--editor-mode"],"env":{"FLEETY_AGENT_URL":"wss://paired.example/ws","EDITOR_FLAG":"keep"},"extra":"keep"}}}"#;
-        let refreshed = refresh_zed_settings(bound, "/new/fleety", None).expect("refresh");
+        let bound = r#"{"agent_servers":{"Fleety":{"type":"custom","command":"/old/fleety","args":["acp","--editor-mode"],"env":{"FLEETY_AGENT_URL":"wss://paired.example/ws","FLEETY_TOKEN":"old-token","EDITOR_FLAG":"keep"},"extra":"keep"}}}"#;
+        let refreshed = refresh_zed_settings(bound, "/new/fleety", None)
+            .expect("valid settings")
+            .expect("refresh");
         let before: Value = serde_json::from_str(bound).unwrap();
         let after: Value = serde_json::from_str(&refreshed).unwrap();
         assert_eq!(
@@ -1594,6 +2224,7 @@ mod tests {
         // An explicit replacement changes only the server binding while
         // retaining unrelated editor env values.
         let rebound = refresh_zed_settings(&refreshed, "/new/fleety", Some("wss://new/ws"))
+            .expect("valid settings")
             .expect("explicit server replacement");
         let rebound: Value = serde_json::from_str(&rebound).unwrap();
         assert_eq!(
@@ -1603,6 +2234,29 @@ mod tests {
         assert_eq!(
             rebound["agent_servers"]["Fleety"]["env"]["EDITOR_FLAG"],
             "keep"
+        );
+        assert!(
+            rebound["agent_servers"]["Fleety"]["env"]
+                .get("FLEETY_TOKEN")
+                .is_none(),
+            "changing the refreshed endpoint must clear its bound token"
+        );
+    }
+
+    #[test]
+    fn settings_base_must_be_nonempty_and_absolute() {
+        assert!(absolute_env_path(None).is_none());
+        assert!(absolute_env_path(Some(std::ffi::OsString::from(""))).is_none());
+        assert!(absolute_env_path(Some(std::ffi::OsString::from("relative"))).is_none());
+        #[cfg(not(windows))]
+        assert_eq!(
+            absolute_env_path(Some(std::ffi::OsString::from("/absolute"))),
+            Some(std::path::PathBuf::from("/absolute"))
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            absolute_env_path(Some(std::ffi::OsString::from(r"C:\absolute"))),
+            Some(std::path::PathBuf::from(r"C:\absolute"))
         );
     }
 
@@ -1625,6 +2279,314 @@ mod tests {
     }
 
     #[test]
+    fn zed_replace_rejects_content_drift() {
+        let dir = std::env::temp_dir().join(format!("fleety-acp-drift-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, b"{\"theme\":\"old\"}").unwrap();
+        let expected = std::fs::read(&path).unwrap();
+        std::fs::write(&path, b"{\"theme\":\"newer\"}").unwrap();
+
+        let error = atomic_replace_if_unchanged(
+            &path,
+            Some(expected.as_slice()),
+            b"{\"agent_servers\":{}}",
+        )
+        .expect_err("drift must abort replacement");
+        assert!(error.to_string().contains("settings changed"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"theme\":\"newer\"}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn zed_replace_never_clobbers_a_path_recreated_during_publication() {
+        let dir =
+            std::env::temp_dir().join(format!("fleety-acp-recreate-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        let original = b"{\"theme\":\"old\"}";
+        std::fs::write(&path, original).unwrap();
+
+        let error = atomic_replace_if_unchanged_with(
+            &path,
+            Some(original),
+            b"{\"agent_servers\":{}}",
+            |_| {
+                std::fs::write(&path, b"{\"theme\":\"concurrent\"}")?;
+                Ok(())
+            },
+        )
+        .expect_err("a concurrent path owner must win without being overwritten");
+
+        assert!(
+            error.to_string().contains("recovery copy"),
+            "error must identify recoverable partial state: {error}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"theme\":\"concurrent\"}");
+        let recovery = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .find(|entry| entry.file_name().to_string_lossy().contains(".recovery"))
+            .expect("the displaced original must remain recoverable");
+        assert_eq!(std::fs::read(recovery.path()).unwrap(), original);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn displaced_permission_or_read_failure_reports_recovery_when_restore_fails() {
+        for cause in ["injected chmod failure", "injected recovery read failure"] {
+            let dir = std::env::temp_dir().join(format!(
+                "fleety-acp-restore-report-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("settings.json");
+            let recovery = dir.join(".fleety-zed-test.recovery");
+            std::fs::write(&path, b"concurrent owner").unwrap();
+            std::fs::write(&recovery, b"displaced secret settings").unwrap();
+
+            let error = restore_displaced_or_report(std::io::Error::other(cause), &recovery, &path);
+            let message = error.to_string();
+
+            assert!(message.contains(cause), "{message}");
+            assert!(
+                message.contains(&recovery.display().to_string()),
+                "{message}"
+            );
+            assert!(message.contains("could not be restored"), "{message}");
+            assert_eq!(
+                std::fs::read(&recovery).unwrap(),
+                b"displaced secret settings"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), b"concurrent owner");
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn displaced_restore_reports_canonical_active_when_only_cleanup_fails() {
+        let dir = std::env::temp_dir().join(format!(
+            "fleety-acp-restore-cleanup-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        let recovery = dir.join(".fleety-zed-test.recovery");
+        std::fs::write(&recovery, b"displaced secret settings").unwrap();
+
+        let error = restore_displaced_or_report_with_cleanup(
+            std::io::Error::other("injected read failure"),
+            &recovery,
+            &path,
+            |_| Err(std::io::Error::other("injected unlink failure")),
+        );
+        let message = error.to_string();
+
+        assert!(
+            message.contains("canonical settings were restored"),
+            "{message}"
+        );
+        assert!(message.contains("recovery cleanup failed"), "{message}");
+        assert!(!message.contains("could not be restored"), "{message}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"displaced secret settings");
+        assert_eq!(
+            std::fs::read(&recovery).unwrap(),
+            b"displaced secret settings"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn prepublication_failure_reports_a_retained_private_temp_file() {
+        let dir =
+            std::env::temp_dir().join(format!("fleety-acp-prepublish-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+
+        let error = atomic_replace_if_unchanged_with_cleanup(
+            &path,
+            None,
+            b"{\"FLEETY_TOKEN\":\"secret\"}",
+            |_| Err(std::io::Error::other("injected publication failure")),
+            |_| Err(std::io::Error::other("injected temp unlink failure")),
+        )
+        .expect_err("prepublication cleanup failure must be explicit");
+        let message = error.to_string();
+
+        assert!(
+            message.contains("injected publication failure"),
+            "{message}"
+        );
+        assert!(
+            message.contains("private temporary settings file"),
+            "{message}"
+        );
+        let retained = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .find(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .expect("reported temp file remains");
+        assert!(message.contains(&retained.path().display().to_string()));
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn permission_failure_reports_a_retained_private_temp_file() {
+        let dir =
+            std::env::temp_dir().join(format!("fleety-acp-permission-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+
+        let error = atomic_replace_if_unchanged_with_hooks(
+            &path,
+            None,
+            b"{\"FLEETY_TOKEN\":\"secret\"}",
+            |_| Ok(()),
+            |_| Err(std::io::Error::other("injected permission failure")),
+            |_| Err(std::io::Error::other("injected temp unlink failure")),
+        )
+        .expect_err("permission cleanup failure must be explicit");
+        let message = error.to_string();
+
+        assert!(message.contains("injected permission failure"), "{message}");
+        assert!(
+            message.contains("private temporary settings file"),
+            "{message}"
+        );
+        let retained = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .find(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .expect("reported temp file remains");
+        assert!(message.contains(&retained.path().display().to_string()));
+        assert_eq!(std::fs::read(retained.path()).unwrap(), b"");
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn backup_replace_failure_reports_a_retained_private_temp_file() {
+        let dir =
+            std::env::temp_dir().join(format!("fleety-acp-backup-temp-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json.bak");
+
+        let error = atomic_replace_with_cleanup(
+            &path,
+            b"{\"FLEETY_TOKEN\":\"secret\"}",
+            |_| Err(std::io::Error::other("injected backup publication failure")),
+            |_| Err(std::io::Error::other("injected backup temp unlink failure")),
+        )
+        .expect_err("backup cleanup failure must be explicit");
+        let message = error.to_string();
+
+        assert!(
+            message.contains("injected backup publication failure"),
+            "{message}"
+        );
+        assert!(
+            message.contains("private temporary settings file"),
+            "{message}"
+        );
+        let retained = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .find(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .expect("reported backup temp remains");
+        assert!(message.contains(&retained.path().display().to_string()));
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn zed_replace_reports_published_when_temp_cleanup_fails() {
+        let dir =
+            std::env::temp_dir().join(format!("fleety-acp-tmp-cleanup-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        let original = b"{\"theme\":\"old\"}";
+        std::fs::write(&path, original).unwrap();
+
+        let publication = atomic_replace_if_unchanged_with_cleanup(
+            &path,
+            Some(original),
+            b"{\"agent_servers\":{}}",
+            |_| Ok(()),
+            |candidate| {
+                if candidate
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().ends_with(".tmp"))
+                {
+                    Err(std::io::Error::other("injected temp cleanup failure"))
+                } else {
+                    std::fs::remove_file(candidate)
+                }
+            },
+        )
+        .expect("publication remains successful after cleanup failure");
+
+        let AtomicPublication::PublishedWithCleanupWarning(warning) = publication else {
+            panic!("cleanup failure must be explicit");
+        };
+        assert!(warning.contains(".tmp"));
+        assert!(warning.contains("new settings are active"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"agent_servers\":{}}");
+        assert!(
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(std::result::Result::ok)
+                .any(|entry| entry.file_name().to_string_lossy().ends_with(".tmp")),
+            "the warning must name a retained file that actually exists"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn zed_replace_reports_published_when_recovery_cleanup_fails() {
+        let dir = std::env::temp_dir().join(format!(
+            "fleety-acp-recovery-cleanup-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        let original = b"{\"theme\":\"old\"}";
+        std::fs::write(&path, original).unwrap();
+
+        let publication = atomic_replace_if_unchanged_with_cleanup(
+            &path,
+            Some(original),
+            b"{\"agent_servers\":{}}",
+            |_| Ok(()),
+            |candidate| {
+                if candidate
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().ends_with(".recovery"))
+                {
+                    Err(std::io::Error::other("injected recovery cleanup failure"))
+                } else {
+                    std::fs::remove_file(candidate)
+                }
+            },
+        )
+        .expect("publication remains successful after cleanup failure");
+
+        let AtomicPublication::PublishedWithCleanupWarning(warning) = publication else {
+            panic!("cleanup failure must be explicit");
+        };
+        assert!(warning.contains(".recovery"));
+        assert!(warning.contains("new settings are active"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"agent_servers\":{}}");
+        let recovery = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .find(|entry| entry.file_name().to_string_lossy().ends_with(".recovery"))
+            .expect("the warning must name a retained recovery file");
+        assert_eq!(std::fs::read(recovery.path()).unwrap(), original);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn failed_zed_replace_keeps_the_existing_file() {
         let dir = std::env::temp_dir().join(format!("fleety-acp-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1644,6 +2606,83 @@ mod tests {
             "temporary file must be cleaned up"
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn zed_install_refuses_to_replace_unreadable_settings_bytes() {
+        let dir = std::env::temp_dir().join(format!("fleety-acp-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create settings dir");
+        let path = dir.join("settings.json");
+        let original = [0xff, 0xfe, 0xfd];
+        std::fs::write(&path, original).expect("write invalid utf-8 settings");
+
+        let error = update_zed_settings_file(&path, "/bin/fleety", Some("ws://new:8787"))
+            .expect_err("unreadable text settings must fail closed");
+        assert!(error.contains("cannot read"));
+        assert_eq!(
+            std::fs::read(&path).expect("read preserved settings"),
+            original
+        );
+        assert!(!path.with_extension("json.bak").exists());
+
+        std::fs::remove_dir_all(dir).expect("remove settings fixture");
+    }
+
+    #[test]
+    fn zed_install_refuses_to_report_success_when_backup_fails() {
+        let dir = std::env::temp_dir().join(format!("fleety-acp-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create settings dir");
+        let path = dir.join("settings.json");
+        let original = br#"{"theme":"keep"}"#;
+        std::fs::write(&path, original).expect("write existing settings");
+        std::fs::create_dir(path.with_extension("json.bak"))
+            .expect("block backup with a directory");
+
+        let error = update_zed_settings_file(&path, "/bin/fleety", Some("ws://new:8787"))
+            .expect_err("backup failure must fail the install");
+        assert!(error.contains("cannot back up"));
+        assert_eq!(
+            std::fs::read(&path).expect("read preserved settings"),
+            original
+        );
+
+        std::fs::remove_dir_all(dir).expect("remove settings fixture");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zed_install_keeps_token_bearing_settings_and_backup_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("fleety-acp-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create settings dir");
+        let path = dir.join("settings.json");
+        let original = br#"{"agent_servers":{"Fleety":{"type":"custom","command":"/old/fleety","args":["acp"],"env":{"FLEETY_AGENT_URL":"ws://same:8787","FLEETY_TOKEN":"private-token"}}}}"#;
+        std::fs::write(&path, original).expect("write settings");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("secure source settings");
+
+        update_zed_settings_file(&path, "/new/fleety", Some("ws://same:8787"))
+            .expect("update settings");
+
+        for protected in [&path, &path.with_extension("json.bak")] {
+            assert_eq!(
+                std::fs::metadata(protected)
+                    .expect("protected file metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600,
+                "{} must remain private",
+                protected.display()
+            );
+            assert!(String::from_utf8_lossy(
+                &std::fs::read(protected).expect("read protected file")
+            )
+            .contains("private-token"));
+        }
+
+        std::fs::remove_dir_all(dir).expect("remove settings fixture");
     }
 
     #[test]
@@ -1795,21 +2834,35 @@ mod tests {
         }
     }
 
+    fn acp_welcome() -> ServerMsg {
+        ServerMsg::Welcome {
+            session_id: "acp-session".to_string(),
+            conversation_id: "acp-conversation".to_string(),
+            protocol: fleety_protocol::PROTOCOL_VERSION,
+            server_version: String::new(),
+            audio_input: false,
+            config_protocol: 0,
+            server_fingerprint: Some("acp-server".to_string()),
+            loopback_trusted: false,
+            token: None,
+        }
+    }
+
     #[tokio::test]
     async fn bridge_hello_uses_the_resolved_profile_token() {
         let (url, server_rx) = scripted_server(vec![vec![
-            vec![],
+            vec![acp_welcome()],
             vec![ServerMsg::Done {
                 conversation_id: "c-token".to_string(),
             }],
         ]]);
         let (editor_in, _editor_out) = tokio::io::duplex(1024);
         let bridge = WsBridge::new(
-            fleety_tools::connection::Resolved {
+            fleety_tools::connection::Resolved::unowned(
                 url,
-                token: Some("paired-profile-token".to_string()),
-                source: fleety_tools::connection::Source::Profile("paired".to_string()),
-            },
+                Some("paired-profile-token".to_string()),
+                fleety_tools::connection::Source::Profile("paired".to_string()),
+            ),
             std::sync::Arc::new(tokio::sync::Mutex::new(tokio::io::BufReader::new(
                 editor_in,
             ))),
@@ -1832,6 +2885,114 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn bridge_rejects_control_before_welcome_without_sending_user_data() {
+        let pre_welcome_control = ServerMsg::RunTool {
+            call_id: "pre-welcome-call".to_string(),
+            tool: "unknown-pre-welcome-tool".to_string(),
+            args_json: "{}".to_string(),
+        };
+        let rejection = ServerMsg::Error {
+            error: fleety_protocol::WireError {
+                kind: "unauthenticated".to_string(),
+                message: "pair first".to_string(),
+                remediation: None,
+            },
+        };
+        let (url, server_rx) =
+            scripted_server(vec![vec![vec![pre_welcome_control], vec![rejection]]]);
+        let (bridge, _editor_out) = duplex_bridge(&url);
+
+        assert!(
+            bridge
+                .run_turn("c-pre-welcome", "private editor prompt", None, false)
+                .await
+                .is_err(),
+            "a control frame cannot authenticate an ACP session"
+        );
+
+        let received = server_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("server frames");
+        assert!(
+            matches!(received.as_slice(), [ClientMsg::Hello { .. }]),
+            "ACP sent user data or a control reply before Welcome: {received:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bridge_rejects_partial_output_when_server_disconnects_before_done() {
+        let (url, server_rx) = scripted_server(vec![vec![
+            vec![acp_welcome()],
+            vec![assistant("c-partial", "unfinished", 1)],
+        ]]);
+        let (bridge, _editor_out) = duplex_bridge(&url);
+
+        let error = bridge
+            .run_turn("c-partial", "do work", None, false)
+            .await
+            .expect_err("disconnect before Done must not become end_turn");
+        assert!(
+            error
+                .report()
+                .message
+                .contains("disconnected before completing"),
+            "{}",
+            error.report().message
+        );
+        let received = server_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("server frames");
+        assert!(matches!(
+            received.as_slice(),
+            [ClientMsg::Hello { .. }, ClientMsg::UserMessage { .. }]
+        ));
+    }
+
+    #[tokio::test]
+    async fn bridge_rejects_malformed_protocol_after_partial_output() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind malformed server");
+        let addr = listener.local_addr().expect("malformed server addr");
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept malformed client");
+            let mut ws =
+                tokio_tungstenite::tungstenite::accept(stream).expect("upgrade malformed client");
+            let _hello = ws.read().expect("read hello");
+            ws.send(tokio_tungstenite::tungstenite::Message::Text(
+                serde_json::to_string(&acp_welcome()).expect("serialize welcome"),
+            ))
+            .expect("send welcome");
+            let _user = ws.read().expect("read user message");
+            ws.send(tokio_tungstenite::tungstenite::Message::Text(
+                serde_json::to_string(&assistant("c-malformed", "unfinished", 1))
+                    .expect("serialize assistant"),
+            ))
+            .expect("send assistant");
+            ws.send(tokio_tungstenite::tungstenite::Message::Text(
+                "{not protocol json".to_string(),
+            ))
+            .expect("send malformed protocol");
+            ws.send(tokio_tungstenite::tungstenite::Message::Text(
+                serde_json::to_string(&ServerMsg::Done {
+                    conversation_id: "c-malformed".to_string(),
+                })
+                .expect("serialize done"),
+            ))
+            .expect("send done");
+        });
+        let (bridge, _editor_out) = duplex_bridge(&format!("ws://{addr}"));
+
+        let error = bridge
+            .run_turn("c-malformed", "do work", None, false)
+            .await
+            .expect_err("malformed protocol must reject the partial turn");
+        assert!(
+            error.report().message.contains("malformed protocol"),
+            "{}",
+            error.report().message
+        );
+    }
+
     /// A real WsBridge whose editor input is an in-memory duplex; returns the
     /// write half the test uses to play the editor.
     fn duplex_bridge(
@@ -1842,11 +3003,11 @@ mod tests {
     ) {
         let (editor_in, editor_out) = tokio::io::duplex(1024);
         let bridge = WsBridge::new(
-            fleety_tools::connection::Resolved {
-                url: url.to_string(),
-                token: None,
-                source: fleety_tools::connection::Source::OverrideUrl,
-            },
+            fleety_tools::connection::Resolved::unowned(
+                url.to_string(),
+                None,
+                fleety_tools::connection::Source::OverrideUrl,
+            ),
             std::sync::Arc::new(tokio::sync::Mutex::new(tokio::io::BufReader::new(
                 editor_in,
             ))),
@@ -1861,8 +3022,8 @@ mod tests {
     #[tokio::test]
     async fn mid_turn_session_cancel_sends_cancel_turn_and_prompt_stops_cancelled() {
         let (url, server_rx) = scripted_server(vec![vec![
-            vec![], // Hello
-            vec![], // UserMessage — the server now waits for the CancelTurn
+            vec![acp_welcome()], // Hello
+            vec![],              // UserMessage — the server now waits for the CancelTurn
             vec![
                 // CancelTurn → ack, wind-down, Done (decision five's shape).
                 assistant("c-mid", "cancelling — stopping at the next safe point", 1),
@@ -1931,10 +3092,10 @@ mod tests {
     async fn idle_session_cancel_forwards_and_leaves_next_prompt_normal() {
         let (url, server_rx) = scripted_server(vec![
             // Connection 1 — the idle cancel: Hello, CancelTurn.
-            vec![vec![], vec![]],
+            vec![vec![acp_welcome()], vec![]],
             // Connection 2 — the next prompt: Hello, UserMessage → reply+Done.
             vec![
-                vec![],
+                vec![acp_welcome()],
                 vec![
                     assistant("c-idle", "fresh answer", 1),
                     ServerMsg::Done {
@@ -1973,5 +3134,61 @@ mod tests {
         .await
         .expect("prompt after idle cancel must complete");
         assert_eq!(frames.last().unwrap()["result"]["stopReason"], "end_turn");
+    }
+
+    #[tokio::test]
+    async fn authenticated_welcome_wait_is_bounded_for_a_silent_endpoint() {
+        let target = fleety_tools::connection::Resolved::unowned(
+            "ws://silent.invalid:8787".to_string(),
+            None,
+            fleety_tools::connection::Source::OverrideUrl,
+        );
+        let mut silent = futures::stream::pending::<
+            Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error>,
+        >();
+
+        let error = receive_authenticated_welcome(
+            &mut silent,
+            &target,
+            std::time::Duration::from_millis(20),
+        )
+        .await
+        .expect_err("a silent endpoint must time out");
+        assert!(
+            error
+                .report()
+                .message
+                .contains("timed out waiting for the Server to authenticate"),
+            "{}",
+            error.report().message
+        );
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_wait_is_bounded_and_redacts_the_endpoint() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stalled upgrade server");
+        let address = listener.local_addr().expect("stalled server address");
+        let stalled = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.expect("accept ACP connection");
+            std::future::pending::<()>().await;
+        });
+        let target = fleety_tools::connection::Resolved::unowned(
+            format!("ws://user:password@{address}/acp?token=secret#fragment"),
+            None,
+            fleety_tools::connection::Source::OverrideUrl,
+        );
+
+        let error = connect_websocket(&target, std::time::Duration::from_millis(20))
+            .await
+            .expect_err("a stalled WebSocket upgrade must time out");
+        stalled.abort();
+        let message = error.report().message;
+        assert!(message.contains("timed out connecting to"));
+        assert!(message.contains("/acp"));
+        assert!(!message.contains("password"));
+        assert!(!message.contains("secret"));
+        assert!(!message.contains("fragment"));
     }
 }

@@ -475,7 +475,9 @@ fn acp_command() -> ClapCommand {
     leaf("acp", "Run as an ACP agent").subcommand(
         leaf("install", "Print or install ACP editor configuration")
             .arg(positional("editor", false))
-            .arg(option("server")),
+            .arg(option("server").help(
+                "Use a transient Server endpoint; authenticated endpoints also need an explicit FLEETY_TOKEN",
+            )),
     )
 }
 

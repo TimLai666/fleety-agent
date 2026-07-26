@@ -47,7 +47,7 @@ const USAGE: &str = "usage: fleety server <add|use|list|show|current|rename|remo
      \x20 show [<name>]           details for one server (default: current)\n\
      \x20 current                 the current server\n\
      \x20 rename <old> <new>      rename a server\n\
-     \x20 remove <name> [--force] delete a server (--force if it is current)\n\
+     \x20 remove <name> [--force] delete a non-current server\n\
      \x20 set-url <name> <ws-url> change a server's url";
 
 /// Parse `server <args...>`. Pure; a missing required argument or unknown flag
@@ -202,6 +202,7 @@ pub fn apply_at(path: &Path, cmd: Cmd, _env_url: Option<String>) -> Result<Strin
                         token: None,
                         label,
                         fingerprint: None,
+                        generation: uuid::Uuid::new_v4().to_string(),
                     },
                 );
                 if becomes_current {
@@ -281,21 +282,21 @@ pub fn apply_at(path: &Path, cmd: Cmd, _env_url: Option<String>) -> Result<Strin
                 Ok(format!("renamed server '{old}' → '{new}'"))
             })
         }
-        Cmd::Remove { name, force } => {
+        Cmd::Remove {
+            name,
+            force: _force,
+        } => {
             check_display_field("server name", &name)?;
             connection::mutate_at(path, |conns| {
                 if !conns.profiles.contains_key(&name) {
                     return Err(unknown_server(&name, conns));
                 }
-                if conns.current.as_deref() == Some(&name) && !force {
+                if conns.current.as_deref() == Some(&name) {
                     return Err(CoreError::Message(format!(
-                        "'{name}' is the current server — switch with `fleety server use <other>` first, or pass --force"
+                        "'{name}' is the current server — explicitly switch with `fleety server use <replacement>` before removing it; --force never chooses a server for you"
                     )));
                 }
                 conns.profiles.remove(&name);
-                if conns.current.as_deref() == Some(&name) {
-                    conns.current = None;
-                }
                 Ok(format!("removed server '{name}'"))
             })
         }
@@ -348,7 +349,7 @@ fn render_list(conns: &Connections) -> String {
             " "
         };
         let url = if p.url.is_empty() {
-            "(mDNS)".to_string()
+            "(endpoint required — run `fleety init`)".to_string()
         } else {
             safe_endpoint(&p.url)
         };
@@ -373,7 +374,7 @@ fn render_show(name: &str, p: &Profile, is_current: bool) -> String {
         if is_current { " (current)" } else { "" }
     );
     let endpoint = if p.url.is_empty() {
-        "(none — falls back to mDNS)".to_string()
+        "(none — select and pair with `fleety init`)".to_string()
     } else {
         safe_endpoint(&p.url)
     };
@@ -399,15 +400,27 @@ fn render_show(name: &str, p: &Profile, is_current: bool) -> String {
 /// connections.toml, printing the result.
 pub fn run(args: &[String]) -> Result<()> {
     let cmd = parse(args)?;
-    let switched_profile = match &cmd {
-        Cmd::Use(name) => Some(name.clone()),
-        Cmd::Add {
+    let explicit_reconnect_profile = match &cmd {
+        Cmd::Use(name)
+        | Cmd::Add {
             name,
             use_current: true,
             ..
         } => Some(name.clone()),
         _ => None,
     };
+    let path = connection::connections_path();
+    let mutates_profiles = matches!(
+        cmd,
+        Cmd::Add { .. }
+            | Cmd::Use(_)
+            | Cmd::Rename { .. }
+            | Cmd::Remove { .. }
+            | Cmd::SetUrl { .. }
+    );
+    let before = mutates_profiles
+        .then(|| connection::load_at(&path))
+        .transpose()?;
     let env_url = std::env::var("FLEETY_AGENT_URL").ok();
     if matches!(cmd, Cmd::List) && !crate::quiet_mode() && !crate::json_mode() {
         if let Some(url) = env_url.as_deref().filter(|url| !url.is_empty()) {
@@ -418,8 +431,16 @@ pub fn run(args: &[String]) -> Result<()> {
             );
         }
     }
-    let out = apply_at(&connection::connections_path(), cmd, None)?;
-    let daemon_notice = match switched_profile.as_deref() {
+    let out = apply_at(&path, cmd, None)?;
+    let after = mutates_profiles
+        .then(|| connection::load_at(&path))
+        .transpose()?;
+    let reconnect_profile = before
+        .as_ref()
+        .zip(after.as_ref())
+        .and_then(|(before, after)| reconnect_profile_after_change(before, after))
+        .or(explicit_reconnect_profile);
+    let daemon_notice = match reconnect_profile.as_deref() {
         Some(profile) => Some(notify_daemon_reconnect(profile).map_err(|error| {
             CoreError::Message(format!(
                 "server profile '{profile}' was saved, but fleetyd was not notified: {}",
@@ -436,6 +457,17 @@ pub fn run(args: &[String]) -> Result<()> {
         crate::output_stdout(crate::terminal_safe_multiline_redacted(&notice), true);
     }
     Ok(())
+}
+
+fn current_profile_generation(conns: &Connections) -> Option<(&str, &Profile)> {
+    let name = conns.current.as_deref()?;
+    conns.profiles.get(name).map(|profile| (name, profile))
+}
+
+fn reconnect_profile_after_change(before: &Connections, after: &Connections) -> Option<String> {
+    (current_profile_generation(before) != current_profile_generation(after))
+        .then(|| after.current.clone())
+        .flatten()
 }
 
 /// Ask the local Daemon owner to leave its current Server session and resolve
@@ -511,6 +543,7 @@ mod tests {
             "wss://user:password@example.test/ws",
             "ws://",
             "ws://example.test/\nnext",
+            "wss://example.test/ws#fragment",
         ] {
             let error = check_ws_url(invalid)
                 .expect_err("unsafe endpoint must be rejected")
@@ -530,6 +563,7 @@ mod tests {
             token: Some("stored-token".into()),
             label: Some("label\r\n\u{1b}[2Jclear".into()),
             fingerprint: Some("fp\n\u{1b}[1mvalue".into()),
+            generation: "legacy-generation".into(),
         };
         let mut conns = Connections {
             current: Some(name.clone()),
@@ -563,6 +597,26 @@ mod tests {
             );
         }
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn urlless_profile_requires_explicit_init_in_list_and_show() {
+        let profile = Profile::default();
+        let mut conns = Connections {
+            current: Some("legacy".into()),
+            ..Connections::default()
+        };
+        conns.profiles.insert("legacy".into(), profile.clone());
+
+        let list = render_list(&conns);
+        let show = render_show("legacy", &profile, true);
+        assert!(list.contains("endpoint required"), "{list}");
+        assert!(
+            show.contains("select and pair with `fleety init`"),
+            "{show}"
+        );
+        assert!(!list.contains("(mDNS)"), "{list}");
+        assert!(!show.contains("falls back to mDNS"), "{show}");
     }
 
     #[test]
@@ -619,7 +673,7 @@ mod tests {
     }
 
     #[test]
-    fn remove_current_requires_force() {
+    fn remove_current_requires_an_explicit_switch() {
         let p = tmp();
         apply_at(
             &p,
@@ -627,16 +681,29 @@ mod tests {
             None,
         )
         .unwrap();
-        // Removing the current server without --force is rejected.
+        // Removing the current server is rejected.
         let err = apply_at(&p, parse(&v(&["remove", "home"])).unwrap(), None)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("--force"), "must demand --force: {err}");
-        // With --force it is removed and current is cleared.
-        apply_at(&p, parse(&v(&["remove", "home", "--force"])).unwrap(), None).unwrap();
-        assert!(apply_at(&p, Cmd::Current, None)
-            .unwrap()
-            .contains("no current"));
+        assert!(err.contains("explicitly switch"), "{err}");
+        // --force never guesses which replacement the user meant.
+        let err = apply_at(&p, parse(&v(&["remove", "home", "--force"])).unwrap(), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("never chooses"), "{err}");
+        apply_at(
+            &p,
+            parse(&v(&["add", "work", "ws://work:8787"])).unwrap(),
+            None,
+        )
+        .unwrap();
+        let err = apply_at(&p, parse(&v(&["remove", "home", "--force"])).unwrap(), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("explicitly switch"), "{err}");
+        apply_at(&p, parse(&v(&["use", "work"])).unwrap(), None).unwrap();
+        apply_at(&p, parse(&v(&["remove", "home"])).unwrap(), None).unwrap();
+        assert!(apply_at(&p, Cmd::Current, None).unwrap().contains("work"));
         let _ = std::fs::remove_file(&p);
     }
 
@@ -682,6 +749,49 @@ mod tests {
         let show = apply_at(&p, Cmd::Show(Some("home".into())), None).unwrap();
         assert!(show.contains("ws://new:9000"), "{show}");
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn every_current_profile_generation_change_requests_daemon_reconnect() {
+        let mut before = Connections {
+            current: Some("home".to_string()),
+            ..Default::default()
+        };
+        before.profiles.insert(
+            "home".to_string(),
+            Profile {
+                url: "ws://home:8787".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let mut changed_url = before.clone();
+        changed_url.profiles.get_mut("home").unwrap().url = "ws://new:8787".to_string();
+        assert_eq!(
+            reconnect_profile_after_change(&before, &changed_url).as_deref(),
+            Some("home")
+        );
+
+        let mut renamed = before.clone();
+        let renamed_profile = renamed.profiles.remove("home").unwrap();
+        renamed
+            .profiles
+            .insert("house".to_string(), renamed_profile);
+        renamed.current = Some("house".to_string());
+        assert_eq!(
+            reconnect_profile_after_change(&before, &renamed).as_deref(),
+            Some("house")
+        );
+
+        let mut unrelated = before.clone();
+        unrelated.profiles.insert(
+            "work".to_string(),
+            Profile {
+                url: "ws://work:8787".to_string(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(reconnect_profile_after_change(&before, &unrelated), None);
     }
 
     #[test]

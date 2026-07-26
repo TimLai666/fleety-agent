@@ -42,7 +42,7 @@ server keeps the fallback root and records the originating device on the binding
 | `FLEETY_POLICY` | `full_access` | `require_approval` gates every non-read tool through the approval flow. Limitation: under `require_approval` the server does not read frames mid-turn (the approval gate owns the inbound stream), so a `CancelTurn` sent during a gated turn has no effect — cancel works under the default full-access policy. |
 | `FLEETY_REQUIRE_AUTH` | `1` | Require a valid token / pairing code on every `Hello`. **On by default** — set `0` to disable. A fresh auth-required server (no `FLEETY_TOKEN`, no paired device) prints a short-lived first-run pairing code at startup. |
 | `FLEETY_TRUST_LOOPBACK` | `1` | Trust same-host connections: a client whose transport peer is a loopback address (`127.0.0.0/8` / `::1`, taken from the connection socket — never a header) is accepted without a token even when auth is required, because a same-host process can already read the server's token and config files. Set `0` to require auth even on loopback (multi-tenant hosts, or a reverse proxy that forwards remote connections over loopback — otherwise it would falsely trust them). LAN/remote connections are always authenticated regardless. |
-| `FLEETY_TOKEN` | (unset) | Bootstrap admin token. Use it once to pair the first device. |
+| `FLEETY_TOKEN` | (unset) | Server-owned bootstrap admin token. Use it once to pair the first device. A value saved under the Server scope in `config.toml` is loaded only by `fleety-server`; it is never seeded into `fleety` or `fleetyd` as a client credential. |
 | `FLEETY_SCHED_TICK` | `60` | Seconds between scheduler fire-loop ticks. |
 | `FLEETY_SYSTEM_PROMPT` | (unset → full) | `minimal` drops the embedded behavioural docs (protocol/rules/memory/policy) from the system message, leaving only core memory (ME/USER/TODO) — for token-lean / debugging runs. |
 | `FLEETY_SUBAGENT_MAX_CONCURRENT` | `4` | Max background subagents running at once per connection. A spawn past the cap errors rather than queueing. Clamped to a floor of 1. |
@@ -331,15 +331,18 @@ reversible, then prints a restart prompt. It never runs automatically at boot.
 
 ## mDNS service discovery
 
-Server announces `_fleety._tcp.local.`; CLI / fleetyd browse for it as the
-last fallback when no URL is configured. Bare `fleety init` on a TTY uses the
-same discovery interactively: it first probes the **local** server on loopback
+Server announces `_fleety._tcp.local.`; CLI / fleetyd may browse it when no URL
+is configured, but advertisements are display-only until explicitly selected
+and paired. Bare `fleety init` on a TTY provides that interactive selection: it
+first probes the **local** server on loopback
 (a same-host server needs no pairing — see `FLEETY_TRUST_LOOPBACK`) and lists it
 first as the default pick, then scans the LAN for a few seconds and lists
 **every** announced server by name (the instance name minus the `fleety-`
 prefix; saved ones are marked), lets you pick one (Enter takes the default),
 saves it as the current profile, and — for a non-local pick — prompts for a
-pairing code in the same flow. Switch servers later with `fleety connection use
+pairing code in the same flow. A new LAN pick cannot skip this step and is not
+saved until `Welcome` returns a newly minted token; an exact saved paired
+profile may reuse its credential. Switch servers later with `fleety connection use
 <name>` (config and every command land on whichever profile is current). With
 mDNS disabled, no TTY, or nothing found, it falls back to the explicit
 `fleety init ws://host:8787` guidance. The server install script installs the
@@ -372,10 +375,10 @@ identity proof.
 
 | Var | Default | Meaning |
 |---|---|---|
-| `FLEETY_AGENT_URL` | (see Connection profiles) | **Transient** override of the server URL (never written to a file). It inherits the current profile token only when the URLs are identical; otherwise set `FLEETY_TOKEN` explicitly. The persistent connection target lives in `~/.fleety/connections.toml`, managed by `fleety connection …` (`server` is an alias) — see **Connection profiles** below. |
+| `FLEETY_AGENT_URL` | (see Connection profiles) | **Transient** override of the server URL (never written to a file). It never inherits a saved profile token, even when the URLs are identical; set `FLEETY_TOKEN` explicitly or use the saved current profile. The persistent connection target lives in `~/.fleety/connections.toml`, managed by `fleety connection …` (`server` is an alias) — see **Connection profiles** below. |
 | `FLEETY_DEVICE_ID` | OS machine id → hostname | Override for this device's id (path-safe; no slashes / `:`). See **Device identity** below. |
 | `FLEETY_DEVICE_ROOT` | cwd | Filesystem root the on-device tools operate within. |
-| `FLEETY_TOKEN` | (unset → exact target profile's token) | Auth-token override. A freshly-minted token is persisted only to the profile that owns the resolved URL. A different transient env URL cannot overwrite or clear the current profile; a pure-env first run with no profile may create `default`. |
+| `FLEETY_TOKEN` | (unset → exact named/current profile's token) | Process-environment auth-token override. Raw `--server` / `--url` and `FLEETY_AGENT_URL` targets use only this explicit value and never own a saved profile, so they cannot persist, overwrite, or clear profile credentials. A Server-scoped value stored in `config.toml` is not a caller-explicit client token. A freshly minted token is persisted only to the explicit named/current profile that owns the resolved target, or to a fresh trusted-local default connection. |
 | `FLEETY_PAIRING_CODE` | (unset) | Pass once to enroll a new device; server mints a token in `Welcome`, fleetyd writes it to disk. |
 
 ## Connection profiles (`connections.toml`)
@@ -394,16 +397,31 @@ fleety pair <code>               # enroll current; add --profile <name> to repai
 fleety --profile <name> <cmd> | --server <ws> <cmd>   # one-shot override; doesn't change current
 ```
 
-Resolution precedence: a one-shot `-s`/`--url` → the `FLEETY_AGENT_URL` env
-(transient, with no inherited token unless its URL equals the current profile) → the current profile's URL + token → mDNS discovery without stored profile credentials → `ws://127.0.0.1:8787`. `FLEETY_AGENT_URL`
-is **no longer a `config` key** — the connection target is managed here, not in
+Every saved change that affects the current Server selection, endpoint, or
+paired credential asks a running `fleetyd` to reconnect and reports if that
+handoff is incomplete. Removing any current profile is refused, including with
+`--force`; explicitly switch to its replacement first so profile ordering cannot
+silently retarget `fleetyd`.
+
+Resolution precedence: a one-shot `--profile <name>` (that profile's saved
+token) or `-s`/`--server`/`--url` (transient, caller-explicit token only) → the
+`FLEETY_AGENT_URL` env (transient, with no inherited saved token) → the current
+profile's URL + token → trusted loopback → `ws://127.0.0.1:8787`. `FLEETY_AGENT_URL`
+with an empty value is treated as unset. It is **no longer a `config` key** —
+the connection target is managed here, not in
 `config.toml`. A legacy `config.json` / `fleetyd.token` is migrated once into
 `connections.toml` on first run (device_id preserved). The file is `0600`.
-When discovery is needed, clients collect the full probe window and may prefer
-an advertiser matching the current profile's fingerprint as an untrusted hint.
-Every automatic mDNS result remains unowned and receives no stored token. A
-URL-less credentialed current profile stops with explicit reselect/re-pair
-guidance instead of entering automatic discovery.
+Each profile also carries an internal lifecycle generation. An older selected
+profile receives one before it can become a durable connection owner; transient
+raw/environment commands do not rewrite unrelated legacy records. Deleting and
+recreating an otherwise identical profile gets a new generation so an in-flight
+pairing or identity reply cannot write into the replacement.
+When discovery is needed, clients may collect the full probe window for display
+and ordering. Every automatic mDNS result remains unowned and cannot become an
+operational session, receive a token or pairing code, persist a `Welcome` token,
+or send control frames. A URL-less credentialed current profile stops with
+explicit reselect/re-pair guidance. A saved current profile with a URL reconnects
+automatically and skips discovery.
 
 ## Transport (WebSocket + SSE fallback)
 
@@ -488,8 +506,16 @@ than hanging.
 `fleety acp` makes Fleety an **Agent Client Protocol** agent: an ACP-capable
 editor (e.g. Zed) launches it as a subprocess and speaks JSON-RPC 2.0 over stdio
 (LSP-style `Content-Length` framing). It **bridges to the fleety-server** — it
-does not run its own model — connecting at `FLEETY_AGENT_URL` (else mDNS, else
-`ws://127.0.0.1:8787`), authenticating with `FLEETY_TOKEN` if set. The editor's
+does not run its own model — connecting at `FLEETY_AGENT_URL` (else the saved
+current profile, else trusted localhost), authenticating with `FLEETY_TOKEN` if
+set. LAN mDNS candidates must first be selected and paired with `fleety init`.
+Before forwarding a prompt, resume, or cancellation, ACP waits for `Welcome`
+within bounded connection/upgrade and handshake deadlines, then validates the
+exact non-empty identity pin of any saved profile. It rejects pre-`Welcome`
+Server control and does not expose editor content to an unauthenticated session.
+The Zed installer preserves an explicit `FLEETY_TOKEN` only while its transient
+`FLEETY_AGENT_URL` stays identical; changing or removing that endpoint clears
+the token. The editor's
 working directory (`session/new` cwd) becomes the conversation's workspace root
 (via session-workspace-cwd). **stdout carries only JSON-RPC; logs go to stderr.**
 

@@ -172,9 +172,10 @@ fn main() -> std::process::ExitCode {
     // Seed env from ~/.fleety/config.toml before anything reads env: an explicit
     // env var always wins (we only fill what's unset), so existing deployments
     // are unaffected. Best-effort (a missing/corrupt file is ignored).
-    fleety_tools::config::seed_env_from_config(&fleety_tools::config::load(
-        &fleety_tools::config::config_path(),
-    ));
+    fleety_tools::config::seed_env_from_config(
+        &fleety_tools::config::load(&fleety_tools::config::config_path()),
+        fleety_tools::config::SERVER_SCOPES,
+    );
     // `config ...` inspects/edits this host's settings (model, addr, token, …),
     // then exits — no runtime needed. Same command surface as `fleety config`.
     if cmd.as_deref() == Some("config") {
@@ -657,7 +658,7 @@ async fn run_server(shutdown: Option<tokio::sync::watch::Receiver<bool>>) {
             Ok(code) => tracing::warn!(
                 pairing_code = %code,
                 "first run: authentication is required but no device is paired yet. \
-                 On a device, run `fleety init <this-server-ws-url>` then `fleety pair {code}` \
+                 On a device, run `fleety init <this-server-ws-url> --pairing-code {code}` \
                  within 10 minutes to enroll it.",
             ),
             Err(e) => {
