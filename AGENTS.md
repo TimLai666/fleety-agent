@@ -90,6 +90,23 @@ no Fleety crate). This file holds things that aren't derivable from the code.
 
 ## Follow-ups
 
+### [2026-07-27] — the mDNS daemon smoke test cannot pass on a CI runner
+
+- **Where:** `crates/fleety-daemon/tests/fleetyd_smoke.rs`,
+  `automatic_mdns_never_opens_a_control_session_or_persists_rogue_credentials`
+- **What:** The test starts a real mDNS advertiser, runs `fleetyd` for four
+  seconds, and asserts its stderr mentions "automatic discovery is display-only".
+  GitHub's runners do not carry multicast between processes the way a LAN does,
+  so `fleetyd` never sees the advertiser, never prints the line, and the
+  assertion fails. It passes locally. Introduced by `8081465`; CI has not been
+  green on `main` since, though until the archive guard was fixed the run died
+  earlier and never reached the test.
+- **Suggestion:** Either drive the discovery path through an injected candidate
+  instead of live mDNS, or mark the test `#[ignore]` with a documented opt-in
+  (the repo already uses that shape for PTY-dependent tests elsewhere). Asserting
+  on stderr text also makes the test brittle to log wording.
+- **Status:** pending
+
 ### [2026-07-27] — `server_smoke` command tests fail on a spawn deadline, and say the wrong thing
 
 - **Where:** `crates/fleety-server/tests/server_smoke.rs`
