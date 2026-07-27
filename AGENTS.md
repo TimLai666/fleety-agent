@@ -71,9 +71,13 @@ no Fleety crate). This file holds things that aren't derivable from the code.
   CLI reads it at archive time to inject `@trace` blocks into the main specs, and
   it never cleans the file up itself — delete it only after a successful archive.
   The generated skill files (`.claude/.agents/.opencode` spectra-archive copies)
-  used to get this order backwards; they are locally patched, but `spectra update`
-  (even without `--force`) regenerates them and silently reverts local patches —
-  re-check the step order after any spectra update. Not yet reported upstream:
+  used to get this order backwards. They now carry a runnable
+  `# SPECTRA_SAFE_ARCHIVE_START/END` block that
+  `scripts/check-spectra-archive-instructions.sh` executes in CI against a fake
+  `spectra`, proving a failed archive keeps its tracking file and a successful
+  one removes it. `spectra update` still regenerates these files and will drop
+  the block, but now CI says so instead of the loss being silent — restore the
+  block rather than only re-reading the prose. Not yet reported upstream:
   `spectra feedback` only prints the message (transmits nothing) and points at
   github.com/kaochenlong/Spectra/issues, which is not publicly accessible as of
   2026-07-11 (nor is the spectra-app/spectra URL from the config comments) —

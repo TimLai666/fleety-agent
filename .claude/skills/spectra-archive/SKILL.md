@@ -73,8 +73,23 @@ Archive a completed change.
    Use the `spectra archive` CLI command which handles the full archive workflow
    (spec snapshot, delta application, @trace injection, identity recording, vector indexing):
 
+   Run the archive and the cleanup as one ordered block — the markers are
+   checked by `scripts/check-spectra-archive-instructions.sh`, which executes
+   what is between them against a fake `spectra` to prove that a failed archive
+   keeps its tracking file and a successful one removes it:
+
    ```bash
-   spectra archive <name>
+   # SPECTRA_SAFE_ARCHIVE_START
+   change_name="<name>"
+   if spectra archive "$change_name"; then
+       # Only now is the tracking file safe to remove: `spectra archive` reads it
+       # to inject @trace blocks into the main specs, and never cleans it up.
+       rm -f ".spectra/touched/${change_name}.json"
+   else
+       echo "archive failed — keeping .spectra/touched/${change_name}.json so it can be retried" >&2
+       exit 1
+   fi
+   # SPECTRA_SAFE_ARCHIVE_END
    ```
 
    **Optional flags:**
@@ -84,21 +99,7 @@ Archive a completed change.
 
    **If archive fails** with "already exists" error, suggest renaming existing archive.
 
-6. **Clean up tracking file**
-
-   ONLY after `spectra archive` has succeeded, delete `.spectra/touched/<change-name>.json`
-   if it exists. The archive step READS this file to inject `@trace` blocks into the main
-   specs, so deleting it first silently loses that trace data — and the CLI never cleans the
-   file up itself, which is why this step exists at all.
-
-   ```bash
-   rm -f .spectra/touched/<change-name>.json
-   ```
-
-   If the archive failed, KEEP the file so the archive can be retried.
-   If the file does not exist, silently continue.
-
-7. **Display summary**
+6. **Display summary**
 
    Show archive completion summary including:
    - Change name
