@@ -31,6 +31,7 @@ use fleety_tools::connection::{self, Resolved, Source, Target};
 const RECONNECT_ACK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 const RECONNECT_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 const RECONNECT_HANDSHAKE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+const RECONNECT_CONTROL_VERSION: u64 = 1;
 
 fn control_nonce() -> String {
     static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -42,10 +43,17 @@ fn control_nonce() -> String {
     format!("{}-{nanos}-{sequence}", std::process::id())
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ControlReady {
     pid: u32,
+    process_start: String,
     instance: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ControlReadyRecord {
+    Current(ControlReady),
+    Legacy { pid: u32, instance: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,6 +94,13 @@ struct ReconnectJournalState {
 struct PendingReconnect {
     request: ReconnectRequest,
     decision: Option<ReconnectAck>,
+    authenticated: Option<AuthenticatedReconnect>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AuthenticatedReconnect {
+    target: Resolved,
+    server_fingerprint: String,
 }
 
 impl PendingReconnect {
@@ -93,22 +108,238 @@ impl PendingReconnect {
         Self {
             request,
             decision: None,
+            authenticated: None,
         }
     }
 }
 
 fn encode_ready(ready: &ControlReady) -> Vec<u8> {
-    serde_json::json!({ "pid": ready.pid, "instance": ready.instance })
-        .to_string()
-        .into_bytes()
+    serde_json::json!({
+        "version": RECONNECT_CONTROL_VERSION,
+        "pid": ready.pid,
+        "process_start": ready.process_start,
+        "instance": ready.instance
+    })
+    .to_string()
+    .into_bytes()
+}
+
+fn parse_ready_record(bytes: &[u8]) -> Result<ControlReadyRecord> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|error| {
+        agent_core::CoreError::Message(format!(
+            "fleetyd reconnect control identity is unreadable: {error}; restart fleetyd, then retry"
+        ))
+    })?;
+    let version = value.get("version");
+    if let Some(version) = version {
+        if version.as_u64() != Some(RECONNECT_CONTROL_VERSION) {
+            return Err(agent_core::CoreError::Message(format!(
+                "fleetyd reconnect control version {} is incompatible with this binary (supported: {}); update fleetyd and the Fleety CLI together, restart fleetyd, then retry",
+                version,
+                RECONNECT_CONTROL_VERSION
+            )));
+        }
+    }
+    let pid = value
+        .get("pid")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok())
+        .ok_or_else(|| {
+            agent_core::CoreError::Message(
+                "fleetyd reconnect control identity has no valid pid; restart fleetyd, then retry"
+                    .to_string(),
+            )
+        })?;
+    let instance = value
+        .get("instance")
+        .and_then(serde_json::Value::as_str)
+        .filter(|instance| !instance.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            agent_core::CoreError::Message(
+                "fleetyd reconnect control identity has no instance; restart fleetyd, then retry"
+                    .to_string(),
+            )
+        })?;
+    match version {
+        None => Ok(ControlReadyRecord::Legacy { pid, instance }),
+        Some(_) => {
+            let process_start = value
+                .get("process_start")
+                .and_then(serde_json::Value::as_str)
+                .filter(|identity| !identity.is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    agent_core::CoreError::Message(
+                        "fleetyd reconnect control identity has no process-start proof; update or restart fleetyd, then retry"
+                            .to_string(),
+                    )
+                })?;
+            Ok(ControlReadyRecord::Current(ControlReady {
+                pid,
+                process_start,
+                instance,
+            }))
+        }
+    }
 }
 
 fn parse_ready(bytes: &[u8]) -> Option<ControlReady> {
-    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
-    Some(ControlReady {
-        pid: u32::try_from(value.get("pid")?.as_u64()?).ok()?,
-        instance: value.get("instance")?.as_str()?.to_string(),
-    })
+    match parse_ready_record(bytes).ok()? {
+        ControlReadyRecord::Current(ready) => Some(ready),
+        ControlReadyRecord::Legacy { .. } => None,
+    }
+}
+
+fn publish_ready_at_with<W, P, F, S, C>(
+    path: &std::path::Path,
+    ready: &ControlReady,
+    mut stage: W,
+    mut publish: P,
+    mut flush_published: F,
+    mut sync_directory: S,
+    mut cleanup: C,
+) -> Result<()>
+where
+    W: FnMut(&std::path::Path, &[u8]) -> Result<()>,
+    P: FnMut(&std::path::Path, &std::path::Path) -> Result<()>,
+    F: FnMut(&std::path::Path) -> Result<()>,
+    S: FnMut(&std::path::Path) -> Result<()>,
+    C: FnMut(&std::path::Path) -> Result<()>,
+{
+    let parent = path.parent().ok_or_else(|| {
+        agent_core::CoreError::Message(
+            "daemon reconnect ready path has no control directory".to_string(),
+        )
+    })?;
+    std::fs::create_dir_all(parent).map_err(|error| {
+        agent_core::CoreError::Message(format!(
+            "cannot create daemon control directory {}: {error}",
+            parent.display()
+        ))
+    })?;
+    if path.exists() {
+        return Err(agent_core::CoreError::Message(format!(
+            "cannot publish daemon reconnect identity because {} already exists",
+            path.display()
+        )));
+    }
+    let temp = parent.join(format!(".fleetyd.control-ready.{}.tmp", control_nonce()));
+    if let Err(error) = stage(&temp, &encode_ready(ready)) {
+        let _ = cleanup(&temp);
+        return Err(error);
+    }
+    if let Err(error) = publish(&temp, path) {
+        let _ = cleanup(&temp);
+        return Err(error);
+    }
+    let durability_error = flush_published(path)
+        .err()
+        .or_else(|| sync_directory(parent).err());
+    if let Some(error) = durability_error {
+        loop {
+            match cleanup(path) {
+                Ok(()) => break,
+                Err(cleanup_error) => {
+                    tracing::warn!(
+                        ready = %path.display(),
+                        report = ?cleanup_error.report(),
+                        "cannot hide ambiguous daemon reconnect identity; retaining ownership"
+                    );
+                    std::thread::sleep(RECONNECT_POLL);
+                }
+            }
+        }
+        while let Err(sync_error) = sync_directory(parent) {
+            tracing::warn!(
+                directory = %parent.display(),
+                report = ?sync_error.report(),
+                "daemon reconnect identity absence is not durable; retaining ownership"
+            );
+            std::thread::sleep(RECONNECT_POLL);
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn sync_ready_directory_at(parent: &std::path::Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| {
+                agent_core::CoreError::Message(format!(
+                    "cannot make daemon reconnect identity directory durable {}: {error}",
+                    parent.display()
+                ))
+            })?;
+    }
+    #[cfg(not(unix))]
+    let _ = parent;
+    Ok(())
+}
+
+fn cleanup_ready_artifact_at(path: &std::path::Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(agent_core::CoreError::Message(format!(
+            "cannot remove daemon reconnect identity artifact {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+fn publish_ready_at(path: &std::path::Path, ready: &ControlReady) -> Result<()> {
+    publish_ready_at_with(
+        path,
+        ready,
+        |temp, bytes| {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(temp)
+                .map_err(|error| {
+                    agent_core::CoreError::Message(format!(
+                        "cannot stage daemon reconnect identity {}: {error}",
+                        temp.display()
+                    ))
+                })?;
+            use std::io::Write;
+            file.write_all(bytes)
+                .and_then(|()| file.sync_all())
+                .map_err(|error| {
+                    agent_core::CoreError::Message(format!(
+                        "cannot make staged daemon reconnect identity durable {}: {error}",
+                        temp.display()
+                    ))
+                })
+        },
+        |temp, target| {
+            std::fs::rename(temp, target).map_err(|error| {
+                agent_core::CoreError::Message(format!(
+                    "cannot publish daemon reconnect identity {}: {error}",
+                    target.display()
+                ))
+            })
+        },
+        |target| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(target)
+                .and_then(|file| file.sync_all())
+                .map_err(|error| {
+                    agent_core::CoreError::Message(format!(
+                        "cannot flush published daemon reconnect identity {}: {error}",
+                        target.display()
+                    ))
+                })
+        },
+        sync_ready_directory_at,
+        cleanup_ready_artifact_at,
+    )
 }
 
 fn control_path(name: &str) -> std::path::PathBuf {
@@ -122,8 +353,46 @@ fn ready_path() -> std::path::PathBuf {
     control_path("fleetyd.control-ready.json")
 }
 
+fn process_identity_path(process_start: &str) -> std::path::PathBuf {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(process_start.len().saturating_mul(2));
+    for byte in process_start.as_bytes() {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    control_path(&format!("fleetyd.process-start-{encoded}.lock"))
+}
+
 fn reconnect_journal_path() -> std::path::PathBuf {
     control_path("fleetyd.reconnect-journal.jsonl")
+}
+
+fn reconnect_nonce_record_path_at(
+    journal: &std::path::Path,
+    directory: &str,
+    nonce: &str,
+) -> Result<std::path::PathBuf> {
+    let parent = journal
+        .parent()
+        .ok_or_else(|| reconnect_journal_error("reconnect journal has no control directory"))?;
+    let mut encoded = String::with_capacity(nonce.len().saturating_mul(2));
+    use std::fmt::Write as _;
+    for byte in nonce.as_bytes() {
+        write!(&mut encoded, "{byte:02x}")
+            .map_err(|error| reconnect_journal_error(format!("encode receipt nonce: {error}")))?;
+    }
+    Ok(parent.join(directory).join(format!("{encoded}.json")))
+}
+
+fn reconnect_receipt_path_at(journal: &std::path::Path, nonce: &str) -> Result<std::path::PathBuf> {
+    reconnect_nonce_record_path_at(journal, "fleetyd.reconnect-receipts", nonce)
+}
+
+fn reconnect_success_proof_path_at(
+    journal: &std::path::Path,
+    nonce: &str,
+) -> Result<std::path::PathBuf> {
+    reconnect_nonce_record_path_at(journal, "fleetyd.reconnect-success", nonce)
 }
 
 fn reconnect_lock_path() -> std::path::PathBuf {
@@ -138,6 +407,13 @@ fn reconnect_journal_error(message: impl Into<String>) -> agent_core::CoreError 
 }
 
 fn reconnect_event_from_value(value: &serde_json::Value) -> Result<ReconnectJournalEvent> {
+    if let Some(version) = value.get("version") {
+        if version.as_u64() != Some(RECONNECT_CONTROL_VERSION) {
+            return Err(reconnect_journal_error(format!(
+                "control version {version} is incompatible (supported: {RECONNECT_CONTROL_VERSION}); update fleetyd and the Fleety CLI together"
+            )));
+        }
+    }
     let event = value
         .get("event")
         .and_then(serde_json::Value::as_str)
@@ -193,16 +469,19 @@ fn reconnect_event_from_value(value: &serde_json::Value) -> Result<ReconnectJour
 fn reconnect_event_value(event: &ReconnectJournalEvent) -> serde_json::Value {
     match event {
         ReconnectJournalEvent::Submitted { request } => serde_json::json!({
+            "version": RECONNECT_CONTROL_VERSION,
             "event": "submitted",
             "instance": request.instance,
             "nonce": request.nonce,
             "expected_profile": request.expected_profile,
         }),
         ReconnectJournalEvent::Claimed { nonce } => serde_json::json!({
+            "version": RECONNECT_CONTROL_VERSION,
             "event": "claimed",
             "nonce": nonce,
         }),
         ReconnectJournalEvent::Settled { ack } => serde_json::json!({
+            "version": RECONNECT_CONTROL_VERSION,
             "event": "settled",
             "nonce": ack.nonce,
             "accepted": ack.accepted,
@@ -448,12 +727,14 @@ fn decide_pending_reconnect(
     }
 }
 
-fn settle_pending_reconnect_at_with<F>(
+fn settle_pending_reconnect_at_with_proof<P, F>(
     path: &std::path::Path,
     pending: &mut Option<PendingReconnect>,
+    publish_proof: P,
     append: F,
 ) -> Result<bool>
 where
+    P: FnOnce(&std::path::Path, &ReconnectAck) -> Result<()>,
     F: FnOnce(&std::path::Path, &ReconnectJournalEvent) -> Result<()>,
 {
     let Some(decision) = pending
@@ -468,21 +749,129 @@ where
             ack: decision.clone(),
         },
     )?;
+    if decision.accepted {
+        publish_proof(path, &decision)?;
+    }
     // A waiting caller may observe and reap the durable event immediately after
-    // the append returns. Re-reading here races that legitimate cleanup and can
+    // the proof returns. Re-reading here races that legitimate cleanup and can
     // revive an already-observed decision into a journal without its Submitted
-    // event. A successful durable append is the settlement commit point.
+    // event. Accepted success commits only after both durability steps return.
     pending.take();
     Ok(true)
 }
 
+fn settle_pending_reconnect_at_with<F>(
+    path: &std::path::Path,
+    pending: &mut Option<PendingReconnect>,
+    append: F,
+) -> Result<bool>
+where
+    F: FnOnce(&std::path::Path, &ReconnectJournalEvent) -> Result<()>,
+{
+    settle_pending_reconnect_at_with_proof(path, pending, publish_reconnect_success_proof, append)
+}
+
 fn settle_pending_reconnect(pending: &mut Option<PendingReconnect>) -> Result<bool> {
+    settle_pending_reconnect_with_credential_sync(pending, || {
+        connection::sync_connections_publication()
+    })
+}
+
+fn settle_pending_reconnect_with_credential_sync<S>(
+    pending: &mut Option<PendingReconnect>,
+    sync_credentials: S,
+) -> Result<bool>
+where
+    S: FnOnce() -> Result<()>,
+{
+    if let Some(authenticated) = pending
+        .as_ref()
+        .and_then(|pending| pending.authenticated.clone())
+    {
+        let expected_profile = pending
+            .as_ref()
+            .map(|pending| pending.request.expected_profile.as_str())
+            .ok_or_else(|| reconnect_journal_error("authenticated reconnect disappeared"))?;
+        let owner_matches = connection::inspect_locked(|conns| {
+            let source_matches = matches!(
+                authenticated.target.source(),
+                Source::Profile(name) | Source::OverrideProfile(name)
+                    if name == expected_profile
+            );
+            let profile = conns.profiles.get(expected_profile);
+            Ok(source_matches
+                && conns.current.as_deref() == Some(expected_profile)
+                && profile.is_some_and(|profile| {
+                    profile.url == authenticated.target.url()
+                        && profile.token.as_deref() == authenticated.target.token()
+                        && profile.fingerprint.as_deref()
+                            == Some(authenticated.server_fingerprint.as_str())
+                }))
+        })?;
+        if !owner_matches {
+            return reject_frozen_authenticated_reconnect(
+                pending,
+                format!(
+                    "requested profile '{expected_profile}' changed before reconnect success became durable"
+                ),
+            );
+        }
+        sync_credentials()?;
+        return settle_authenticated_reconnect_with(
+            &authenticated.target,
+            Some(&authenticated.server_fingerprint),
+            pending,
+            append_reconnect_event_at,
+        );
+    }
     let _lease = acquire_reconnect_lease()?;
     settle_pending_reconnect_at_with(
         &reconnect_journal_path(),
         pending,
         append_reconnect_event_at,
     )
+}
+
+fn reject_frozen_authenticated_reconnect(
+    pending: &mut Option<PendingReconnect>,
+    message: String,
+) -> Result<bool> {
+    let _lease = acquire_reconnect_lease()?;
+    let journal = reconnect_journal_path();
+    let nonce = pending
+        .as_ref()
+        .map(|pending| pending.request.nonce.clone())
+        .ok_or_else(|| reconnect_journal_error("authenticated reconnect disappeared"))?;
+    let failure = ReconnectAck {
+        nonce: nonce.clone(),
+        accepted: false,
+        message,
+    };
+    let receipt = reconnect_receipt_path_at(&journal, &nonce)?;
+    if load_reconnect_receipt_at(&receipt)?.as_ref() == Some(&failure) {
+        reap_reconnect_journal_at(&journal)?;
+        pending.take();
+        return Ok(true);
+    }
+    if let Some(state) = load_reconnect_journal_at(&journal)? {
+        if state.request.nonce == nonce {
+            if let ReconnectPhase::Settled(ack) = state.phase {
+                if ack.accepted && reconnect_success_proof_matches(&journal, &ack)? {
+                    pending.take();
+                    return Ok(true);
+                }
+                preserve_reconnect_receipt_at(&receipt, &failure)?;
+                reap_reconnect_journal_at(&journal)?;
+                pending.take();
+                return Ok(true);
+            }
+        }
+    }
+    if let Some(pending) = pending.as_mut() {
+        pending.decision = Some(failure);
+        pending.authenticated = None;
+    }
+    settle_pending_reconnect_at_with(&journal, pending, append_reconnect_event_at)
 }
 
 async fn settle_pending_reconnect_before_exit_with<F>(
@@ -512,6 +901,198 @@ async fn settle_pending_reconnect_before_exit(pending: &mut Option<PendingReconn
     settle_pending_reconnect_before_exit_with(pending, settle_pending_reconnect).await;
 }
 
+fn reconnect_success_proof_matches(journal: &std::path::Path, ack: &ReconnectAck) -> Result<bool> {
+    let proof = reconnect_success_proof_path_at(journal, &ack.nonce)?;
+    if load_reconnect_receipt_at(&proof)?.as_ref() != Some(ack) {
+        return Ok(false);
+    }
+    let parent = proof
+        .parent()
+        .ok_or_else(|| reconnect_journal_error("success proof has no control directory"))?;
+    sync_reconnect_receipt_at(&proof, parent)?;
+    Ok(true)
+}
+
+fn require_reconnect_success_proof(journal: &std::path::Path, ack: &ReconnectAck) -> Result<()> {
+    if ack.accepted && !reconnect_success_proof_matches(journal, ack)? {
+        return Err(reconnect_journal_error(
+            "success settlement has no durable credential commit proof",
+        ));
+    }
+    Ok(())
+}
+
+fn quarantine_ambiguous_success_proof_with<R, D, S, W>(
+    path: &std::path::Path,
+    mut rename: R,
+    mut remove: D,
+    mut sync_directories: S,
+    mut wait: W,
+) -> Result<()>
+where
+    R: FnMut(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
+    D: FnMut(&std::path::Path) -> std::io::Result<()>,
+    S: FnMut(&std::path::Path) -> Result<()>,
+    W: FnMut(),
+{
+    let parent = path
+        .parent()
+        .ok_or_else(|| reconnect_journal_error("success proof has no control directory"))?;
+    let quarantine = parent.join(format!(".receipt-{}.tmp", control_nonce()));
+    loop {
+        match rename(path, &quarantine) {
+            Ok(()) => break,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                break;
+            }
+            Err(rename_error) => match remove(path) {
+                Ok(()) => break,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    break;
+                }
+                Err(remove_error) => {
+                    tracing::warn!(
+                        proof = %path.display(),
+                        %rename_error,
+                        %remove_error,
+                        "cannot hide ambiguous reconnect success proof; retaining leases"
+                    );
+                    wait();
+                }
+            },
+        }
+    }
+    loop {
+        match sync_directories(parent) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                tracing::warn!(
+                    proof = %path.display(),
+                    report = ?error.report(),
+                    "ambiguous reconnect success proof is hidden but not durable; retaining leases"
+                );
+                wait();
+            }
+        }
+    }
+}
+
+fn quarantine_ambiguous_success_proof(path: &std::path::Path) -> Result<()> {
+    quarantine_ambiguous_success_proof_with(
+        path,
+        |from, to| std::fs::rename(from, to),
+        |target| std::fs::remove_file(target),
+        sync_hidden_reconnect_proof_directories_at,
+        || std::thread::sleep(RECONNECT_POLL),
+    )
+}
+
+fn publish_reconnect_success_proof(journal: &std::path::Path, ack: &ReconnectAck) -> Result<()> {
+    let proof = reconnect_success_proof_path_at(journal, &ack.nonce)?;
+    match preserve_reconnect_receipt_at(&proof, ack) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            quarantine_ambiguous_success_proof(&proof)?;
+            Err(error)
+        }
+    }
+}
+
+fn freeze_authenticated_reconnect(
+    target: &Resolved,
+    server_fingerprint: Option<&str>,
+    pending: &mut Option<PendingReconnect>,
+) -> Result<()> {
+    let decision = ReconnectAck {
+        nonce: pending
+            .as_ref()
+            .map(|pending| pending.request.nonce.clone())
+            .ok_or_else(|| reconnect_journal_error("authenticated request disappeared"))?,
+        accepted: true,
+        message: "fleetyd authenticated the selected profile and loaded its Server identity"
+            .to_string(),
+    };
+    if let Some(existing) = pending
+        .as_ref()
+        .and_then(|pending| pending.decision.as_ref())
+    {
+        if existing != &decision {
+            return Err(reconnect_journal_error(
+                "authenticated reconnect already froze a different terminal result",
+            ));
+        }
+    } else if let Some(pending) = pending.as_mut() {
+        pending.decision = Some(decision);
+    }
+    let authenticated = AuthenticatedReconnect {
+        target: target.clone(),
+        server_fingerprint: server_fingerprint
+            .ok_or_else(|| reconnect_journal_error("authenticated reconnect has no identity"))?
+            .to_string(),
+    };
+    if let Some(existing) = pending
+        .as_ref()
+        .and_then(|pending| pending.authenticated.as_ref())
+    {
+        if existing != &authenticated {
+            return Err(reconnect_journal_error(
+                "authenticated reconnect retry changed its committed owner snapshot",
+            ));
+        }
+    } else if let Some(pending) = pending.as_mut() {
+        pending.authenticated = Some(authenticated);
+    }
+    Ok(())
+}
+
+fn settle_authenticated_reconnect_with_proof<P, F>(
+    target: &Resolved,
+    server_fingerprint: Option<&str>,
+    pending: &mut Option<PendingReconnect>,
+    publish_proof: P,
+    append: F,
+) -> Result<bool>
+where
+    P: FnOnce(&std::path::Path, &ReconnectAck) -> Result<()>,
+    F: FnOnce(&std::path::Path, &ReconnectJournalEvent) -> Result<()>,
+{
+    let Some(expected_profile) = pending
+        .as_ref()
+        .map(|pending| pending.request.expected_profile.clone())
+    else {
+        return Ok(false);
+    };
+    // Keep reconnect ownership outside the connections lease. The success
+    // journal cannot become observable until the inner connections guard has
+    // dropped, so an immediate caller-triggered process exit cannot strand the
+    // credential mutation lock.
+    let _reconnect_lease = acquire_reconnect_lease()?;
+    connection::inspect_locked(|conns| {
+        let fingerprint = reconnect_target_fingerprint_in(conns, &expected_profile, target)?;
+        if fingerprint.as_deref() != server_fingerprint {
+            return Err(agent_core::CoreError::Message(format!(
+                "fleetyd authenticated profile '{expected_profile}', but its persisted owner snapshot changed before settlement"
+            )));
+        }
+        freeze_authenticated_reconnect(target, server_fingerprint, pending)?;
+        let journal = reconnect_journal_path();
+        // The journal must report a successful durability boundary before the
+        // caller-visible proof is published. Any append error remains a
+        // retryable frozen success and is never promoted from readable bytes.
+        settle_pending_reconnect_at_with_proof(&journal, pending, publish_proof, append)
+    })
+}
+
 fn settle_authenticated_reconnect_with<F>(
     target: &Resolved,
     server_fingerprint: Option<&str>,
@@ -521,73 +1102,148 @@ fn settle_authenticated_reconnect_with<F>(
 where
     F: FnOnce(&std::path::Path, &ReconnectJournalEvent) -> Result<()>,
 {
+    settle_authenticated_reconnect_with_proof(
+        target,
+        server_fingerprint,
+        pending,
+        publish_reconnect_success_proof,
+        append,
+    )
+}
+
+#[cfg(test)]
+fn persist_authenticated_profile_credentials(
+    target: &Resolved,
+    expected_profile: &str,
+    server_fingerprint: &str,
+    minted_token: Option<&str>,
+) -> Result<Resolved> {
+    if target.profile_owner_name() != Some(expected_profile) {
+        return Err(agent_core::CoreError::Message(format!(
+            "reconnect profile '{expected_profile}' did not resolve to its durable owner"
+        )));
+    }
+    connection::store_resolved_profile_credentials(target, minted_token, server_fingerprint)
+        .map(|(_, committed)| committed)
+}
+
+#[cfg(test)]
+fn commit_authenticated_reconnect_with<P, A>(
+    target: &Resolved,
+    server_fingerprint: &str,
+    minted_token: Option<&str>,
+    pending: &mut Option<PendingReconnect>,
+    persist: P,
+    append: A,
+) -> Result<bool>
+where
+    P: FnOnce(&Resolved, &str, &str, Option<&str>) -> Result<Resolved>,
+    A: FnOnce(&std::path::Path, &ReconnectJournalEvent) -> Result<()>,
+{
+    commit_authenticated_reconnect_with_settle(
+        target,
+        server_fingerprint,
+        minted_token,
+        pending,
+        persist,
+        |persisted_target, fingerprint, pending| {
+            settle_authenticated_reconnect_with(persisted_target, fingerprint, pending, append)
+        },
+    )
+}
+
+#[cfg(test)]
+fn commit_authenticated_reconnect_with_settle<P, S>(
+    target: &Resolved,
+    server_fingerprint: &str,
+    minted_token: Option<&str>,
+    pending: &mut Option<PendingReconnect>,
+    persist: P,
+    settle: S,
+) -> Result<bool>
+where
+    P: FnOnce(&Resolved, &str, &str, Option<&str>) -> Result<Resolved>,
+    S: FnOnce(&Resolved, Option<&str>, &mut Option<PendingReconnect>) -> Result<bool>,
+{
     let Some(expected_profile) = pending
         .as_ref()
         .map(|pending| pending.request.expected_profile.clone())
     else {
         return Ok(false);
     };
-    connection::inspect_locked(|conns| {
-        let fingerprint = reconnect_target_fingerprint_in(conns, &expected_profile, target)?;
-        if fingerprint.as_deref() != server_fingerprint {
-            return Err(agent_core::CoreError::Message(format!(
-                "fleetyd authenticated profile '{expected_profile}', but its persisted owner snapshot changed before settlement"
-            )));
-        }
-        let decision = ReconnectAck {
-            nonce: pending
-                .as_ref()
-                .map(|pending| pending.request.nonce.clone())
-                .ok_or_else(|| reconnect_journal_error("authenticated request disappeared"))?,
-            accepted: true,
-            message: "fleetyd authenticated the selected profile and loaded its Server identity"
-                .to_string(),
-        };
-        let _lease = acquire_reconnect_lease()?;
-        match append(
-            &reconnect_journal_path(),
-            &ReconnectJournalEvent::Settled {
-                ack: decision.clone(),
-            },
-        ) {
-            Ok(()) => {
-                pending.take();
-                Ok(true)
-            }
-            Err(error) => {
-                let committed = load_reconnect_journal_at(&reconnect_journal_path())?
-                    .is_some_and(|state| {
-                        matches!(state.phase, ReconnectPhase::Settled(ref ack) if ack == &decision)
-                    });
-                if committed {
-                    pending.take();
-                    Ok(true)
-                } else {
-                    Err(error)
-                }
-            }
-        }
-    })
+    let persisted_target = persist(target, &expected_profile, server_fingerprint, minted_token)?;
+    freeze_authenticated_reconnect(&persisted_target, Some(server_fingerprint), pending)?;
+    settle(&persisted_target, Some(server_fingerprint), pending)
 }
 
-fn settle_authenticated_reconnect(
+fn commit_authenticated_reconnect(
     target: &Resolved,
-    server_fingerprint: Option<&str>,
+    owner: Option<&SessionCredentialOwner>,
+    server_fingerprint: &str,
+    minted_token: Option<&str>,
     pending: &mut Option<PendingReconnect>,
 ) -> Result<bool> {
-    settle_authenticated_reconnect_with(
-        target,
+    let Some(expected_profile) = pending
+        .as_ref()
+        .map(|pending| pending.request.expected_profile.clone())
+    else {
+        return Ok(false);
+    };
+    let Some(SessionCredentialOwner::Existing(owner_target)) = owner else {
+        return Err(agent_core::CoreError::Message(format!(
+            "reconnect profile '{expected_profile}' has no frozen credential owner"
+        )));
+    };
+    if owner_target.as_ref() != target
+        || owner_target.profile_owner_name() != Some(expected_profile.as_str())
+    {
+        return Err(agent_core::CoreError::Message(format!(
+            "reconnect requested profile '{expected_profile}', but the frozen owner does not match"
+        )));
+    }
+    match connection::store_resolved_profile_credentials_recoverable(
+        owner_target,
+        minted_token,
         server_fingerprint,
-        pending,
-        append_reconnect_event_at,
-    )
+    )? {
+        connection::CredentialCommit::Durable { committed, .. } => {
+            freeze_authenticated_reconnect(&committed, Some(server_fingerprint), pending)?;
+            settle_authenticated_reconnect_with(
+                &committed,
+                Some(server_fingerprint),
+                pending,
+                append_reconnect_event_at,
+            )
+        }
+        connection::CredentialCommit::PublishedNotDurable {
+            committed, error, ..
+        } => {
+            freeze_authenticated_reconnect(&committed, Some(server_fingerprint), pending)?;
+            Err(error)
+        }
+    }
 }
 
 fn recover_reconnect_for_instance_at(path: &std::path::Path, instance: &str) -> Result<()> {
     let Some(state) = load_reconnect_journal_at(path)? else {
         return Ok(());
     };
-    if state.request.instance == instance || matches!(state.phase, ReconnectPhase::Settled(_)) {
+    if let ReconnectPhase::Settled(ack) = &state.phase {
+        if !ack.accepted || reconnect_success_proof_matches(path, ack)? {
+            return Ok(());
+        }
+        let failure = ReconnectAck {
+            nonce: state.request.nonce,
+            accepted: false,
+            message: "fleetyd restarted before reconnect success committed its durable proof"
+                .to_string(),
+        };
+        let receipt = reconnect_receipt_path_at(path, &failure.nonce)?;
+        preserve_reconnect_receipt_at(&receipt, &failure)?;
+        reap_reconnect_journal_at(path)?;
+        return Ok(());
+    }
+    if state.request.instance == instance {
         return Ok(());
     }
     append_reconnect_event_at(
@@ -603,22 +1259,23 @@ fn recover_reconnect_for_instance_at(path: &std::path::Path, instance: &str) -> 
 }
 
 fn reap_reconnect_journal_at(path: &std::path::Path) -> Result<()> {
-    match std::fs::remove_file(path) {
-        Ok(()) => {
-            #[cfg(unix)]
-            if let Some(parent) = path.parent() {
-                std::fs::File::open(parent)
-                    .and_then(|directory| directory.sync_all())
-                    .map_err(|error| {
-                        agent_core::CoreError::Message(format!(
-                            "reconnect result was reaped, but its directory was not durable {}: {error}",
-                            parent.display()
-                        ))
-                    })?;
-            }
-            Ok(())
+    let sync_parent = || -> Result<()> {
+        #[cfg(unix)]
+        if let Some(parent) = path.parent() {
+            std::fs::File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| {
+                    agent_core::CoreError::Message(format!(
+                        "reconnect result cleanup directory was not durable {}: {error}",
+                        parent.display()
+                    ))
+                })?;
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(())
+    };
+    match std::fs::remove_file(path) {
+        Ok(()) => sync_parent(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => sync_parent(),
         Err(error) => Err(agent_core::CoreError::Message(format!(
             "reconnect result was observed, but its journal could not be reaped {}: {error}",
             path.display()
@@ -626,14 +1283,368 @@ fn reap_reconnect_journal_at(path: &std::path::Path) -> Result<()> {
     }
 }
 
+fn load_reconnect_receipt_at(path: &std::path::Path) -> Result<Option<ReconnectAck>> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(reconnect_journal_error(format!(
+                "cannot read reconnect receipt {}: {error}",
+                path.display()
+            )))
+        }
+    };
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        reconnect_journal_error(format!(
+            "reconnect receipt {} is not valid JSON: {error}",
+            path.display()
+        ))
+    })?;
+    match reconnect_event_from_value(&value)? {
+        ReconnectJournalEvent::Settled { ack } => Ok(Some(ack)),
+        ReconnectJournalEvent::Submitted { .. } | ReconnectJournalEvent::Claimed { .. } => {
+            Err(reconnect_journal_error(format!(
+                "reconnect receipt {} is not terminal",
+                path.display()
+            )))
+        }
+    }
+}
+
+fn reconnect_receipt_sync_directories(parent: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut directories = vec![parent.to_path_buf()];
+    if let Some(control_root) = parent
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty() && *path != parent)
+    {
+        directories.push(control_root.to_path_buf());
+    }
+    directories
+}
+
+fn sync_reconnect_receipt_directories_at(parent: &std::path::Path) -> Result<()> {
+    #[cfg(unix)]
+    for directory in reconnect_receipt_sync_directories(parent) {
+        std::fs::File::open(&directory)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| {
+                reconnect_journal_error(format!(
+                    "cannot make reconnect receipt directory durable {}: {error}",
+                    directory.display()
+                ))
+            })?;
+    }
+    Ok(())
+}
+
+fn sync_hidden_reconnect_proof_directories_at(parent: &std::path::Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mut synced_existing_directory = false;
+        for directory in reconnect_receipt_sync_directories(parent) {
+            let file = match std::fs::File::open(&directory) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(reconnect_journal_error(format!(
+                        "cannot open reconnect proof directory for durable quarantine {}: {error}",
+                        directory.display()
+                    )));
+                }
+            };
+            file.sync_all().map_err(|error| {
+                reconnect_journal_error(format!(
+                    "cannot make reconnect proof quarantine durable {}: {error}",
+                    directory.display()
+                ))
+            })?;
+            synced_existing_directory = true;
+        }
+        if !synced_existing_directory {
+            return Err(reconnect_journal_error(
+                "cannot prove reconnect success proof absence without an existing control directory",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn sync_reconnect_receipt_at(path: &std::path::Path, parent: &std::path::Path) -> Result<()> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| {
+            reconnect_journal_error(format!(
+                "cannot make reconnect receipt durable {}: {error}",
+                path.display()
+            ))
+        })?;
+    sync_reconnect_receipt_directories_at(parent)
+}
+
+fn preserve_reconnect_receipt_at_with<F>(
+    path: &std::path::Path,
+    ack: &ReconnectAck,
+    mut sync_published: F,
+) -> Result<()>
+where
+    F: FnMut(&std::path::Path, &std::path::Path) -> Result<()>,
+{
+    let parent = path
+        .parent()
+        .ok_or_else(|| reconnect_journal_error("reconnect receipt has no control directory"))?;
+    if let Some(existing) = load_reconnect_receipt_at(path)? {
+        return if existing == *ack {
+            sync_published(path, parent)
+        } else {
+            Err(reconnect_journal_error(format!(
+                "reconnect receipt {} conflicts with its terminal result",
+                path.display()
+            )))
+        };
+    }
+    std::fs::create_dir_all(parent).map_err(|error| {
+        reconnect_journal_error(format!(
+            "cannot create reconnect receipt directory {}: {error}",
+            parent.display()
+        ))
+    })?;
+    let temp = parent.join(format!(".receipt-{}.tmp", control_nonce()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .map_err(|error| {
+            reconnect_journal_error(format!(
+                "cannot stage reconnect receipt {}: {error}",
+                temp.display()
+            ))
+        })?;
+    let bytes =
+        reconnect_event_value(&ReconnectJournalEvent::Settled { ack: ack.clone() }).to_string();
+    use std::io::Write;
+    if let Err(error) = file
+        .write_all(bytes.as_bytes())
+        .and_then(|()| file.sync_all())
+    {
+        let _ = std::fs::remove_file(&temp);
+        return Err(reconnect_journal_error(format!(
+            "cannot make reconnect receipt durable {}: {error}",
+            temp.display()
+        )));
+    }
+    drop(file);
+    if let Err(error) = std::fs::rename(&temp, path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(reconnect_journal_error(format!(
+            "cannot publish reconnect receipt {}: {error}",
+            path.display()
+        )));
+    }
+    sync_published(path, parent)
+}
+
+fn preserve_reconnect_receipt_at(path: &std::path::Path, ack: &ReconnectAck) -> Result<()> {
+    preserve_reconnect_receipt_at_with(path, ack, sync_reconnect_receipt_at)
+}
+
+fn reap_reconnect_receipt_at(path: &std::path::Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {
+            #[cfg(unix)]
+            if let Some(parent) = path.parent() {
+                std::fs::File::open(parent)
+                    .and_then(|directory| directory.sync_all())
+                    .map_err(|error| {
+                        reconnect_journal_error(format!(
+                            "reconnect receipt was reaped, but its directory was not durable {}: {error}",
+                            parent.display()
+                        ))
+                    })?;
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(reconnect_journal_error(format!(
+            "reconnect receipt could not be reaped {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+fn reap_reconnect_success_proof_at(journal: &std::path::Path, ack: &ReconnectAck) -> Result<()> {
+    if ack.accepted {
+        reap_reconnect_receipt_at(&reconnect_success_proof_path_at(journal, &ack.nonce)?)?;
+    }
+    Ok(())
+}
+
+fn reap_orphan_reconnect_success_proofs_at(journal: &std::path::Path) -> Result<()> {
+    let Some(control_root) = journal.parent() else {
+        return Err(reconnect_journal_error(
+            "reconnect journal has no control directory",
+        ));
+    };
+    let proof_dir = control_root.join("fleetyd.reconnect-success");
+    let entries = match std::fs::read_dir(&proof_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(reconnect_journal_error(format!(
+                "cannot inspect reconnect success proofs {}: {error}",
+                proof_dir.display()
+            )))
+        }
+    };
+    let active = load_reconnect_journal_at(journal)?;
+    let active_proof = active.as_ref().and_then(|state| match &state.phase {
+        ReconnectPhase::Settled(ack) if ack.accepted => {
+            reconnect_success_proof_path_at(journal, &ack.nonce).ok()
+        }
+        _ => None,
+    });
+    let receipt_dir = control_root.join("fleetyd.reconnect-receipts");
+    for entry in entries {
+        let path = entry
+            .map_err(|error| {
+                reconnect_journal_error(format!(
+                    "cannot inspect reconnect success proof entry: {error}"
+                ))
+            })?
+            .path();
+        if !path.is_file() {
+            continue;
+        }
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        if file_name.starts_with(".receipt-") && file_name.ends_with(".tmp") {
+            reap_reconnect_receipt_at(&path)?;
+            continue;
+        }
+        let ack = match load_reconnect_receipt_at(&path) {
+            Ok(Some(ack)) => ack,
+            Ok(None) => {
+                reap_reconnect_receipt_at(&path)?;
+                continue;
+            }
+            Err(error) => {
+                let has_carrier = active_proof.as_deref() == Some(path.as_path())
+                    || receipt_dir.join(file_name).exists();
+                if has_carrier {
+                    return Err(error);
+                }
+                reap_reconnect_receipt_at(&path)?;
+                continue;
+            }
+        };
+        let active_carrier = active.as_ref().is_some_and(|state| {
+            state.request.nonce == ack.nonce
+                && matches!(state.phase, ReconnectPhase::Settled(ref active_ack) if active_ack == &ack)
+        });
+        let receipt = reconnect_receipt_path_at(journal, &ack.nonce)?;
+        let receipt_carrier = load_reconnect_receipt_at(&receipt)?.as_ref() == Some(&ack);
+        if !active_carrier && !receipt_carrier {
+            reap_reconnect_receipt_at(&path)?;
+        }
+    }
+    Ok(())
+}
+
+fn take_reconnect_ack_at_with<FR, FJ>(
+    journal: &std::path::Path,
+    nonce: &str,
+    mut reap_receipt: FR,
+    mut reap_journal: FJ,
+) -> Result<Option<ReconnectAck>>
+where
+    FR: FnMut(&std::path::Path) -> Result<()>,
+    FJ: FnMut(&std::path::Path) -> Result<()>,
+{
+    let receipt = reconnect_receipt_path_at(journal, nonce)?;
+    if let Some(ack) = load_reconnect_receipt_at(&receipt)? {
+        if ack.nonce != nonce {
+            return Err(reconnect_journal_error(
+                "receipt nonce does not match its requested result",
+            ));
+        }
+        require_reconnect_success_proof(journal, &ack)?;
+        match reap_receipt(&receipt) {
+            Ok(()) => {
+                if let Err(error) = reap_reconnect_success_proof_at(journal, &ack) {
+                    tracing::warn!(
+                        report = ?error.report(),
+                        "reconnect result was observed, but its success proof cleanup needs retry"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    report = ?error.report(),
+                    "reconnect result was observed, but its receipt cleanup needs retry"
+                );
+            }
+        }
+        return Ok(Some(ack));
+    }
+    let Some(state) = load_reconnect_journal_at(journal)? else {
+        return Ok(None);
+    };
+    if state.request.nonce != nonce {
+        return Ok(None);
+    }
+    match state.phase {
+        ReconnectPhase::Settled(ack) => {
+            require_reconnect_success_proof(journal, &ack)?;
+            match reap_journal(journal) {
+                Ok(()) => {
+                    if let Err(error) = reap_reconnect_success_proof_at(journal, &ack) {
+                        tracing::warn!(
+                            report = ?error.report(),
+                            "reconnect result was observed, but its success proof cleanup needs retry"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        report = ?error.report(),
+                        "reconnect result was observed, but its journal cleanup needs retry"
+                    );
+                }
+            }
+            Ok(Some(ack))
+        }
+        ReconnectPhase::Submitted | ReconnectPhase::Claimed => Ok(None),
+    }
+}
+
+fn take_reconnect_ack_at(journal: &std::path::Path, nonce: &str) -> Result<Option<ReconnectAck>> {
+    take_reconnect_ack_at_with(
+        journal,
+        nonce,
+        reap_reconnect_receipt_at,
+        reap_reconnect_journal_at,
+    )
+}
+
 struct ControlGuard {
     ready: ControlReady,
+    _process_identity: fleety_tools::service::ProcessIdentityGuard,
 }
 
 impl ControlGuard {
     fn claim() -> Result<Self> {
+        let process_start = control_nonce();
+        let process_identity = fleety_tools::service::claim_process_identity_at(
+            &process_identity_path(&process_start),
+            &process_start,
+        )?;
         let ready = ControlReady {
             pid: std::process::id(),
+            process_start,
             instance: control_nonce(),
         };
         // Ready ownership, old-generation recovery, and publication are one
@@ -642,57 +1653,47 @@ impl ControlGuard {
         let _reconnect_lease = acquire_reconnect_lease()?;
         let path = ready_path();
         if let Ok(bytes) = std::fs::read(&path) {
-            if let Some(existing) = parse_ready(&bytes) {
-                match fleety_tools::service::probe_pid(existing.pid) {
-                    fleety_tools::service::PidState::Dead => {
-                        let _ = std::fs::remove_file(&path);
-                    }
-                    fleety_tools::service::PidState::Alive
-                    | fleety_tools::service::PidState::Unknown => {
-                        return Err(agent_core::CoreError::Message(format!(
-                            "another fleetyd process owns local reconnect control (pid {})",
-                            existing.pid
-                        )));
+            match parse_ready_record(&bytes)? {
+                ControlReadyRecord::Current(existing) => {
+                    let existing_identity = process_identity_path(&existing.process_start);
+                    match fleety_tools::service::probe_process_identity_at(&existing_identity)? {
+                        fleety_tools::service::ProcessIdentityState::Available => {
+                            let _ = std::fs::remove_file(&path);
+                            let _ = std::fs::remove_file(existing_identity);
+                        }
+                        fleety_tools::service::ProcessIdentityState::Held => {
+                            return Err(agent_core::CoreError::Message(format!(
+                                "another fleetyd process owns local reconnect control (pid {})",
+                                existing.pid
+                            )));
+                        }
                     }
                 }
-            } else {
-                return Err(agent_core::CoreError::Message(
-                    "fleetyd reconnect control identity is unreadable; remove it only after confirming no daemon is running"
-                        .to_string(),
-                ));
+                ControlReadyRecord::Legacy { pid, .. } => {
+                    match fleety_tools::service::probe_pid(pid) {
+                        fleety_tools::service::PidState::Dead => {
+                            let _ = std::fs::remove_file(&path);
+                        }
+                        fleety_tools::service::PidState::Alive
+                        | fleety_tools::service::PidState::Unknown => {
+                            return Err(agent_core::CoreError::Message(format!(
+                                "running fleetyd uses an incompatible legacy reconnect control contract (pid {pid}); update fleetyd and the Fleety CLI together, restart fleetyd, then retry"
+                            )));
+                        }
+                    }
+                }
             }
-        }
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| {
-                agent_core::CoreError::Message(format!(
-                    "cannot create daemon control directory {}: {error}",
-                    parent.display()
-                ))
-            })?;
         }
         // Serialize generation handoff with publishers: a request can bind to
         // either the old owner (then recovery settles it) or this new owner,
         // never to an unpublished generation between the two.
         recover_reconnect_for_instance_at(&reconnect_journal_path(), &ready.instance)?;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(|error| {
-                agent_core::CoreError::Message(format!(
-                    "cannot claim daemon reconnect control {}: {error}",
-                    path.display()
-                ))
-            })?;
-        use std::io::Write;
-        if let Err(error) = file.write_all(&encode_ready(&ready)) {
-            drop(file);
-            let _ = std::fs::remove_file(&path);
-            return Err(agent_core::CoreError::Message(format!(
-                "cannot publish daemon reconnect identity: {error}"
-            )));
-        }
-        Ok(Self { ready })
+        reap_orphan_reconnect_success_proofs_at(&reconnect_journal_path())?;
+        publish_ready_at(&path, &ready)?;
+        Ok(Self {
+            ready,
+            _process_identity: process_identity,
+        })
     }
 }
 
@@ -768,7 +1769,7 @@ impl Drop for ControlGuard {
         let still_ours = std::fs::read(ready_path())
             .ok()
             .and_then(|bytes| parse_ready(&bytes))
-            .is_some_and(|ready| ready.instance == self.ready.instance);
+            .is_some_and(|ready| ready == self.ready);
         if still_ours {
             let _ = std::fs::remove_file(ready_path());
         }
@@ -841,11 +1842,15 @@ fn request_running_daemon_reconnect_with_wait(
     // The Daemon needs the same lease to claim and settle the request.
     let lease = acquire_reconnect_lease()?;
     let ready = match std::fs::read(ready_path()) {
-        Ok(bytes) => parse_ready(&bytes).ok_or_else(|| {
-            agent_core::CoreError::Message(
-                "fleetyd control state is unreadable; restart fleetyd, then retry".to_string(),
-            )
-        })?,
+        Ok(bytes) => match parse_ready_record(&bytes)? {
+            ControlReadyRecord::Current(ready) => ready,
+            ControlReadyRecord::Legacy { .. } => {
+                return Err(agent_core::CoreError::Message(
+                    "running fleetyd uses an incompatible legacy reconnect control contract; update fleetyd and the Fleety CLI together, restart fleetyd, then retry"
+                        .to_string(),
+                ))
+            }
+        },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(format!(
                 "no running fleetyd owns this connection store; profile '{expected_profile}' will be used when that Daemon owner starts"
@@ -857,6 +1862,14 @@ fn request_running_daemon_reconnect_with_wait(
             )))
         }
     };
+    if fleety_tools::service::probe_process_identity_at(&process_identity_path(
+        &ready.process_start,
+    ))? != fleety_tools::service::ProcessIdentityState::Held
+    {
+        return Err(agent_core::CoreError::Message(
+            "fleetyd reconnect control owner is stale; restart fleetyd, then retry".to_string(),
+        ));
+    }
     let request = ReconnectRequest {
         instance: ready.instance,
         nonce: control_nonce(),
@@ -865,25 +1878,10 @@ fn request_running_daemon_reconnect_with_wait(
     let journal = reconnect_journal_path();
     if let Some(state) = load_reconnect_journal_at(&journal)? {
         if let ReconnectPhase::Settled(ack) = state.phase {
+            require_reconnect_success_proof(&journal, &ack)?;
+            let receipt = reconnect_receipt_path_at(&journal, &ack.nonce)?;
+            preserve_reconnect_receipt_at(&receipt, &ack)?;
             reap_reconnect_journal_at(&journal)?;
-            if state.request.expected_profile != expected_profile {
-                return Err(agent_core::CoreError::Message(format!(
-                    "previous reconnect request '{}' for profile '{}' settled {}; profile \
-                     '{expected_profile}' was not submitted — retry now",
-                    state.request.nonce,
-                    state.request.expected_profile,
-                    if ack.accepted {
-                        "successfully"
-                    } else {
-                        "with failure"
-                    }
-                )));
-            }
-            return if ack.accepted {
-                Ok(ack.message)
-            } else {
-                Err(agent_core::CoreError::Message(ack.message))
-            };
         }
     }
     submit_reconnect_at(&journal, &request)?;
@@ -891,37 +1889,19 @@ fn request_running_daemon_reconnect_with_wait(
 
     let deadline = std::time::Instant::now() + wait;
     while std::time::Instant::now() < deadline {
-        if let Some(state) = load_reconnect_journal_at(&journal)? {
-            if state.request.nonce == request.nonce {
-                if let ReconnectPhase::Settled(observed_ack) = state.phase {
-                    let _observe_lease = acquire_reconnect_lease()?;
-                    if let Some(observed) = load_reconnect_journal_at(&journal)? {
-                        if observed.request.nonce == request.nonce {
-                            match observed.phase {
-                                ReconnectPhase::Settled(ref ack) if ack == &observed_ack => {}
-                                ReconnectPhase::Settled(_) => {
-                                    return Err(reconnect_journal_error(
-                                        "nonce changed terminal result while being observed",
-                                    ))
-                                }
-                                ReconnectPhase::Submitted | ReconnectPhase::Claimed => {
-                                    return Err(reconnect_journal_error(
-                                        "nonce regressed after terminal result was observed",
-                                    ))
-                                }
-                            }
-                            reap_reconnect_journal_at(&journal)?;
-                        }
-                    }
-                    // Another same-profile caller may have reaped this exact
-                    // result after our durable read. The result was still
-                    // observed; never turn that race into a false timeout.
-                    return if observed_ack.accepted {
-                        Ok(observed_ack.message)
-                    } else {
-                        Err(agent_core::CoreError::Message(observed_ack.message))
-                    };
-                }
+        let receipt = reconnect_receipt_path_at(&journal, &request.nonce)?;
+        let active_is_settled = load_reconnect_journal_at(&journal)?.is_some_and(|state| {
+            state.request.nonce == request.nonce
+                && matches!(state.phase, ReconnectPhase::Settled(_))
+        });
+        if receipt.exists() || active_is_settled {
+            let _observe_lease = acquire_reconnect_lease()?;
+            if let Some(observed_ack) = take_reconnect_ack_at(&journal, &request.nonce)? {
+                return if observed_ack.accepted {
+                    Ok(observed_ack.message)
+                } else {
+                    Err(agent_core::CoreError::Message(observed_ack.message))
+                };
             }
         }
         std::thread::sleep(RECONNECT_POLL);
@@ -933,47 +1913,35 @@ fn request_running_daemon_reconnect_with_wait(
     )))
 }
 
-/// Return the exact persisted profile that owns this resolved target. A pure
-/// env/default deployment may create `default`; an env URL that differs from an
-/// existing current profile deliberately has no persisted owner.
+/// Return the exact persisted profile that owns this resolved target. A fresh
+/// local/default connection may create `default`; raw URL and environment
+/// overrides deliberately have no persisted owner.
+#[cfg(test)]
 fn target_profile_name(
     conns: &connection::Connections,
     target: &Resolved,
     allow_default: bool,
 ) -> Option<String> {
-    match &target.source {
-        Source::Profile(name) | Source::OverrideProfile(name) => conns
-            .profiles
-            .get(name)
-            .filter(|profile| profile.url == target.url)
-            .map(|_| name.clone()),
-        Source::OverrideUrl => conns
-            .profiles
-            .iter()
-            .find(|(_, profile)| profile.url == target.url)
-            .map(|(name, _)| name.clone()),
-        Source::Env => match conns.current.as_ref() {
-            Some(name) => conns
-                .profiles
-                .get(name)
-                .filter(|profile| profile.url == target.url)
-                .map(|_| name.clone()),
-            None if allow_default && conns.profiles.is_empty() => Some("default".to_string()),
-            None => None,
-        },
-        Source::Mdns | Source::Default => match conns.current.as_ref() {
-            // Unowned discovery must never be attached to an existing current
-            // profile. Unsigned discovery never becomes Source::Profile.
-            Some(_) => None,
-            None if allow_default && conns.profiles.is_empty() => Some("default".to_string()),
-            None => None,
-        },
+    if let Some(name) = target.profile_owner_name() {
+        return connection::validate_resolved_profile_owner(conns, target, "profile lookup")
+            .ok()
+            .map(|_| name.to_string());
+    }
+    if allow_default
+        && target.can_create_fresh_default_owner()
+        && conns.current.is_none()
+        && conns.profiles.is_empty()
+    {
+        Some("default".to_string())
+    } else {
+        None
     }
 }
 
 /// Confirm that the resolved target is still the exact persisted owner snapshot
 /// selected by this reconnect. Re-run this before terminal success so a later
 /// profile mutation cannot make one nonce acknowledge another owner.
+#[cfg(test)]
 fn reconnect_target_fingerprint(
     expected_profile: &str,
     target: &Resolved,
@@ -987,39 +1955,145 @@ fn reconnect_target_fingerprint_in(
     expected_profile: &str,
     target: &Resolved,
 ) -> Result<Option<String>> {
-    let source_profile = match &target.source {
-        Source::Profile(name) | Source::OverrideProfile(name) => name,
-        _ => {
-            return Err(agent_core::CoreError::Message(format!(
-                "reconnect profile '{expected_profile}' did not resolve to a persisted owner"
-            )))
-        }
+    let Some(source_profile) = target.profile_owner_name() else {
+        return Err(agent_core::CoreError::Message(format!(
+            "reconnect profile '{expected_profile}' did not resolve to a persisted owner"
+        )));
     };
     if source_profile != expected_profile {
         return Err(agent_core::CoreError::Message(format!(
             "reconnect requested profile '{expected_profile}', but resolved profile '{source_profile}'"
         )));
     }
-    if conns.current.as_deref() != Some(expected_profile) {
-        return Err(agent_core::CoreError::Message(format!(
-            "reconnect profile '{expected_profile}' is no longer current"
-        )));
-    }
-    let profile = conns.profiles.get(expected_profile).ok_or_else(|| {
-        agent_core::CoreError::Message(format!(
-            "reconnect profile '{expected_profile}' no longer exists"
-        ))
-    })?;
-    if profile.url != target.url || profile.token.as_deref() != target.token.as_deref() {
-        return Err(agent_core::CoreError::Message(format!(
-            "reconnect profile '{expected_profile}' changed while fleetyd was connecting"
-        )));
-    }
+    let profile =
+        connection::validate_resolved_profile_owner(conns, target, "reconnect owner validation")?;
     Ok(profile.fingerprint.clone())
+}
+
+fn reconnect_owner_fingerprint_in(
+    conns: &connection::Connections,
+    expected_profile: &str,
+    target: &Resolved,
+    owner: Option<&SessionCredentialOwner>,
+) -> Result<Option<String>> {
+    let Some(source_profile) = target.profile_owner_name() else {
+        return Err(agent_core::CoreError::Message(format!(
+            "reconnect profile '{expected_profile}' did not resolve to a persisted owner"
+        )));
+    };
+    let Some(SessionCredentialOwner::Existing(owner_target)) = owner else {
+        return Err(agent_core::CoreError::Message(format!(
+            "reconnect profile '{expected_profile}' has no frozen credential owner"
+        )));
+    };
+    if source_profile != expected_profile
+        || owner_target.profile_owner_name() != Some(expected_profile)
+        || owner_target.as_ref() != target
+    {
+        return Err(agent_core::CoreError::Message(format!(
+            "reconnect requested profile '{expected_profile}', but resolved profile '{source_profile}'"
+        )));
+    }
+    let profile = connection::validate_resolved_profile_owner(
+        conns,
+        owner_target,
+        "reconnect owner validation",
+    )?;
+    Ok(profile.fingerprint.clone())
+}
+
+/// Atomically persist a normal authenticated session's minted token and
+/// identity pin onto its exact durable owner. Ephemeral explicit targets remain
+/// unpersisted.
+#[derive(Debug, Clone)]
+enum SessionCredentialOwner {
+    Existing(Box<Resolved>),
+    FreshDefault,
+}
+
+fn session_credential_owner_in(
+    conns: &connection::Connections,
+    target: &Resolved,
+) -> Option<SessionCredentialOwner> {
+    if target.has_profile_owner()
+        && connection::validate_resolved_profile_owner(conns, target, "session owner capture")
+            .is_ok()
+    {
+        return Some(SessionCredentialOwner::Existing(Box::new(target.clone())));
+    }
+    (target.can_create_fresh_default_owner()
+        && conns.current.is_none()
+        && conns.profiles.is_empty())
+    .then_some(SessionCredentialOwner::FreshDefault)
+}
+
+#[cfg(test)]
+fn session_credential_owner(target: &Resolved) -> Result<Option<SessionCredentialOwner>> {
+    Ok(session_credential_owner_in(&connection::load()?, target))
+}
+
+fn persist_authenticated_target_credentials(
+    owner: &SessionCredentialOwner,
+    target: &Resolved,
+    server_fingerprint: &str,
+    minted_token: Option<&str>,
+) -> Result<bool> {
+    if server_fingerprint.trim().is_empty()
+        || minted_token.is_some_and(|token| token.trim().is_empty())
+    {
+        return Err(agent_core::CoreError::Message(
+            "fleetyd received incomplete authenticated credentials".to_string(),
+        ));
+    }
+    if let SessionCredentialOwner::Existing(owner_target) = owner {
+        if owner_target.as_ref() != target {
+            return Err(agent_core::CoreError::Message(
+                "authenticated session owner does not match the resolved target".to_string(),
+            ));
+        }
+        connection::store_resolved_profile_credentials(
+            owner_target,
+            minted_token,
+            server_fingerprint,
+        )?;
+        return Ok(true);
+    }
+    connection::mutate(|conns| {
+        if conns.device_id.is_empty() {
+            conns.device_id = fleety_tools::device::device_id();
+        }
+        if conns.current.is_some() || !conns.profiles.is_empty() {
+            return Err(agent_core::CoreError::Message(
+                "connection profiles changed before the fresh authenticated owner committed"
+                    .to_string(),
+            ));
+        }
+        let name = "default".to_string();
+        let profile = conns.profiles.entry(name.clone()).or_default();
+        profile.url = target.url_owned();
+        conns.current = Some(name.clone());
+        match connection::tofu_pin_decision(profile.fingerprint.as_deref(), server_fingerprint) {
+            connection::PinDecision::IdentityChanged => {
+                return Err(agent_core::CoreError::Message(format!(
+                    "profile '{name}' has a different Server identity"
+                )))
+            }
+            connection::PinDecision::Pin => {
+                profile.fingerprint = Some(server_fingerprint.to_string());
+            }
+            connection::PinDecision::AlreadyPinned => {}
+        }
+        if let Some(token) = minted_token {
+            profile.token = Some(token.to_string());
+        }
+        let _ = name;
+        Ok(true)
+    })
 }
 
 /// Persist a freshly-minted token only onto the profile that owned the resolved
 /// connection. Returns false when the target is intentionally ephemeral.
+#[cfg(test)]
 fn persist_token(target: &Resolved, token: &str) -> Result<bool> {
     connection::mutate(|conns| {
         let Some(name) = target_profile_name(conns, target, true) else {
@@ -1031,7 +2105,7 @@ fn persist_token(target: &Resolved, token: &str) -> Result<bool> {
         }
         let profile = conns.profiles.entry(name.clone()).or_default();
         if profile.url.is_empty() {
-            profile.url = target.url.clone();
+            profile.url = target.url_owned();
         }
         profile.token = Some(token.to_string());
         if first_profile {
@@ -1041,7 +2115,21 @@ fn persist_token(target: &Resolved, token: &str) -> Result<bool> {
     })
 }
 
+fn clear_session_owner_token(
+    owner: Option<&SessionCredentialOwner>,
+    target: &Resolved,
+) -> Result<bool> {
+    let Some(SessionCredentialOwner::Existing(owner_target)) = owner else {
+        return Ok(false);
+    };
+    if owner_target.as_ref() != target {
+        return Ok(false);
+    }
+    connection::clear_resolved_profile_token(owner_target)
+}
+
 /// Clear only the token that was actually sent to the rejecting target.
+#[cfg(test)]
 fn clear_target_token(target: &Resolved) -> Result<bool> {
     connection::mutate(|conns| {
         let Some(name) = target_profile_name(conns, target, false) else {
@@ -1052,7 +2140,7 @@ fn clear_target_token(target: &Resolved) -> Result<bool> {
         };
         // An explicit FLEETY_TOKEN may target the same URL without being the saved
         // profile credential. Only delete the exact token that was rejected.
-        if profile.token.as_deref() != target.token.as_deref() || target.token.is_none() {
+        if profile.token.as_deref() != target.token() || target.token().is_none() {
             return Ok(false);
         }
         profile.token = None;
@@ -1060,6 +2148,7 @@ fn clear_target_token(target: &Resolved) -> Result<bool> {
     })
 }
 
+#[cfg(test)]
 fn pin_target_fingerprint(
     target: &Resolved,
     fingerprint: &str,
@@ -1135,9 +2224,10 @@ fn main() -> std::process::ExitCode {
     obs::init();
     // Seed env from ~/.fleety/config.toml before reading env (env still wins;
     // only unset keys are filled). Best-effort.
-    fleety_tools::config::seed_env_from_config(&fleety_tools::config::load(
-        &fleety_tools::config::config_path(),
-    ));
+    fleety_tools::config::seed_env_from_config(
+        &fleety_tools::config::load(&fleety_tools::config::config_path()),
+        fleety_tools::config::DAEMON_SCOPES,
+    );
     // One-time, idempotent migration of the legacy config.json / fleetyd.token
     // into connections.toml (best-effort; a fresh device has nothing to migrate).
     let _ = connection::migrate_from_config_json();
@@ -1186,15 +2276,18 @@ fn main() -> std::process::ExitCode {
     // the daemon on its own runtime (see winsvc).
     #[cfg(windows)]
     if cmd.as_deref() == Some("run-service") {
-        if let Err(e) = winsvc::dispatch() {
-            tracing::error!(
-                %e,
-                "windows service dispatcher failed; `run-service` only works when started \
-                 by the Service Control Manager (use `fleetyd start` after `fleetyd install`)"
-            );
-            return std::process::ExitCode::FAILURE;
-        }
-        return std::process::ExitCode::SUCCESS;
+        return match winsvc::dispatch() {
+            Ok(0) => std::process::ExitCode::SUCCESS,
+            Ok(_) => std::process::ExitCode::FAILURE,
+            Err(e) => {
+                tracing::error!(
+                    %e,
+                    "windows service dispatcher failed; `run-service` only works when started \
+                     by the Service Control Manager (use `fleetyd start` after `fleetyd install`)"
+                );
+                std::process::ExitCode::FAILURE
+            }
+        };
     }
 
     let rt = match tokio::runtime::Builder::new_multi_thread()
@@ -1353,10 +2446,18 @@ async fn async_main(cmd: Option<String>) -> std::process::ExitCode {
         _ => {}
     }
 
-    // Service mode (non-Windows run-service) claims the single-instance pidfile
-    // (defense-in-depth on top of the manager); foreground dev runs do not, so a
-    // developer can run one alongside an installed service. On Windows the
-    // service path goes through winsvc, which claims the pidfile itself.
+    // Reconnect control is the atomic outer owner. Claim it before a service
+    // pidfile so two starters cannot race a dead-owner pidfile takeover.
+    let control = match ControlGuard::claim() {
+        Ok(control) => control,
+        Err(e) => {
+            tracing::error!(report = ?e.report(), "cannot claim fleetyd reconnect control; exiting");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    // Service mode (non-Windows run-service) also claims the single-instance
+    // pidfile (defense-in-depth on top of the manager). Foreground dev runs do
+    // not, and Windows claims it in winsvc after reconnect control.
     let service_mode = cmd.as_deref() == Some("run-service");
     let _pid_guard = if service_mode {
         match fleety_tools::service::acquire("fleetyd") {
@@ -1366,8 +2467,8 @@ async fn async_main(cmd: Option<String>) -> std::process::ExitCode {
                 return std::process::ExitCode::FAILURE;
             }
             Err(e) => {
-                tracing::warn!(report = ?e.report(), "pidfile check failed; continuing without it");
-                None
+                tracing::error!(report = ?e.report(), "cannot claim fleetyd service ownership; exiting");
+                return std::process::ExitCode::FAILURE;
             }
         }
     } else {
@@ -1375,10 +2476,7 @@ async fn async_main(cmd: Option<String>) -> std::process::ExitCode {
     };
 
     tracing::info!(version = agent_core::VERSION, "fleetyd starting");
-    // Best-effort background update poller (no-op when the user hasn't set
-    // FLEETY_UPDATE_MANIFEST — keeps the existing dev/install posture).
-    poll_updates::spawn();
-    if let Err(e) = run(None).await {
+    if let Err(e) = run(None, control).await {
         tracing::error!(report = ?e.report(), "fleetyd exited with error");
         return std::process::ExitCode::FAILURE;
     }
@@ -1470,26 +2568,56 @@ fn restart_due_at_idle() -> bool {
 /// Resolve which server (url + token) to connect to, via the shared resolver
 /// over connections.toml. `FLEETY_AGENT_URL` stays a persistent unit-file source
 /// for the daemon (transient env override in the resolver): env > current
-/// profile > mDNS > localhost. The daemon has no per-invocation override — it
-/// always follows `current`.
-fn resolve_target() -> Result<connection::Resolved> {
-    let conns = connection::load()?;
-    let env_url = std::env::var("FLEETY_AGENT_URL").ok();
+/// profile > trusted localhost. mDNS is browsed only to direct an unconfigured
+/// device into explicit `fleety init` selection; it never becomes a daemon
+/// connection target. The daemon has no per-invocation override.
+fn local_server_url() -> String {
+    let port = std::env::var("FLEETY_ADDR")
+        .ok()
+        .and_then(|address| address.rsplit(':').next().map(String::from))
+        .and_then(|port| port.trim().parse::<u16>().ok())
+        .unwrap_or(8787);
+    format!("ws://127.0.0.1:{port}")
+}
+
+fn resolve_target_with_owner() -> Result<(connection::Resolved, Option<SessionCredentialOwner>)> {
+    let env_url = std::env::var("FLEETY_AGENT_URL")
+        .ok()
+        .filter(|url| !url.is_empty());
     let env_token = std::env::var("FLEETY_TOKEN").ok();
-    connection::resolve(&conns, &Target::Current, env_url, env_token, || {
-        let discovered =
-            connection::discover_for_connections(&conns, std::time::Duration::from_secs(2));
-        if let Some(server) = &discovered {
-            tracing::info!(url = %server.url, "discovered fleety server via mDNS");
-        }
-        discovered
-    })
+    connection::ensure_resolvable_profile_generation(&Target::Current, env_url.is_some())?;
+    let conns = connection::load()?;
+    let target = connection::resolve(&conns, &Target::Current, env_url, env_token, || {
+        connection::prefer_trusted_local_candidate(
+            || {
+                connection::trusted_local_server_up(
+                    &local_server_url(),
+                    std::time::Duration::from_millis(300),
+                )
+            },
+            || {
+                let discovered =
+                    connection::discover_for_connections(&conns, std::time::Duration::from_secs(2));
+                if let Some(server) = &discovered {
+                    tracing::info!(url = %server.url, "discovered fleety server via mDNS");
+                }
+                discovered
+            },
+        )
+    })?;
+    let owner = session_credential_owner_in(&conns, &target);
+    Ok((target, owner))
+}
+
+#[cfg(test)]
+fn resolve_target() -> Result<connection::Resolved> {
+    resolve_target_with_owner().map(|(target, _)| target)
 }
 
 fn reconnect_connect_error(target: &Resolved, cause: &str) -> String {
     let cause = fleety_tools::transport::redact_urls_in_text(cause);
     if matches!(
-        target.source,
+        target.source(),
         Source::Profile(_) | Source::OverrideProfile(_)
     ) {
         format!("{cause}. {}", connection::explicit_repair_guidance())
@@ -1675,16 +2803,18 @@ enum Outcome {
 /// optional external stop (set by the Windows service control handler); a clean
 /// stop is also delivered by Ctrl+C and, on Unix, SIGTERM (so `systemctl stop`
 /// is graceful).
-async fn run(shutdown: Option<tokio::sync::watch::Receiver<bool>>) -> Result<()> {
+async fn run(
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+    control: ControlGuard,
+) -> Result<()> {
+    // Runtime work is allowed only after the caller holds every applicable
+    // owner. Keeping reconnect control in this frame covers all spawned work.
+    let control = Some(control);
+    // Best-effort background update poller (no-op when the user hasn't set
+    // FLEETY_UPDATE_MANIFEST — keeps the existing dev/install posture).
+    poll_updates::spawn();
     // Ensure device dependencies in the background (best-effort, non-blocking).
     tokio::spawn(ensure_dependencies());
-    let control = match ControlGuard::claim() {
-        Ok(control) => Some(control),
-        Err(error) => {
-            tracing::warn!(report = ?error.report(), "fleetyd local reconnect control is unavailable");
-            None
-        }
-    };
     let mut bo = backoff::Backoff::new();
     let mut pending_reconnect: Option<PendingReconnect> = None;
     loop {
@@ -1720,8 +2850,8 @@ async fn run(shutdown: Option<tokio::sync::watch::Receiver<bool>>) -> Result<()>
         }
         // Resolve the server (url + token) via the shared resolver over
         // connections.toml, honoring a persistent FLEETY_AGENT_URL env override.
-        match resolve_target() {
-            Ok(target) => {
+        match resolve_target_with_owner() {
+            Ok((target, session_owner)) => {
                 // WebSocket first, SSE+POST fallback (unless overridden by env) —
                 // so a device behind a proxy that blocks the WS upgrade connects.
                 let reconnect_deadline = pending_reconnect
@@ -1731,7 +2861,7 @@ async fn run(shutdown: Option<tokio::sync::watch::Receiver<bool>>) -> Result<()>
                     tokio::select! {
                         result = tokio::time::timeout_at(
                             deadline,
-                            fleety_tools::transport::connect(&target.url, target.token.as_deref()),
+                            fleety_tools::transport::connect(target.url(), target.token()),
                         ) => match result {
                             Ok(result) => result,
                             Err(_) => {
@@ -1759,8 +2889,8 @@ async fn run(shutdown: Option<tokio::sync::watch::Receiver<bool>>) -> Result<()>
                 } else {
                     tokio::select! {
                         result = fleety_tools::transport::connect(
-                            &target.url,
-                            target.token.as_deref(),
+                            target.url(),
+                            target.token(),
                         ) => result,
                         _ = wait_stop(shutdown.clone()) => return Ok(()),
                     }
@@ -1770,6 +2900,7 @@ async fn run(shutdown: Option<tokio::sync::watch::Receiver<bool>>) -> Result<()>
                         bo.reset();
                         match serve(
                             &target,
+                            session_owner.as_ref(),
                             conn,
                             shutdown.clone(),
                             control.as_ref(),
@@ -1899,19 +3030,31 @@ async fn wait_stop(shutdown: Option<tokio::sync::watch::Receiver<bool>>) {
 /// drops or a shutdown signal arrives.
 async fn serve(
     target: &Resolved,
+    session_owner: Option<&SessionCredentialOwner>,
     mut conn: fleety_tools::transport::Connection,
     shutdown: Option<tokio::sync::watch::Receiver<bool>>,
     control: Option<&ControlGuard>,
     pending_reconnect: &mut Option<PendingReconnect>,
     reconnect_deadline: Option<tokio::time::Instant>,
 ) -> Outcome {
-    let url = &target.url;
-    let pairing_code = std::env::var("FLEETY_PAIRING_CODE")
-        .ok()
-        .filter(|s| !s.is_empty());
+    let url = target.url();
+    let pairing_code = session_owner.and_then(|_| {
+        std::env::var("FLEETY_PAIRING_CODE")
+            .ok()
+            .filter(|s| !s.is_empty())
+    });
     let expected_reconnect_fingerprint = match pending_reconnect
         .as_ref()
-        .map(|pending| reconnect_target_fingerprint(&pending.request.expected_profile, target))
+        .map(|pending| {
+            connection::inspect_locked(|conns| {
+                reconnect_owner_fingerprint_in(
+                    conns,
+                    &pending.request.expected_profile,
+                    target,
+                    session_owner,
+                )
+            })
+        })
         .transpose()
     {
         Ok(fingerprint) => fingerprint.flatten(),
@@ -1927,7 +3070,6 @@ async fn serve(
             return Outcome::Disconnected;
         }
     };
-
     let registry = ondevice::build_local_registry(&ondevice::device_root());
     // Advertise the on-device tool set so the agent knows what device_exec can
     // invoke here — without this, the server has to guess (or hardcode).
@@ -1936,7 +3078,7 @@ async fn serve(
     let hello = match serde_json::to_string(&ClientMsg::Hello {
         device_id: device_id(),
         protocol: PROTOCOL_VERSION,
-        token: target.token.clone(),
+        token: target.token_owned(),
         pairing_code,
         local_tools_json,
         hostname: fleety_tools::device::hostname(),
@@ -2008,15 +3150,10 @@ async fn serve(
     // Presence: when opted in (`FLEETY_PRESENCE=on`), periodically report this
     // device's co-location fingerprint so the server can infer its site. Absent
     // when disabled — nothing is computed or sent.
-    let mut presence_tick = if colocation::presence_enabled() {
-        let mut iv =
-            tokio::time::interval(std::time::Duration::from_secs(colocation::interval_secs()));
-        iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        Some(iv)
-    } else {
-        None
-    };
+    let presence_enabled = colocation::presence_enabled();
+    let mut presence_tick: Option<tokio::time::Interval> = None;
     let mut welcome_deadline = pending_reconnect.as_ref().and(reconnect_deadline);
+    let mut authenticated_welcome = false;
     loop {
         if pending_reconnect
             .as_ref()
@@ -2113,6 +3250,13 @@ async fn serve(
             continue;
         };
         match msg {
+            ServerMsg::Welcome { .. } if authenticated_welcome => {
+                tracing::warn!(
+                    "fleetyd received a duplicate Welcome after authentication; refusing the session"
+                );
+                conn.close().await;
+                return Outcome::Disconnected;
+            }
             ServerMsg::Welcome {
                 session_id,
                 token,
@@ -2120,6 +3264,22 @@ async fn serve(
                 server_fingerprint,
                 ..
             } => {
+                if token
+                    .as_deref()
+                    .is_some_and(|token| token.trim().is_empty())
+                {
+                    decide_pending_reconnect(
+                        pending_reconnect,
+                        false,
+                        "fleetyd received an empty credential from the selected profile"
+                            .to_string(),
+                    );
+                    tracing::warn!(
+                        "fleetyd received Welcome with an empty minted token; refusing the session"
+                    );
+                    conn.close().await;
+                    return Outcome::Disconnected;
+                }
                 if expected_reconnect_fingerprint
                     .as_deref()
                     .is_some_and(|expected| server_fingerprint.as_deref() != Some(expected))
@@ -2133,96 +3293,118 @@ async fn serve(
                     conn.close().await;
                     return Outcome::Disconnected;
                 }
-                // Pin (or back-fill) the authenticated endpoint's identity for
-                // future mismatch detection; never overwrite a different pin —
-                // that is an anomaly worth a warning.
-                if let Some(fp) = server_fingerprint.as_deref().filter(|f| !f.is_empty()) {
-                    match pin_target_fingerprint(target, fp) {
-                        Ok(Some(fleety_tools::connection::PinDecision::IdentityChanged)) => {
-                            tracing::warn!(
-                                "the server's identity fingerprint changed since it was pinned; \
-                                 keeping the old pin — re-pair this device if the server was \
-                                 intentionally rebuilt"
-                            );
-                            decide_pending_reconnect(
-                                pending_reconnect,
-                                false,
-                                "fleetyd reached the selected endpoint, but its Server identity changed"
-                                    .to_string(),
-                            );
-                            conn.close().await;
-                            return Outcome::Disconnected;
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            tracing::warn!(report = ?e.report(), "could not pin the server fingerprint");
-                            if pending_reconnect.is_some() {
-                                decide_pending_reconnect(
-                                    pending_reconnect,
-                                    false,
-                                    "fleetyd authenticated the selected endpoint, but could not persist its Server identity"
-                                        .to_string(),
-                                );
-                                conn.close().await;
-                                return Outcome::Disconnected;
-                            }
-                        }
-                    }
-                } else if pending_reconnect.is_some() {
-                    decide_pending_reconnect(
-                        pending_reconnect,
-                        false,
-                        "fleetyd authenticated the selected endpoint, but it did not provide a Server identity"
-                            .to_string(),
-                    );
-                    conn.close().await;
-                    return Outcome::Disconnected;
-                }
                 if pending_reconnect.is_some() {
-                    if let Err(error) = settle_authenticated_reconnect(
+                    let Some(fingerprint) = server_fingerprint
+                        .as_deref()
+                        .filter(|value| !value.is_empty())
+                    else {
+                        decide_pending_reconnect(
+                            pending_reconnect,
+                            false,
+                            "fleetyd authenticated the selected endpoint, but it did not provide a Server identity"
+                                .to_string(),
+                        );
+                        conn.close().await;
+                        return Outcome::Disconnected;
+                    };
+                    if let Err(error) = commit_authenticated_reconnect(
                         target,
-                        server_fingerprint.as_deref(),
+                        session_owner,
+                        fingerprint,
+                        token.as_deref(),
                         pending_reconnect,
                     ) {
                         decide_pending_reconnect(
                             pending_reconnect,
                             false,
                             format!(
-                                "fleetyd could not commit the authenticated reconnect result: {}",
+                                "fleetyd could not persist authenticated credentials and commit the reconnect result: {}",
                                 error.report().message
                             ),
                         );
                         conn.close().await;
                         return Outcome::Disconnected;
                     }
-                }
-                if let Some(tok) = token {
-                    match persist_token(target, &tok) {
-                        Ok(true) => tracing::info!(
-                            "fleetyd token persisted to the owning profile in connections.toml"
-                        ),
-                        Ok(false) => tracing::info!(
-                            "fleetyd token belongs to an ephemeral target; not persisting it"
-                        ),
-                        Err(e) => {
-                            tracing::warn!(report = ?e.report(), "could not persist fleetyd token")
+                    tracing::info!(
+                        "fleetyd credentials persisted before reconnect success publication"
+                    );
+                } else {
+                    // Outside an owner-requested reconnect there is no success
+                    // settlement to publish, but the same identity rules still
+                    // protect normal startup/session refresh.
+                    if let Some(fp) = server_fingerprint.as_deref().filter(|f| !f.is_empty()) {
+                        match session_owner {
+                            Some(owner) => match persist_authenticated_target_credentials(
+                                owner,
+                                target,
+                                fp,
+                                token.as_deref(),
+                            ) {
+                                Ok(true) => tracing::info!(
+                                    "fleetyd identity and token committed to their exact profile owner"
+                                ),
+                                Ok(false) => {}
+                                Err(error) => {
+                                    tracing::warn!(
+                                        report = ?error.report(),
+                                        "could not atomically persist fleetyd identity and token"
+                                    );
+                                    conn.close().await;
+                                    return Outcome::Disconnected;
+                                }
+                            },
+                            None => tracing::info!(
+                                "fleetyd target is intentionally ephemeral; credentials were not persisted"
+                            ),
                         }
+                    } else if session_owner.is_some() {
+                        tracing::warn!(
+                            "fleetyd received Welcome without a Server identity for a durable profile owner; refusing the control session"
+                        );
+                        conn.close().await;
+                        return Outcome::Disconnected;
                     }
                 }
                 tracing::info!(%session_id, "registered with agent");
+                authenticated_welcome = true;
+                if presence_enabled {
+                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                        colocation::interval_secs(),
+                    ));
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    presence_tick = Some(interval);
+                }
                 // Forward-only fleet convergence: match this host to the server's
                 // version when the server is newer (so a device that was offline
                 // during a `fleety update` catches up on reconnect).
                 converge_to_server_version(&server_version).await;
             }
             ServerMsg::Error { ref error } if error.kind == "unauthenticated" => {
-                tracing::warn!(
-                    "server rejected our token: {} — clearing saved token so the next \
-                     connect can re-pair",
-                    error.message
-                );
-                if let Err(e) = clear_target_token(target) {
-                    tracing::warn!(report = ?e.report(), "could not clear the rejected token");
+                if target.sent_caller_explicit_token() {
+                    tracing::warn!(
+                        "the Server rejected the caller-explicit FLEETY_TOKEN: {} — unset or correct FLEETY_TOKEN; it overrides saved profile credentials and no saved token was changed",
+                        error.message
+                    );
+                } else if matches!(target.source(), Source::OverrideUrl | Source::Env) {
+                    tracing::warn!(
+                        "the transient Server rejected authentication: {} — set a non-empty FLEETY_TOKEN for this endpoint, or unset FLEETY_AGENT_URL to use the saved current profile; no saved token was changed",
+                        error.message
+                    );
+                } else if target.sent_saved_profile_token() {
+                    tracing::warn!(
+                        "server rejected our saved token: {} — clearing only that profile token so the next connect can re-pair",
+                        error.message
+                    );
+                } else {
+                    tracing::warn!(
+                        "the selected Server requires authentication: {} — pair this saved profile before reconnecting",
+                        error.message
+                    );
+                }
+                if target.sent_saved_profile_token() {
+                    if let Err(e) = clear_session_owner_token(session_owner, target) {
+                        tracing::warn!(report = ?e.report(), "could not clear the rejected token");
+                    }
                 }
                 decide_pending_reconnect(
                     pending_reconnect,
@@ -2232,6 +3414,19 @@ async fn serve(
                         error.message
                     ),
                 );
+                return Outcome::Disconnected;
+            }
+            ServerMsg::RunTool { .. } if !authenticated_welcome => {
+                tracing::warn!(
+                    "fleetyd received a control frame before authenticated Welcome; refusing the session"
+                );
+                decide_pending_reconnect(
+                    pending_reconnect,
+                    false,
+                    "fleetyd received Server control before the selected profile completed authenticated Welcome"
+                        .to_string(),
+                );
+                conn.close().await;
                 return Outcome::Disconnected;
             }
             ServerMsg::RunTool {
@@ -2360,13 +3555,20 @@ mod tests {
         let _lock = ENV_LOCK.lock().expect("env lock");
         let _guard = EnvGuard::new("token");
 
-        // With no profile yet (a pure-env deployment), persist_token creates a
-        // `default` profile pointing at the connected url and stores the token.
-        let target = Resolved {
-            url: "ws://srv:8787".to_string(),
-            token: None,
-            source: Source::Env,
+        let mut conns = connection::Connections {
+            current: Some("default".to_string()),
+            ..Default::default()
         };
+        conns.profiles.insert(
+            "default".to_string(),
+            connection::Profile {
+                url: "ws://srv:8787".to_string(),
+                ..Default::default()
+            },
+        );
+        connection::save(&conns).expect("save default");
+        let target =
+            connection::resolve(&conns, &Target::Current, None, None, || None).expect("resolve");
         assert!(persist_token(&target, "daemon-tok").expect("persist"));
         let conns = connection::load().expect("load");
         assert_eq!(conns.current.as_deref(), Some("default"));
@@ -2375,11 +3577,9 @@ mod tests {
         assert_eq!(p.token.as_deref(), Some("daemon-tok"));
 
         // Clearing after a rejection drops the token but keeps the profile.
-        let reconnect = Resolved {
-            url: "ws://srv:8787".to_string(),
-            token: Some("daemon-tok".to_string()),
-            source: Source::Profile("default".to_string()),
-        };
+        let persisted = connection::load().expect("load persisted token");
+        let reconnect = connection::resolve(&persisted, &Target::Current, None, None, || None)
+            .expect("resolve persisted token");
         assert!(clear_target_token(&reconnect).expect("clear"));
         let conns = connection::load().expect("reload");
         assert!(conns
@@ -2389,12 +3589,163 @@ mod tests {
     }
 
     #[test]
-    fn saved_profile_connect_failure_directs_explicit_repair_without_leaking_url_secrets() {
-        let target = Resolved {
-            url: "wss://host.test".into(),
-            token: Some("stored-token".into()),
-            source: Source::Profile("office".into()),
+    fn explicit_env_token_has_no_disk_owner_even_for_the_same_endpoint() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("explicit-env-token-owner");
+        let mut conns = connection::Connections {
+            current: Some("A".to_string()),
+            ..Default::default()
         };
+        conns.profiles.insert(
+            "A".to_string(),
+            connection::Profile {
+                url: "ws://server-a:8787".to_string(),
+                token: Some("disk-token".to_string()),
+                ..Default::default()
+            },
+        );
+        connection::save(&conns).expect("save A");
+        let target = Resolved::unowned(
+            "ws://server-a:8787".to_string(),
+            Some("explicit-env-token".to_string()),
+            Source::Env,
+        );
+        assert!(session_credential_owner(&target)
+            .expect("capture owner")
+            .is_none());
+        assert!(!persist_token(&target, "minted-token").expect("skip persist"));
+        assert_eq!(
+            pin_target_fingerprint(&target, "fingerprint-a").expect("skip pin"),
+            None
+        );
+
+        let saved = connection::load().expect("load A");
+        assert_eq!(saved.profiles["A"].token.as_deref(), Some("disk-token"));
+        assert!(saved.profiles["A"].fingerprint.is_none());
+    }
+
+    #[test]
+    fn env_same_endpoint_has_no_owner_before_or_after_current_switch() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("env-owner-drift");
+        let mut conns = connection::Connections {
+            current: Some("A".to_string()),
+            ..Default::default()
+        };
+        for name in ["A", "B"] {
+            conns.profiles.insert(
+                name.to_string(),
+                connection::Profile {
+                    url: "ws://shared:8787".to_string(),
+                    token: Some("shared-token".to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+        connection::save(&conns).expect("save A/B");
+        let target = Resolved::unowned(
+            "ws://shared:8787".to_string(),
+            Some("shared-token".to_string()),
+            Source::Env,
+        );
+        assert!(session_credential_owner(&target)
+            .expect("capture before switch")
+            .is_none());
+        connection::mutate(|live| {
+            live.current = Some("B".to_string());
+            Ok(())
+        })
+        .expect("switch to B");
+        assert!(session_credential_owner(&target)
+            .expect("capture after switch")
+            .is_none());
+        assert!(!clear_session_owner_token(None, &target).expect("skip clear"));
+
+        let saved = connection::load().expect("load A/B");
+        for name in ["A", "B"] {
+            assert_eq!(saved.profiles[name].token.as_deref(), Some("shared-token"));
+            assert!(saved.profiles[name].fingerprint.is_none());
+        }
+    }
+
+    #[test]
+    fn auth_rejection_refuses_to_clear_a_frozen_owner_after_current_switches() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("auth-rejection-frozen-owner");
+        let mut conns = connection::Connections {
+            current: Some("A".to_string()),
+            ..Default::default()
+        };
+        for name in ["A", "B"] {
+            conns.profiles.insert(
+                name.to_string(),
+                connection::Profile {
+                    url: "ws://shared:8787".to_string(),
+                    token: Some("shared-token".to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+        connection::save(&conns).expect("save A/B");
+        let target =
+            connection::resolve(&conns, &Target::Current, None, None, || None).expect("resolve A");
+        let owner = session_credential_owner_in(&conns, &target).expect("owner A");
+        connection::mutate(|live| {
+            live.current = Some("B".to_string());
+            Ok(())
+        })
+        .expect("switch to B");
+
+        let error = clear_session_owner_token(Some(&owner), &target)
+            .expect_err("a drifted current-profile owner must be rejected");
+        assert!(
+            error.report().message.contains("is no longer current"),
+            "{}",
+            error.report().message
+        );
+
+        let saved = connection::load().expect("load A/B");
+        assert_eq!(saved.profiles["A"].token.as_deref(), Some("shared-token"));
+        assert_eq!(saved.profiles["B"].token.as_deref(), Some("shared-token"));
+    }
+
+    #[test]
+    fn reconnect_owner_snapshot_allows_an_explicit_transport_token() {
+        let mut conns = connection::Connections {
+            current: Some("B".to_string()),
+            ..Default::default()
+        };
+        let disk_profile = connection::Profile {
+            url: "ws://shared:8787".to_string(),
+            token: Some("disk-token-b".to_string()),
+            fingerprint: Some("fingerprint-b".to_string()),
+            ..Default::default()
+        };
+        conns.profiles.insert("B".to_string(), disk_profile.clone());
+        let target = connection::resolve(
+            &conns,
+            &Target::Current,
+            None,
+            Some("caller-token".to_string()),
+            || None,
+        )
+        .expect("resolve B with explicit token");
+        let owner = session_credential_owner_in(&conns, &target).expect("owner B");
+
+        assert_eq!(
+            reconnect_owner_fingerprint_in(&conns, "B", &target, Some(&owner))
+                .expect("transport token does not change the disk owner"),
+            Some("fingerprint-b".to_string())
+        );
+    }
+
+    #[test]
+    fn saved_profile_connect_failure_directs_explicit_repair_without_leaking_url_secrets() {
+        let target = Resolved::unowned(
+            "wss://host.test".into(),
+            Some("stored-token".into()),
+            Source::Profile("office".into()),
+        );
         let message = reconnect_connect_error(
             &target,
             "connect wss://user:pass@host.test/x?token=SECRET#tail failed",
@@ -2424,14 +3775,11 @@ mod tests {
                 token: Some("token-a".to_string()),
                 label: None,
                 fingerprint: Some("fp-a".to_string()),
+                ..Default::default()
             },
         );
         connection::save(&conns).expect("save A");
-        let target = Resolved {
-            url: "ws://server-b:8787".to_string(),
-            token: None,
-            source: Source::Env,
-        };
+        let target = Resolved::unowned("ws://server-b:8787".to_string(), None, Source::Env);
 
         assert!(!persist_token(&target, "token-b").expect("skip persist"));
         assert!(!clear_target_token(&target).expect("skip clear"));
@@ -2450,7 +3798,7 @@ mod tests {
     }
 
     #[test]
-    fn unowned_mdns_target_never_mutates_current_profile_a_or_saved_b() {
+    fn unowned_mdns_candidate_is_rejected_before_profile_mutation() {
         let _lock = ENV_LOCK.lock().expect("env lock");
         let _guard = EnvGuard::new("mdns-provenance");
         let mut conns = connection::Connections {
@@ -2475,36 +3823,24 @@ mod tests {
             },
         );
         connection::save(&conns).expect("save A/B");
-        let target = Resolved {
-            url: "ws://server-b:8787".to_string(),
-            token: None,
-            source: Source::Mdns,
-        };
-        assert_eq!(target.source, Source::Mdns);
-        assert_eq!(target.token, None);
+        // A credentialed current profile never turns copied TXT metadata into a
+        // target, so the persistence helpers cannot be reached for it.
+        let error = connection::resolve(&conns, &Target::Current, None, None, || {
+            Some(connection::ResolutionCandidate::Mdns(
+                connection::Discovered {
+                    url: "ws://server-b:8787".to_string(),
+                    fingerprint: Some("fp-b".to_string()),
+                },
+            ))
+        })
+        .expect_err("credentialed profile requires explicit recovery");
+        assert!(error.report().message.contains("--pairing-code <code>"));
 
-        assert!(!persist_token(&target, "minted").expect("skip persist"));
-        assert!(!clear_target_token(&target).expect("skip clear"));
-        assert_eq!(
-            pin_target_fingerprint(&target, "fp-b").expect("skip pin"),
-            None
-        );
         let after = connection::load().expect("reload A/B");
         assert_eq!(after.profiles["a"].token.as_deref(), Some("token-a"));
         assert_eq!(after.profiles["a"].fingerprint, None);
         assert_eq!(after.profiles["b"].token.as_deref(), Some("token-b"));
         assert_eq!(after.profiles["b"].fingerprint.as_deref(), Some("fp-b"));
-
-        // A credentialed current profile no longer enters automatic discovery
-        // on reconnect, even if copied TXT metadata matches another profile.
-        let error = connection::resolve(&after, &Target::Current, None, None, || {
-            Some(connection::Discovered {
-                url: "ws://server-b:8787".to_string(),
-                fingerprint: Some("fp-b".to_string()),
-            })
-        })
-        .expect_err("credentialed profile requires explicit recovery");
-        assert!(error.report().message.contains("--pairing-code <code>"));
     }
 
     #[test]
@@ -2534,11 +3870,11 @@ mod tests {
             },
         );
         connection::save(&conns).expect("save A/B");
-        let target = Resolved {
-            url: "ws://server-a:8787".to_string(),
-            token: Some("old-a".to_string()),
-            source: Source::Profile("a".to_string()),
-        };
+        let target = Resolved::unowned(
+            "ws://server-a:8787".to_string(),
+            Some("old-a".to_string()),
+            Source::Profile("a".to_string()),
+        );
 
         assert!(!persist_token(&target, "new-a").expect("reject synthetic owner"));
         let after = connection::load().expect("reload A/B");
@@ -2546,6 +3882,32 @@ mod tests {
         assert_eq!(after.profiles["a"].token.as_deref(), Some("old-a"));
         assert_eq!(after.profiles["b"].token.as_deref(), Some("token-b"));
         assert_eq!(after.profiles["b"].fingerprint.as_deref(), Some("fp-b"));
+    }
+
+    #[test]
+    fn profile_source_without_resolver_owner_capability_is_not_durable() {
+        let mut conns = connection::Connections {
+            current: Some("a".to_string()),
+            ..Default::default()
+        };
+        conns.profiles.insert(
+            "a".to_string(),
+            connection::Profile {
+                url: "ws://server-a:8787".to_string(),
+                token: Some("saved-a".to_string()),
+                ..Default::default()
+            },
+        );
+        let target = Resolved::unowned(
+            "ws://server-a:8787".to_string(),
+            Some("saved-a".to_string()),
+            Source::Profile("a".to_string()),
+        );
+
+        assert!(
+            session_credential_owner_in(&conns, &target).is_none(),
+            "display provenance is not a resolver-issued owner capability"
+        );
     }
 
     #[test]
@@ -2565,19 +3927,54 @@ mod tests {
             },
         );
         connection::save(&conns).expect("save A");
-        let target = Resolved {
-            url: "ws://server-a:8787".to_string(),
-            token: Some("explicit-env".to_string()),
-            source: Source::Env,
-        };
+        let target = connection::resolve(
+            &conns,
+            &Target::Current,
+            None,
+            Some("saved-a".to_string()),
+            || None,
+        )
+        .expect("resolve current with same-value explicit token");
+        let owner = session_credential_owner_in(&conns, &target)
+            .expect("saved profile still supplies the disk owner snapshot");
 
-        assert!(!clear_target_token(&target).expect("skip clear"));
+        assert!(!clear_session_owner_token(Some(&owner), &target).expect("skip clear"));
         assert_eq!(
             connection::load().expect("reload").profiles["a"]
                 .token
                 .as_deref(),
             Some("saved-a")
         );
+    }
+
+    #[test]
+    fn durable_session_rejects_whitespace_server_fingerprint() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("whitespace-server-fingerprint");
+        let mut conns = connection::Connections {
+            current: Some("a".to_string()),
+            ..Default::default()
+        };
+        conns.profiles.insert(
+            "a".to_string(),
+            connection::Profile {
+                url: "ws://server-a:8787".to_string(),
+                token: Some("saved-a".to_string()),
+                ..Default::default()
+            },
+        );
+        connection::save(&conns).expect("save A");
+        let target =
+            connection::resolve(&conns, &Target::Current, None, None, || None).expect("resolve A");
+        let owner = session_credential_owner_in(&conns, &target).expect("capture owner A");
+
+        assert!(
+            persist_authenticated_target_credentials(&owner, &target, " \t ", None).is_err(),
+            "a durable identity pin must contain non-whitespace bytes"
+        );
+        assert!(connection::load().expect("reload").profiles["a"]
+            .fingerprint
+            .is_none());
     }
 
     #[test]
@@ -2598,14 +3995,9 @@ mod tests {
 
         for (source, url) in [
             (Source::Env, "ws://server-b:8787"),
-            (Source::Mdns, "ws://server-b:8787"),
             (Source::Default, connection::DEFAULT_URL),
         ] {
-            let target = Resolved {
-                url: url.to_string(),
-                token: None,
-                source,
-            };
+            let target = Resolved::unowned(url.to_string(), None, source);
             assert!(!persist_token(&target, "token-b").expect("skip persist"));
         }
 
@@ -2632,13 +4024,16 @@ mod tests {
             },
         );
         connection::save(&conns).expect("save URL-less default");
-        let target = Resolved {
-            url: "ws://rogue-advertiser:8787".to_string(),
-            token: None,
-            source: Source::Mdns,
-        };
-
-        assert!(!persist_token(&target, "rogue-token").expect("skip persist"));
+        let error = connection::resolve(&conns, &Target::Current, None, None, || {
+            Some(connection::ResolutionCandidate::Mdns(
+                connection::Discovered {
+                    url: "ws://rogue-advertiser:8787".to_string(),
+                    fingerprint: Some("legacy-pin".to_string()),
+                },
+            ))
+        })
+        .expect_err("unselected discovery cannot become a persistence target");
+        assert!(error.report().message.contains("fleety init"));
 
         let after = connection::load().expect("reload default");
         assert!(after.current.is_none());
@@ -2656,24 +4051,56 @@ mod tests {
 
         // Nothing configured → the localhost default.
         assert_eq!(
-            resolve_target().expect("resolve").url,
+            resolve_target().expect("resolve").url(),
             connection::DEFAULT_URL
         );
 
         // No env + a current profile (a paired device) → its url + token.
-        let target = Resolved {
-            url: "ws://srv:8787".to_string(),
-            token: None,
-            source: Source::Env,
+        let mut conns = connection::Connections {
+            current: Some("home".to_string()),
+            ..Default::default()
         };
-        persist_token(&target, "tok").expect("persist");
+        conns.profiles.insert(
+            "home".to_string(),
+            connection::Profile {
+                url: "ws://srv:8787".to_string(),
+                token: Some("tok".to_string()),
+                ..Default::default()
+            },
+        );
+        connection::save(&conns).expect("save paired profile");
         let r = resolve_target().expect("resolve");
-        assert_eq!(r.url, "ws://srv:8787");
-        assert_eq!(r.token.as_deref(), Some("tok"));
+        assert_eq!(r.url(), "ws://srv:8787");
+        assert_eq!(r.token(), Some("tok"));
 
         // An old env deployment still connects: FLEETY_AGENT_URL overrides.
         std::env::set_var("FLEETY_AGENT_URL", "ws://env:8787");
-        assert_eq!(resolve_target().expect("resolve").url, "ws://env:8787");
+        assert_eq!(resolve_target().expect("resolve").url(), "ws://env:8787");
+    }
+
+    #[test]
+    fn empty_environment_url_upgrades_and_resolves_the_legacy_current_profile() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let guard = EnvGuard::new("resolve-empty-agent-url");
+        std::env::set_var("FLEETY_AGENT_URL", "");
+        let path = guard.temp_home.join(".fleety").join("connections.toml");
+        std::fs::create_dir_all(path.parent().unwrap()).expect("create connections directory");
+        std::fs::write(
+            &path,
+            "current = \"home\"\n\n[profiles.home]\nurl = \"ws://srv:8787\"\ntoken = \"tok\"\n",
+        )
+        .expect("seed legacy profile");
+
+        let (target, owner) = resolve_target_with_owner().expect("empty environment URL is unset");
+
+        assert_eq!(target.url(), "ws://srv:8787");
+        assert!(target.has_profile_owner());
+        assert!(owner.is_some());
+        assert!(
+            !connection::load().expect("load upgraded profile").profiles["home"]
+                .generation
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2766,10 +4193,16 @@ mod tests {
         let journal = reconnect_journal_path();
         let ready = ControlReady {
             pid: std::process::id(),
+            process_start: "test-process-start".to_string(),
             instance: "daemon-a".to_string(),
         };
         std::fs::create_dir_all(ready_path().parent().expect("control directory"))
             .expect("create control directory");
+        let _identity = fleety_tools::service::claim_process_identity_at(
+            &process_identity_path(&ready.process_start),
+            &ready.process_start,
+        )
+        .expect("claim test process identity");
         std::fs::write(ready_path(), encode_ready(&ready)).expect("publish test control owner");
 
         let timeout = request_running_daemon_reconnect_with_wait("B", std::time::Duration::ZERO)
@@ -2882,16 +4315,22 @@ mod tests {
     }
 
     #[test]
-    fn later_profile_request_cannot_mistake_an_older_settlement_for_its_own() {
+    fn later_profile_request_reaps_an_older_settlement_and_submits_its_own_nonce() {
         let _lock = ENV_LOCK.lock().expect("env lock");
         let _guard = EnvGuard::new("reconnect-settlement-owner");
         let journal = reconnect_journal_path();
         let ready = ControlReady {
             pid: std::process::id(),
+            process_start: "test-process-start".to_string(),
             instance: "daemon-a".to_string(),
         };
         std::fs::create_dir_all(ready_path().parent().expect("control directory"))
             .expect("create control directory");
+        let _identity = fleety_tools::service::claim_process_identity_at(
+            &process_identity_path(&ready.process_start),
+            &ready.process_start,
+        )
+        .expect("claim test process identity");
         std::fs::write(ready_path(), encode_ready(&ready)).expect("publish test control owner");
         let request = ReconnectRequest {
             instance: "daemon-a".to_string(),
@@ -2899,27 +4338,387 @@ mod tests {
             expected_profile: "B".to_string(),
         };
         submit_reconnect_at(&journal, &request).expect("submit B");
-        append_reconnect_event_at(
-            &journal,
-            &ReconnectJournalEvent::Settled {
-                ack: ReconnectAck {
-                    nonce: "r1".to_string(),
-                    accepted: true,
-                    message: "B connected".to_string(),
-                },
-            },
-        )
-        .expect("settle B");
+        let ack = ReconnectAck {
+            nonce: "r1".to_string(),
+            accepted: true,
+            message: "B connected".to_string(),
+        };
+        publish_reconnect_success_proof(&journal, &ack).expect("prove B success");
+        append_reconnect_event_at(&journal, &ReconnectJournalEvent::Settled { ack })
+            .expect("settle B");
 
         let error = request_running_daemon_reconnect_with_wait("C", std::time::Duration::ZERO)
             .expect_err("C must not inherit B's success");
 
-        assert!(error.report().message.contains("profile 'B'"));
-        assert!(error
-            .report()
-            .message
-            .contains("profile 'C' was not submitted"));
-        assert!(!journal.exists(), "observed settlement should be reaped");
+        assert!(error.report().message.contains("remains durable"));
+        assert!(!error.report().message.contains("B connected"));
+        let state = load_reconnect_journal_at(&journal)
+            .expect("load new journal")
+            .expect("new C request");
+        assert_eq!(state.request.expected_profile, "C");
+        assert_ne!(state.request.nonce, "r1");
+        assert!(matches!(state.phase, ReconnectPhase::Submitted));
+    }
+
+    #[test]
+    fn same_profile_request_submits_a_new_nonce_after_reaping_an_older_settlement() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("reconnect-same-profile-settlement-owner");
+        let journal = reconnect_journal_path();
+        let ready = ControlReady {
+            pid: std::process::id(),
+            process_start: "test-process-start".to_string(),
+            instance: "daemon-a".to_string(),
+        };
+        std::fs::create_dir_all(ready_path().parent().expect("control directory"))
+            .expect("create control directory");
+        let _identity = fleety_tools::service::claim_process_identity_at(
+            &process_identity_path(&ready.process_start),
+            &ready.process_start,
+        )
+        .expect("claim test process identity");
+        std::fs::write(ready_path(), encode_ready(&ready)).expect("publish test control owner");
+        let previous = ReconnectRequest {
+            instance: "daemon-a".to_string(),
+            nonce: "r1".to_string(),
+            expected_profile: "B".to_string(),
+        };
+        submit_reconnect_at(&journal, &previous).expect("submit previous B request");
+        let ack = ReconnectAck {
+            nonce: "r1".to_string(),
+            accepted: true,
+            message: "stale B success".to_string(),
+        };
+        publish_reconnect_success_proof(&journal, &ack).expect("prove previous B success");
+        append_reconnect_event_at(&journal, &ReconnectJournalEvent::Settled { ack })
+            .expect("settle previous B request");
+
+        let error = request_running_daemon_reconnect_with_wait("B", std::time::Duration::ZERO)
+            .expect_err("a new B operation cannot return r1 success");
+
+        assert!(error.report().message.contains("remains durable"));
+        assert!(!error.report().message.contains("stale B success"));
+        let state = load_reconnect_journal_at(&journal)
+            .expect("load new journal")
+            .expect("new B request");
+        assert_eq!(state.request.expected_profile, "B");
+        assert_ne!(state.request.nonce, "r1");
+        assert!(matches!(state.phase, ReconnectPhase::Submitted));
+    }
+
+    #[test]
+    fn replacing_a_settled_request_preserves_its_nonce_addressed_receipt() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("reconnect-settlement-receipt");
+        let journal = reconnect_journal_path();
+        let ready = ControlReady {
+            pid: std::process::id(),
+            process_start: "test-process-start".to_string(),
+            instance: "daemon-a".to_string(),
+        };
+        std::fs::create_dir_all(ready_path().parent().expect("control directory"))
+            .expect("create control directory");
+        let _identity = fleety_tools::service::claim_process_identity_at(
+            &process_identity_path(&ready.process_start),
+            &ready.process_start,
+        )
+        .expect("claim test process identity");
+        std::fs::write(ready_path(), encode_ready(&ready)).expect("publish test control owner");
+        let previous = ReconnectRequest {
+            instance: "daemon-a".to_string(),
+            nonce: "r1".to_string(),
+            expected_profile: "B".to_string(),
+        };
+        submit_reconnect_at(&journal, &previous).expect("submit r1");
+        let ack = ReconnectAck {
+            nonce: "r1".to_string(),
+            accepted: true,
+            message: "r1 connected".to_string(),
+        };
+        publish_reconnect_success_proof(&journal, &ack).expect("prove r1 success");
+        append_reconnect_event_at(&journal, &ReconnectJournalEvent::Settled { ack })
+            .expect("settle r1");
+
+        request_running_daemon_reconnect_with_wait("B", std::time::Duration::ZERO)
+            .expect_err("r2 remains pending while daemon is offline");
+
+        let receipt = control_path("fleetyd.reconnect-receipts").join("7231.json");
+        let bytes = std::fs::read(receipt).expect("r1 result must survive r2 submission");
+        assert!(String::from_utf8_lossy(&bytes).contains("r1 connected"));
+        let observed = take_reconnect_ack_at(&journal, "r1")
+            .expect("observe r1 receipt")
+            .expect("r1 terminal result");
+        assert!(observed.accepted);
+        assert_eq!(observed.message, "r1 connected");
+        assert!(
+            !reconnect_success_proof_path_at(&journal, "r1")
+                .expect("proof path")
+                .exists(),
+            "delivered success proof is reaped with its terminal carrier"
+        );
+        let active = load_reconnect_journal_at(&journal)
+            .expect("load active journal")
+            .expect("r2 remains active");
+        assert_ne!(active.request.nonce, "r1");
+    }
+
+    #[test]
+    fn existing_receipt_retries_a_failed_durability_sync() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("reconnect-receipt-sync-retry");
+        let journal = reconnect_journal_path();
+        let receipt = reconnect_receipt_path_at(&journal, "r1").expect("receipt path");
+        let ack = ReconnectAck {
+            nonce: "r1".to_string(),
+            accepted: true,
+            message: "connected".to_string(),
+        };
+        let mut attempts = 0;
+        let mut fail_once = |_: &std::path::Path, _: &std::path::Path| {
+            attempts += 1;
+            if attempts == 1 {
+                Err(reconnect_journal_error(
+                    "injected receipt directory sync failure",
+                ))
+            } else {
+                Ok(())
+            }
+        };
+
+        preserve_reconnect_receipt_at_with(&receipt, &ack, &mut fail_once)
+            .expect_err("first durability sync fails after receipt publication");
+        assert!(receipt.exists(), "published receipt remains retryable");
+        preserve_reconnect_receipt_at_with(&receipt, &ack, &mut fail_once)
+            .expect("existing receipt retries durability");
+        assert_eq!(attempts, 2);
+    }
+
+    #[test]
+    fn ambiguous_published_proof_is_hidden_before_leases_release() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("reconnect-proof-quarantine");
+        let journal = reconnect_journal_path();
+        let proof = reconnect_success_proof_path_at(&journal, "r1").expect("proof path");
+        let ack = ReconnectAck {
+            nonce: "r1".to_string(),
+            accepted: true,
+            message: "connected".to_string(),
+        };
+        preserve_reconnect_receipt_at(&proof, &ack).expect("publish proof");
+
+        quarantine_ambiguous_success_proof(&proof).expect("quarantine proof");
+
+        assert!(!proof.exists(), "caller cannot see the ambiguous proof");
+    }
+
+    #[test]
+    fn ambiguous_proof_quarantine_retries_directory_sync_before_returning() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("reconnect-proof-quarantine-sync");
+        let journal = reconnect_journal_path();
+        let proof = reconnect_success_proof_path_at(&journal, "r1").expect("proof path");
+        let ack = ReconnectAck {
+            nonce: "r1".to_string(),
+            accepted: true,
+            message: "connected".to_string(),
+        };
+        preserve_reconnect_receipt_at(&proof, &ack).expect("publish proof");
+        let mut sync_attempts = 0;
+
+        quarantine_ambiguous_success_proof_with(
+            &proof,
+            |from, to| std::fs::rename(from, to),
+            |target| std::fs::remove_file(target),
+            |_| {
+                sync_attempts += 1;
+                if sync_attempts == 1 {
+                    Err(reconnect_journal_error(
+                        "injected quarantine directory sync failure",
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+            || {},
+        )
+        .expect("quarantine retries durability");
+
+        assert_eq!(sync_attempts, 2);
+        assert!(!proof.exists(), "canonical proof stays hidden");
+    }
+
+    #[test]
+    fn ambiguous_proof_quarantine_retries_transient_hide_failures() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("reconnect-proof-quarantine-hide");
+        let journal = reconnect_journal_path();
+        let proof = reconnect_success_proof_path_at(&journal, "r1").expect("proof path");
+        let ack = ReconnectAck {
+            nonce: "r1".to_string(),
+            accepted: true,
+            message: "connected".to_string(),
+        };
+        preserve_reconnect_receipt_at(&proof, &ack).expect("publish proof");
+        let mut rename_attempts = 0;
+        let mut remove_attempts = 0;
+
+        quarantine_ambiguous_success_proof_with(
+            &proof,
+            |from, to| {
+                rename_attempts += 1;
+                if rename_attempts == 1 {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "injected rename failure",
+                    ))
+                } else {
+                    std::fs::rename(from, to)
+                }
+            },
+            |path| {
+                remove_attempts += 1;
+                if remove_attempts == 1 {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "injected remove failure",
+                    ))
+                } else {
+                    std::fs::remove_file(path)
+                }
+            },
+            |_| Ok(()),
+            || {},
+        )
+        .expect("quarantine retries hiding");
+
+        assert_eq!(rename_attempts, 2);
+        assert_eq!(remove_attempts, 1);
+        assert!(!proof.exists(), "canonical proof stays hidden");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absent_proof_under_a_missing_directory_syncs_its_control_root() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("reconnect-proof-quarantine-absent");
+        let journal = reconnect_journal_path();
+        let proof = reconnect_success_proof_path_at(&journal, "r1").expect("proof path");
+        let parent = proof.parent().expect("proof parent");
+        std::fs::create_dir_all(journal.parent().expect("control root"))
+            .expect("create control root");
+
+        assert!(!parent.exists(), "proof directory starts absent");
+        sync_hidden_reconnect_proof_directories_at(parent)
+            .expect("the existing control root proves the absent child durable");
+    }
+
+    #[test]
+    fn receipt_durability_includes_the_control_root_for_a_new_subdirectory() {
+        let control_root = std::path::Path::new("control-root");
+        let receipt_dir = control_root.join("fleetyd.reconnect-success");
+
+        assert_eq!(
+            reconnect_receipt_sync_directories(&receipt_dir),
+            vec![receipt_dir, control_root.to_path_buf()]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reconnect_receipt_sync_opens_the_published_file_with_write_access() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("reconnect-receipt-windows-sync");
+        let journal = reconnect_journal_path();
+        let receipt = reconnect_receipt_path_at(&journal, "r1").expect("receipt path");
+        let ack = ReconnectAck {
+            nonce: "r1".to_string(),
+            accepted: true,
+            message: "connected".to_string(),
+        };
+
+        preserve_reconnect_receipt_at(&receipt, &ack)
+            .expect("Windows FlushFileBuffers requires a write-capable file handle");
+        preserve_reconnect_receipt_at(&receipt, &ack)
+            .expect("an existing receipt remains durably retryable on Windows");
+    }
+
+    #[test]
+    fn receipt_cleanup_failure_cannot_replace_the_observed_terminal_result() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("reconnect-receipt-cleanup-failure");
+        let journal = reconnect_journal_path();
+        let receipt = reconnect_receipt_path_at(&journal, "r1").expect("receipt path");
+        let ack = ReconnectAck {
+            nonce: "r1".to_string(),
+            accepted: false,
+            message: "r1 failed".to_string(),
+        };
+        preserve_reconnect_receipt_at(&receipt, &ack).expect("publish r1 receipt");
+        submit_reconnect_at(
+            &journal,
+            &ReconnectRequest {
+                instance: "daemon-a".to_string(),
+                nonce: "r2".to_string(),
+                expected_profile: "B".to_string(),
+            },
+        )
+        .expect("submit active r2");
+
+        let observed = take_reconnect_ack_at_with(
+            &journal,
+            "r1",
+            |_| {
+                Err(reconnect_journal_error(
+                    "injected receipt cleanup sync failure",
+                ))
+            },
+            |_| panic!("r2 journal must not be reaped while observing r1"),
+        )
+        .expect("cleanup failure does not replace settlement")
+        .expect("r1 terminal result");
+
+        assert_eq!(observed, ack);
+        assert!(receipt.exists(), "failed cleanup remains retryable");
+        let active = load_reconnect_journal_at(&journal)
+            .expect("load active journal")
+            .expect("r2 remains active");
+        assert_eq!(active.request.nonce, "r2");
+    }
+
+    #[test]
+    fn startup_reaps_a_success_proof_whose_terminal_carrier_is_gone() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("reconnect-orphan-proof-reap");
+        let journal = reconnect_journal_path();
+        let ack = ReconnectAck {
+            nonce: "r1".to_string(),
+            accepted: true,
+            message: "connected".to_string(),
+        };
+        publish_reconnect_success_proof(&journal, &ack).expect("publish orphan proof");
+        let proof = reconnect_success_proof_path_at(&journal, "r1").expect("proof path");
+
+        reap_orphan_reconnect_success_proofs_at(&journal).expect("reap orphan proof");
+
+        assert!(!proof.exists());
+    }
+
+    #[test]
+    fn startup_reaps_a_crash_left_success_proof_temp_file() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("reconnect-orphan-proof-temp");
+        let journal = reconnect_journal_path();
+        let proof_dir = journal
+            .parent()
+            .expect("control root")
+            .join("fleetyd.reconnect-success");
+        std::fs::create_dir_all(&proof_dir).expect("create proof dir");
+        let temp = proof_dir.join(".receipt-crash.tmp");
+        std::fs::write(&temp, b"{").expect("leave torn temp");
+
+        reap_orphan_reconnect_success_proofs_at(&journal).expect("reap crash temp");
+
+        assert!(!temp.exists());
     }
 
     #[test]
@@ -3019,11 +4818,22 @@ mod tests {
         let mut pending = Some(PendingReconnect::new(request));
         decide_pending_reconnect(&mut pending, true, "connected".to_string());
 
-        let settled = settle_pending_reconnect_at_with(&journal, &mut pending, |path, event| {
-            append_reconnect_event_at(path, event)?;
-            std::fs::remove_file(path).expect("caller reaps observed settlement");
-            Ok(())
-        });
+        let settled = settle_pending_reconnect_at_with_proof(
+            &journal,
+            &mut pending,
+            |path, ack| {
+                publish_reconnect_success_proof(path, ack)?;
+                let observed = take_reconnect_ack_at(path, &ack.nonce)?
+                    .ok_or_else(|| reconnect_journal_error("caller did not observe settlement"))?;
+                if observed != *ack {
+                    return Err(reconnect_journal_error(
+                        "caller observed a different settlement",
+                    ));
+                }
+                Ok(())
+            },
+            append_reconnect_event_at,
+        );
 
         assert!(settled.expect("durable settlement"));
         assert!(
@@ -3082,11 +4892,8 @@ mod tests {
             },
         );
         connection::save(&conns).expect("save B");
-        let target = Resolved {
-            url: "ws://server-b:8787".to_string(),
-            token: Some("token-b".to_string()),
-            source: Source::Profile("B".to_string()),
-        };
+        let target =
+            connection::resolve(&conns, &Target::Current, None, None, || None).expect("resolve B");
 
         assert_eq!(
             reconnect_target_fingerprint("B", &target)
@@ -3103,7 +4910,7 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_reconnect_write_failure_never_freezes_uncommitted_success() {
+    fn authenticated_reconnect_write_failure_keeps_retryable_success_after_credentials() {
         let _lock = ENV_LOCK.lock().expect("env lock");
         let _guard = EnvGuard::new("reconnect-authenticated-write-failure");
         let mut conns = connection::Connections {
@@ -3120,11 +4927,8 @@ mod tests {
             },
         );
         connection::save(&conns).expect("save B");
-        let target = Resolved {
-            url: "ws://server-b:8787".to_string(),
-            token: Some("token-b".to_string()),
-            source: Source::Profile("B".to_string()),
-        };
+        let target =
+            connection::resolve(&conns, &Target::Current, None, None, || None).expect("resolve B");
         let journal = reconnect_journal_path();
         let request = ReconnectRequest {
             instance: "daemon-a".to_string(),
@@ -3152,15 +4956,827 @@ mod tests {
         assert!(
             pending
                 .as_ref()
-                .is_some_and(|pending| pending.decision.is_none()),
-            "a success that was not durably committed is not terminal"
+                .and_then(|pending| pending.decision.as_ref())
+                .is_some_and(|decision| decision.accepted),
+            "authenticated success remains frozen for durable settlement retry"
         );
         decide_pending_reconnect(&mut pending, false, "later failure".to_string());
         let decision = pending
             .as_ref()
             .and_then(|pending| pending.decision.as_ref())
             .expect("frozen decision");
-        assert!(!decision.accepted);
-        assert_eq!(decision.message, "later failure");
+        assert!(decision.accepted);
+        assert!(!decision.message.contains("later failure"));
+    }
+
+    #[test]
+    fn credential_persistence_failure_prevents_success_publication() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("reconnect-credential-persistence-failure");
+        let target = Resolved::unowned(
+            "ws://server-b:8787".to_string(),
+            Some("old-token".to_string()),
+            Source::Profile("B".to_string()),
+        );
+        let journal = reconnect_journal_path();
+        let request = ReconnectRequest {
+            instance: "daemon-a".to_string(),
+            nonce: "nonce-a".to_string(),
+            expected_profile: "B".to_string(),
+        };
+        submit_reconnect_at(&journal, &request).expect("submit reconnect");
+        let claimed = claim_reconnect_at(&journal, "daemon-a")
+            .expect("claim reconnect")
+            .expect("claimed request");
+        let mut pending = Some(PendingReconnect::new(claimed));
+        let mut appended = false;
+
+        let error = commit_authenticated_reconnect_with(
+            &target,
+            "fingerprint-b",
+            Some("new-token"),
+            &mut pending,
+            |_, _, _, _| {
+                Err(agent_core::CoreError::Message(
+                    "injected credential persistence failure".to_string(),
+                ))
+            },
+            |_, _| {
+                appended = true;
+                Ok(())
+            },
+        )
+        .expect_err("credential failure must stop success publication");
+
+        assert!(error.report().message.contains("credential"));
+        assert!(!appended, "success settlement must not be attempted");
+        assert!(
+            pending
+                .as_ref()
+                .is_some_and(|pending| pending.decision.is_none()),
+            "failed credential persistence cannot freeze success"
+        );
+    }
+
+    #[test]
+    fn storage_failure_after_credential_commit_keeps_success_retryable() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("reconnect-post-credential-storage-failure");
+        let target = Resolved::unowned(
+            "ws://server-b:8787".to_string(),
+            Some("old-token".to_string()),
+            Source::Profile("B".to_string()),
+        );
+        let request = ReconnectRequest {
+            instance: "daemon-a".to_string(),
+            nonce: "nonce-a".to_string(),
+            expected_profile: "B".to_string(),
+        };
+        let mut pending = Some(PendingReconnect::new(request));
+
+        commit_authenticated_reconnect_with_settle(
+            &target,
+            "fingerprint-b",
+            Some("new-token"),
+            &mut pending,
+            |_, _, _, _| {
+                Ok(Resolved::unowned(
+                    target.url_owned(),
+                    Some("new-token".to_string()),
+                    target.source().clone(),
+                ))
+            },
+            |_, _, _| {
+                Err(agent_core::CoreError::Message(
+                    "injected reconnect lease storage failure".to_string(),
+                ))
+            },
+        )
+        .expect_err("post-credential storage failure remains retryable");
+
+        let pending = pending.expect("pending reconnect retained");
+        assert!(
+            pending.decision.is_some_and(|decision| decision.accepted),
+            "committed credentials freeze success before storage-dependent settlement"
+        );
+        assert_eq!(
+            pending
+                .authenticated
+                .expect("committed snapshot")
+                .target
+                .token(),
+            Some("new-token")
+        );
+    }
+
+    #[test]
+    fn authenticated_retry_repeats_credential_publication_sync_before_success() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("reconnect-credential-publication-retry");
+        let mut conns = connection::Connections {
+            current: Some("B".to_string()),
+            ..Default::default()
+        };
+        conns.profiles.insert(
+            "B".to_string(),
+            connection::Profile {
+                url: "ws://server-b:8787".to_string(),
+                token: Some("new-token".to_string()),
+                fingerprint: Some("fingerprint-b".to_string()),
+                ..Default::default()
+            },
+        );
+        connection::save(&conns).expect("save committed credentials");
+        let target =
+            connection::resolve(&conns, &Target::Current, None, None, || None).expect("resolve B");
+        let request = ReconnectRequest {
+            instance: "daemon-a".to_string(),
+            nonce: "nonce-a".to_string(),
+            expected_profile: "B".to_string(),
+        };
+        let mut pending = Some(PendingReconnect::new(request));
+        freeze_authenticated_reconnect(&target, Some("fingerprint-b"), &mut pending)
+            .expect("freeze authenticated result");
+
+        let error = settle_pending_reconnect_with_credential_sync(&mut pending, || {
+            Err(agent_core::CoreError::Message(
+                "injected credential publication sync failure".to_string(),
+            ))
+        })
+        .expect_err("publication sync must gate success settlement");
+
+        assert!(error.report().message.contains("credential publication"));
+        let pending = pending.expect("accepted reconnect remains retryable");
+        assert!(
+            pending.decision.is_some_and(|decision| decision.accepted),
+            "sync failure cannot replace the frozen authenticated decision"
+        );
+        assert!(pending.authenticated.is_some());
+    }
+
+    #[test]
+    fn success_proof_failure_keeps_journal_unobservable_and_retryable() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("reconnect-success-proof-failure");
+        let mut conns = connection::Connections {
+            current: Some("B".to_string()),
+            ..Default::default()
+        };
+        conns.profiles.insert(
+            "B".to_string(),
+            connection::Profile {
+                url: "ws://server-b:8787".to_string(),
+                token: Some("new-token".to_string()),
+                fingerprint: Some("fingerprint-b".to_string()),
+                ..Default::default()
+            },
+        );
+        connection::save(&conns).expect("save committed credentials");
+        let target =
+            connection::resolve(&conns, &Target::Current, None, None, || None).expect("resolve B");
+        let mut pending = Some(PendingReconnect::new(ReconnectRequest {
+            instance: "daemon-a".to_string(),
+            nonce: "nonce-a".to_string(),
+            expected_profile: "B".to_string(),
+        }));
+        let mut appended = false;
+
+        settle_authenticated_reconnect_with_proof(
+            &target,
+            Some("fingerprint-b"),
+            &mut pending,
+            |_, _| {
+                Err(agent_core::CoreError::Message(
+                    "injected success proof failure".to_string(),
+                ))
+            },
+            |_, _| {
+                appended = true;
+                Ok(())
+            },
+        )
+        .expect_err("proof failure blocks caller-visible success");
+
+        assert!(appended, "journal durability precedes proof publication");
+        assert!(
+            pending
+                .as_ref()
+                .and_then(|pending| pending.decision.as_ref())
+                .is_some_and(|decision| decision.accepted),
+            "unproven success remains frozen for proof retry"
+        );
+    }
+
+    #[test]
+    fn append_sync_ambiguity_never_promotes_page_cache_success() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("reconnect-append-sync-ambiguity");
+        let mut conns = connection::Connections {
+            current: Some("B".to_string()),
+            ..Default::default()
+        };
+        conns.profiles.insert(
+            "B".to_string(),
+            connection::Profile {
+                url: "ws://server-b:8787".to_string(),
+                token: Some("new-token".to_string()),
+                fingerprint: Some("fingerprint-b".to_string()),
+                ..Default::default()
+            },
+        );
+        connection::save(&conns).expect("save committed credentials");
+        let target =
+            connection::resolve(&conns, &Target::Current, None, None, || None).expect("resolve B");
+        let journal = reconnect_journal_path();
+        let request = ReconnectRequest {
+            instance: "daemon-a".to_string(),
+            nonce: "nonce-a".to_string(),
+            expected_profile: "B".to_string(),
+        };
+        submit_reconnect_at(&journal, &request).expect("submit");
+        claim_reconnect_at(&journal, "daemon-a")
+            .expect("claim")
+            .expect("request");
+        let mut pending = Some(PendingReconnect::new(request));
+
+        let error = settle_authenticated_reconnect_with_proof(
+            &target,
+            Some("fingerprint-b"),
+            &mut pending,
+            |_, _| Ok(()),
+            |path, event| {
+                append_reconnect_event_at(path, event)?;
+                Err(agent_core::CoreError::Message(
+                    "injected sync ambiguity after write".to_string(),
+                ))
+            },
+        )
+        .expect_err("an append error cannot be promoted from readable bytes");
+
+        assert!(error.report().message.contains("sync ambiguity"));
+        assert!(
+            pending
+                .as_ref()
+                .and_then(|pending| pending.decision.as_ref())
+                .is_some_and(|decision| decision.accepted),
+            "authenticated success remains frozen for a durable retry"
+        );
+        assert!(
+            take_reconnect_ack_at(&journal, "nonce-a").is_err(),
+            "caller cannot observe success until its post-append proof commits"
+        );
+    }
+
+    #[test]
+    fn authenticated_success_retry_rejects_owner_drift_before_proof() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("reconnect-success-retry-owner-drift");
+        let mut conns = connection::Connections {
+            current: Some("B".to_string()),
+            ..Default::default()
+        };
+        conns.profiles.insert(
+            "B".to_string(),
+            connection::Profile {
+                url: "ws://server-b:8787".to_string(),
+                token: Some("new-token".to_string()),
+                fingerprint: Some("fingerprint-b".to_string()),
+                ..Default::default()
+            },
+        );
+        connection::save(&conns).expect("save committed credentials");
+        let target =
+            connection::resolve(&conns, &Target::Current, None, None, || None).expect("resolve B");
+        let journal = reconnect_journal_path();
+        let request = ReconnectRequest {
+            instance: "daemon-a".to_string(),
+            nonce: "nonce-a".to_string(),
+            expected_profile: "B".to_string(),
+        };
+        submit_reconnect_at(&journal, &request).expect("submit");
+        claim_reconnect_at(&journal, "daemon-a")
+            .expect("claim")
+            .expect("request");
+        let mut pending = Some(PendingReconnect::new(request));
+        settle_authenticated_reconnect_with(
+            &target,
+            Some("fingerprint-b"),
+            &mut pending,
+            |_, _| {
+                Err(agent_core::CoreError::Message(
+                    "injected first append failure".to_string(),
+                ))
+            },
+        )
+        .expect_err("first append fails");
+
+        connection::mutate(|live| {
+            live.current = None;
+            Ok(())
+        })
+        .expect("drift current owner");
+
+        assert!(
+            settle_pending_reconnect(&mut pending).expect("owner drift settles failure"),
+            "owner drift produces a terminal result"
+        );
+        let result = take_reconnect_ack_at(&journal, "nonce-a")
+            .expect("read owner-drift result")
+            .expect("terminal result");
+        assert!(!result.accepted);
+        assert!(result.message.contains("changed before reconnect success"));
+        assert!(
+            !reconnect_success_proof_path_at(&journal, "nonce-a")
+                .expect("proof path")
+                .exists(),
+            "owner drift cannot publish success proof"
+        );
+    }
+
+    #[test]
+    fn frozen_success_retry_finishes_from_an_existing_failure_receipt() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("reconnect-owner-drift-receipt-retry");
+        let journal = reconnect_journal_path();
+        let request = ReconnectRequest {
+            instance: "daemon-a".to_string(),
+            nonce: "nonce-a".to_string(),
+            expected_profile: "B".to_string(),
+        };
+        let mut pending = Some(PendingReconnect {
+            request,
+            decision: Some(ReconnectAck {
+                nonce: "nonce-a".to_string(),
+                accepted: true,
+                message: "frozen success".to_string(),
+            }),
+            authenticated: None,
+        });
+        let failure = ReconnectAck {
+            nonce: "nonce-a".to_string(),
+            accepted: false,
+            message: "owner drift".to_string(),
+        };
+        let receipt = reconnect_receipt_path_at(&journal, "nonce-a").expect("receipt path");
+        preserve_reconnect_receipt_at(&receipt, &failure).expect("publish failure receipt");
+
+        assert!(
+            reject_frozen_authenticated_reconnect(&mut pending, "owner drift".to_string())
+                .expect("resume failure cleanup"),
+            "existing failure receipt is authoritative"
+        );
+        assert!(pending.is_none());
+        assert!(!journal.exists());
+        let observed = take_reconnect_ack_at(&journal, "nonce-a")
+            .expect("observe failure receipt")
+            .expect("failure result");
+        assert!(!observed.accepted);
+    }
+
+    #[test]
+    fn caller_rejects_success_without_durable_credential_commit_proof() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("reconnect-unproven-success");
+        let journal = reconnect_journal_path();
+        let request = ReconnectRequest {
+            instance: "daemon-a".to_string(),
+            nonce: "nonce-a".to_string(),
+            expected_profile: "B".to_string(),
+        };
+        submit_reconnect_at(&journal, &request).expect("submit");
+        claim_reconnect_at(&journal, "daemon-a")
+            .expect("claim")
+            .expect("request");
+        append_reconnect_event_at(
+            &journal,
+            &ReconnectJournalEvent::Settled {
+                ack: ReconnectAck {
+                    nonce: "nonce-a".to_string(),
+                    accepted: true,
+                    message: "page-cache-only success".to_string(),
+                },
+            },
+        )
+        .expect("inject unproven success");
+
+        let error =
+            take_reconnect_ack_at(&journal, "nonce-a").expect_err("unproven success is rejected");
+        assert!(error.report().message.contains("no durable"));
+    }
+
+    #[test]
+    fn caller_rejects_success_receipt_without_durable_credential_commit_proof() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("reconnect-unproven-success-receipt");
+        let journal = reconnect_journal_path();
+        let receipt = reconnect_receipt_path_at(&journal, "nonce-a").expect("receipt path");
+        preserve_reconnect_receipt_at(
+            &receipt,
+            &ReconnectAck {
+                nonce: "nonce-a".to_string(),
+                accepted: true,
+                message: "unproven receipt success".to_string(),
+            },
+        )
+        .expect("inject unproven success receipt");
+
+        let error = take_reconnect_ack_at(&journal, "nonce-a")
+            .expect_err("unproven receipt success is rejected");
+        assert!(error.report().message.contains("no durable"));
+        assert!(
+            receipt.exists(),
+            "rejected receipt remains available for repair"
+        );
+    }
+
+    #[test]
+    fn restart_converts_unproven_success_projection_to_failure() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("reconnect-unproven-success-restart");
+        let journal = reconnect_journal_path();
+        let request = ReconnectRequest {
+            instance: "daemon-a".to_string(),
+            nonce: "nonce-a".to_string(),
+            expected_profile: "B".to_string(),
+        };
+        submit_reconnect_at(&journal, &request).expect("submit");
+        claim_reconnect_at(&journal, "daemon-a")
+            .expect("claim")
+            .expect("request");
+        append_reconnect_event_at(
+            &journal,
+            &ReconnectJournalEvent::Settled {
+                ack: ReconnectAck {
+                    nonce: "nonce-a".to_string(),
+                    accepted: true,
+                    message: "journal survived before proof".to_string(),
+                },
+            },
+        )
+        .expect("inject unproven success projection");
+
+        recover_reconnect_for_instance_at(&journal, "daemon-restarted")
+            .expect("restart repairs unproven success");
+        let recovered = take_reconnect_ack_at(&journal, "nonce-a")
+            .expect("read repaired result")
+            .expect("terminal failure");
+        assert!(!recovered.accepted);
+        assert!(recovered
+            .message
+            .contains("before reconnect success committed"));
+    }
+
+    #[test]
+    fn settlement_failure_after_credential_commit_leaves_restart_ready_token_without_success() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("reconnect-credential-commit-before-settlement");
+        let mut conns = connection::Connections {
+            current: Some("B".to_string()),
+            ..Default::default()
+        };
+        conns.profiles.insert(
+            "B".to_string(),
+            connection::Profile {
+                url: "ws://server-b:8787".to_string(),
+                token: Some("old-token".to_string()),
+                ..Default::default()
+            },
+        );
+        connection::save(&conns).expect("save B");
+        let target =
+            connection::resolve(&conns, &Target::Current, None, None, || None).expect("resolve B");
+        let journal = reconnect_journal_path();
+        let request = ReconnectRequest {
+            instance: "daemon-a".to_string(),
+            nonce: "nonce-a".to_string(),
+            expected_profile: "B".to_string(),
+        };
+        submit_reconnect_at(&journal, &request).expect("submit reconnect");
+        let claimed = claim_reconnect_at(&journal, "daemon-a")
+            .expect("claim reconnect")
+            .expect("claimed request");
+        let mut pending = Some(PendingReconnect::new(claimed));
+
+        commit_authenticated_reconnect_with(
+            &target,
+            "fingerprint-b",
+            Some("new-token"),
+            &mut pending,
+            persist_authenticated_profile_credentials,
+            |_, _| {
+                Err(agent_core::CoreError::Message(
+                    "injected settlement failure after credential commit".to_string(),
+                ))
+            },
+        )
+        .expect_err("settlement append fails");
+
+        let persisted = connection::load().expect("load committed credential");
+        let profile = &persisted.profiles["B"];
+        assert_eq!(profile.token.as_deref(), Some("new-token"));
+        assert_eq!(profile.fingerprint.as_deref(), Some("fingerprint-b"));
+        assert!(
+            pending
+                .as_ref()
+                .and_then(|pending| pending.decision.as_ref())
+                .is_some_and(|decision| decision.accepted),
+            "failed settlement append remains retryable but has no caller-visible proof"
+        );
+        let restart_target = resolve_target().expect("restart resolves committed profile");
+        assert_eq!(restart_target.token(), Some("new-token"));
+        recover_reconnect_for_instance_at(&journal, "daemon-restarted")
+            .expect("restart settles interrupted nonce");
+        let recovered = load_reconnect_journal_at(&journal)
+            .expect("load recovered journal")
+            .expect("recovered settlement");
+        assert!(matches!(
+            recovered.phase,
+            ReconnectPhase::Settled(ReconnectAck {
+                accepted: false,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn ready_publication_declares_control_version_and_process_start_identity() {
+        let ready = ControlReady {
+            pid: std::process::id(),
+            process_start: "test-process-start".to_string(),
+            instance: "daemon-a".to_string(),
+        };
+        let value: serde_json::Value =
+            serde_json::from_slice(&encode_ready(&ready)).expect("ready JSON");
+
+        assert_eq!(
+            value.get("version").and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+        assert!(
+            value
+                .get("process_start")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|identity| !identity.is_empty()),
+            "ready publication must distinguish PID reuse"
+        );
+    }
+
+    #[test]
+    fn unknown_ready_and_journal_versions_fail_immediately() {
+        let unknown_ready = serde_json::json!({
+            "version": 999,
+            "pid": std::process::id(),
+            "process_start": "start-a",
+            "instance": "daemon-a"
+        });
+        assert!(
+            parse_ready(unknown_ready.to_string().as_bytes()).is_none(),
+            "an unknown ready contract must not be treated as the current owner format"
+        );
+        let future_shape = serde_json::json!({
+            "version": 999,
+            "owner": {
+                "process": 42,
+                "generation": "future-a"
+            }
+        });
+        let future_error = parse_ready_record(future_shape.to_string().as_bytes())
+            .expect_err("version negotiation must precede current-version fields");
+        assert!(future_error.report().message.contains("incompatible"));
+        assert!(future_error.report().message.contains("update"));
+
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("unknown-reconnect-journal-version");
+        let journal = reconnect_journal_path();
+        std::fs::create_dir_all(journal.parent().expect("control directory"))
+            .expect("create control directory");
+        std::fs::write(
+            &journal,
+            serde_json::json!({
+                "version": 999,
+                "event": "submitted",
+                "instance": "daemon-a",
+                "nonce": "nonce-a",
+                "expected_profile": "B"
+            })
+            .to_string()
+                + "\n",
+        )
+        .expect("seed unknown journal");
+
+        let error = load_reconnect_journal_at(&journal)
+            .expect_err("unknown control journal must fail closed");
+        assert!(error.report().message.contains("version"));
+        assert!(error.report().message.contains("update"));
+    }
+
+    #[test]
+    fn current_requester_rejects_legacy_ready_without_waiting_or_submitting() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("legacy-ready-version");
+        std::fs::create_dir_all(ready_path().parent().expect("control directory"))
+            .expect("create control directory");
+        std::fs::write(
+            ready_path(),
+            serde_json::json!({
+                "pid": std::process::id(),
+                "instance": "legacy-daemon"
+            })
+            .to_string(),
+        )
+        .expect("seed legacy ready");
+
+        let error = request_running_daemon_reconnect_with_wait("B", std::time::Duration::ZERO)
+            .expect_err("legacy control owner must require an update");
+
+        assert!(error.report().message.contains("incompatible"));
+        assert!(error.report().message.contains("update"));
+        assert!(
+            !reconnect_journal_path().exists(),
+            "the new requester must not submit a request an old Daemon may mishandle"
+        );
+    }
+
+    #[test]
+    fn current_daemon_reads_and_settles_a_legacy_requester_journal() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("legacy-requester-current-daemon");
+        let journal = reconnect_journal_path();
+        std::fs::create_dir_all(journal.parent().expect("control directory"))
+            .expect("create control directory");
+        std::fs::write(
+            &journal,
+            serde_json::json!({
+                "event": "submitted",
+                "instance": "daemon-a",
+                "nonce": "legacy-nonce",
+                "expected_profile": "B"
+            })
+            .to_string()
+                + "\n",
+        )
+        .expect("seed legacy requester journal");
+
+        let request = claim_reconnect_at(&journal, "daemon-a")
+            .expect("read legacy request")
+            .expect("claim legacy request");
+        let mut pending = Some(PendingReconnect::new(request));
+        decide_pending_reconnect(
+            &mut pending,
+            false,
+            "update the Fleety CLI to use reconnect control version 1".to_string(),
+        );
+        settle_pending_reconnect_at_with(&journal, &mut pending, append_reconnect_event_at)
+            .expect("settle for legacy requester");
+
+        let state = load_reconnect_journal_at(&journal)
+            .expect("load mixed journal")
+            .expect("terminal state");
+        assert!(matches!(
+            state.phase,
+            ReconnectPhase::Settled(ReconnectAck {
+                accepted: false,
+                ref message,
+                ..
+            }) if message.contains("update")
+        ));
+        let records = std::fs::read_to_string(&journal).expect("mixed journal");
+        assert!(
+            records
+                .lines()
+                .skip(1)
+                .all(|line| line.contains("\"version\":1")),
+            "new events carry a version while remaining readable to the legacy parser"
+        );
+    }
+
+    #[test]
+    fn same_pid_with_a_different_start_identity_is_not_a_live_owner() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("reused-pid-ready-owner");
+        std::fs::create_dir_all(ready_path().parent().expect("control directory"))
+            .expect("create control directory");
+        let stale = ControlReady {
+            pid: std::process::id(),
+            process_start: "stale-process-start".to_string(),
+            instance: "stale-daemon".to_string(),
+        };
+        std::fs::write(ready_path(), encode_ready(&stale)).expect("seed stale ready");
+
+        let guard = ControlGuard::claim()
+            .expect("a reused pid without the matching start-identity lock is stale");
+        assert_ne!(guard.ready.process_start, stale.process_start);
+    }
+
+    #[test]
+    fn ready_publication_failure_matrix_never_leaves_an_ambiguous_owner() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("ready-publication-crash-matrix");
+        let path = ready_path();
+        let ready = ControlReady {
+            pid: std::process::id(),
+            process_start: "start-a".to_string(),
+            instance: "daemon-a".to_string(),
+        };
+
+        let stage_error = publish_ready_at_with(
+            &path,
+            &ready,
+            |_, _| Err(agent_core::CoreError::Message("stage crash".to_string())),
+            |_, _| Ok(()),
+            |_| Ok(()),
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .expect_err("staging failure");
+        assert!(stage_error.report().message.contains("stage crash"));
+        assert!(!path.exists());
+
+        let rename_error = publish_ready_at_with(
+            &path,
+            &ready,
+            |temp, bytes| {
+                std::fs::write(temp, bytes)
+                    .map_err(|error| agent_core::CoreError::Message(error.to_string()))
+            },
+            |_, _| Err(agent_core::CoreError::Message("rename crash".to_string())),
+            |_| Ok(()),
+            |_| Ok(()),
+            |target| match std::fs::remove_file(target) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(agent_core::CoreError::Message(error.to_string())),
+            },
+        )
+        .expect_err("rename failure");
+        assert!(rename_error.report().message.contains("rename crash"));
+        assert!(!path.exists());
+
+        let flush_error = publish_ready_at_with(
+            &path,
+            &ready,
+            |temp, bytes| {
+                std::fs::write(temp, bytes)
+                    .map_err(|error| agent_core::CoreError::Message(error.to_string()))
+            },
+            |temp, target| {
+                std::fs::rename(temp, target)
+                    .map_err(|error| agent_core::CoreError::Message(error.to_string()))
+            },
+            |_| {
+                Err(agent_core::CoreError::Message(
+                    "canonical flush crash".to_string(),
+                ))
+            },
+            |_| Ok(()),
+            |target| match std::fs::remove_file(target) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(agent_core::CoreError::Message(error.to_string())),
+            },
+        )
+        .expect_err("post-rename canonical flush failure");
+        assert!(flush_error
+            .report()
+            .message
+            .contains("canonical flush crash"));
+        assert!(
+            !path.exists(),
+            "a failed canonical flush must hide the renamed ready record"
+        );
+
+        let sync_calls = std::cell::Cell::new(0usize);
+        let sync_error = publish_ready_at_with(
+            &path,
+            &ready,
+            |temp, bytes| {
+                std::fs::write(temp, bytes)
+                    .map_err(|error| agent_core::CoreError::Message(error.to_string()))
+            },
+            |temp, target| {
+                std::fs::rename(temp, target)
+                    .map_err(|error| agent_core::CoreError::Message(error.to_string()))
+            },
+            |_| Ok(()),
+            |_| {
+                let call = sync_calls.get();
+                sync_calls.set(call + 1);
+                if call == 0 {
+                    Err(agent_core::CoreError::Message(
+                        "directory sync crash".to_string(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+            |target| {
+                std::fs::remove_file(target)
+                    .map_err(|error| agent_core::CoreError::Message(error.to_string()))
+            },
+        )
+        .expect_err("post-rename sync failure");
+        assert!(sync_error.report().message.contains("directory sync crash"));
+        assert_eq!(sync_calls.get(), 2, "absence must be synced after cleanup");
+        assert!(!path.exists());
     }
 }

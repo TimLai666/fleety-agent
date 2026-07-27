@@ -474,6 +474,22 @@ fn tasklist_contains_pid(output: &[u8], pid: u32) -> bool {
         .any(|line| csv_field(line.trim(), 1).as_deref() == Some(expected.as_str()))
 }
 
+#[cfg(not(target_os = "windows"))]
+fn classify_unix_ps_probe(code: Option<i32>, stdout: &[u8], stderr: &[u8], pid: u32) -> PidState {
+    let expected = pid.to_string();
+    match code {
+        Some(0)
+            if String::from_utf8_lossy(stdout)
+                .lines()
+                .any(|line| line.trim() == expected) =>
+        {
+            PidState::Alive
+        }
+        Some(1) if stdout.is_empty() && stderr.is_empty() => PidState::Dead,
+        _ => PidState::Unknown,
+    }
+}
+
 /// Probe whether a process with `pid` is currently alive. Windows first uses
 /// native `tasklist.exe` CSV output as a language-independent live-process fast
 /// path. If that cannot confirm the PID, bounded PowerShell fallback
@@ -529,21 +545,35 @@ pub fn probe_pid(pid: u32) -> PidState {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        // `-0` only probes; suppress output so a dead pid doesn't leak
-        // "kill: <pid>: No such process" to the terminal (it is expected here).
-        Command::new("kill")
+        // Unix process IDs use a signed `pid_t`; values outside that domain
+        // cannot identify a live owner.
+        if pid > i32::MAX as u32 {
+            return PidState::Dead;
+        }
+        // `kill -0` success proves liveness. A non-zero result can also mean
+        // permission denial, so confirm absence through `ps` before declaring
+        // the owner dead; unexpected output remains Unknown and fails closed.
+        let kill = Command::new("kill")
             .args(["-0", &pid.to_string()])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status()
-            .map(|status| {
-                if status.success() {
-                    PidState::Alive
-                } else {
-                    PidState::Dead
-                }
-            })
-            .unwrap_or(PidState::Unknown)
+            .status();
+        match kill {
+            Ok(status) if status.success() => PidState::Alive,
+            Ok(_) => Command::new("ps")
+                .args(["-p", &pid.to_string(), "-o", "pid="])
+                .output()
+                .map(|output| {
+                    classify_unix_ps_probe(
+                        output.status.code(),
+                        &output.stdout,
+                        &output.stderr,
+                        pid,
+                    )
+                })
+                .unwrap_or(PidState::Unknown),
+            Err(_) => PidState::Unknown,
+        }
     }
 }
 
@@ -710,38 +740,255 @@ fn acquire_at_with_probe<F>(path: &Path, mut probe: F) -> Result<Acquire>
 where
     F: FnMut(u32) -> PidState,
 {
-    if let Some(pid) = read_pid(path) {
-        match probe(pid) {
-            PidState::Alive => return Ok(Acquire::AlreadyRunning(pid)),
-            PidState::Dead => {}
-            PidState::Unknown => {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| CoreError::Message(format!("cannot create {}: {e}", parent.display())))?;
+    }
+    let mut lock_name = path.as_os_str().to_os_string();
+    lock_name.push(".lock");
+    let lock_path = PathBuf::from(lock_name);
+    let claim_lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|error| {
+            CoreError::Message(format!(
+                "cannot open ownership claim lock {}: {error}",
+                lock_path.display()
+            ))
+        })?;
+    fs4::FileExt::try_lock(&claim_lock).map_err(|error| {
+        CoreError::Message(format!(
+            "ownership claim is already locked at {}; refusing concurrent startup: {error}",
+            lock_path.display()
+        ))
+    })?;
+    let owner = std::process::id().to_string();
+    loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(mut file) => {
+                use std::io::Write;
+                if let Err(error) = file.write_all(owner.as_bytes()) {
+                    drop(file);
+                    let _ = std::fs::remove_file(path);
+                    return Err(CoreError::Message(format!(
+                        "cannot write pidfile {}: {error}",
+                        path.display()
+                    )));
+                }
+                return Ok(Acquire::Started(PidGuard {
+                    path: path.to_path_buf(),
+                    owner,
+                }));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let contents = std::fs::read_to_string(path).map_err(|read_error| {
+                    CoreError::Message(format!(
+                        "cannot read pid owner {}: {read_error}; refusing to replace its ownership file",
+                        path.display()
+                    ))
+                })?;
+                let pid = contents.trim().parse::<u32>().map_err(|parse_error| {
+                    CoreError::Message(format!(
+                        "cannot parse pid owner {}: {parse_error}; refusing to replace its ownership file",
+                        path.display()
+                    ))
+                })?;
+                match probe(pid) {
+                    PidState::Alive => return Ok(Acquire::AlreadyRunning(pid)),
+                    PidState::Unknown => {
+                        return Err(CoreError::Message(format!(
+                            "could not verify pid {pid} from {}; refusing to replace its ownership file",
+                            path.display()
+                        )));
+                    }
+                    PidState::Dead => {
+                        if std::fs::read_to_string(path).ok().as_deref() != Some(contents.as_str())
+                        {
+                            continue;
+                        }
+                        match std::fs::remove_file(path) {
+                            Ok(()) => continue,
+                            Err(remove_error)
+                                if remove_error.kind() == std::io::ErrorKind::NotFound =>
+                            {
+                                continue;
+                            }
+                            Err(remove_error) => {
+                                return Err(CoreError::Message(format!(
+                                    "cannot remove stale pid owner {}: {remove_error}",
+                                    path.display()
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+            Err(error) => {
                 return Err(CoreError::Message(format!(
-                    "could not verify pid {pid} from {}; refusing to replace its ownership file",
+                    "cannot claim pidfile {}: {error}",
                     path.display()
                 )));
             }
         }
     }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| CoreError::Message(format!("cannot create {}: {e}", parent.display())))?;
-    }
-    std::fs::write(path, std::process::id().to_string())
-        .map_err(|e| CoreError::Message(format!("cannot write pidfile {}: {e}", path.display())))?;
-    Ok(Acquire::Started(PidGuard {
-        path: path.to_path_buf(),
-    }))
 }
 
 /// Holds the pidfile for the process lifetime; removes it on drop.
 #[derive(Debug)]
 pub struct PidGuard {
     path: PathBuf,
+    owner: String,
 }
 
 impl Drop for PidGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        if std::fs::read_to_string(&self.path).is_ok_and(|owner| owner == self.owner) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessIdentityState {
+    Held,
+    Available,
+}
+
+#[derive(Debug)]
+pub struct ProcessIdentityGuard {
+    file: std::fs::File,
+    path: PathBuf,
+    identity: String,
+}
+
+impl ProcessIdentityGuard {
+    pub fn identity(&self) -> &str {
+        &self.identity
+    }
+}
+
+pub fn probe_process_identity_at(path: &Path) -> Result<ProcessIdentityState> {
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ProcessIdentityState::Available)
+        }
+        Err(error) => {
+            return Err(CoreError::Message(format!(
+                "cannot inspect process identity lock {}: {error}",
+                path.display()
+            )))
+        }
+    };
+    match fs4::FileExt::try_lock(&file) {
+        Ok(()) => {
+            let _ = fs4::FileExt::unlock(&file);
+            Ok(ProcessIdentityState::Available)
+        }
+        Err(fs4::TryLockError::WouldBlock) => Ok(ProcessIdentityState::Held),
+        Err(fs4::TryLockError::Error(error)) => Err(CoreError::Message(format!(
+            "cannot verify process identity lock {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+pub fn claim_process_identity_at(path: &Path, identity: &str) -> Result<ProcessIdentityGuard> {
+    if identity.is_empty() {
+        return Err(CoreError::Message(
+            "process identity must not be empty".to_string(),
+        ));
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            CoreError::Message(format!("cannot create {}: {error}", parent.display()))
+        })?;
+    }
+    let created = !path.exists();
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|error| {
+            CoreError::Message(format!(
+                "cannot open process identity lock {}: {error}",
+                path.display()
+            ))
+        })?;
+    fs4::FileExt::try_lock(&file).map_err(|error| {
+        CoreError::Message(format!(
+            "another process holds identity lock {}: {error}",
+            path.display()
+        ))
+    })?;
+    use std::io::{Seek, Write};
+    file.set_len(0)
+        .and_then(|()| file.rewind())
+        .and_then(|_| file.write_all(identity.as_bytes()))
+        .and_then(|()| file.sync_all())
+        .map_err(|error| {
+            CoreError::Message(format!(
+                "cannot publish process identity lock {}: {error}",
+                path.display()
+            ))
+        })?;
+    #[cfg(unix)]
+    if created {
+        if let Some(parent) = path.parent() {
+            std::fs::File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| {
+                    CoreError::Message(format!(
+                        "cannot make process identity directory durable {}: {error}",
+                        parent.display()
+                    ))
+                })?;
+        }
+    }
+    Ok(ProcessIdentityGuard {
+        file,
+        path: path.to_path_buf(),
+        identity: identity.to_string(),
+    })
+}
+
+fn release_process_identity_with<R, D, U>(
+    identity: &str,
+    mut read_identity: R,
+    mut remove_path: D,
+    mut unlock: U,
+) where
+    R: FnMut() -> std::io::Result<String>,
+    D: FnMut() -> std::io::Result<()>,
+    U: FnMut() -> std::io::Result<()>,
+{
+    if read_identity().is_ok_and(|current| current == identity) {
+        let _ = remove_path();
+    }
+    let _ = unlock();
+}
+
+impl Drop for ProcessIdentityGuard {
+    fn drop(&mut self) {
+        release_process_identity_with(
+            &self.identity,
+            || std::fs::read_to_string(&self.path),
+            || std::fs::remove_file(&self.path),
+            || fs4::FileExt::unlock(&self.file),
+        );
     }
 }
 
@@ -1041,6 +1288,59 @@ mod tests {
     }
 
     #[test]
+    fn process_identity_lock_distinguishes_live_owner_from_reused_pid() {
+        let dir = std::env::temp_dir().join(format!(
+            "fleety-process-identity-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("tempdir");
+        let path = dir.join("fleetyd.process-start.lock");
+
+        assert_eq!(
+            probe_process_identity_at(&path).expect("missing identity"),
+            ProcessIdentityState::Available
+        );
+        let guard = claim_process_identity_at(&path, "start-a").expect("claim identity");
+        assert_eq!(guard.identity(), "start-a");
+        assert_eq!(
+            probe_process_identity_at(&path).expect("held identity"),
+            ProcessIdentityState::Held
+        );
+        drop(guard);
+        assert_eq!(
+            probe_process_identity_at(&path).expect("released identity"),
+            ProcessIdentityState::Available
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn process_identity_release_removes_our_path_before_unlocking() {
+        let events = std::cell::RefCell::new(Vec::new());
+        release_process_identity_with(
+            "start-a",
+            || {
+                events.borrow_mut().push("read");
+                Ok("start-a".to_string())
+            },
+            || {
+                events.borrow_mut().push("remove");
+                Ok(())
+            },
+            || {
+                events.borrow_mut().push("unlock");
+                Ok(())
+            },
+        );
+
+        assert_eq!(*events.borrow(), ["read", "remove", "unlock"]);
+    }
+
+    #[test]
     fn acquire_does_not_overwrite_owner_when_probe_is_unknown() {
         let dir =
             std::env::temp_dir().join(format!("fleety-acq-unknown-test-{}", std::process::id()));
@@ -1053,6 +1353,92 @@ mod tests {
         assert!(error.to_string().contains("could not verify pid 4242"));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "4242");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn acquire_rejects_malformed_owner_without_replacing_it() {
+        let dir =
+            std::env::temp_dir().join(format!("fleety-acq-malformed-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("owner.pid");
+        std::fs::write(&path, "not-a-pid").unwrap();
+
+        let error = acquire_at(&path).unwrap_err();
+
+        assert!(error.to_string().contains("cannot parse pid owner"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not-a-pid");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn acquire_never_takes_over_a_dead_owner_while_claim_is_locked() {
+        let dir =
+            std::env::temp_dir().join(format!("fleety-acq-locked-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("owner.pid");
+        let lock_path = dir.join("owner.pid.lock");
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        fs4::FileExt::try_lock(&lock).unwrap();
+        let dead = definitely_dead_pid().to_string();
+        std::fs::write(&path, &dead).unwrap();
+
+        let error = acquire_at(&path).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("ownership claim is already locked"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), dead);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pid_guard_does_not_remove_a_replaced_owner() {
+        let dir =
+            std::env::temp_dir().join(format!("fleety-guard-owner-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("owner.pid");
+        let guard = match acquire_at(&path).unwrap() {
+            Acquire::Started(guard) => guard,
+            Acquire::AlreadyRunning(pid) => panic!("unexpected live owner {pid}"),
+        };
+        let replacement = definitely_dead_pid().to_string();
+        std::fs::write(&path, &replacement).unwrap();
+
+        drop(guard);
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), replacement);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn unix_fallback_distinguishes_visible_denied_pid_from_a_missing_pid() {
+        assert_eq!(
+            classify_unix_ps_probe(Some(0), b" 4242\n", b"", 4242),
+            PidState::Alive
+        );
+        assert_eq!(
+            classify_unix_ps_probe(Some(1), b"", b"", 4242),
+            PidState::Dead
+        );
+        assert_eq!(
+            classify_unix_ps_probe(Some(1), b"", b"permission denied", 4242),
+            PidState::Unknown
+        );
+        assert_eq!(
+            classify_unix_ps_probe(Some(2), b"", b"", 4242),
+            PidState::Unknown
+        );
+        assert_eq!(
+            classify_unix_ps_probe(Some(0), b"", b"", 4242),
+            PidState::Unknown
+        );
     }
 
     #[test]

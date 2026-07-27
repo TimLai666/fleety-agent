@@ -248,7 +248,7 @@ async fn provider_edit_remote_loop(
             now_secs,
         )
         .await;
-        let connection_id = target.url.clone();
+        let connection_id = target.url_owned();
 
         // The editor loop is synchronous (crossterm events); each save runs the
         // async apply on the runtime from inside it.

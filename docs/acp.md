@@ -69,12 +69,44 @@ ACP is a shared protocol, so the installer is not Zed-only:
 
 - Writes `command` = the binary you ran the installer from (`current_exe`),
   `args` = `["acp"]`, and `env.FLEETY_AGENT_URL` when `--server` is given.
+- `zed` and `--server <url>` may appear in either order. The endpoint must be a
+  non-empty `ws://` or `wss://` URL without embedded credentials, terminal
+  controls, or a URL fragment; validation failure returns non-zero before any
+  settings file is touched.
 - **Re-running updates it** (reports `Configured` on a fresh add vs `Updated` on a
   re-run) — handy after `cargo install` moves the binary.
+- `FLEETY_TOKEN` is treated as bound to the configured transient endpoint. A
+  same-endpoint re-run preserves it; changing or removing
+  `FLEETY_AGENT_URL` clears it so an old bearer token cannot reach another
+  Server or override the saved current profile.
 - **Non-destructive**: other settings and other agent servers are preserved; the
-  previous file is saved to `settings.json.bak`.
+  previous file is saved to `settings.json.bak`. Read, backup, or replacement
+  failure returns non-zero. On Unix, the replacement, backup, and any recovery
+  copy use owner-only `0600` permissions because they may contain
+  `FLEETY_TOKEN`. Publication moves the exact file read by Fleety aside, compares
+  those displaced bytes, then creates the destination only if it is still
+  absent. If another process changes or recreates `settings.json`, Fleety
+  preserves that path and reports the unique `.recovery` copy when needed.
+  Any failure to restore displaced settings reports the recovery path instead
+  of implying that the canonical file was preserved. If restoration succeeds
+  but removing the recovery link fails, Fleety says the canonical settings are
+  active and reports only the retained cleanup path.
+  If publication succeeds but antivirus or filesystem policy prevents removing
+  a private `.tmp` or `.recovery` file, Fleety reports the settings as active,
+  warns with every retained path, and does not tell you to reapply the change.
+  If publication itself fails and its private temp file also cannot be removed,
+  the error reports that retained path for manual cleanup.
+  Close Zed before installing or updating: no portable filesystem operation can
+  stop a non-cooperating process from writing through a handle it opened before
+  the update.
 - **JSONC-safe**: if your `settings.json` has comments (so it can't be parsed as
   plain JSON), it is **not** clobbered — the snippet is printed for you to paste.
+- The settings base (`HOME` or `APPDATA`) must be a non-empty absolute path.
+  Otherwise the command prints the manual snippet and exits non-zero without
+  writing relative to the working directory.
+- `fleety update` refreshes an already-installed Fleety entry. An unreadable,
+  invalid, or unwritable existing Zed settings file makes the update incomplete
+  and returns non-zero instead of being silently skipped.
 
 Zed settings location: `%APPDATA%\Zed\settings.json` (Windows),
 `~/.config/zed/settings.json` (macOS/Linux).
@@ -92,14 +124,28 @@ settings. The Zed shape, as a reference:
       "type": "custom",
       "command": "/absolute/path/to/fleety",
       "args": ["acp"],
-      "env": { "FLEETY_AGENT_URL": "ws://127.0.0.1:8787" }
+      "env": {}
     }
   }
 }
 ```
 
 Use an **absolute** path for `command` (editors don't always inherit your shell
-`PATH`). `FLEETY_AGENT_URL` is optional — it defaults to `ws://127.0.0.1:8787`.
+`PATH`). With no endpoint environment override, ACP uses the saved current
+profile and its credential, then the trusted local default when no profile is
+configured. `FLEETY_AGENT_URL` is optional; when present, it is a transient
+endpoint and never borrows a saved profile token. For an authenticated server,
+either add `FLEETY_TOKEN` explicitly to the editor environment or omit
+`FLEETY_AGENT_URL` so ACP uses the saved current profile.
+
+The adapter bounds both WebSocket connection/upgrade and `Welcome` waits. It
+sends no prompt, resume, or cancellation frame until the Server returns
+`Welcome`. A saved profile must receive its exact non-empty pinned Server
+identity in that `Welcome`; otherwise the adapter closes the connection without
+forwarding editor content or accepting Server control.
+An ACP turn completes only after `Done`. A disconnect, receive failure, or
+failure to deliver a required editor-tool／approval reply fails the turn instead
+of returning a misleading `end_turn` after partial output.
 
 ## Remote / shared server
 
@@ -107,7 +153,9 @@ Because the editor only runs a thin adapter, the actual agent can live elsewhere
 set `FLEETY_AGENT_URL` (in the editor's `env`, or via `fleety acp install --server
 <url>`) to point at a server on another host. The same server can be shared by
 Zed, `fleety tui`, scheduled runs, etc. Use `wss://` + TLS for anything beyond
-loopback.
+loopback. `fleety acp install --server <url>` writes only the transient endpoint;
+an authenticated endpoint also needs an explicit `FLEETY_TOKEN`, or a saved
+current profile with the raw server override omitted.
 
 ## Using a real model
 

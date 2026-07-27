@@ -143,7 +143,9 @@ polling, and on-device tool routing.
 An ACP-capable editor (Zed, …) can drive Fleety from its agent panel: it launches
 `fleety acp` as a subprocess, which bridges to your server. Auto-configure Zed
 with `fleety acp install zed`. Full guide (setup, other editors, remote server,
-updates, troubleshooting): [`docs/acp.md`](docs/acp.md).
+updates, troubleshooting): [`docs/acp.md`](docs/acp.md). ACP uses the saved
+current profile by default; `acp install --server` creates a transient endpoint
+that needs an explicit `FLEETY_TOKEN` when authentication is required.
 
 ### Point the CLI at a server
 
@@ -153,34 +155,45 @@ updates, troubleshooting): [`docs/acp.md`](docs/acp.md).
 2. `FLEETY_AGENT_URL` (env, transient), else
 3. the current server profile in `~/.fleety/connections.toml` (set by
    `fleety connection use` / `fleety init`), else
-4. mDNS discovery on the LAN without borrowing stored profile credentials (a short 2 s probe), else
+4. a trusted same-host loopback server, else
 5. the local default `ws://127.0.0.1:8787`.
 
-`FLEETY_AGENT_URL` never borrows credentials from a profile for a different
-URL. Set `FLEETY_TOKEN` explicitly for a transient endpoint, or use a named
-profile. A transient endpoint also cannot overwrite or clear another profile's
-token or fingerprint.
+Raw `--server` / `--url` and `FLEETY_AGENT_URL` targets never borrow credentials
+from any saved profile, even when the URL is identical. Set `FLEETY_TOKEN`
+in the client process environment for a transient endpoint, or use
+`--profile <name>` / the saved current profile. The Server-owned
+`FLEETY_TOKEN` in `config.toml` is never loaded as a client credential. A
+transient endpoint also cannot overwrite or clear a saved profile's token or
+fingerprint. Explicit endpoints reject embedded credentials, terminal controls,
+and URL fragments before any connection or settings write.
+Each saved profile has an internal lifecycle generation, so deleting and
+recreating the same name and URL cannot retarget an in-flight pairing reply.
 
-mDNS keeps the advertised Server fingerprint only as an untrusted selection
-hint. Automatic discovery never attaches a stored token or changes a
-credentialed profile. A token-only profile with no URL, or a saved endpoint that
-stops answering, requires explicit endpoint selection and re-pairing. Changing a
-profile URL clears its old token and fingerprint first.
+mDNS keeps the advertised Server fingerprint only as an untrusted picker hint.
+Automatic discovery never creates a connection target, sends a token or pairing
+code, accepts control frames, or changes a profile. Select a LAN server through
+bare `fleety init` and pair it first. A saved current profile with an explicit
+URL still reconnects automatically without scanning. A token-only profile with
+no URL, or a saved endpoint that stops answering, requires explicit endpoint
+selection and re-pairing. Changing a profile URL clears its old token and
+fingerprint first.
 
 So on one machine bare `fleety` or `fleety chat` just works. For a remote server the easiest path
 is bare `fleety init` on a TTY: it scans the LAN, lists every announced server by
 name (marking ones you already saved), lets you pick, saves the profile, and
-prompts for the pairing code in one flow. Or point it explicitly with
-`fleety init ws://host:8787` (or `fleety connection add <name> <url> --use`) — every
-later command uses the saved profile. Auth is **required by default**, so enroll
-this device with a pairing code. Mint one on the **server host** with
-`fleety pair-code` — same-host loopback trust means it needs no auth there, and
-it prints the exact `fleety pair <code>` to run on the new device (from an
-already-paired device it works too with that device's token; the agent's
-`pair_create` tool mints one in-conversation as well). A fresh server also prints
+requires a pairing code before a new LAN pick can be saved. A matching saved
+paired profile reuses its credential; same-host loopback needs no pairing. Or
+point it explicitly with
+`fleety init ws://host:8787 --pairing-code <code>` — every later command uses
+the saved profile. Auth is **required by default**, so the first remote init must
+redeem the code in that command; a failed unauthenticated init does not create a
+profile for a later `pair`. Mint a code on the **server host** with
+`fleety pair-code` — same-host loopback trust means it needs no auth there. From
+an already-paired device it works with that device's token; the agent's
+`pair_create` tool mints one in-conversation as well. A fresh server also prints
 a first-run code at startup. The very first device can instead connect with the
-server's bootstrap admin token (`FLEETY_TOKEN`, the same value set on the server)
-and pair the rest from there.
+server's bootstrap admin token by explicitly placing the same `FLEETY_TOKEN`
+value in that one client process, then pair the rest from there.
 
 ### Configure the model (server side)
 
@@ -307,7 +320,7 @@ launchd / Windows SCM).
 | Command | What it does |
 |---|---|
 | `fleety init <ws-url>` | Point this device at a server (e.g. `ws://host:8787`) for later commands — guided sugar for adding and selecting a connection profile. |
-| `fleety connection <add\|use\|list\|show\|rename\|remove\|set-url>` | Manage the Server profiles this device can connect to (`~/.fleety/connections.toml`). `use` switches the current one; `add … --use` adds and switches. |
+| `fleety connection <add\|use\|list\|show\|rename\|remove\|set-url>` | Manage the Server profiles this device can connect to (`~/.fleety/connections.toml`). Current-profile changes notify `fleetyd`; removing any current profile is refused until you explicitly switch to its replacement. |
 | `fleety ask "<text>"` | One-shot prompt; prints the reply. Accepts file paths as attachments. |
 | `fleety chat` | Open the shared terminal workspace at Chat. Drafts, cursor, attachments, notices, conversation resume state, profile identity, and model context survive navigation through Conversations and Settings. |
 | `fleety conversations list [--limit N]` / `fleety conversations resume <id>` | List recent conversations or continue one. Legacy `fleety conversations [N]` and `fleety resume <id>` remain accepted. |

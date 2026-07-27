@@ -167,13 +167,20 @@ resolver):
 
 1. **單次覆寫**:`--profile <name>`(選一個既有 profile 跑這一次)或
    `-s/--server <ws-url>`(不具名單次直連)——本次呼叫、**不寫檔、不動 daemon**。
+   不具名 URL 只使用明示的 `FLEETY_TOKEN`，即使 URL 與 saved profile 相同也不借用
+   token；此處的明示值只指 client process env，Server scope 的 `config.toml`
+   `FLEETY_TOKEN` 不會 seed 進 CLI／Daemon；`--profile` 才能使用該 profile 的
+   saved credential。
    (這是「CLI 臨時連別台看一眼」的正道,見 M6。)
 2. **env `FLEETY_AGENT_URL`**:保留為**唯一的臨時 env 覆寫**——永不寫檔、永不從
    `config.toml` seed;生效時 `server list`/`status` 頂部**醒目提示**「env 覆寫中,
-   略過 profile <current>」。對背景 daemon,env 是 unit 檔裡的**持久**設定(見 M6)。
+   略過 profile <current>」。它只使用明示的 `FLEETY_TOKEN`，不因 URL 相同而取得
+   saved profile 的 token 或寫回 credential。對背景 daemon,env 是 unit 檔裡的
+   **持久**設定(見 M6)。
 3. `connections.toml.current` 的 `profile.url`。
-4. mDNS(短探測)——TXT `fingerprint` 只是不可信提示;automatic discovery
-   **一律不附 stored token**,credentialed endpoint 改變需明確重選並重新配對。
+4. mDNS(短探測)只探索與顯示——TXT `fingerprint` 只是不可信提示。候選必須透過
+   `fleety init` 明確選取並配對，才會成為可連線的 profile；automatic discovery
+   不得送 token／pairing code、接收控制或寫入 `Welcome` token。
 5. `ws://127.0.0.1:8787`。
 
 「檔案存在但解析失敗」要**報錯**,不可靜默越過 current 去探索(補 M6)。

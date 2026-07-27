@@ -49,6 +49,7 @@ chrono-tz = { version = "0.10", default-features = false }
 iana-time-zone = "0.1"
 mdns-sd = "0.13"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+fs4 = { version = "=1.1.0", default-features = false, features = ["sync"] }
 # These exact pins were taken to hold Clap at the old Rust 1.80 baseline. That
 # baseline is now 1.85, so the constraint no longer applies — the pins are kept
 # only because nothing has re-tested a newer Clap. Safe to revisit.

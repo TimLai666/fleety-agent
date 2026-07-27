@@ -861,12 +861,15 @@ pub fn resolve(key: &str, map: &ConfigMap) -> Option<Resolved> {
     })
 }
 
-/// Seed env from config: for each known setting that is unset in the env but
-/// present in config, set the env var. Env always wins (we never overwrite a set
-/// var), so existing env deployments are unaffected. Call once, early at boot.
-pub fn seed_env_from_config(map: &ConfigMap) {
+/// Seed only the scopes owned by the current runtime. This prevents a
+/// Server-owned bootstrap credential such as `FLEETY_TOKEN` from becoming
+/// caller-explicit client input in the CLI or daemon process.
+pub fn seed_env_from_config(map: &ConfigMap, scopes: &[Scope]) {
     let mut explicit = std::collections::HashSet::new();
-    for setting in registry() {
+    for setting in registry()
+        .iter()
+        .filter(|setting| scopes.contains(&setting.scope))
+    {
         let already = std::env::var(setting.key)
             .map(|v| !v.is_empty())
             .unwrap_or(false);
@@ -2324,7 +2327,7 @@ mod tests {
             (Scope::Daemon, "FLEETY_AGENT_URL".into()),
             "ws://seeded".into(),
         );
-        seed_env_from_config(&map);
+        seed_env_from_config(&map, DAEMON_SCOPES);
         assert!(
             std::env::var("FLEETY_AGENT_URL").is_err(),
             "must not seed a non-registry key"
@@ -2364,7 +2367,7 @@ mod tests {
         );
         std::env::remove_var("FLEETY_TZ");
         std::env::set_var("FLEETY_POLICY", "full_access"); // already set → must not change
-        seed_env_from_config(&map);
+        seed_env_from_config(&map, &[Scope::Shared, Scope::Server]);
         assert_eq!(std::env::var("FLEETY_TZ").unwrap(), "Asia/Taipei");
         assert_eq!(std::env::var("FLEETY_POLICY").unwrap(), "full_access");
         std::env::remove_var("FLEETY_TZ");

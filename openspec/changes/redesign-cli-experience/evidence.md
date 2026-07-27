@@ -796,3 +796,49 @@ strict validation also passed. It did not run the complete workspace test,
 release build, a Windows-native session, a hostile live LAN advertiser, or a
 real OAuth browser／clipboard flow; those remain required final gates or
 explicit live-environment limitations.
+
+## 2026-07-26 — task 5.64 freezes durable profile ownership and transient provenance
+
+Raw `--server`／`--url`, ACP, and daemon transport overrides now remain
+transient and use only a non-empty caller-explicit token. Stored credentials,
+TOFU pins, minted tokens, pairing replacement, and auth-rejection cleanup are
+authorized only by the exact named／current profile generation frozen by the
+resolver. An empty `FLEETY_AGENT_URL` is treated as unset without mutating
+`connections.toml`; diagnostic resolution retains immutable fingerprint
+expectations while removing mutation authority, including repeated read-only
+conversion.
+
+Pairing and guided init now retain the exact committed generation when rename
+succeeds but publication sync is ambiguous. A retry revalidates that generation
+under the mutation lease before syncing the canonical file, so owner drift
+fails explicitly. Current-profile notification is decided inside the same
+credential commit lease. Doctor remains byte-for-byte read-only.
+
+Zed ACP installation now uses private no-clobber publication and reports every
+partial state precisely: canonical publication with cleanup warnings,
+recoverable displaced bytes, retained temporary files after write, permission,
+backup, or publication failure, and restored canonical bytes with retained
+recovery cleanup. Users must close Zed before retrying because a
+non-cooperating process that already holds the file open remains outside the
+cooperative publication contract.
+
+TDD and regression proof:
+
+- `cargo test -p fleety-cli
+  acp::tests::permission_failure_reports_a_retained_private_temp_file --locked`:
+  1 passed; the complete CLI unit suite now has 315 tests.
+- `cargo test -p fleety-tools
+  connection::tests::repeated_read_only_conversion_preserves_identity_expectation
+  --locked`: 1 passed; the complete fleety-tools unit suite now has 237 tests.
+- `cargo test --workspace --locked`: passed, including 315 CLI unit tests, 107
+  CLI smoke tests, 69 daemon unit tests, 41 fleetyd smoke tests, 237
+  fleety-tools unit tests, and 329 Server unit tests.
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`: passed.
+- `cargo build --workspace --release --locked`: passed.
+- `cargo fmt --all -- --check` and `git diff --check`: passed.
+- `spectra analyze redesign-cli-experience --no-color`: Coverage, Consistency,
+  Ambiguity, and Gaps are all Clean with zero findings.
+- `spectra validate redesign-cli-experience --strict --no-color`: valid.
+- Three context-isolated Sol medium reviewers independently reported exact
+  `No findings.` after the final permission-cleanup and read-only-idempotence
+  fixes.

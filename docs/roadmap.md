@@ -33,7 +33,7 @@
 ### CLI 設定架構重設計 Phase 1(2026-07-10 出貨,見 `docs/design-cli-config.md`)
 
 三層徹底分離(連線 / 本機 CLI / server)的 Phase 1(全 additive、不動 wire),四個變更全部實作、測試、archive(`openspec/changes/archive/2026-07-10-{connection-profiles,provider-model-two-tier,auth-default-on,local-config-scope}`):
-- **connection-profiles** — `~/.fleety/connections.toml` + CLI/daemon 共用 resolver(單一優先序、mDNS 僅作無 credential 的 discovery hint)+ `fleety server` 命令群 + `init`/`pair` sugar + config.json/fleetyd.token 一次性冪等遷移(O_EXCL 閂);`FLEETY_AGENT_URL` 移出 registry,消除三處優先序陷阱。
+- **connection-profiles** — `~/.fleety/connections.toml` + CLI/daemon 共用 resolver(單一優先序、mDNS 僅探索／顯示，明確選取配對後才建立 profile)+ `fleety server` 命令群 + `init`/`pair` sugar + config.json/fleetyd.token 一次性冪等遷移(O_EXCL 閂);`FLEETY_AGENT_URL` 移出 registry,消除三處優先序陷阱。
 - **provider-model-two-tier** — providers.toml 改兩層:type-tagged provider(api / oauth:codex,可擴展註冊)+ main/cheap member pool(stream/modalities/effort 下沉 member);混族 pool 能力取聯集;參照完整性寫前 validate;providers.toml 去重遷移;`FLEETY_MODEL_*` 降為 bootstrap seed、壞結構化設定硬啟動錯誤。
 - **auth-default-on** — `FLEETY_REQUIRE_AUTH` 預設開(顯式 `0` 才關)+ 首啟配對引導 + 遠端寫入⇒認證必開(auth 關閉時拒 mutating config frame)。
 - **owner-routed-config** — `fleety config` 依 key owner 路由。CLI 只寫 Cli scope，Daemon/Shared 經 fleetyd，Server/provider/model 經 fleety-server，無直接改檔 fallback。

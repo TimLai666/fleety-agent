@@ -32,13 +32,19 @@ Every command node SHALL accept `--help`, `-h`, and the unambiguous `fleety help
 
 ### Requirement: Invocation context is explicit and non-mutating
 
-`--profile <name>` SHALL select one saved profile for the current invocation without changing the persisted current profile. Every remote human result SHALL identify the resolved profile and owner; every machine result SHALL include them in `context`. The raw `--server <ws-url>` override SHALL remain transient and SHALL be labeled as such.
+`--profile <name>` SHALL select one saved profile for the current invocation without changing the persisted current profile. Every remote human result SHALL identify the resolved profile and owner; every machine result SHALL include them in `context`. The raw `--server <ws-url>` and `--url <ws-url>` overrides SHALL remain transient, SHALL be labeled as such, and SHALL use only a caller-explicit `FLEETY_TOKEN`; they SHALL NOT obtain a stored credential by matching the URL of any saved profile.
 
 #### Scenario: profile override does not become current
 
 - **GIVEN** profile `A` is current and profile `B` exists
 - **WHEN** the user runs `fleety --profile B status`
 - **THEN** the command SHALL query `B`, identify `B` in its result, and leave `A` persisted as current
+
+#### Scenario: raw URL override has no saved credential provenance
+
+- **GIVEN** profiles `A` and `B` both store URL `ws://same:8787` with different tokens
+- **WHEN** the user runs a remote command with `--server ws://same:8787` or `--url ws://same:8787` and no `FLEETY_TOKEN`
+- **THEN** its `Hello` SHALL contain no token regardless of profile ordering or current selection
 
 ### Requirement: Machine output has a stable envelope and exit classes
 
@@ -61,6 +67,13 @@ Commands supporting structured output SHALL emit one JSON value with `schema_ver
 ### Requirement: Diagnosis and completion are first-class commands
 
 `fleety doctor` SHALL perform bounded read-only checks for CLI, current profile, Server, Daemon, config protocol, Provider/OAuth, and active model state, rendering PASS, WARN, or FAIL with remediation. Any FAIL SHALL exit 1. `fleety completion <shell>` SHALL write completion source to stdout and SHALL NOT modify shell files.
+
+#### Scenario: doctor does not upgrade a legacy profile
+
+- **GIVEN** the selected saved profile predates lifecycle generations
+- **WHEN** the user runs `fleety doctor`
+- **THEN** diagnostics SHALL use its endpoint and credential without modifying `connections.toml` or carrying profile mutation authority
+- **AND** it SHALL retain a separate immutable identity expectation and fail a missing or mismatched saved Server fingerprint
 
 #### Scenario: doctor identifies an unavailable daemon
 

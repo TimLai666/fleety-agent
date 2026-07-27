@@ -139,15 +139,15 @@ fn credential_support_err(config_protocol: u32) -> Option<CoreError> {
 
 /// Human-readable name of the server a credential operation acted on.
 fn server_label(target: &connection::Resolved) -> String {
-    match &target.source {
+    match target.source() {
         connection::Source::Profile(name) | connection::Source::OverrideProfile(name) => {
             format!(
                 "'{}' ({})",
                 crate::terminal_safe_text(name),
-                crate::terminal_safe_endpoint(&target.url)
+                crate::terminal_safe_endpoint(target.url())
             )
         }
-        _ => crate::terminal_safe_endpoint(&target.url),
+        _ => crate::terminal_safe_endpoint(target.url()),
     }
 }
 
@@ -240,9 +240,13 @@ fn credential_result(reply: Option<ServerMsg>) -> Result<()> {
         Some(ServerMsg::CredentialResult { .. }) => Err(CoreError::Message(
             "the server refused the credential operation without a reason".to_string(),
         )),
-        other => Err(CoreError::Provider(format!(
-            "expected a credential reply, got {other:?}"
+        Some(other) => Err(CoreError::Provider(format!(
+            "expected a credential reply, got {}",
+            crate::server_msg_kind(&other)
         ))),
+        None => Err(CoreError::Provider(
+            "the Server closed before returning a credential result".to_string(),
+        )),
     }
 }
 
@@ -295,9 +299,10 @@ async fn login_with_target(
             expected_fingerprint,
         )) = fixed_target
         {
-            let (tx, rx, protocol, fingerprint) = connect_hello_for_auth_target(&target)
-                .await
-                .map_err(|e| {
+            let (tx, rx, protocol, fingerprint, committed_target) =
+                crate::connect_hello_for_auth_target_refreshed(&target)
+                    .await
+                    .map_err(|e| {
                     CoreError::Message(format!(
                         "could not reach the Server that owns this Provider login: {} — retry without switching the selected profile",
                         e.report().message
@@ -309,7 +314,7 @@ async fn login_with_target(
                 "Provider login",
             )
             .map_err(crate::provider_service::issue_as_error)?;
-            (tx, rx, protocol, target, fingerprint)
+            (tx, rx, protocol, committed_target, fingerprint)
         } else {
             connect_hello_for_auth_transaction().await.map_err(|e| {
                 CoreError::Message(format!(
@@ -475,10 +480,16 @@ pub async fn status(provider: Option<String>) -> Result<()> {
                     remote_status_line(present, expires_at_secs, detail.as_deref(), &label)
                 );
             }
-            other => {
+            Some(other) => {
                 return Err(CoreError::Provider(format!(
-                    "expected a credential status reply, got {other:?}"
+                    "expected a credential status reply, got {}",
+                    crate::server_msg_kind(&other)
                 )))
+            }
+            None => {
+                return Err(CoreError::Provider(
+                    "the Server closed before returning credential status".to_string(),
+                ))
             }
         }
     }
@@ -1207,24 +1218,24 @@ mod tests {
 
     #[test]
     fn server_label_names_profile_or_url() {
-        let profiled = connection::Resolved {
-            url: "ws://mini:8787".into(),
-            token: Some("t".into()),
-            source: connection::Source::Profile("home".into()),
-        };
+        let profiled = connection::Resolved::unowned(
+            "ws://mini:8787".into(),
+            Some("t".into()),
+            connection::Source::Profile("home".into()),
+        );
         assert_eq!(server_label(&profiled), "'home' (ws://mini:8787)");
-        let discovered = connection::Resolved {
-            url: "ws://found:8787".into(),
-            token: None,
-            source: connection::Source::Mdns,
-        };
+        let discovered = connection::Resolved::unowned(
+            "ws://found:8787".into(),
+            None,
+            connection::Source::Local,
+        );
         assert_eq!(server_label(&discovered), "ws://found:8787");
 
-        let hostile = connection::Resolved {
-            url: "wss://user:pass@host/path?token=SECRET#tail".into(),
-            token: None,
-            source: connection::Source::Profile("bad\u{1b}\nprofile".into()),
-        };
+        let hostile = connection::Resolved::unowned(
+            "wss://user:pass@host/path?token=SECRET#tail".into(),
+            None,
+            connection::Source::Profile("bad\u{1b}\nprofile".into()),
+        );
         let label = server_label(&hostile);
         assert!(!label.contains("pass"), "{label}");
         assert!(!label.contains("SECRET"), "{label}");

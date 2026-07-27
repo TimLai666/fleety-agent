@@ -12,6 +12,7 @@
 //! FFI `unsafe` lives inside the dependency.
 
 use std::ffi::OsString;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use windows_service::service::{
@@ -21,22 +22,31 @@ use windows_service::service_control_handler::{self, ServiceControlHandlerResult
 use windows_service::{define_windows_service, service_dispatcher};
 
 const SERVICE_NAME: &str = "fleetyd";
+const SERVICE_FAILURE: u32 = 1;
+static SERVICE_EXIT_CODE: AtomicU32 = AtomicU32::new(SERVICE_FAILURE);
 
 define_windows_service!(ffi_service_main, service_main);
 
 /// Hand control to the SCM. Returns an error if the process was not started by
 /// the SCM (e.g. run by hand) — the caller turns that into an actionable hint.
-pub fn dispatch() -> windows_service::Result<()> {
-    service_dispatcher::start(SERVICE_NAME, ffi_service_main)
+pub fn dispatch() -> windows_service::Result<u32> {
+    SERVICE_EXIT_CODE.store(SERVICE_FAILURE, Ordering::Release);
+    service_dispatcher::start(SERVICE_NAME, ffi_service_main)?;
+    Ok(SERVICE_EXIT_CODE.load(Ordering::Acquire))
 }
 
 fn service_main(_args: Vec<OsString>) {
-    if let Err(e) = run_service() {
-        tracing::error!(%e, "fleetyd windows service exited with error");
-    }
+    let exit_code = match run_service() {
+        Ok(exit_code) => exit_code,
+        Err(e) => {
+            tracing::error!(%e, "fleetyd windows service exited with error");
+            SERVICE_FAILURE
+        }
+    };
+    SERVICE_EXIT_CODE.store(exit_code, Ordering::Release);
 }
 
-fn run_service() -> windows_service::Result<()> {
+fn run_service() -> windows_service::Result<u32> {
     // The control handler signals shutdown by flipping this watch to true; the
     // daemon's `run`/`serve` selects on it (see main::wait_stop).
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
@@ -50,30 +60,50 @@ fn run_service() -> windows_service::Result<()> {
     };
     let status_handle = service_control_handler::register(SERVICE_NAME, event_handler)?;
 
-    let running = ServiceStatus {
+    let starting = ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
-        current_state: ServiceState::Running,
-        controls_accepted: ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+        current_state: ServiceState::StartPending,
+        controls_accepted: ServiceControlAccept::empty(),
         exit_code: ServiceExitCode::Win32(0),
-        checkpoint: 0,
-        wait_hint: Duration::default(),
+        checkpoint: 1,
+        wait_hint: Duration::from_secs(10),
         process_id: None,
     };
-    status_handle.set_service_status(running.clone())?;
+    status_handle.set_service_status(starting.clone())?;
 
-    // Single-instance: don't run a second copy alongside one already up.
+    // Reconnect control is the atomic outer owner. Claim it before the pidfile
+    // so simultaneous service starts cannot race a dead-owner takeover.
+    let control = match crate::ControlGuard::claim() {
+        Ok(control) => control,
+        Err(e) => {
+            tracing::error!(report = ?e.report(), "cannot claim fleetyd reconnect control; exiting");
+            set_stopped(&status_handle, &starting, SERVICE_FAILURE);
+            return Ok(SERVICE_FAILURE);
+        }
+    };
+    // Single-instance defense-in-depth under the already-held outer owner.
     let _pid_guard = match fleety_tools::service::acquire(SERVICE_NAME) {
         Ok(fleety_tools::service::Acquire::Started(g)) => Some(g),
         Ok(fleety_tools::service::Acquire::AlreadyRunning(pid)) => {
             tracing::error!(pid, "another fleetyd is already running; service exiting");
-            set_stopped(&status_handle, &running, 0);
-            return Ok(());
+            set_stopped(&status_handle, &starting, SERVICE_FAILURE);
+            return Ok(SERVICE_FAILURE);
         }
         Err(e) => {
-            tracing::warn!(report = ?e.report(), "pidfile check failed; continuing without it");
-            None
+            tracing::error!(report = ?e.report(), "cannot claim fleetyd service ownership; exiting");
+            set_stopped(&status_handle, &starting, SERVICE_FAILURE);
+            return Ok(SERVICE_FAILURE);
         }
     };
+
+    let running = ServiceStatus {
+        current_state: ServiceState::Running,
+        controls_accepted: ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+        checkpoint: 0,
+        wait_hint: Duration::default(),
+        ..starting.clone()
+    };
+    status_handle.set_service_status(running.clone())?;
 
     tracing::info!(
         version = agent_core::VERSION,
@@ -84,11 +114,7 @@ fn run_service() -> windows_service::Result<()> {
         .build()
     {
         Ok(rt) => {
-            let res = rt.block_on(async {
-                // Best-effort background update poller (within the runtime).
-                crate::poll_updates::spawn();
-                crate::run(Some(stop_rx)).await
-            });
+            let res = rt.block_on(crate::run(Some(stop_rx), control));
             if let Err(e) = res {
                 tracing::error!(report = ?e.report(), "fleetyd service run exited with error");
                 1
@@ -103,7 +129,7 @@ fn run_service() -> windows_service::Result<()> {
     };
 
     set_stopped(&status_handle, &running, exit_code);
-    Ok(())
+    Ok(exit_code)
 }
 
 fn set_stopped(
