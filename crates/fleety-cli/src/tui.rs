@@ -18,7 +18,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::input::LineEditor;
+use fleety_textarea::{TextArea, TextAreaState};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConversationSummary {
@@ -55,9 +55,6 @@ pub fn parse_conversation_summaries(
         .collect())
 }
 
-/// Lines jumped per PageUp/PageDown press.
-const SCROLL_STEP: u16 = 5;
-
 /// Braille spinner frames, advanced on a fixed tick while a turn is in flight
 /// (or during reconnection) so the wait shows motion even with no new frames.
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -65,7 +62,7 @@ const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 /// TUI state.
 pub struct App {
     pub messages: Vec<(String, String)>,
-    pub input: LineEditor,
+    pub input: TextArea,
     pub status: String,
     pub should_quit: bool,
     /// Attachments staged for the next `Send`. Cleared automatically when the
@@ -73,9 +70,20 @@ pub struct App {
     pub pending_attachments: Vec<WireAttachment>,
     /// Whether the last message is an assistant reply still streaming in.
     streaming: bool,
-    /// Wrapped lines scrolled up from the bottom of the conversation
-    /// (0 = follow the newest output). Clamped to the content at render time.
-    pub scroll_back: u16,
+    /// Index of the first message not yet handed to the terminal. Everything
+    /// before it is terminal history and is never drawn again.
+    emitted_upto: usize,
+    /// How many bytes of the in-flight streaming reply have been handed over.
+    /// Only whole markdown blocks are emitted, so the rest stays in the
+    /// viewport where it can still be redrawn as it changes.
+    stream_emitted_bytes: usize,
+    /// Queued ahead of the conversation: the startup banner. Goes out through
+    /// the same seam as everything else so a resize replays it too.
+    outbox: Vec<String>,
+    /// Everything handed over so far, in the form it was handed over in. Kept
+    /// so a resize can re-emit it: the terminal's own reflow mangles styled
+    /// output, so the whole history is reset and replayed at the new width.
+    history: String,
     /// Approvals awaiting a y/n decision, oldest first: (approval_id, summary).
     /// While non-empty the input is modal — only y / n / Esc act.
     pub pending_approvals: VecDeque<(String, String)>,
@@ -105,12 +113,15 @@ impl App {
     pub fn new(status: impl Into<String>) -> Self {
         Self {
             messages: Vec::new(),
-            input: LineEditor::default(),
+            input: TextArea::new(),
             status: status.into(),
             should_quit: false,
             pending_attachments: Vec::new(),
             streaming: false,
-            scroll_back: 0,
+            outbox: Vec::new(),
+            emitted_upto: 0,
+            stream_emitted_bytes: 0,
+            history: String::new(),
             pending_approvals: VecDeque::new(),
             turn_in_flight: false,
             spinner_frame: 0,
@@ -226,7 +237,7 @@ impl App {
             return format!("{} Working… (Esc=cancel, Ctrl+C=quit)", self.spinner_char());
         }
         if self.pending_attachments.is_empty() {
-            "Message (Enter=send, Ctrl+V=paste, PgUp/PgDn=scroll, Esc=quit)".to_string()
+            "Message (Enter=send, Alt+Enter=newline, Ctrl+V=paste, Esc=quit)".to_string()
         } else {
             format!(
                 "Message [{} attached] (Enter=send, Ctrl+X=drop attachments, Esc=quit)",
@@ -244,11 +255,119 @@ impl App {
         self.status = "approval required — y approve · n deny".to_string();
     }
 
+    /// The part of the conversation that is still changing, and so is still
+    /// drawn by Fleety: the tail of a streaming reply past its last closed
+    /// block. Empty whenever nothing is in flight.
+    pub fn viewport_tail(&self) -> Vec<Line<'static>> {
+        if !self.streaming {
+            return Vec::new();
+        }
+        let Some((role, text)) = self.messages.last() else {
+            return Vec::new();
+        };
+        let rest = &text[char_boundary(text, self.stream_emitted_bytes)..];
+        if rest.trim().is_empty() {
+            return Vec::new();
+        }
+        let mut lines = if role == "fleety" {
+            crate::markdown::render(rest)
+        } else {
+            rest.split('\n')
+                .map(|l| Line::from(l.to_string()))
+                .collect()
+        };
+        if self.stream_emitted_bytes == 0 {
+            match lines.first_mut() {
+                Some(first) => first.spans.insert(0, Span::raw(format!("{role}: "))),
+                None => lines.push(Line::from(format!("{role}: "))),
+            }
+        }
+        lines
+    }
+
+    /// How tall the viewport wants to be for `width`, capped at `max`.
+    ///
+    /// The cap is what keeps inline mode inline: a reply that streams a huge
+    /// unclosed code block would otherwise grow the viewport until it covered
+    /// the screen, which is the mode we just left.
+    pub fn viewport_height(&self, width: u16, max: u16) -> u16 {
+        let inner_w = width.saturating_sub(2);
+        let composer = self.input.desired_height(inner_w).clamp(1, MAX_INPUT_ROWS);
+        let tail = u16::try_from(self.viewport_tail().len()).unwrap_or(u16::MAX);
+        // composer box borders + status line
+        tail.saturating_add(composer)
+            .saturating_add(3)
+            .clamp(4, max.max(4))
+    }
+
+    /// Queue a block to be written above the conversation, before anything else.
+    pub fn announce(&mut self, block: String) {
+        self.outbox.push(block);
+    }
+
+    /// Hand over everything that has settled, oldest first.
+    ///
+    /// A message that is complete goes over whole. A reply still streaming goes
+    /// over only as far as its last closed markdown block — the rest is still
+    /// changing shape, so it stays in the viewport where it can be redrawn.
+    /// Whatever this returns is appended to `history`, so a resize can replay
+    /// it, and is never drawn by Fleety again.
+    pub fn take_emissions(&mut self) -> Vec<String> {
+        let mut out = Vec::new();
+        for block in std::mem::take(&mut self.outbox) {
+            self.history.push_str(&block);
+            out.push(block);
+        }
+        while self.emitted_upto < self.messages.len() {
+            let index = self.emitted_upto;
+            let (role, text) = &self.messages[index];
+            let in_flight = self.streaming && index + 1 == self.messages.len();
+
+            let (body, consumed_whole) = if in_flight {
+                let settled = char_boundary(text, crate::markdown::settled_prefix_len(text));
+                let from = char_boundary(text, self.stream_emitted_bytes);
+                if settled <= from {
+                    break;
+                }
+                (text[from..settled].to_string(), false)
+            } else {
+                let from = char_boundary(text, self.stream_emitted_bytes);
+                (text[from..].to_string(), true)
+            };
+
+            // The role label belongs to the first piece of a message only; a
+            // reply handed over in several pieces must not repeat it.
+            let label = if self.stream_emitted_bytes == 0 {
+                Some(role.as_str())
+            } else {
+                None
+            };
+            let block = render_emission(role, label, &body);
+
+            if consumed_whole {
+                self.emitted_upto = index + 1;
+                self.stream_emitted_bytes = 0;
+            } else {
+                self.stream_emitted_bytes += body.len();
+            }
+            if !block.is_empty() {
+                self.history.push_str(&block);
+                out.push(block);
+            }
+        }
+        out
+    }
+
+    /// Everything handed to the terminal so far, for replaying after a resize.
+    pub fn history(&self) -> &str {
+        &self.history
+    }
+
     /// Commit a prepared user message after the transport accepts it. Until
     /// this point the composer, attachments, transcript, and turn state stay
     /// untouched so a failed write cannot destroy unsent work.
     pub fn commit_send(&mut self) {
-        let text = self.input.take();
+        let text = take_input(&mut self.input);
         let attachments = std::mem::take(&mut self.pending_attachments);
         let display = if attachments.is_empty() {
             text
@@ -256,7 +375,6 @@ impl App {
             format!("{text} [+{} attachment(s)]", attachments.len())
         };
         self.push("you", display);
-        self.scroll_back = 0;
         self.turn_in_flight = true;
     }
 
@@ -318,6 +436,95 @@ pub enum Action {
     CancelTurn,
 }
 
+/// The largest offset at or below `at` that `text` can be sliced on.
+///
+/// Emission works in byte offsets, and this TUI is not allowed to panic. The
+/// markdown checkpoint should already land on a character boundary, so this
+/// normally returns `at` unchanged — it exists so that "should" is not what
+/// stands between a multi-byte reply and a crash.
+fn char_boundary(text: &str, at: usize) -> usize {
+    let mut at = at.min(text.len());
+    while at > 0 && !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    at
+}
+
+/// The wordmark and session facts, written once when Chat starts.
+///
+/// It goes into the scrollback rather than the viewport because it never
+/// changes: redrawing a constant on every frame is the alternate-screen habit
+/// this mode exists to drop. It scrolls away as the conversation grows, which
+/// is what you want from a banner.
+pub fn banner(version: &str, endpoint: &str, model: Option<&str>) -> String {
+    const WORDMARK: [&str; 5] = [
+        "███████ ██      ███████ ███████ ████████ ██    ██",
+        "██      ██      ██      ██         ██     ██  ██ ",
+        "█████   ██      █████   █████      ██      ████  ",
+        "██      ██      ██      ██         ██       ██   ",
+        "██      ███████ ███████ ███████    ██       ██   ",
+    ];
+    // Cyan wordmark, dim facts — the same two weights the chat palette uses.
+    const CYAN: &str = "\x1b[36m";
+    const DIM: &str = "\x1b[2m";
+    const OFF: &str = "\x1b[0m";
+
+    let mut out = String::from("\n");
+    for row in WORDMARK {
+        out.push_str(&format!("  {CYAN}{row}{OFF}\n"));
+    }
+    out.push('\n');
+    out.push_str(&format!("  {DIM}v{version}  ·  {endpoint}{OFF}\n"));
+    out.push_str(&format!(
+        "  {DIM}model {}  ·  Enter sends  ·  Esc quits{OFF}\n\n",
+        model.unwrap_or("unset")
+    ));
+    out
+}
+
+/// Format one piece of a message for the terminal.
+///
+/// Assistant replies go through markdown; everything else is the user's own
+/// text and is passed through untouched.
+fn render_emission(role: &str, label: Option<&str>, body: &str) -> String {
+    if body.is_empty() {
+        return String::new();
+    }
+    let rendered = if role == "fleety" {
+        crate::markdown::render_ansi(body)
+    } else {
+        body.to_string()
+    };
+    let mut out = match label {
+        Some(label) => format!("{label}: {rendered}"),
+        None => rendered,
+    };
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// Drain the composer, returning what was in it. `TextArea` has no `take`, and
+/// clearing it via `set_text("")` also resets selection and scroll — which is
+/// what we want when the draft has just been sent or staged.
+fn take_input(input: &mut TextArea) -> String {
+    let text = input.text().to_string();
+    input.set_text("");
+    input.clear_history();
+    text
+}
+
+/// Replace the composer's contents and park the caret at the end.
+///
+/// `TextArea::set_text` keeps the caret where it was, which is wrong for every
+/// prefill we do — restoring a rejected draft, or seeding one in a test — where
+/// the next keystroke must continue the text rather than land in front of it.
+pub(crate) fn prefill(input: &mut TextArea, text: &str) {
+    input.set_text(text);
+    input.set_cursor(text.len());
+}
+
 /// If `input` is the `/attach <path>` command, return the path argument (an
 /// empty string when the command was typed with no path). `None` means it is
 /// not the command, so it should be sent as an ordinary message.
@@ -350,19 +557,6 @@ pub fn on_key(app: &mut App, key: KeyEvent) -> Action {
     if app.confirm_quit && key.code != KeyCode::Esc {
         app.confirm_quit = false;
     }
-    // Scrollback works in every mode; clamping happens at render time.
-    // (Home/End belong to the input cursor below, not to scrolling.)
-    match key.code {
-        KeyCode::PageUp => {
-            app.scroll_back = app.scroll_back.saturating_add(SCROLL_STEP);
-            return Action::None;
-        }
-        KeyCode::PageDown => {
-            app.scroll_back = app.scroll_back.saturating_sub(SCROLL_STEP);
-            return Action::None;
-        }
-        _ => {}
-    }
     // A pending approval is modal: only y / n / Esc act until it's answered
     // (the server's gate ignores other client messages while waiting anyway).
     if !app.pending_approvals.is_empty() {
@@ -383,31 +577,19 @@ pub fn on_key(app: &mut App, key: KeyEvent) -> Action {
     }
     // Ctrl-prefixed shortcuts come before plain Char fallthrough so it doesn't
     // swallow them (e.g. Ctrl+V should NOT type 'v').
+    // Two Ctrl chords mean something to Fleety that they do not mean to the
+    // composer, so they are claimed before it sees them. Everything else Ctrl
+    // (word motion, kill/yank, undo, the Ctrl+J newline) is the composer's.
     if key.modifiers.contains(KeyModifiers::CONTROL) {
-        match key.code {
-            KeyCode::Char(c) => match c.to_ascii_lowercase() {
+        if let KeyCode::Char(c) = key.code {
+            match c.to_ascii_lowercase() {
                 'v' => return Action::PasteFromClipboard,
                 'x' => {
                     app.clear_attachments();
                     return Action::None;
                 }
-                'j' => {
-                    // Ctrl+J: compatibility newline key for terminals that can't
-                    // deliver Alt+Enter distinctly.
-                    app.input.insert_newline();
-                    return Action::None;
-                }
                 _ => {}
-            },
-            KeyCode::Left => {
-                app.input.word_left();
-                return Action::None;
             }
-            KeyCode::Right => {
-                app.input.word_right();
-                return Action::None;
-            }
-            _ => {}
         }
     }
     match key.code {
@@ -434,7 +616,7 @@ pub fn on_key(app: &mut App, key: KeyEvent) -> Action {
             // Alt+Enter inserts a line break instead of submitting (Shift+Enter
             // is unreliable across terminals; Ctrl+J is the other newline key).
             if key.modifiers.contains(KeyModifiers::ALT) {
-                app.input.insert_newline();
+                app.input.insert_str("\n");
                 return Action::None;
             }
             let text = app.input.text().to_string();
@@ -442,9 +624,9 @@ pub fn on_key(app: &mut App, key: KeyEvent) -> Action {
             if let Some(path) = attach_command_path(&text) {
                 if path.is_empty() {
                     app.status = "usage: /attach <path>".to_string();
-                    app.input.set_text(text);
+                    prefill(&mut app.input, &text);
                 } else if let Some(att) = crate::clipboard::attach_path(path) {
-                    let _ = app.input.take();
+                    take_input(&mut app.input);
                     app.attach(att);
                 } else {
                     // `attach_path` returns `None` for a missing/unreadable path
@@ -454,7 +636,7 @@ pub fn on_key(app: &mut App, key: KeyEvent) -> Action {
                         "could not attach '{path}' — no such file, or larger than the {} MiB limit",
                         crate::clipboard::MAX_ATTACHMENT_BYTES / (1024 * 1024)
                     );
-                    app.input.set_text(text);
+                    prefill(&mut app.input, &text);
                 }
                 return Action::None;
             }
@@ -465,75 +647,13 @@ pub fn on_key(app: &mut App, key: KeyEvent) -> Action {
                 Action::Send { text, attachments }
             }
         }
-        KeyCode::Backspace => {
-            app.input.backspace();
+        // Editing, cursor motion, word/line kills, yank and undo all belong to
+        // the composer; it owns the key map so the two cannot drift apart.
+        _ => {
+            app.input.input(key);
             Action::None
-        }
-        KeyCode::Delete => {
-            app.input.delete();
-            Action::None
-        }
-        KeyCode::Left => {
-            app.input.left();
-            Action::None
-        }
-        KeyCode::Right => {
-            app.input.right();
-            Action::None
-        }
-        KeyCode::Home => {
-            app.input.home();
-            Action::None
-        }
-        KeyCode::End => {
-            app.input.end();
-            Action::None
-        }
-        KeyCode::Up => {
-            app.input.up();
-            Action::None
-        }
-        KeyCode::Down => {
-            app.input.down();
-            Action::None
-        }
-        KeyCode::Char(c) => {
-            app.input.insert(c);
-            Action::None
-        }
-        _ => Action::None,
-    }
-}
-
-/// Flatten messages into display lines. Assistant (`fleety`) replies are given
-/// rich markdown rendering; the role label is folded onto the first rendered
-/// line so the flattened line count still tracks the source. User and system
-/// messages stay plain, split per embedded newline — a ratatui `Line` is
-/// single-line and drops `\n`, so the segments must become real `Line`s or they
-/// would be glued together with no break.
-fn message_lines(app: &App) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    for (role, text) in &app.messages {
-        let role = crate::terminal_safe_text(role);
-        let text = crate::terminal_safe_multiline_redacted(text);
-        if role == "fleety" {
-            let mut rendered = crate::markdown::render(&text);
-            match rendered.first_mut() {
-                Some(first) => first.spans.insert(0, Span::raw(format!("{role}: "))),
-                None => rendered.push(Line::from(format!("{role}: "))),
-            }
-            lines.extend(rendered);
-        } else {
-            for (i, part) in text.split('\n').enumerate() {
-                if i == 0 {
-                    lines.push(Line::from(format!("{role}: {part}")));
-                } else {
-                    lines.push(Line::from(part.to_string()));
-                }
-            }
         }
     }
-    lines
 }
 
 /// Maximum inner rows the input box grows to before it scrolls internally.
@@ -580,63 +700,47 @@ pub fn render_conversations_in_area(frame: &mut Frame, app: &App, area: Rect) {
 
 /// Render Chat inside the shared workspace content region.
 pub fn render_in_area(frame: &mut Frame, app: &App, area: Rect) {
-    // The input box grows with the composed line count (capped), then scrolls.
-    let input_rows = u16::try_from(app.input.line_count())
-        .unwrap_or(MAX_INPUT_ROWS)
+    // Top to bottom: what you are talking to, then the part of the reply still
+    // arriving, then the box you type in. The composer is last because that is
+    // where the cursor lives — nothing should sit between it and the edge of
+    // the screen. The finished conversation is above the viewport entirely; it
+    // belongs to the terminal.
+    let input_inner_w = area.width.saturating_sub(2);
+    let input_rows = app
+        .input
+        .desired_height(input_inner_w)
         .clamp(1, MAX_INPUT_ROWS);
+    let tail = app.viewport_tail();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(1),
-            Constraint::Length(input_rows + 2),
             Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(input_rows + 2),
         ])
         .split(area);
 
-    // Anchor the conversation to the bottom (newest output), minus any manual
-    // scrollback; the wrapped height comes from the block-less paragraph so
-    // the count and the render agree on the text width.
-    let para = Paragraph::new(message_lines(app)).wrap(Wrap { trim: false });
-    let inner_w = chunks[0].width.saturating_sub(2);
-    let inner_h = chunks[0].height.saturating_sub(2);
-    let total = u16::try_from(para.line_count(inner_w)).unwrap_or(u16::MAX);
-    let max_off = total.saturating_sub(inner_h);
-    let offset = max_off.saturating_sub(app.scroll_back.min(max_off));
-    frame.render_widget(
-        para.block(Block::bordered().title("Fleety"))
-            .scroll((offset, 0)),
-        chunks[0],
-    );
+    frame.render_widget(Paragraph::new(app.status.as_str()), chunks[0]);
 
-    // Render the (possibly multi-line) input, scrolling vertically and
-    // horizontally just enough to keep the cursor inside the box, then park the
-    // terminal cursor on it.
-    let inner_w = chunks[1].width.saturating_sub(2) as usize;
-    let inner_h = chunks[1].height.saturating_sub(2) as usize;
-    let (crow, ccol) = app.input.cursor_row_col();
-    let h_off = ccol.saturating_sub(inner_w.saturating_sub(1));
-    let v_off = crow.saturating_sub(inner_h.saturating_sub(1));
-    let input_lines: Vec<Line> = app
-        .input
-        .text()
-        .split('\n')
-        .map(|l| Line::from(l.to_string()))
-        .collect();
-    frame.render_widget(
-        Paragraph::new(input_lines)
-            .scroll((
-                u16::try_from(v_off).unwrap_or(u16::MAX),
-                u16::try_from(h_off).unwrap_or(u16::MAX),
-            ))
-            .block(Block::bordered().title(app.input_title())),
-        chunks[1],
-    );
-    frame.set_cursor_position((
-        chunks[1].x + 1 + u16::try_from(ccol - h_off).unwrap_or(u16::MAX),
-        chunks[1].y + 1 + u16::try_from(crow - v_off).unwrap_or(u16::MAX),
-    ));
+    if !tail.is_empty() && chunks[1].height > 0 {
+        // Show the end of the tail: it is the part still being written, and it
+        // is what the reader is waiting on.
+        let para = Paragraph::new(tail).wrap(Wrap { trim: false });
+        let total = u16::try_from(para.line_count(chunks[1].width)).unwrap_or(u16::MAX);
+        let offset = total.saturating_sub(chunks[1].height);
+        frame.render_widget(para.scroll((offset, 0)), chunks[1]);
+    }
 
-    frame.render_widget(Paragraph::new(app.status.as_str()), chunks[2]);
+    // The composer wraps and scrolls itself and keeps the cursor in view, so
+    // the scroll state is rebuilt each frame from the cursor alone.
+    let block = Block::bordered().title(app.input_title());
+    let text_area = block.inner(chunks[2]);
+    frame.render_widget(block, chunks[2]);
+    let mut input_state = TextAreaState::default();
+    frame.render_stateful_widget_ref(&app.input, text_area, &mut input_state);
+    if let Some((cx, cy)) = app.input.cursor_pos_with_state(text_area, input_state) {
+        frame.set_cursor_position((cx, cy));
+    }
 }
 
 #[cfg(test)]
@@ -758,6 +862,271 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_x_clears_attachments_instead_of_cutting_the_draft() {
+        // Ctrl+X means "cut" to the composer and "drop the attachments" to
+        // Fleety. Fleety wins, and the draft must survive intact.
+        let mut app = App::new("ready");
+        prefill(&mut app.input, "keep me");
+        app.attach(WireAttachment {
+            mime: "image/png".into(),
+            bytes_b64: Some("AAAA".into()),
+            url: None,
+            name: None,
+        });
+        assert_eq!(on_key(&mut app, ctrl('x')), Action::None);
+        assert!(app.pending_attachments.is_empty());
+        assert_eq!(app.input.text(), "keep me", "draft not cut");
+    }
+
+    fn emitted(app: &mut App) -> String {
+        app.take_emissions().join("")
+    }
+
+    #[test]
+    fn a_streaming_cjk_reply_is_split_on_character_boundaries() {
+        // Emission slices the reply by byte offset. A CJK character is three
+        // bytes, so an offset landing inside one would panic — and this TUI is
+        // not allowed to panic.
+        let mut app = App::new("ready");
+        for chunk in ["第一段文字。\n\n", "第二段還沒寫完", "的中文\n\n"] {
+            app.push_delta(chunk);
+            let _ = app.take_emissions();
+            let _ = app.viewport_tail();
+        }
+        app.finish_assistant("第一段文字。\n\n第二段還沒寫完的中文\n\n".to_string());
+        let out = app.take_emissions().join("");
+        let all = format!("{}{out}", app.history());
+        assert!(all.contains("第一段文字"), "content survives: {all:?}");
+    }
+
+    #[test]
+    fn the_banner_goes_out_before_the_conversation_and_only_once() {
+        let mut app = App::new("ready");
+        app.announce(banner("9.9.9", "ws://127.0.0.1:9999", Some("gpt-x")));
+        app.push("you", "hello");
+
+        let out = emitted(&mut app);
+        let mark = out.find("FLEETY").or_else(|| out.find('█'));
+        assert!(mark.is_some(), "the wordmark is drawn: {out:?}");
+        assert!(
+            mark < out.find("you: hello"),
+            "and it goes out ahead of the conversation"
+        );
+        assert!(
+            out.contains("9.9.9") && out.contains("gpt-x"),
+            "facts: {out:?}"
+        );
+
+        // It lives in the scrollback, so it is never drawn again — but a resize
+        // has to be able to replay it.
+        assert!(emitted(&mut app).is_empty(), "not re-emitted");
+        assert!(app.history().contains('█'), "replayable after a resize");
+    }
+
+    #[test]
+    fn a_completed_exchange_is_handed_to_the_terminal_whole() {
+        let mut app = App::new("ready");
+        app.push("you", "hi");
+        app.push("fleety", "hello");
+        let out = emitted(&mut app);
+        assert!(out.contains("you: hi"), "user message handed over: {out:?}");
+        assert!(out.contains("hello"), "reply handed over: {out:?}");
+
+        // Handed over means gone from Fleety's hands: nothing is emitted twice.
+        assert!(
+            emitted(&mut app).is_empty(),
+            "an emitted message is never handed over again"
+        );
+        assert!(
+            app.viewport_tail().is_empty(),
+            "nothing left in the viewport"
+        );
+    }
+
+    #[test]
+    fn a_multi_line_message_keeps_its_breaks_when_handed_over() {
+        let mut app = App::new("ready");
+        app.push("fleety", "first line\nsecond line");
+        let out = emitted(&mut app);
+        assert!(out.contains("first line"), "{out:?}");
+        assert!(out.contains("second line"), "{out:?}");
+        assert!(
+            !out.contains("first linesecond"),
+            "the break survives: {out:?}"
+        );
+    }
+
+    #[test]
+    fn history_accumulates_everything_handed_over() {
+        let mut app = App::new("ready");
+        app.push("you", "one");
+        let first = emitted(&mut app);
+        app.push("you", "two");
+        let second = emitted(&mut app);
+        assert_eq!(
+            app.history(),
+            format!("{first}{second}"),
+            "history is the replay source for a resize, so it must be exact"
+        );
+    }
+
+    #[test]
+    fn the_viewport_holds_only_the_composer_and_status_when_nothing_is_in_flight() {
+        let mut app = App::new("ready");
+        app.push("you", "hi");
+        app.push("fleety", "hello");
+        let _ = app.take_emissions();
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 6)).expect("term");
+        terminal.draw(|f| render(f, &app)).expect("draw");
+        let rows = visible_rows(&terminal);
+        assert!(
+            rows.iter().any(|r| r.contains("Message")),
+            "composer drawn: {rows:#?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("ready")),
+            "status drawn: {rows:#?}"
+        );
+        assert!(
+            !rows.iter().any(|r| r.contains("hello")),
+            "the conversation is the terminal's, not drawn here: {rows:#?}"
+        );
+    }
+
+    #[test]
+    fn the_composer_fits_the_viewport_height_that_was_asked_for() {
+        // Regression: the height was computed for the content alone while the
+        // workspace chrome drew a header line above it, so the composer was
+        // squeezed out of the frame entirely — and every existing test missed
+        // it by calling `render_in_area` directly instead of going through the
+        // chrome the real loop uses.
+        let app = App::new("ready");
+        let width = 60;
+        let rows = app.viewport_height(width, 15) + crate::workspace::INLINE_CHROME_ROWS;
+
+        let mut terminal = Terminal::new(TestBackend::new(width, rows)).expect("term");
+        let state = crate::workspace::WorkspaceState::new(crate::workspace::Route::Chat);
+        terminal
+            .draw(|f| {
+                crate::workspace::render_inline(f, &state, |f, area| render_in_area(f, &app, area))
+            })
+            .expect("draw");
+        let rows_text = visible_rows(&terminal);
+        let top = rows_text
+            .iter()
+            .position(|r| r.contains('┌'))
+            .expect("composer top border");
+        let bottom = rows_text
+            .iter()
+            .position(|r| r.contains('└'))
+            .expect("composer bottom border");
+        assert!(
+            bottom > top + 1,
+            "the composer has a row to type into. Sized one row short it still \
+             draws both borders with nothing between them, which looks fine and \
+             cannot be typed in: {rows_text:#?}"
+        );
+        assert!(
+            rows_text.iter().any(|r| r.contains("ready")),
+            "the status line is drawn: {rows_text:#?}"
+        );
+    }
+
+    #[test]
+    fn a_streaming_reply_shows_its_end_in_the_viewport() {
+        let mut app = App::new("ready");
+        for i in 0..40 {
+            app.push_delta(&format!("line {i}\n"));
+        }
+        let _ = app.take_emissions();
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).expect("term");
+        terminal.draw(|f| render(f, &app)).expect("draw");
+        let rows = visible_rows(&terminal);
+        assert!(
+            rows.iter().any(|r| r.contains("line 39")),
+            "the newest content is what the reader is waiting on: {rows:#?}"
+        );
+    }
+
+    /// Drop ANSI escape sequences, leaving the text a reader would see.
+    fn without_escapes(s: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c != '\u{1b}' {
+                out.push(c);
+                continue;
+            }
+            // CSI/SGR run: skip up to and including the final byte.
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_handed_over_code_block_carries_its_styling() {
+        let mut app = App::new("ready");
+        app.push("fleety", "intro\n```rust\nlet x = 1;\n```");
+        let out = app.take_emissions().join("");
+        assert!(
+            without_escapes(&out).contains("let x = 1;"),
+            "code kept: {out:?}"
+        );
+        // Syntect colours the code, and that styling has to travel with the
+        // text as escape sequences — the terminal owns these rows now, so there
+        // is no ratatui buffer left to carry a Style.
+        assert!(
+            out.contains("\u{1b}[38;2;"),
+            "syntax colours travel with the text: {out:?}"
+        );
+    }
+
+    #[test]
+    fn long_line_wraps_in_the_composer_instead_of_scrolling_sideways() {
+        // The old editor kept one long line on one row and scrolled it
+        // horizontally, so the start of what you typed went off-screen. The
+        // composer wraps instead, and the box grows a row to hold the wrap.
+        let mut app = App::new("ready");
+        let typed = "the quick brown fox jumps over the lazy dog";
+        prefill(&mut app.input, typed);
+        let mut terminal = Terminal::new(TestBackend::new(30, 12)).expect("term");
+        terminal.draw(|f| render(f, &app)).expect("draw");
+        let rows = visible_rows(&terminal);
+
+        let head = rows.iter().position(|r| r.contains("the quick brown"));
+        let tail = rows.iter().position(|r| r.contains("lazy dog"));
+        assert!(
+            head.is_some(),
+            "start of the line still visible:\n{rows:#?}"
+        );
+        assert!(tail.is_some(), "end of the line also visible:\n{rows:#?}");
+        assert_ne!(head, tail, "the line wrapped onto a second row");
+    }
+
+    #[test]
+    fn composer_owns_word_kill_and_undo() {
+        // Everything Fleety does not claim reaches the composer's own key map.
+        // These two are the ones the old editor had no answer for at all.
+        let mut app = App::new("ready");
+        for c in "hello world".chars() {
+            on_key(&mut app, key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.input.text(), "hello world");
+
+        on_key(&mut app, ctrl('w'));
+        assert_eq!(app.input.text(), "hello ", "Ctrl+W kills the last word");
+
+        on_key(&mut app, ctrl('z'));
+        assert_eq!(app.input.text(), "hello world", "Ctrl+Z undoes the kill");
+    }
+
+    #[test]
     fn input_title_reflects_attachment_count() {
         let mut app = App::new("ready");
         assert!(app.input_title().contains("Ctrl+V=paste"));
@@ -829,135 +1198,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn renders_all_panes() {
-        let mut terminal = Terminal::new(TestBackend::new(80, 12)).expect("term");
-        let mut app = App::new("connected");
-        app.push("fleety", "hello there");
-        app.input.set_text("typing".into());
-        terminal.draw(|f| render(f, &app)).expect("draw");
-        let content: String = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|c| c.symbol())
-            .collect();
-        assert!(content.contains("hello there"), "messages pane");
-        assert!(content.contains("typing"), "input pane");
-        assert!(content.contains("Fleety"), "title");
-        assert!(content.contains("connected"), "status line");
-    }
-
     /// One terminal row per rendered line, for asserting what's visible where.
     fn visible_rows(terminal: &Terminal<TestBackend>) -> Vec<String> {
         let buf = terminal.backend().buffer();
         let w = buf.area.width as usize;
         let syms: Vec<&str> = buf.content().iter().map(|c| c.symbol()).collect();
         syms.chunks(w).map(|r| r.concat()).collect()
-    }
-
-    #[test]
-    fn multiline_message_renders_as_separate_lines() {
-        let mut app = App::new("ready");
-        app.push("fleety", "first line\nsecond line");
-        // The flattener splits on \n (a single ratatui Line would drop it).
-        assert_eq!(message_lines(&app).len(), 2);
-
-        let mut terminal = Terminal::new(TestBackend::new(40, 12)).expect("term");
-        terminal.draw(|f| render(f, &app)).expect("draw");
-        let rows = visible_rows(&terminal);
-        let first = rows.iter().position(|r| r.contains("first line"));
-        let second = rows.iter().position(|r| r.contains("second line"));
-        assert!(first.is_some() && second.is_some(), "both lines visible");
-        assert_ne!(first, second, "on different rows");
-        assert!(
-            !rows.iter().any(|r| r.contains("first linesecond")),
-            "not glued together"
-        );
-    }
-
-    #[test]
-    fn assistant_code_block_is_visually_distinguished() {
-        let mut app = App::new("ready");
-        app.push("fleety", "intro line\n```\nlet x = 1;\n```\ndone");
-        let mut terminal = Terminal::new(TestBackend::new(40, 12)).expect("term");
-        terminal.draw(|f| render(f, &app)).expect("draw");
-        let rows = visible_rows(&terminal);
-        // The code content survives and lands on a gutter-marked row ("│ code"),
-        // set apart from the prose. (The pane border is also "│", so we assert
-        // the gutter+content adjacency, not the bare glyph.)
-        assert!(
-            rows.iter().any(|r| r.contains("let x = 1;")),
-            "code visible"
-        );
-        assert!(
-            rows.iter().any(|r| r.contains("│ let x = 1;")),
-            "code row carries the gutter marker"
-        );
-        // Prose renders with the role label, not a gutter.
-        assert!(
-            rows.iter().any(|r| r.contains("fleety: intro line")),
-            "prose keeps the role label"
-        );
-        assert!(
-            !rows.iter().any(|r| r.contains("│ intro line")),
-            "prose is not gutter-marked"
-        );
-        assert!(
-            rows.iter().any(|r| r.contains("done")),
-            "trailing prose kept"
-        );
-    }
-
-    #[test]
-    fn conversation_follows_the_bottom_when_it_overflows() {
-        // 9 rows: messages pane gets 5 (3 inner), input 3, status 1.
-        let mut terminal = Terminal::new(TestBackend::new(30, 9)).expect("term");
-        let mut app = App::new("ready");
-        for i in 1..=8 {
-            app.push("x", format!("m{i}"));
-        }
-        terminal.draw(|f| render(f, &app)).expect("draw");
-        let content: String = visible_rows(&terminal).concat();
-        assert!(content.contains("m8"), "newest message visible");
-        assert!(!content.contains("m1 "), "oldest scrolled out");
-    }
-
-    #[test]
-    fn page_up_scrolls_back_and_sending_returns_to_bottom() {
-        let mut terminal = Terminal::new(TestBackend::new(30, 9)).expect("term");
-        let mut app = App::new("ready");
-        for i in 1..=8 {
-            app.push("x", format!("m{i}"));
-        }
-        assert_eq!(on_key(&mut app, key(KeyCode::PageUp)), Action::None);
-        assert_eq!(app.scroll_back, SCROLL_STEP);
-        terminal.draw(|f| render(f, &app)).expect("draw");
-        let content: String = visible_rows(&terminal).concat();
-        assert!(content.contains("m1"), "scrolled back to the top");
-        assert!(!content.contains("m8"), "bottom out of view");
-
-        // PageDown steps back toward the bottom.
-        assert_eq!(on_key(&mut app, key(KeyCode::PageDown)), Action::None);
-        assert_eq!(app.scroll_back, 0);
-
-        // End no longer touches the scrollback — it's an input-cursor key now.
-        on_key(&mut app, key(KeyCode::PageUp));
-        assert_eq!(on_key(&mut app, key(KeyCode::End)), Action::None);
-        assert_eq!(app.scroll_back, SCROLL_STEP, "End left scrollback alone");
-
-        // Sending a message snaps back to the newest output.
-        on_key(&mut app, key(KeyCode::Char('z')));
-        assert!(matches!(
-            on_key(&mut app, key(KeyCode::Enter)),
-            Action::Send { .. }
-        ));
-        app.commit_send();
-        assert_eq!(app.scroll_back, 0);
-        terminal.draw(|f| render(f, &app)).expect("draw");
-        let content: String = visible_rows(&terminal).concat();
-        assert!(content.contains("you: z"), "sent line at the bottom");
     }
 
     #[test]
@@ -987,7 +1233,7 @@ mod tests {
     #[test]
     fn multiline_input_renders_on_separate_rows() {
         let mut app = App::new("ready");
-        app.input.set_text("aaa\nbbb".to_string());
+        prefill(&mut app.input, "aaa\nbbb");
         let mut terminal = Terminal::new(TestBackend::new(30, 12)).expect("term");
         terminal.draw(|f| render(f, &app)).expect("draw");
         let rows = visible_rows(&terminal);
@@ -1032,8 +1278,10 @@ mod tests {
         std::fs::write(&path, b"hello").expect("write");
 
         // A `/attach <existing>` submission stages the file and does NOT send.
-        app.input
-            .set_text(format!("/attach {}", path.to_string_lossy()));
+        prefill(
+            &mut app.input,
+            &format!("/attach {}", path.to_string_lossy()),
+        );
         assert_eq!(on_key(&mut app, key(KeyCode::Enter)), Action::None);
         assert_eq!(app.pending_attachments.len(), 1);
         assert!(
@@ -1044,7 +1292,7 @@ mod tests {
         // A missing path preserves the input and reports an error — nothing new
         // is staged and no message is sent.
         let missing = "/attach /no/such/file-xyz".to_string();
-        app.input.set_text(missing.clone());
+        prefill(&mut app.input, &missing);
         assert_eq!(on_key(&mut app, key(KeyCode::Enter)), Action::None);
         assert_eq!(app.pending_attachments.len(), 1, "no new attachment staged");
         assert_eq!(app.input.text(), missing, "input preserved on failure");
@@ -1061,7 +1309,7 @@ mod tests {
     fn esc_cancels_while_a_turn_is_in_flight_then_quits_when_idle() {
         let mut app = App::new("ready");
         // Sending a message marks a turn in flight.
-        app.input.set_text("hello".into());
+        prefill(&mut app.input, "hello");
         let Action::Send { .. } = on_key(&mut app, key(KeyCode::Enter)) else {
             panic!("expected Send");
         };
@@ -1082,7 +1330,7 @@ mod tests {
     #[test]
     fn esc_with_unsent_input_confirms_before_quitting() {
         let mut app = App::new("ready");
-        app.input.set_text("draft".into());
+        prefill(&mut app.input, "draft");
         // First Esc: enter the confirm state without quitting.
         assert_eq!(on_key(&mut app, key(KeyCode::Esc)), Action::None);
         assert!(app.confirm_quit);
@@ -1108,7 +1356,7 @@ mod tests {
     #[test]
     fn editing_cancels_quit_confirmation() {
         let mut app = App::new("ready");
-        app.input.set_text("draft".into());
+        prefill(&mut app.input, "draft");
         assert_eq!(on_key(&mut app, key(KeyCode::Esc)), Action::None);
         assert!(app.confirm_quit);
         // An editing keypress clears the confirm state…
@@ -1122,7 +1370,7 @@ mod tests {
     #[test]
     fn ctrl_c_bypasses_quit_confirmation() {
         let mut app = App::new("ready");
-        app.input.set_text("draft".into());
+        prefill(&mut app.input, "draft");
         assert_eq!(on_key(&mut app, ctrl('c')), Action::Quit);
         assert!(app.should_quit);
     }
@@ -1138,7 +1386,7 @@ mod tests {
     #[test]
     fn approval_deny_takes_priority_over_turn_cancel() {
         let mut app = App::new("ready");
-        app.input.set_text("go".into());
+        prefill(&mut app.input, "go");
         let _ = on_key(&mut app, key(KeyCode::Enter));
         app.commit_send();
         assert!(app.turn_in_flight);
@@ -1185,7 +1433,7 @@ mod tests {
     #[test]
     fn expired_transport_approval_cannot_be_committed_and_preserves_composer() {
         let mut app = App::new("ready");
-        app.input.set_text("keep this draft".into());
+        prefill(&mut app.input, "keep this draft");
         app.attach(WireAttachment {
             mime: "text/plain".into(),
             bytes_b64: Some("aGVsbG8=".into()),

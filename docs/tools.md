@@ -501,11 +501,54 @@ so the surface is complete.
 | `fleety init <url>` | Save the agent URL into `~/.fleety/config.json`. |
 | `fleety pair <code>` | Enroll this device with a code minted by `pair_create` somewhere else. |
 | `fleety ask "..."` | One-shot conversation. Multimodal: `--image PATH`, `--audio PATH`, `--video PATH`, `--file PATH` (read once, base64-encoded, attached). |
-| `fleety tui` | Interactive multi-pane TUI. **Ctrl+V** pastes a clipboard image (re-encoded to PNG) or a single-line file path as an attachment; **Ctrl+X** clears staged attachments. |
+| `fleety tui` | Interactive multi-pane TUI. **Ctrl+V** pastes a clipboard image (re-encoded to PNG) or a single-line file path as an attachment; **Ctrl+X** clears staged attachments. See [TUI input](#tui-input) for the composer and mouse keys. |
 | `fleety resume <conv> [after_seq]` | Replay a conversation. |
 | `fleety status` | Version, uptime, connected devices, sidecar health (insyra binary path / missing). |
 | `fleety audit list [N]` / `fleety audit show <i>` | Browse the audit log; `5m ago` relative time. |
 | `fleety rollback list` / `fleety rollback apply <id>` | Inspect and restore backups. |
+
+### TUI input
+
+The Chat composer is [`fleety-textarea`](../crates/fleety-textarea), a vendored
+copy of grok-build's editor, so it answers the usual readline keys as well as
+Fleety's own.
+
+| Keys | Does |
+|---|---|
+| Enter / Alt+Enter / Ctrl+J | Send / newline / newline |
+| Ctrl+Z, Ctrl+Y | Undo, redo |
+| Ctrl+W, Ctrl+K, Ctrl+U | Kill previous word, to end of line, to start of line |
+| Ctrl+Y | Yank back the last kill |
+| Alt+←/→, Ctrl+←/→ | Move by word |
+| Ctrl+V, Ctrl+X | Paste attachment, clear staged attachments (Fleety's, not the composer's cut) |
+
+Long lines wrap and grow the box rather than scrolling sideways.
+
+Assistant replies render through [`fleety-markdown`](../crates/fleety-markdown),
+also vendored from grok-build: full CommonMark, with fenced code blocks
+syntax-highlighted by language, plus tables, task lists and links. Markdown
+markers stay on screen but dimmed, so a reply still reads as what the model
+wrote. A bare newline stays a line break — Fleety turns off the CommonMark rule
+that would fold it into the previous line.
+
+A ` ```mermaid ` fence is drawn as a diagram rather than shown as source:
+`graph` / `flowchart`, `sequenceDiagram` and `stateDiagram` become Unicode line
+art. Any other diagram type falls back to its raw source in a framed box. This
+is pure text — no graphics protocol and no external process — so it renders the
+same in every terminal.
+
+Chat opens with the Fleety wordmark, the version, the Server it reached, and the
+model — written into the scrollback once, so it scrolls away as the conversation
+grows instead of occupying the viewport forever.
+
+Chat does not take over the screen. It keeps a small viewport at the bottom and
+writes the conversation above it as ordinary terminal output, so the exchange
+becomes part of your scrollback: scroll it with the terminal's own scrollbar,
+select and copy it with a plain drag, and it is still there after you quit.
+Fleety takes no mouse input and no longer scrolls the conversation itself.
+
+While a reply is streaming, the part whose markdown has closed is written out as
+it settles; the part still being written stays in the viewport until it does.
 
 ## Built-in MCP / sidecars
 

@@ -54,7 +54,7 @@ pub async fn run(args: &[String]) -> Result<()> {
         Some("logout") if args.len() == 2 && !args[1].starts_with('-') => logout(&args[1]).await,
         Some("logout") => Err(usage_error("logout")),
         Some("status")
-            if args.len() <= 2 && args.get(1).map_or(true, |a| !a.starts_with('-')) =>
+            if args.len() <= 2 && args.get(1).is_none_or(|a| !a.starts_with('-')) =>
         {
             status(args.get(1).cloned()).await
         }

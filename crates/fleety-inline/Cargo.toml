@@ -1,0 +1,22 @@
+[package]
+name = "fleety-inline"
+description = "Vendored inline-viewport ratatui Terminal with real terminal scrollback (see README.md)."
+# Vendored third-party source: edition and rust-version are the upstream crate's
+# own, NOT the workspace values. See README.md.
+edition = "2024"
+rust-version = "1.85"
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+anstyle-parse = "0.2"
+crossterm = { version = "0.28", features = ["event-stream", "bracketed-paste"] }
+ratatui = { version = "0.29", features = ["crossterm"] }
+unicode-width = "0.2"
+
+[features]
+# Upstream declares this; the vendored terminal fork gates code on it, so the
+# feature has to exist here too or every build warns about an unknown cfg.
+scrolling-regions = ["ratatui/scrolling-regions"]

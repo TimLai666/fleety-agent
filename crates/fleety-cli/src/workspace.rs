@@ -834,6 +834,36 @@ fn run_palette_selection(state: &mut WorkspaceState) -> KeyOutcome {
     KeyOutcome::Consumed(effects)
 }
 
+/// Draw the workspace chrome for an inline viewport.
+///
+/// The full-screen chrome spends seven rows on bordered header and key panels,
+/// which is more than an inline viewport has to give. Here the header collapses
+/// to one unbordered line and the key panel is dropped — Chat draws its own
+/// status line, and the conversation above the viewport is the terminal's.
+///
+/// Routes that need room (Conversations, modals, the palette) grow the viewport
+/// to full height and go through `render` instead.
+///
+/// [`INLINE_CHROME_ROWS`] is what this costs the caller; a viewport sized
+/// without it squeezes the content it was sized for.
+pub const INLINE_CHROME_ROWS: u16 = 1;
+
+pub fn render_inline(
+    frame: &mut Frame,
+    state: &WorkspaceState,
+    render_content: impl FnOnce(&mut Frame, Rect),
+) {
+    let regions = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .split(frame.area());
+    frame.render_widget(
+        Paragraph::new(header_line(state, regions[0].width)),
+        regions[0],
+    );
+    render_content(frame, regions[1]);
+}
+
 pub fn render(
     frame: &mut Frame,
     state: &WorkspaceState,
@@ -1128,16 +1158,18 @@ mod tests {
     #[test]
     fn workspace_session_preserves_multiline_draft_cursor_and_attachment_across_routes() {
         let mut session = WorkspaceSession::new(Route::Chat);
-        session.chat.input.set_text("first line\n第二行".into());
-        session.chat.input.left();
-        session.chat.input.left();
+        crate::tui::prefill(&mut session.chat.input, "first line\n第二行");
+        session.chat.input.move_cursor_left();
+        session.chat.input.move_cursor_left();
         session.chat.attach(fleety_protocol::WireAttachment {
             mime: "image/png".into(),
             bytes_b64: Some("cG5n".into()),
             url: None,
             name: Some("draft.png".into()),
         });
-        let cursor = session.chat.input.cursor_row_col();
+        // Byte offset into the draft, so the assertion is about the caret's
+        // place in the text rather than the geometry of whatever rendered it.
+        let cursor = session.chat.input.cursor();
         let attachment = session.chat.pending_attachments[0].clone();
 
         session
@@ -1151,7 +1183,7 @@ mod tests {
 
         assert_eq!(session.workspace.route, Route::Chat);
         assert_eq!(session.chat.input.text(), "first line\n第二行");
-        assert_eq!(session.chat.input.cursor_row_col(), cursor);
+        assert_eq!(session.chat.input.cursor(), cursor);
         assert_eq!(session.chat.pending_attachments, vec![attachment]);
     }
 
@@ -1583,7 +1615,7 @@ mod tests {
                 state.reduce(Action::Connected);
                 let mut app = crate::tui::App::new("準備完成 ✅");
                 app.push("you", "ASCII + 中文 + emoji 🧭");
-                app.input.set_text("草稿🙂".into());
+                crate::tui::prefill(&mut app.input, "草稿🙂");
                 app.conversations = vec![crate::tui::ConversationSummary {
                     conversation_id: "對話-1".into(),
                     last_ts_secs: 1,

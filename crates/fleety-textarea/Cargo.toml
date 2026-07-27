@@ -1,0 +1,46 @@
+[package]
+name = "fleety-textarea"
+description = "Vendored multi-line ratatui textarea widget (see README.md for provenance)."
+# Vendored third-party source: edition and rust-version are the upstream crate's
+# own, NOT the workspace values. Upstream uses let-chains, which require edition
+# 2024 (Rust >= 1.85). Inheriting the workspace's edition 2021 / rust-version
+# 1.80 would need ~9 hand edits to `src/`, which is why they are declared here
+# instead — see README.md, "Why edition 2024".
+edition = "2024"
+rust-version = "1.85"
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+crossterm = { version = "0.28", features = ["event-stream", "bracketed-paste"] }
+ratatui = { version = "0.29", features = ["crossterm", "unstable-widget-ref"] }
+ratatui-core = "0.1"
+textwrap = "0.16"
+tracing = { workspace = true, optional = true }
+tui-scrollbar = "0.2"
+unicode-segmentation = "1.12"
+unicode-width = "0.2"
+
+[dev-dependencies]
+arboard = { workspace = true }
+chrono = { workspace = true }
+fuzzy-matcher = "0.3.7"
+ignore = "0.4"
+itertools = "0.14"
+pretty_assertions = "1"
+rand = "0.9"
+
+[features]
+default = []
+debug-logs = ["dep:tracing"]
+
+# Vendored source is kept byte-identical, so lints it trips are silenced here
+# rather than patched in `src/`. Both fire only in upstream's own test modules,
+# which upstream builds under its workspace lint config. Keep this list exact —
+# it is a record of the drift, not a blanket opt-out — and re-check it after
+# every re-sync (see README.md).
+[lints.clippy]
+single_range_in_vec_init = "allow"
+useless_borrows_in_formatting = "allow"

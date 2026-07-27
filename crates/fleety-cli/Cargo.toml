@@ -15,6 +15,12 @@ path = "src/main.rs"
 [dependencies]
 agent-core = { workspace = true }
 fleety-protocol = { workspace = true }
+# anstyle: the vendored markdown renderer types its palette in anstyle, so the
+# chat theme in markdown.rs has to speak it too.
+anstyle = "1.0"
+fleety-inline = { workspace = true }
+fleety-markdown = { workspace = true }
+fleety-textarea = { workspace = true }
 fleety-tools = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
@@ -24,9 +30,14 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 reqwest = { workspace = true }
 # unstable-rendered-line-info: Paragraph::line_count, used to bottom-anchor the
-# TUI conversation (the version stays pinned to 0.29 so the unstable API can't
-# drift under us).
-ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
+# TUI conversation. unstable-widget-ref: render_stateful_widget_ref, used to
+# draw the `fleety-textarea` composer from a shared &App. (The version stays
+# pinned to 0.29 so the unstable APIs can't drift under us — and it is the same
+# 0.29 the vendored composer was written against.)
+ratatui = { version = "0.29", features = [
+    "unstable-rendered-line-info",
+    "unstable-widget-ref",
+] }
 base64 = { workspace = true }
 arboard = { workspace = true }
 png = { workspace = true }
