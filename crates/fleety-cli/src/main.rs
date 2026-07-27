@@ -1207,7 +1207,7 @@ async fn run_tui(session: workspace::WorkspaceSession) -> Result<workspace::Sess
     };
     app.announce(tui::banner(
         env!("CARGO_PKG_VERSION"),
-        &target.url,
+        target.url(),
         banner_model.as_deref(),
     ));
     let mut viewport = ViewportState::new(&terminal);

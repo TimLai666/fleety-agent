@@ -439,7 +439,7 @@ pub fn ensure_resolvable_profile_generation_at(
     if existing
         .profiles
         .get(existing_name)
-        .map_or(true, |profile| !profile.generation.trim().is_empty())
+        .is_none_or(|profile| !profile.generation.trim().is_empty())
     {
         return Ok(false);
     }
