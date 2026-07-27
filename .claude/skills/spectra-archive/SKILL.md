@@ -68,17 +68,7 @@ Archive a completed change.
 
    If user chooses sync, use Task tool (subagent_type: "general-purpose", prompt: "Use Skill tool to invoke spectra-sync-specs for change '<name>'. Delta spec analysis: <include the analyzed delta spec summary>"). Proceed to archive regardless of choice.
 
-5. **Clean up tracking file**
-
-   Delete `.spectra/touched/<change-name>.json` if it exists. This file contains implementation tracking data that is not needed after archiving.
-
-   ```bash
-   rm -f .spectra/touched/<change-name>.json
-   ```
-
-   If the file does not exist, silently continue.
-
-6. **Perform the archive**
+5. **Perform the archive**
 
    Use the `spectra archive` CLI command which handles the full archive workflow
    (spec snapshot, delta application, @trace injection, identity recording, vector indexing):
@@ -93,6 +83,20 @@ Archive a completed change.
    - `--no-validate` — skip delta spec validation
 
    **If archive fails** with "already exists" error, suggest renaming existing archive.
+
+6. **Clean up tracking file**
+
+   ONLY after `spectra archive` has succeeded, delete `.spectra/touched/<change-name>.json`
+   if it exists. The archive step READS this file to inject `@trace` blocks into the main
+   specs, so deleting it first silently loses that trace data — and the CLI never cleans the
+   file up itself, which is why this step exists at all.
+
+   ```bash
+   rm -f .spectra/touched/<change-name>.json
+   ```
+
+   If the archive failed, KEEP the file so the archive can be retried.
+   If the file does not exist, silently continue.
 
 7. **Display summary**
 
