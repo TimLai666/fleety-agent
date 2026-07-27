@@ -58,6 +58,8 @@ mod model_picker;
 mod provider_service;
 mod provider_tui;
 mod server;
+#[cfg(test)]
+mod test_terminal;
 mod tui;
 mod voice;
 pub mod workspace;
@@ -1177,6 +1179,7 @@ async fn run_tui(session: workspace::WorkspaceSession) -> Result<workspace::Sess
     let server_identity = welcome.server_identity.clone();
     let (provider, model) =
         load_chat_model_context(&mut tx, &mut rx, welcome.config_protocol).await;
+    let banner_model = model.clone();
     workspace::activate_chat_transport(
         &mut workspace,
         &mut chat_transport,
@@ -1191,7 +1194,23 @@ async fn run_tui(session: workspace::WorkspaceSession) -> Result<workspace::Sess
         },
     );
 
-    let mut terminal = ratatui::init();
+    // Inline viewport: the conversation goes into the terminal's own scrollback
+    // and stays there, so Fleety only owns the few rows at the bottom. Settings
+    // and Provider keep their own full-screen terminals; this one is Chat's.
+    let mut terminal = match open_inline_terminal() {
+        Ok(terminal) => terminal,
+        Err(e) => {
+            return Err(CoreError::Message(format!(
+                "could not prepare the terminal: {e}"
+            )))
+        }
+    };
+    app.announce(tui::banner(
+        env!("CARGO_PKG_VERSION"),
+        target.url(),
+        banner_model.as_deref(),
+    ));
+    let mut viewport = ViewportState::new(&terminal);
     app.status = remote_context(&target, &RemoteOwner::Server, server_identity.as_deref());
     // Redraw only when something changed — a key/frame event, or a spinner tick
     // while waiting. Idle ticks must not force periodic repaints (the spinner is
@@ -1228,6 +1247,19 @@ async fn run_tui(session: workspace::WorkspaceSession) -> Result<workspace::Sess
             conversations_requested = false;
         }
         if dirty {
+            let chat = matches!(&workspace.route, workspace::Route::Chat);
+            sync_terminal(&mut app, &mut terminal, chat, &mut viewport);
+            if chat {
+                if let Err(e) = terminal.draw(|frame| {
+                    workspace::render_inline(frame, &workspace, |frame, area| {
+                        tui::render_in_area(frame, &app, area)
+                    });
+                }) {
+                    break Err(CoreError::Message(format!("draw failed: {e}")));
+                }
+                dirty = false;
+                continue;
+            }
             if let Err(e) = terminal.draw(|frame| {
                 workspace::render(frame, &workspace, |frame, area| match &workspace.route {
                     workspace::Route::Chat => tui::render_in_area(frame, &app, area),
@@ -1593,7 +1625,7 @@ async fn run_tui(session: workspace::WorkspaceSession) -> Result<workspace::Sess
             }
         }
     };
-    ratatui::restore();
+    close_inline_terminal(&mut terminal);
     let _ = tx.close().await;
     result
 }
@@ -1757,7 +1789,7 @@ async fn reconnect(
     app: &mut tui::App,
     workspace: &mut workspace::WorkspaceState,
     chat_transport: &mut Option<workspace::ChatTransportContext>,
-    terminal: &mut ratatui::DefaultTerminal,
+    terminal: &mut fleety_inline::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     input: &mut workspace::WorkspaceInput,
 ) -> Option<(Tx, Rx)> {
     prepare_for_chat_reconnect(app, chat_transport);
@@ -1777,7 +1809,7 @@ async fn reconnect(
             backoff_ms: delay_ms,
         });
         let _ = terminal.draw(|frame| {
-            workspace::render(frame, workspace, |frame, area| {
+            workspace::render_inline(frame, workspace, |frame, area| {
                 if matches!(&workspace.route, workspace::Route::Chat) {
                     tui::render_in_area(frame, app, area);
                 }
@@ -1805,7 +1837,7 @@ async fn reconnect(
                         return None;
                     }
                     let _ = terminal.draw(|frame| {
-                        workspace::render(frame, workspace, |frame, area| {
+                        workspace::render_inline(frame, workspace, |frame, area| {
                             if matches!(&workspace.route, workspace::Route::Chat) {
                                 tui::render_in_area(frame, app, area);
                             }
@@ -1856,7 +1888,7 @@ async fn reconnect(
                         return None;
                     }
                     let _ = terminal.draw(|frame| {
-                        workspace::render(frame, workspace, |frame, area| {
+                        workspace::render_inline(frame, workspace, |frame, area| {
                             if matches!(&workspace.route, workspace::Route::Chat) {
                                 tui::render_in_area(frame, app, area);
                             }
@@ -2120,6 +2152,94 @@ fn profile_recovery_error(profile: &str, cause: &str) -> String {
 /// The collecting scan + entry type live in `fleety_tools::connection` (shared
 /// with the daemon's discovery); the picker below is CLI-only.
 use fleety_tools::connection::{discover_all_via_mdns, DiscoveredServer};
+
+/// What the terminal needs remembered between frames.
+struct ViewportState {
+    last_size: ratatui::layout::Size,
+    rows: u16,
+}
+
+impl ViewportState {
+    fn new<B: ratatui::backend::Backend + std::io::Write>(
+        terminal: &fleety_inline::Terminal<B>,
+    ) -> Self {
+        Self {
+            last_size: terminal.backend().size().unwrap_or_default(),
+            rows: 0,
+        }
+    }
+}
+
+/// Hand over everything that has settled and size the viewport for the route.
+///
+/// This is the seam where Fleety's state turns into terminal output, and it is
+/// a function rather than part of the draw loop so it can be run against a
+/// captured byte stream — see `test_terminal`. It needs nothing from the event
+/// loop, the transport, or a real terminal.
+fn sync_terminal<B: ratatui::backend::Backend + std::io::Write>(
+    app: &mut tui::App,
+    terminal: &mut fleety_inline::Terminal<B>,
+    chat: bool,
+    state: &mut ViewportState,
+) {
+    // Settled content leaves before the frame is drawn, so the viewport never
+    // shows what the terminal is already showing.
+    for block in app.take_emissions() {
+        if let Err(e) = fleety_inline::emit_to_scrollback(terminal, &block) {
+            app.status = format!("could not write to the terminal: {e}");
+        }
+    }
+    let size = terminal.backend().size().unwrap_or_default();
+    if size != state.last_size {
+        // The terminal reflows already-printed rows before we hear about the
+        // resize, which mangles styled output. Reset and replay the whole
+        // conversation at the new width instead.
+        let _ = fleety_inline::resize_purge_rerender(terminal, app.history());
+        state.last_size = size;
+        state.rows = 0;
+    }
+    // Chat lives in a few rows; every other route needs the screen.
+    let want = if chat {
+        // The chrome sits above the content, so the viewport has to be tall
+        // enough for both or the composer gets squeezed out of the frame.
+        app.viewport_height(size.width, (size.height / 2).max(4))
+            .saturating_add(workspace::INLINE_CHROME_ROWS)
+    } else {
+        size.height
+    };
+    if want != state.rows {
+        let _ = terminal.set_viewport_height(want);
+        state.rows = want;
+    }
+}
+
+/// Terminal for Chat: raw mode, no alternate screen, a viewport at the bottom.
+///
+/// Deliberately not `ratatui::init`, which switches to the alternate screen —
+/// that is the mode this replaces. Whatever the terminal was showing stays put,
+/// and the conversation is written above the viewport as ordinary output.
+fn open_inline_terminal(
+) -> std::io::Result<fleety_inline::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>> {
+    ratatui::crossterm::terminal::enable_raw_mode()?;
+    fleety_inline::Terminal::with_options(
+        ratatui::backend::CrosstermBackend::new(std::io::stdout()),
+        ratatui::TerminalOptions {
+            // Grown to fit on the first frame; four rows is the floor.
+            viewport: ratatui::Viewport::Inline(4),
+        },
+    )
+}
+
+/// Give the terminal back: leave the cursor below the conversation so the next
+/// shell prompt does not land on top of it.
+fn close_inline_terminal(
+    terminal: &mut fleety_inline::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+) {
+    let _ = terminal.clear();
+    let _ = ratatui::crossterm::terminal::disable_raw_mode();
+    let _ = ratatui::crossterm::execute!(std::io::stdout(), ratatui::crossterm::cursor::Show);
+    println!();
+}
 
 /// The picker's parse of one input line: a 1-based pick mapped to its index,
 /// a cancel (empty input / EOF), or garbage worth a re-prompt.
@@ -4925,7 +5045,7 @@ async fn inspect_server_configuration(
                 expires_at_secs,
                 error: None,
                 ..
-            }) if expires_at_secs.map_or(true, |expiry| expiry > now_secs()) => {}
+            }) if expires_at_secs.is_none_or(|expiry| expiry > now_secs()) => {}
             Some(ServerMsg::CredentialStatusResult { .. }) => unavailable.push(provider.clone()),
             Some(ServerMsg::Error { .. }) | None => unavailable.push(provider.clone()),
             Some(_) => unavailable.push(provider.clone()),
@@ -5339,7 +5459,7 @@ mod tests {
     #[test]
     fn reconnect_keeps_local_input_and_can_navigate_to_settings() {
         let mut app = tui::App::new("reconnecting");
-        app.input.set_text("draft".into());
+        tui::prefill(&mut app.input, "draft");
         let mut state = workspace::WorkspaceState::new(workspace::Route::Chat);
         state.reduce(workspace::Action::ConnectionLost {
             attempt: 1,
@@ -5396,7 +5516,7 @@ mod tests {
     #[test]
     fn exhausted_reconnect_stays_in_workspace_with_session_intact() {
         let mut app = tui::App::new("reconnecting");
-        app.input.set_text("unsent".into());
+        tui::prefill(&mut app.input, "unsent");
         let mut state = workspace::WorkspaceState::new(workspace::Route::Chat);
 
         mark_reconnect_exhausted(&mut app, &mut state);
@@ -5417,7 +5537,7 @@ mod tests {
     #[test]
     fn reconnect_start_expires_transport_bound_approval_only() {
         let mut app = tui::App::new("ready");
-        app.input.set_text("unsent".into());
+        tui::prefill(&mut app.input, "unsent");
         app.request_approval("old-id".into(), "run_command", "critical", "deploy");
         app.turn_in_flight = true;
         let mut transport = Some(workspace::ChatTransportContext {
@@ -5526,9 +5646,11 @@ mod tests {
             connection::Source::Profile("B".into()),
         );
         let mut app = tui::App::new("offline");
-        app.input.set_text("first\n草稿".into());
-        app.input.left();
-        let cursor = app.input.cursor_row_col();
+        tui::prefill(&mut app.input, "first\n草稿");
+        app.input.move_cursor_left();
+        // Byte offset, not screen row/col: this asserts the caret keeps its place
+        // in the *text* across a reconnect, independent of how it is laid out.
+        let cursor = app.input.cursor();
         app.attach(WireAttachment {
             mime: "image/png".into(),
             bytes_b64: Some("cG5n".into()),
@@ -5552,7 +5674,7 @@ mod tests {
         assert_eq!(context.server_identity.as_deref(), Some("server-b"));
         assert_eq!(context.server_version.as_deref(), Some("2.0.0"));
         assert_eq!(app.input.text(), "first\n草稿");
-        assert_eq!(app.input.cursor_row_col(), cursor);
+        assert_eq!(app.input.cursor(), cursor);
         assert_eq!(app.pending_attachments.len(), 1);
         let requests = requests.await.expect("reconnect requests");
         assert!(matches!(requests[0], ClientMsg::Hello { .. }));

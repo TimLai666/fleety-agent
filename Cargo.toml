@@ -5,7 +5,11 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.1.21"
 edition = "2021"
-rust-version = "1.80"
+# 1.85 is the edition-2024 floor, required by the vendored `fleety-textarea`
+# (see AGENTS.md, "Vendored Rust source"). CI builds on `stable`, so nothing
+# verifies this number — treat it as a promise to source builders, and check it
+# by hand when raising it.
+rust-version = "1.85"
 license = "Apache-2.0"
 repository = "https://github.com/TimLai666/fleety-agent"
 publish = false
@@ -15,6 +19,10 @@ publish = false
 agent-core = { path = "crates/agent-core" }
 agent-workflow = { path = "crates/agent-workflow" }
 fleety-protocol = { path = "crates/fleety-protocol" }
+fleety-inline = { path = "crates/fleety-inline" }
+fleety-markdown = { path = "crates/fleety-markdown" }
+fleety-markdown-core = { path = "crates/fleety-markdown-core" }
+fleety-textarea = { path = "crates/fleety-textarea" }
 fleety-tools = { path = "crates/fleety-tools" }
 fleety-vec = { path = "crates/fleety-vec" }
 # external
@@ -42,7 +50,8 @@ iana-time-zone = "0.1"
 mdns-sd = "0.13"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 fs4 = { version = "=1.1.0", default-features = false, features = ["sync"] }
-# Keep Clap itself compatible with the workspace's declared Rust 1.80 baseline.
-# The complete dependency graph has separate, currently newer MSRV blockers.
+# These exact pins were taken to hold Clap at the old Rust 1.80 baseline. That
+# baseline is now 1.85, so the constraint no longer applies — the pins are kept
+# only because nothing has re-tested a newer Clap. Safe to revisit.
 clap = { version = "=4.5.4", default-features = false, features = ["derive", "std", "help", "usage", "error-context", "suggestions"] }
 clap_complete = "=4.5.2"

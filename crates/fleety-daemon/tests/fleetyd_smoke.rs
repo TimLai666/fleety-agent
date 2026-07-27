@@ -987,6 +987,11 @@ fn automatic_mdns_never_opens_a_control_session_or_persists_rogue_credentials() 
         .env("FLEETY_PAIRING_CODE", "caller-pairing-code")
         .env_remove("FLEETY_AGENT_URL")
         .env_remove("FLEETY_MDNS_DISABLED")
+        // Hand the daemon the rogue advertiser directly instead of relying on
+        // multicast reaching between processes, which CI runners do not do. The
+        // candidate is fabricated; every decision made about it is not, and
+        // those decisions are what this test is about.
+        .env("FLEETY_MDNS_FAKE_URL", format!("ws://127.0.0.1:{_port}"))
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()

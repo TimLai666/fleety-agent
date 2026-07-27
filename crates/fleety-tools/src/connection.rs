@@ -439,7 +439,7 @@ pub fn ensure_resolvable_profile_generation_at(
     if existing
         .profiles
         .get(existing_name)
-        .map_or(true, |profile| !profile.generation.trim().is_empty())
+        .is_none_or(|profile| !profile.generation.trim().is_empty())
     {
         return Ok(false);
     }
@@ -1057,6 +1057,22 @@ pub fn push_discovered(found: &mut Vec<DiscoveredServer>, entry: DiscoveredServe
 pub fn discover_all_via_mdns(window: std::time::Duration) -> Vec<DiscoveredServer> {
     let mut found = Vec::new();
     if std::env::var("FLEETY_MDNS_DISABLED").is_ok() {
+        return found;
+    }
+    // Stand-in for a live browse, so the discovery path can be exercised where
+    // multicast does not reach between processes — CI runners, most containers.
+    // It only fabricates the *candidate*; everything downstream (whether the
+    // candidate may be used, whether credentials may be sent to it) runs
+    // unchanged, which is the part worth testing.
+    if let Ok(url) = std::env::var("FLEETY_MDNS_FAKE_URL") {
+        let url = url.trim();
+        if !url.is_empty() {
+            found.push(DiscoveredServer {
+                name: "fake".to_string(),
+                url: url.to_string(),
+                fingerprint: None,
+            });
+        }
         return found;
     }
     let Ok(daemon) = mdns_sd::ServiceDaemon::new() else {

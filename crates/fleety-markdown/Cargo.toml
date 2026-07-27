@@ -1,0 +1,46 @@
+[package]
+name = "fleety-markdown"
+description = "Vendored streaming markdown renderer for terminal UIs (see README.md for provenance)."
+# Vendored third-party source: edition and rust-version are the upstream crate's
+# own, NOT the workspace values — see README.md, "Why edition 2024" in
+# ../fleety-textarea/README.md for the same reasoning.
+edition = "2024"
+rust-version = "1.85"
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+
+[dependencies]
+anstyle = "1.0"
+anstyle-lossy = "1.1.4"
+anstyle-syntect = "1.0.4"
+# Renamed, not re-pathed: the vendored `src/` says `xai_grok_markdown_core`, and
+# keeping that extern name is what lets `src/` stay byte-identical to upstream.
+xai-grok-markdown-core = { package = "fleety-markdown-core", path = "../fleety-markdown-core" }
+html-escape = "0.2"
+linkify = "0.10"
+pulldown-cmark = "0.13"
+ratatui = { version = "0.29" }
+supports-color = "3.0"
+syntect = "5.3"
+textwrap = "0.16"
+two-face = { version = "0.4", default-features = false, features = ["syntect-fancy"] }
+unicode-width = "0.2"
+url = "2"
+
+# Vendored source is kept byte-identical, so lints it trips are silenced here
+# rather than patched in `src/`. Keep this list exact — it is a record of the
+# drift, not a blanket opt-out — and re-check it after every re-sync.
+[lints.clippy]
+question_mark = "allow"
+unnecessary_sort_by = "allow"
+
+[features]
+default = []
+
+[dev-dependencies]
+pretty_assertions = "1"

@@ -61,16 +61,6 @@ impl LineEditor {
         self.set_cursor_after_byte(b + c.len_utf8());
     }
 
-    /// Insert a whole string at the cursor (paste path).
-    pub fn insert_str(&mut self, s: &str) {
-        if s.is_empty() {
-            return;
-        }
-        let b = self.byte_offset();
-        self.text.insert_str(b, s);
-        self.set_cursor_after_byte(b + s.len());
-    }
-
     /// Delete the grapheme before the cursor.
     pub fn backspace(&mut self) {
         if self.cursor == 0 {
@@ -119,102 +109,6 @@ impl LineEditor {
         let graphemes: Vec<&str> = self.text.graphemes(true).collect();
         let mut i = self.cursor.min(graphemes.len());
         while i < graphemes.len() && !graphemes[i].contains('\n') {
-            i += 1;
-        }
-        self.cursor = i;
-    }
-
-    /// Insert a line break at the cursor (multi-line composition). Grapheme-index
-    /// and UTF-8 boundary guarantees are the same as any other insert.
-    pub fn insert_newline(&mut self) {
-        self.insert('\n');
-    }
-
-    /// Number of logical lines: 1 plus the count of embedded newlines.
-    pub fn line_count(&self) -> usize {
-        self.text.split('\n').count()
-    }
-
-    /// The cursor's position as `(row, display_col)`: `row` counts newlines
-    /// before the cursor; `display_col` is the terminal-column width of the
-    /// current line up to the cursor (CJK fullwidth counts as two).
-    pub fn cursor_row_col(&self) -> (usize, usize) {
-        let mut row = 0;
-        let mut col = 0;
-        for (i, grapheme) in self.text.graphemes(true).enumerate() {
-            if i == self.cursor {
-                break;
-            }
-            if grapheme.contains('\n') {
-                row += 1;
-                col = 0;
-            } else {
-                col += grapheme_width(grapheme);
-            }
-        }
-        (row, col)
-    }
-
-    /// Place the cursor at (or just before) `target_col` display columns into
-    /// `target_row`, clamped to the row's end. Used by `up`/`down`.
-    fn set_cursor_row_col(&mut self, target_row: usize, target_col: usize) {
-        let graphemes: Vec<&str> = self.text.graphemes(true).collect();
-        let mut i = 0;
-        let mut row = 0;
-        while i < graphemes.len() && row < target_row {
-            if graphemes[i].contains('\n') {
-                row += 1;
-            }
-            i += 1;
-        }
-        let mut col = 0;
-        while i < graphemes.len() && !graphemes[i].contains('\n') && col < target_col {
-            col += grapheme_width(graphemes[i]);
-            i += 1;
-        }
-        self.cursor = i;
-    }
-
-    /// Move the cursor up one line, keeping the display column where possible.
-    pub fn up(&mut self) {
-        let (row, col) = self.cursor_row_col();
-        if row == 0 {
-            return;
-        }
-        self.set_cursor_row_col(row - 1, col);
-    }
-
-    /// Move the cursor down one line, keeping the display column where possible.
-    pub fn down(&mut self) {
-        let (row, col) = self.cursor_row_col();
-        if row + 1 >= self.line_count() {
-            return;
-        }
-        self.set_cursor_row_col(row + 1, col);
-    }
-
-    /// Jump to the start of the previous word (whitespace-delimited).
-    pub fn word_left(&mut self) {
-        let graphemes: Vec<&str> = self.text.graphemes(true).collect();
-        let mut i = self.cursor.min(graphemes.len());
-        while i > 0 && graphemes[i - 1].chars().all(char::is_whitespace) {
-            i -= 1;
-        }
-        while i > 0 && !graphemes[i - 1].chars().all(char::is_whitespace) {
-            i -= 1;
-        }
-        self.cursor = i;
-    }
-
-    /// Jump past the current word to the start of the next (or the end).
-    pub fn word_right(&mut self) {
-        let graphemes: Vec<&str> = self.text.graphemes(true).collect();
-        let n = graphemes.len();
-        let mut i = self.cursor.min(n);
-        while i < n && !graphemes[i].chars().all(char::is_whitespace) {
-            i += 1;
-        }
-        while i < n && graphemes[i].chars().all(char::is_whitespace) {
             i += 1;
         }
         self.cursor = i;
@@ -378,44 +272,6 @@ mod tests {
     }
 
     #[test]
-    fn grapheme_paste_navigation_and_window_share_the_same_boundaries() {
-        let mut e = ed("A🇹🇼B");
-        e.left();
-        e.left();
-        e.insert_str("e\u{301}👍🏽");
-        assert_eq!(e.text(), "Ae\u{301}👍🏽🇹🇼B");
-        e.left();
-        e.backspace();
-        assert_eq!(e.text(), "A👍🏽🇹🇼B", "combining grapheme deleted whole");
-        let (view, _) = e.display_window(4);
-        assert!(!view.starts_with('\u{301}'));
-        assert!(!view.contains('🏽') || view.contains("👍🏽"));
-    }
-
-    #[test]
-    fn multiline_grapheme_cursor_columns_use_rendered_cluster_width() {
-        let mut e = ed("e\u{301}x\n👍🏽界");
-        assert_eq!(e.cursor_row_col(), (1, 4));
-        e.home();
-        assert_eq!(e.cursor_row_col(), (1, 0));
-        e.up();
-        assert_eq!(e.cursor_row_col(), (0, 0));
-        e.end();
-        assert_eq!(e.cursor_row_col(), (0, 2));
-    }
-
-    #[test]
-    fn insert_str_pastes_at_cursor() {
-        let mut e = ed("你好");
-        e.left();
-        e.insert_str("wide 界");
-        assert_eq!(e.text(), "你wide 界好");
-        // Cursor advanced past the paste: typing lands right after it.
-        e.insert('X');
-        assert_eq!(e.text(), "你wide 界X好");
-    }
-
-    #[test]
     fn take_and_set_text() {
         let mut e = ed("送出");
         assert!(!e.is_empty());
@@ -427,71 +283,6 @@ mod tests {
         e.set_text("預填值".to_string());
         e.backspace(); // cursor is at the end after set_text
         assert_eq!(e.text(), "預填");
-    }
-
-    #[test]
-    fn word_jumps_over_whitespace_runs() {
-        let mut e = ed("foo  bar 漢字");
-        assert_eq!(e.cursor_col(), 13); // 9 ascii cols + 2*2 CJK
-        e.word_left(); // → start of 漢字
-        e.insert('|');
-        assert_eq!(e.text(), "foo  bar |漢字");
-        e.backspace();
-        e.word_left(); // → start of bar
-        e.word_left(); // → start of foo
-        e.insert('|');
-        assert_eq!(e.text(), "|foo  bar 漢字");
-        e.backspace();
-        e.word_right(); // past foo + both spaces → start of bar
-        e.insert('|');
-        assert_eq!(e.text(), "foo  |bar 漢字");
-        // word_right from the last word stops at the end (no panic).
-        e.end();
-        e.word_right();
-        assert_eq!(e.cursor_col(), 14);
-    }
-
-    #[test]
-    fn newline_inserts_and_take_preserves_it() {
-        let mut e = LineEditor::default();
-        e.insert('a');
-        e.insert_newline();
-        e.insert('b');
-        assert_eq!(e.text(), "a\nb");
-        assert_eq!(e.line_count(), 2);
-        // The submit path carries the embedded newline through unchanged.
-        assert_eq!(e.take(), "a\nb");
-        assert!(e.is_empty());
-        assert_eq!(e.line_count(), 1); // empty buffer is one (empty) line
-    }
-
-    #[test]
-    fn cursor_row_col_tracks_lines_and_cjk_columns() {
-        let mut e = ed("ab\n漢c");
-        // End: row 1, col = 2 (漢) + 1 (c) = 3.
-        assert_eq!(e.cursor_row_col(), (1, 3));
-        e.home(); // start of line 2
-        assert_eq!(e.cursor_row_col(), (1, 0));
-        e.up(); // up to line 1, col 0
-        assert_eq!(e.cursor_row_col(), (0, 0));
-        e.end(); // end of line 1 ("ab" = 2 columns)
-        assert_eq!(e.cursor_row_col(), (0, 2));
-        e.down(); // back to line 2, column clamped to the row width
-        assert_eq!(e.cursor_row_col().0, 1);
-    }
-
-    #[test]
-    fn left_right_cross_line_boundaries() {
-        let mut e = ed("a\nb");
-        e.home(); // line 2 start
-        assert_eq!(e.cursor_row_col(), (1, 0));
-        e.left(); // onto the newline → end of line 1
-        assert_eq!(e.cursor_row_col(), (0, 1));
-        e.left(); // before 'a'
-        assert_eq!(e.cursor_row_col(), (0, 0));
-        e.right();
-        e.right(); // back across the newline into line 2
-        assert_eq!(e.cursor_row_col(), (1, 0));
     }
 
     #[test]

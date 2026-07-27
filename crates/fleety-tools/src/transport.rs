@@ -347,9 +347,10 @@ pub fn redact_urls_in_text(value: &str) -> String {
 
 fn is_url_scheme_boundary(value: &str, start: usize) -> bool {
     start == 0
-        || value[..start].chars().next_back().map_or(true, |ch| {
-            !ch.is_alphanumeric() && !matches!(ch, '+' | '-' | '.')
-        })
+        || value[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|ch| !ch.is_alphanumeric() && !matches!(ch, '+' | '-' | '.'))
 }
 
 fn trim_sentence_punctuation(value: &str, start: usize, mut end: usize) -> usize {

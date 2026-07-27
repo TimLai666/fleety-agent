@@ -368,6 +368,7 @@ identity proof.
 | Var | Default | Meaning |
 |---|---|---|
 | `FLEETY_MDNS_DISABLED` | (unset) | Set anything to skip both announce and browse. Useful on corporate networks that block mDNS. |
+| `FLEETY_MDNS_FAKE_URL` | (unset) | Test seam: return this URL as the sole discovered server instead of browsing. Set it and no browse happens at all, so the discovery *decision* path (display-only refusal, credential withholding) can be exercised where multicast does not reach between processes — CI runners, most containers. Not for production use. |
 | `FLEETY_MDNS_HOST_IP` | (auto) | Override the advertised IP. When `FLEETY_ADDR` binds `0.0.0.0`, the server **auto-detects** a routable outbound IP; set this to pin a specific one (e.g. multi-homed / VPN hosts). |
 | `FLEETY_MDNS_HOST` | hostname / `COMPUTERNAME` / `HOSTNAME` | mDNS instance name. |
 
