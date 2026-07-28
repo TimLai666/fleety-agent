@@ -97,8 +97,31 @@ pub struct Connection {
     receiver: Receiver,
 }
 
-/// Outbound half.
-pub enum Sender {
+/// The established secure channel, shared by the two halves.
+///
+/// Noise keeps one state for both directions, so the halves cannot own separate
+/// copies. The lock is only ever held across the sealing itself — never across
+/// an await — so the two directions do not block each other in practice.
+type SharedSecure = std::sync::Arc<std::sync::Mutex<crate::secure::SecureSession>>;
+
+fn with_secure<T>(
+    secure: &SharedSecure,
+    op: impl FnOnce(&mut crate::secure::SecureSession) -> Result<T>,
+) -> Result<T> {
+    let mut session = secure
+        .lock()
+        .map_err(|_| CoreError::Message("the secure channel state was lost".to_string()))?;
+    op(&mut session)
+}
+
+/// Outbound half. Once a secure channel is established every frame leaves
+/// sealed; there is no path that puts a control frame back in the clear.
+pub struct Sender {
+    inner: SenderKind,
+    secure: Option<SharedSecure>,
+}
+
+enum SenderKind {
     Ws(futures::stream::SplitSink<Ws, WsMessage>),
     Sse {
         client: reqwest::Client,
@@ -108,7 +131,12 @@ pub enum Sender {
 }
 
 /// Inbound half.
-pub enum Receiver {
+pub struct Receiver {
+    inner: ReceiverKind,
+    secure: Option<SharedSecure>,
+}
+
+enum ReceiverKind {
     Ws(WsReceiver),
     Sse(mpsc::UnboundedReceiver<String>),
 }
@@ -149,13 +177,32 @@ impl Connection {
 }
 
 impl Sender {
+    /// Send one outbound frame. On a secure channel the caller's frame is
+    /// sealed first, so what reaches the wire carries no readable content and
+    /// cannot be altered in flight.
     pub async fn send_text(&mut self, text: String) -> Result<()> {
-        match self {
-            Sender::Ws(tx) => tx
+        let text = match &self.secure {
+            Some(secure) => {
+                let payload = with_secure(secure, |session| session.seal(&text))?;
+                serde_json::to_string(&fleety_protocol::ClientMsg::SecureFrame { payload })
+                    .map_err(|e| {
+                        CoreError::Message(format!("could not frame a sealed send: {e}"))
+                    })?
+            }
+            None => text,
+        };
+        self.send_raw(text).await
+    }
+
+    /// Send one frame exactly as given, bypassing the secure channel. Only the
+    /// handshake itself may use this: it runs before a channel exists.
+    async fn send_raw(&mut self, text: String) -> Result<()> {
+        match &mut self.inner {
+            SenderKind::Ws(tx) => tx
                 .send(WsMessage::Text(text))
                 .await
                 .map_err(|e| CoreError::Provider(format!("websocket send failed: {e}"))),
-            Sender::Sse {
+            SenderKind::Sse {
                 client,
                 send_url,
                 token,
@@ -182,7 +229,7 @@ impl Sender {
 
     /// Best-effort close. SSE has no close frame; dropping it ends the session.
     pub async fn close(&mut self) {
-        if let Sender::Ws(tx) = self {
+        if let SenderKind::Ws(tx) = &mut self.inner {
             let _ = tx.close().await;
         }
     }
@@ -191,9 +238,42 @@ impl Sender {
 impl Receiver {
     /// The next inbound frame text, or `None` when the link is closed/dead
     /// (including a WebSocket whose armed read deadline elapsed with no frames).
+    ///
+    /// On a secure channel the frame is opened first. A peer that sends a
+    /// cleartext control frame after the channel is up is treated as a dead
+    /// link, not as a peer to keep talking to — that is what stops an active
+    /// relay from stripping the encryption back off.
     pub async fn recv_text(&mut self) -> Option<String> {
-        match self {
-            Receiver::Ws(ws) => loop {
+        let raw = self.recv_raw().await?;
+        let Some(secure) = &self.secure else {
+            return Some(raw);
+        };
+        let payload = match serde_json::from_str::<fleety_protocol::ServerMsg>(&raw) {
+            Ok(fleety_protocol::ServerMsg::SecureFrame { payload }) => payload,
+            _ => {
+                tracing::warn!(
+                    "the Server sent an unsealed control frame on a secure channel; dropping the link"
+                );
+                return None;
+            }
+        };
+        match with_secure(secure, |session| session.open(&payload)) {
+            Ok(frame) => Some(frame),
+            Err(error) => {
+                tracing::warn!(
+                    report = ?error.report(),
+                    "a sealed control frame failed verification; dropping the link"
+                );
+                None
+            }
+        }
+    }
+
+    /// The next frame exactly as it arrived, without opening the secure
+    /// channel. Only the handshake may use this.
+    async fn recv_raw(&mut self) -> Option<String> {
+        match &mut self.inner {
+            ReceiverKind::Ws(ws) => loop {
                 // Armed: every wait is bounded; any frame (the server's pings
                 // included) starts a fresh window. Unarmed: wait indefinitely,
                 // exactly the pre-liveness behavior.
@@ -224,8 +304,140 @@ impl Receiver {
                     Some(Ok(_)) => continue, // pong/binary
                 }
             },
-            Receiver::Sse(rx) => rx.recv().await,
+            ReceiverKind::Sse(rx) => rx.recv().await,
         }
+    }
+}
+
+/// What a secure connect attempt found at the far end.
+pub enum SecureChannel {
+    /// The peer proved it holds this profile's device token. Everything from
+    /// here on is sealed.
+    Established(Connection),
+    /// The peer never engaged with the handshake — an older Server, something
+    /// that is not a Fleety Server at all, or a peer staying deliberately
+    /// silent. No credential was revealed either way, so the caller is free to
+    /// apply its own policy: a saved alternative endpoint must give up, while
+    /// the endpoint the user themselves configured may still connect the old
+    /// way if this profile has never seen a secure Server.
+    Unsupported { detail: String },
+}
+
+/// Connect and establish the authenticated, encrypted channel a paired profile
+/// uses, keyed by `token` and the `server_fingerprint` this profile is pinned to.
+///
+/// The token is deliberately *not* handed to [`connect`]: nothing authenticating
+/// reaches the wire until the peer has proven it already holds the same token.
+/// An `Err` means the peer engaged and failed to prove itself — never retry that
+/// endpoint in the clear.
+pub async fn connect_secure(
+    agent_url: &str,
+    token: &str,
+    server_fingerprint: &str,
+    wait: Duration,
+) -> Result<SecureChannel> {
+    let (initiator, opening) = crate::secure::Initiator::start(token, server_fingerprint)?;
+    let key_id = crate::secure::key_id(token, server_fingerprint)?;
+    // WebSocket only. The SSE+POST fallback authenticates its downstream with
+    // the very bearer this handshake exists to keep off the wire, so a sealed
+    // session cannot be opened over it.
+    if mode_from_env() == Mode::ForceSse {
+        return Ok(SecureChannel::Unsupported {
+            detail: "FLEETY_FORCE_SSE is set, and the SSE fallback cannot carry an encrypted \
+                     control channel"
+                .to_string(),
+        });
+    }
+    let mut conn = match connect_ws(agent_url).await {
+        Ok(conn) => conn,
+        Err(error) => {
+            if mode_from_env() == Mode::WsOnly {
+                return Err(error);
+            }
+            return Ok(SecureChannel::Unsupported {
+                detail: format!(
+                    "{} — the SSE fallback cannot carry an encrypted control channel",
+                    error.report().message
+                ),
+            });
+        }
+    };
+
+    let offer = serde_json::to_string(&fleety_protocol::ClientMsg::SecureHandshake {
+        version: crate::secure::SECURE_CHANNEL_VERSION,
+        key_id,
+        msg: opening,
+    })
+    .map_err(|e| CoreError::Message(format!("could not frame the secure handshake: {e}")))?;
+    if let Err(error) = conn.sender.send_raw(offer).await {
+        return Ok(SecureChannel::Unsupported {
+            detail: error.report().message,
+        });
+    }
+
+    let reply = match tokio::time::timeout(wait, conn.receiver.recv_raw()).await {
+        Ok(Some(reply)) => reply,
+        // A closed link is exactly what an older Server does with a frame it
+        // cannot parse, so this is the ordinary "too old" path, not a failure.
+        Ok(None) => {
+            conn.close().await;
+            return Ok(SecureChannel::Unsupported {
+                detail: "the Server closed the connection without answering".to_string(),
+            });
+        }
+        Err(_) => {
+            conn.close().await;
+            return Ok(SecureChannel::Unsupported {
+                detail: format!("the Server did not answer within {} ms", wait.as_millis()),
+            });
+        }
+    };
+
+    let (version, msg) = match serde_json::from_str::<fleety_protocol::ServerMsg>(&reply) {
+        Ok(fleety_protocol::ServerMsg::SecureAccept { version, msg }) => (version, msg),
+        // A Server new enough to understand the frame but unable to answer it
+        // has no credential for this device — which is a statement that it is
+        // not the Server this profile is paired with. That is a refusal, not an
+        // old Server, so it must not buy a cleartext fallback.
+        Ok(fleety_protocol::ServerMsg::Error { error }) => {
+            conn.close().await;
+            return Err(CoreError::Message(format!(
+                "this endpoint has no credential for this device ({}) — re-pair with \
+                 `fleety init <ws-url> --name <profile> --pairing-code <code>`",
+                error.message
+            )));
+        }
+        _ => {
+            conn.close().await;
+            return Ok(SecureChannel::Unsupported {
+                detail: "the Server did not answer the secure handshake".to_string(),
+            });
+        }
+    };
+
+    // From here the peer has committed to the handshake, so a failure is an
+    // impostor rather than an old Server: fail closed and never downgrade.
+    let session = initiator.finish(version, &msg).inspect_err(|_| {
+        tracing::warn!(
+            "a saved endpoint answered the secure handshake but could not prove this profile's credential"
+        );
+    })?;
+    let shared: SharedSecure = std::sync::Arc::new(std::sync::Mutex::new(session));
+    conn.sender.secure = Some(shared.clone());
+    conn.receiver.secure = Some(shared);
+    Ok(SecureChannel::Established(conn))
+}
+
+/// Like [`connect`], but for a speculative probe: nobody asked for this
+/// connection, so a failure is not news. Keeps the fallback, drops the warning.
+pub async fn connect_quietly(agent_url: &str, token: Option<&str>) -> Result<Connection> {
+    match mode_from_env() {
+        Mode::WsOnly => connect_ws(agent_url).await,
+        Mode::ForceSse => connect_sse(agent_url, token).await,
+        Mode::Auto => match connect_ws(agent_url).await {
+            Ok(connection) => Ok(connection),
+            Err(_) => connect_sse(agent_url, token).await,
+        },
     }
 }
 
@@ -238,11 +450,13 @@ pub async fn connect(agent_url: &str, token: Option<&str>) -> Result<Connection>
         Mode::ForceSse => connect_sse(agent_url, token).await,
         Mode::Auto => match connect_ws(agent_url).await {
             Ok(c) => Ok(c),
-            Err(e) => {
-                let error = redact_urls_in_text(&e.to_string());
+            Err(ws_error) => {
                 let endpoint = redact_endpoint(agent_url);
-                tracing::warn!(%error, %endpoint, "websocket connect failed; trying SSE+POST fallback");
-                connect_sse(agent_url, token).await
+                tracing::debug!(%endpoint, "websocket connect failed; trying SSE+POST fallback");
+                // Report the WebSocket failure, which is the transport the user
+                // configured. The fallback is an implementation detail, and
+                // naming only its error sends people to look at the wrong thing.
+                connect_sse(agent_url, token).await.map_err(|_| ws_error)
             }
         },
     }
@@ -305,6 +519,11 @@ pub fn redact_endpoint(value: &str) -> String {
 /// );
 /// ```
 pub fn redact_urls_in_text(value: &str) -> String {
+    // Idempotent: these messages are wrapped and re-wrapped as they travel, and
+    // running the pass twice produced `<redacted><redacted>`.
+    if value.contains("<redacted>") {
+        return value.to_string();
+    }
     const SCHEMES: [&str; 4] = ["ws://", "wss://", "http://", "https://"];
     let mut rendered = String::with_capacity(value.len());
     let mut offset = 0;
@@ -408,12 +627,18 @@ async fn connect_ws(agent_url: &str) -> Result<Connection> {
     })?;
     let (tx, rx) = ws.split();
     Ok(Connection {
-        sender: Sender::Ws(tx),
-        receiver: Receiver::Ws(WsReceiver {
-            rx,
-            deadline: ws_timeout(),
-            armed: false,
-        }),
+        sender: Sender {
+            inner: SenderKind::Ws(tx),
+            secure: None,
+        },
+        receiver: Receiver {
+            inner: ReceiverKind::Ws(WsReceiver {
+                rx,
+                deadline: ws_timeout(),
+                armed: false,
+            }),
+            secure: None,
+        },
     })
 }
 
@@ -453,12 +678,18 @@ async fn connect_sse(agent_url: &str, token: Option<&str>) -> Result<Connection>
     let endpoint = redact_endpoint(&base);
     tracing::info!(%endpoint, "connected via SSE+POST fallback");
     Ok(Connection {
-        sender: Sender::Sse {
-            client,
-            send_url,
-            token: token.map(str::to_string),
+        sender: Sender {
+            inner: SenderKind::Sse {
+                client,
+                send_url,
+                token: token.map(str::to_string),
+            },
+            secure: None,
         },
-        receiver: Receiver::Sse(rx),
+        receiver: Receiver {
+            inner: ReceiverKind::Sse(rx),
+            secure: None,
+        },
     })
 }
 
@@ -512,6 +743,305 @@ mod tests {
         addr
     }
 
+    const TEST_TOKEN: &str = "device-token-must-never-appear";
+    const TEST_FINGERPRINT: &str = "3f1c9a52-0d44-4a51-9b6e-1f2d3c4b5a60";
+
+    /// How a fake Server should behave when the client offers a handshake.
+    #[derive(Clone, Copy)]
+    enum HandshakePeer {
+        /// Holds the same device token and answers honestly.
+        Honest,
+        /// Understands nothing and drops the link, like an older Server.
+        CloseImmediately,
+        /// Understands the frame and says it holds no credential for us.
+        RefuseExplicitly,
+        /// Completes the handshake and then sends a control frame in the clear,
+        /// which is what a relay stripping the encryption would produce.
+        SealsThenSpeaksPlainly,
+        /// Accepts the socket and then says nothing at all.
+        Silent,
+        /// Answers with a well-formed frame it cannot actually back up.
+        ForgedAccept,
+    }
+
+    /// A fake Server for the handshake tests. Returns its address plus a handle
+    /// to everything the client put on the wire, so a test can assert on what
+    /// was actually transmitted rather than on what we believe was transmitted.
+    async fn handshake_ws_server(
+        peer: HandshakePeer,
+    ) -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let recorded = seen.clone();
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                return;
+            };
+            let Some(Ok(WsMessage::Text(opening))) = ws.next().await else {
+                return;
+            };
+            if let Ok(mut log) = recorded.lock() {
+                log.push(opening.to_string());
+            }
+            let Ok(fleety_protocol::ClientMsg::SecureHandshake { version, msg, .. }) =
+                serde_json::from_str(&opening)
+            else {
+                return;
+            };
+            match peer {
+                HandshakePeer::CloseImmediately => {
+                    let _ = ws.close(None).await;
+                }
+                HandshakePeer::RefuseExplicitly => {
+                    let refusal = serde_json::to_string(&fleety_protocol::ServerMsg::Error {
+                        error: fleety_protocol::WireError {
+                            kind: "secure_unavailable".into(),
+                            message: "no credential for that device".into(),
+                            remediation: None,
+                        },
+                    })
+                    .expect("frame");
+                    let _ = ws.send(WsMessage::Text(refusal)).await;
+                    let _ = ws.close(None).await;
+                }
+                HandshakePeer::Silent => {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                }
+                HandshakePeer::ForgedAccept => {
+                    let forged = serde_json::to_string(&fleety_protocol::ServerMsg::SecureAccept {
+                        version,
+                        msg: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+                            .to_string(),
+                    })
+                    .expect("frame");
+                    let _ = ws.send(WsMessage::Text(forged)).await;
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                }
+                HandshakePeer::SealsThenSpeaksPlainly => {
+                    let Ok((responder, reply)) = crate::secure::Responder::accept(
+                        version,
+                        TEST_TOKEN,
+                        TEST_FINGERPRINT,
+                        &msg,
+                    ) else {
+                        return;
+                    };
+                    let accept = serde_json::to_string(&fleety_protocol::ServerMsg::SecureAccept {
+                        version,
+                        msg: reply,
+                    })
+                    .expect("frame");
+                    let _ = ws.send(WsMessage::Text(accept)).await;
+                    let _ = responder.finish();
+                    let plain = serde_json::to_string(&fleety_protocol::ServerMsg::Error {
+                        error: fleety_protocol::WireError {
+                            kind: "stripped".into(),
+                            message: "this frame was never sealed".into(),
+                            remediation: None,
+                        },
+                    })
+                    .expect("frame");
+                    let _ = ws.send(WsMessage::Text(plain)).await;
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                }
+                HandshakePeer::Honest => {
+                    let Ok((responder, reply)) = crate::secure::Responder::accept(
+                        version,
+                        TEST_TOKEN,
+                        TEST_FINGERPRINT,
+                        &msg,
+                    ) else {
+                        return;
+                    };
+                    let accept = serde_json::to_string(&fleety_protocol::ServerMsg::SecureAccept {
+                        version,
+                        msg: reply,
+                    })
+                    .expect("frame");
+                    let _ = ws.send(WsMessage::Text(accept)).await;
+                    let Ok(mut session) = responder.finish() else {
+                        return;
+                    };
+                    // Echo each sealed client frame back, sealed.
+                    while let Some(Ok(WsMessage::Text(text))) = ws.next().await {
+                        if let Ok(mut log) = recorded.lock() {
+                            log.push(text.to_string());
+                        }
+                        let Ok(fleety_protocol::ClientMsg::SecureFrame { payload }) =
+                            serde_json::from_str(&text)
+                        else {
+                            return;
+                        };
+                        let Ok(opened) = session.open(&payload) else {
+                            return;
+                        };
+                        let Ok(payload) = session.seal(&opened) else {
+                            return;
+                        };
+                        let sealed =
+                            serde_json::to_string(&fleety_protocol::ServerMsg::SecureFrame {
+                                payload,
+                            })
+                            .expect("frame");
+                        if ws.send(WsMessage::Text(sealed)).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        (addr, seen)
+    }
+
+    /// The whole point of the handshake: the credential stays off the wire, and
+    /// control frames are unreadable to anything relaying them.
+    #[tokio::test]
+    async fn the_device_token_and_control_frames_never_appear_on_the_wire() {
+        let (addr, seen) = handshake_ws_server(HandshakePeer::Honest).await;
+
+        let SecureChannel::Established(mut conn) = connect_secure(
+            &format!("ws://{addr}"),
+            TEST_TOKEN,
+            TEST_FINGERPRINT,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("the handshake completes against a Server holding this token") else {
+            panic!("an honest Server must establish the channel");
+        };
+
+        let frame = format!(r#"{{"type":"hello","token":"{TEST_TOKEN}"}}"#);
+        conn.send_text(frame.clone()).await.expect("send");
+        assert_eq!(
+            conn.recv_text().await.expect("the echoed frame comes back"),
+            frame,
+            "the caller still sees its own plaintext frames"
+        );
+
+        let wire = seen.lock().expect("recorded wire traffic").join("\n");
+        assert!(!wire.is_empty(), "the fake Server recorded nothing");
+        assert!(
+            !wire.contains(TEST_TOKEN),
+            "the device token must never be transmitted; wire was: {wire}"
+        );
+        assert!(
+            !wire.contains("\"type\":\"hello\""),
+            "control frames must not be readable on the wire; wire was: {wire}"
+        );
+    }
+
+    /// A peer that understands the frame and refuses it has stated it holds no
+    /// credential for this device — which is a statement that it is not the
+    /// Server this profile is paired with. That must not buy a cleartext
+    /// fallback the way an unparseable frame does.
+    #[tokio::test]
+    async fn an_explicit_refusal_is_fatal_rather_than_a_reason_to_downgrade() {
+        let (addr, _) = handshake_ws_server(HandshakePeer::RefuseExplicitly).await;
+
+        assert!(
+            connect_secure(
+                &format!("ws://{addr}"),
+                TEST_TOKEN,
+                TEST_FINGERPRINT,
+                Duration::from_secs(5),
+            )
+            .await
+            .is_err(),
+            "a peer that says it has no credential must not be handed one"
+        );
+    }
+
+    /// Once the channel is up, a cleartext control frame is what an active relay
+    /// sends after stripping the encryption. Accepting one would undo the whole
+    /// handshake, so the link is treated as dead instead.
+    #[tokio::test]
+    async fn a_cleartext_frame_on_a_sealed_channel_is_treated_as_a_dead_link() {
+        let (addr, _) = handshake_ws_server(HandshakePeer::SealsThenSpeaksPlainly).await;
+
+        let SecureChannel::Established(mut conn) = connect_secure(
+            &format!("ws://{addr}"),
+            TEST_TOKEN,
+            TEST_FINGERPRINT,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("the handshake completes") else {
+            panic!("the peer holds this token, so the channel must establish");
+        };
+
+        assert!(
+            conn.recv_text().await.is_none(),
+            "an unsealed frame must end the link, not be handed to the caller"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_that_cannot_speak_the_handshake_is_reported_unsupported() {
+        let (addr, _) = handshake_ws_server(HandshakePeer::CloseImmediately).await;
+
+        let outcome = connect_secure(
+            &format!("ws://{addr}"),
+            TEST_TOKEN,
+            TEST_FINGERPRINT,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("an old Server is not an error, it is a policy decision");
+
+        assert!(
+            matches!(outcome, SecureChannel::Unsupported { .. }),
+            "closing the link is what an older Server does; the caller decides what that means"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_silent_server_is_reported_unsupported_once_the_deadline_passes() {
+        let (addr, _) = handshake_ws_server(HandshakePeer::Silent).await;
+
+        let outcome = connect_secure(
+            &format!("ws://{addr}"),
+            TEST_TOKEN,
+            TEST_FINGERPRINT,
+            Duration::from_millis(300),
+        )
+        .await
+        .expect("a silent peer resolves within the deadline");
+
+        assert!(
+            matches!(outcome, SecureChannel::Unsupported { .. }),
+            "a peer that never answers must not hold the connect open"
+        );
+    }
+
+    /// A peer that engages with the handshake and fails is an impostor, not an
+    /// old Server: this must be a hard error so no caller can read it as a
+    /// reason to try the endpoint in the clear.
+    #[tokio::test]
+    async fn a_forged_acceptance_is_a_hard_failure_not_a_downgrade() {
+        let (addr, _) = handshake_ws_server(HandshakePeer::ForgedAccept).await;
+
+        assert!(
+            connect_secure(
+                &format!("ws://{addr}"),
+                TEST_TOKEN,
+                TEST_FINGERPRINT,
+                Duration::from_secs(5),
+            )
+            .await
+            .is_err(),
+            "a forged acceptance must fail closed"
+        );
+    }
+
     /// Wrap a connected client socket in a `Receiver` with a short deadline
     /// (bypassing env so parallel tests don't race on process globals).
     async fn ws_receiver(addr: std::net::SocketAddr, deadline: Duration) -> Receiver {
@@ -519,11 +1049,14 @@ mod tests {
             .await
             .expect("connect");
         let (_tx, rx) = ws.split();
-        Receiver::Ws(WsReceiver {
-            rx,
-            deadline,
-            armed: false,
-        })
+        Receiver {
+            inner: ReceiverKind::Ws(WsReceiver {
+                rx,
+                deadline,
+                armed: false,
+            }),
+            secure: None,
+        }
     }
 
     /// ws-liveness (spec: armed deadline detects a dead link): after the

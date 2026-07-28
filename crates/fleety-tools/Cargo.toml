@@ -14,6 +14,7 @@ async-trait = { workspace = true }
 mdns-sd = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+fleety-protocol = { workspace = true }
 uuid = { workspace = true }
 grep = "0.3"
 ignore = "0.4"
@@ -37,6 +38,10 @@ png = { workspace = true }
 base64 = { workspace = true }
 # Self-update: verify downloaded artifacts.
 sha2 = "0.10"
+# Paired-profile secure channel: Noise handshake, keyed by HKDF over the
+# per-device token so a saved endpoint proves the Server before we trust it.
+snow = { workspace = true }
+hkdf = "0.12"
 # Interactive PTY terminal sessions (cross-platform: ConPTY / openpty). The
 # crate's internal unsafe is isolated there — our crates stay forbid(unsafe).
 portable-pty = "0.8"

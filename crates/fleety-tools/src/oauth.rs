@@ -91,18 +91,14 @@ pub fn default_token_path() -> PathBuf {
     if let Ok(p) = std::env::var("FLEETY_CODEX_TOKENS") {
         return PathBuf::from(p);
     }
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".fleety").join("codex-oauth.json")
+    let home = crate::device::home_dir();
+    home.join(".fleety").join("codex-oauth.json")
 }
 
 /// The `~/.fleety` runtime directory the token stores live under.
 fn fleety_dir() -> PathBuf {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".fleety")
+    let home = crate::device::home_dir();
+    home.join(".fleety")
 }
 
 /// Pure path builder: the per-provider token file under `fleety_dir`
@@ -151,6 +147,7 @@ pub fn load_tokens(path: &Path) -> Option<Tokens> {
 /// Persist tokens to `path`, creating the directory and restricting the file to
 /// owner-only (mode 0600) on Unix. Never written into the config/providers file.
 pub fn save_tokens(path: &Path, tokens: &Tokens) -> Result<()> {
+    crate::device::ensure_writable_path(path, "the OAuth token store")?;
     save_tokens_with(path, tokens, |_| Ok(()))
 }
 
@@ -214,10 +211,8 @@ pub fn auth_audit_path() -> PathBuf {
     if let Ok(p) = std::env::var("FLEETY_CODEX_AUDIT") {
         return PathBuf::from(p);
     }
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".fleety").join("auth-audit.jsonl")
+    let home = crate::device::home_dir();
+    home.join(".fleety").join("auth-audit.jsonl")
 }
 
 /// Append an auth-audit event (e.g. `"login"`, `"logout"`) with a timestamp.
@@ -579,7 +574,7 @@ pub async fn refresh_access_token(
     if !resp.status().is_success() {
         let code = resp.status();
         return Err(CoreError::Provider(format!(
-            "token refresh returned HTTP {code}; run `fleety auth login` to sign in again"
+            "token refresh returned HTTP {code}; run `fleety provider login <provider>` to sign in again"
         )));
     }
     let body: Value = resp
@@ -677,7 +672,8 @@ impl agent_core::CodexAuth for OAuthCodexAuth {
         let now = OAuthBearer::now();
         match plan_bearer(tokens.as_ref(), now) {
             BearerPlan::NotLoggedIn => Err(CoreError::Provider(
-                "not signed in to ChatGPT; run `fleety auth login` to authenticate".into(),
+                "not signed in to ChatGPT; run `fleety provider login <provider>` to authenticate"
+                    .into(),
             )),
             BearerPlan::Use(access) => Ok(agent_core::CodexCreds {
                 bearer: access,
@@ -711,7 +707,8 @@ impl agent_core::BearerSource for OAuthBearer {
         let now = Self::now();
         match plan_bearer(tokens.as_ref(), now) {
             BearerPlan::NotLoggedIn => Err(CoreError::Provider(
-                "not signed in to ChatGPT; run `fleety auth login` to authenticate".into(),
+                "not signed in to ChatGPT; run `fleety provider login <provider>` to authenticate"
+                    .into(),
             )),
             BearerPlan::Use(access) => Ok(Some(access)),
             BearerPlan::Refresh(refresh) => {
@@ -1084,7 +1081,7 @@ mod tests {
             .expect_err("logged out")
             .report()
             .message
-            .contains("auth login"));
+            .contains("provider login"));
 
         // Logged in with a valid (unexpired) token → bearer + account id.
         let path = temp_token_path();
@@ -1120,7 +1117,7 @@ mod tests {
         };
         let bearer = OAuthBearer::new(missing, &config);
         let err = bearer.bearer().await.expect_err("should not be signed in");
-        assert!(err.report().message.contains("auth login"));
+        assert!(err.report().message.contains("provider login"));
     }
 
     #[tokio::test]
@@ -1155,7 +1152,7 @@ mod tests {
         let err = refresh_access_token(&client, &base, "client-x", "bad-rt", None, 1_000)
             .await
             .expect_err("should fail");
-        assert!(err.report().message.contains("auth login"));
+        assert!(err.report().message.contains("provider login"));
     }
 
     #[test]

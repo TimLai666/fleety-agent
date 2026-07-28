@@ -31,6 +31,22 @@ use fleety_tools::connection::{self, Resolved, Source, Target};
 const RECONNECT_ACK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 const RECONNECT_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 const RECONNECT_HANDSHAKE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+/// Total time an owner-requested reconnect may spend across every endpoint.
+///
+/// It is the whole sweep, not one attempt, and it stays well under
+/// [`RECONNECT_ACK_WAIT`]: a sweep that outlives the caller's wait leaves a
+/// durable request the caller has already given up on, and the next one is
+/// refused until that settles. A profile with several endpoints therefore gives
+/// each a share — deliberately tight, because someone is waiting. The ordinary
+/// (non-reconnect) path uses [`CONNECT_ENDPOINT_WAIT`] instead.
+const RECONNECT_SWEEP_BUDGET: std::time::Duration = std::time::Duration::from_millis(4_500);
+/// How long any session may take to reach an authenticated `Welcome`. Separate
+/// from the reconnect budget, which is deliberately tighter.
+const WELCOME_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+/// Budget for opening one endpoint outside an owner-requested reconnect. The
+/// reconnect budget is deliberately tighter because a caller is waiting on it;
+/// an ordinary connect can afford a slow link, a TLS handshake, and Noise.
+const CONNECT_ENDPOINT_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
 const RECONNECT_CONTROL_VERSION: u64 = 1;
 
 fn control_nonce() -> String {
@@ -777,6 +793,18 @@ fn settle_pending_reconnect(pending: &mut Option<PendingReconnect>) -> Result<bo
     })
 }
 
+/// Whether the endpoint an authenticated session used is one of this profile's.
+///
+/// Roaming means it may be a saved alternative rather than the primary, and the
+/// credential commit deliberately freezes the endpoint that authenticated.
+/// Demanding equality with the primary turned a retryable storage failure into
+/// a permanent one for exactly the sessions roaming exists to serve.
+fn authenticated_endpoint_belongs_to(profile: &connection::Profile, url: &str) -> bool {
+    profile.url == url
+        || profile.configured_url.as_deref() == Some(url)
+        || profile.endpoints.iter().any(|endpoint| endpoint == url)
+}
+
 fn settle_pending_reconnect_with_credential_sync<S>(
     pending: &mut Option<PendingReconnect>,
     sync_credentials: S,
@@ -802,7 +830,7 @@ where
             Ok(source_matches
                 && conns.current.as_deref() == Some(expected_profile)
                 && profile.is_some_and(|profile| {
-                    profile.url == authenticated.target.url()
+                    authenticated_endpoint_belongs_to(profile, authenticated.target.url())
                         && profile.token.as_deref() == authenticated.target.token()
                         && profile.fingerprint.as_deref()
                             == Some(authenticated.server_fingerprint.as_str())
@@ -1181,6 +1209,8 @@ fn commit_authenticated_reconnect(
     owner: Option<&SessionCredentialOwner>,
     server_fingerprint: &str,
     minted_token: Option<&str>,
+    server_endpoints: &[String],
+    sealed: bool,
     pending: &mut Option<PendingReconnect>,
 ) -> Result<bool> {
     let Some(expected_profile) = pending
@@ -1207,6 +1237,21 @@ fn commit_authenticated_reconnect(
         server_fingerprint,
     )? {
         connection::CredentialCommit::Durable { committed, .. } => {
+            let committed = match connection::learn_resolved_profile_endpoints(
+                &committed,
+                server_fingerprint,
+                server_endpoints,
+                sealed,
+            ) {
+                Ok(refreshed) => refreshed,
+                Err(error) => {
+                    tracing::warn!(
+                        report = ?error.report(),
+                        "could not record what this session learned about the profile"
+                    );
+                    committed
+                }
+            };
             freeze_authenticated_reconnect(&committed, Some(server_fingerprint), pending)?;
             settle_authenticated_reconnect_with(
                 &committed,
@@ -2037,6 +2082,8 @@ fn persist_authenticated_target_credentials(
     target: &Resolved,
     server_fingerprint: &str,
     minted_token: Option<&str>,
+    server_endpoints: &[String],
+    sealed: bool,
 ) -> Result<bool> {
     if server_fingerprint.trim().is_empty()
         || minted_token.is_some_and(|token| token.trim().is_empty())
@@ -2051,11 +2098,22 @@ fn persist_authenticated_target_credentials(
                 "authenticated session owner does not match the resolved target".to_string(),
             ));
         }
-        connection::store_resolved_profile_credentials(
+        let (_, committed) = connection::store_resolved_profile_credentials(
             owner_target,
             minted_token,
             server_fingerprint,
         )?;
+        if let Err(error) = connection::learn_resolved_profile_endpoints(
+            &committed,
+            server_fingerprint,
+            server_endpoints,
+            sealed,
+        ) {
+            tracing::warn!(
+                report = ?error.report(),
+                "could not record what this session learned about the profile"
+            );
+        }
         return Ok(true);
     }
     connection::mutate(|conns| {
@@ -2071,6 +2129,9 @@ fn persist_authenticated_target_credentials(
         let name = "default".to_string();
         let profile = conns.profiles.entry(name.clone()).or_default();
         profile.url = target.url_owned();
+        // Only a sealed session may teach a profile addresses; this fresh-default
+        // enrollment has none yet.
+        profile.endpoints.clear();
         conns.current = Some(name.clone());
         match connection::tofu_pin_decision(profile.fingerprint.as_deref(), server_fingerprint) {
             connection::PinDecision::IdentityChanged => {
@@ -2169,7 +2230,9 @@ fn pin_target_fingerprint(
 }
 
 fn command() -> Command {
-    let lifecycle = |name| Command::new(name).about("Manage the installed Daemon service");
+    let lifecycle = |name: &'static str| {
+        Command::new(name).about(fleety_tools::service::lifecycle_about(name, "Daemon"))
+    };
     Command::new("fleetyd")
         .version(agent_core::VERSION)
         .about("Fleety device background service")
@@ -2182,7 +2245,9 @@ fn command() -> Command {
         )
         .subcommands([
             lifecycle("run-service").hide(true),
-            lifecycle("install"),
+            Command::new("install").about(
+                "Install the Daemon as a system service and provision the data-analysis sidecar",
+            ),
             lifecycle("uninstall"),
             lifecycle("start"),
             lifecycle("stop"),
@@ -2199,7 +2264,7 @@ fn command() -> Command {
                         .required(true)
                         .value_name("NAME"),
                 ),
-            lifecycle("update"),
+            Command::new("update").about("Update the fleetyd binary, then restart the service"),
             fleety_tools::config::clap_command_for_daemon(),
             Command::new("version").about("Print the version"),
         ])
@@ -2854,90 +2919,202 @@ async fn run(
             Ok((target, session_owner)) => {
                 // WebSocket first, SSE+POST fallback (unless overridden by env) —
                 // so a device behind a proxy that blocks the WS upgrade connects.
+                // The reconnect budget has to cover the candidate list, not just
+                // one address: a single black-holed endpoint would otherwise
+                // consume it all and settle a failure with working endpoints
+                // still untried. A profile with one endpoint keeps the original
+                // budget exactly.
+                let attempts = target.connection_attempts();
+                // The primary keeps the budget it had before roaming existed;
+                // alternatives share what is left. Splitting evenly made the
+                // endpoint most likely to work worse off than it used to be.
+                let alternates = attempts.len().saturating_sub(1).clamp(1, 3) as u32;
+                let alternate_share = RECONNECT_SWEEP_BUDGET / (alternates + 1);
                 let reconnect_deadline = pending_reconnect
                     .as_ref()
-                    .map(|_| tokio::time::Instant::now() + RECONNECT_HANDSHAKE_WAIT);
-                let connection = if let Some(deadline) = reconnect_deadline {
-                    tokio::select! {
-                        result = tokio::time::timeout_at(
-                            deadline,
-                            fleety_tools::transport::connect(target.url(), target.token()),
-                        ) => match result {
-                            Ok(result) => result,
-                            Err(_) => {
+                    .map(|_| tokio::time::Instant::now() + RECONNECT_SWEEP_BUDGET);
+                let mut last_error = None;
+                // `serve` runs *inside* the candidate loop on purpose: an
+                // endpoint has not earned the attempt until it has completed an
+                // authenticated Welcome. One that accepts the socket and then
+                // stalls, answers as a different Server, or refuses us must not
+                // stand in for the endpoints behind it.
+                let mut served = false;
+                let mut requested_reconnect = None;
+                for (tried_index, candidate) in attempts.into_iter().enumerate() {
+                    // One deadline per candidate, fixed before the connect
+                    // starts and shared with the session below. Recomputing it
+                    // after opening gave a slow candidate two shares, which on a
+                    // two-endpoint profile is the entire sweep.
+                    // Candidate 0 keeps the budget that was tuned to settle inside
+                    // the caller's wait; the wider sweep exists only so the
+                    // alternatives behind it get a turn at all.
+                    let share = if tried_index == 0 {
+                        RECONNECT_HANDSHAKE_WAIT
+                    } else {
+                        alternate_share
+                    };
+                    let candidate_deadline = reconnect_deadline
+                        .map(|deadline| (tokio::time::Instant::now() + share).min(deadline));
+                    let opened = if let Some(deadline) = reconnect_deadline {
+                        let slice = candidate_deadline.unwrap_or(deadline);
+                        tokio::select! {
+                            result = tokio::time::timeout_at(
+                                slice.min(deadline),
+                                connection::open_candidate(
+                                    &candidate,
+                                    connection::open_budget_within(share),
+                                ),
+                            ) => match result {
+                                Ok(result) => result,
+                                Err(_) => {
+                                    if tokio::time::Instant::now() >= deadline {
+                                        break;
+                                    }
+                                    last_error = Some(agent_core::CoreError::Message(
+                                        "the endpoint did not open within its share of the reconnect budget"
+                                            .to_string(),
+                                    ));
+                                    continue;
+                                }
+                            },
+                            _ = wait_stop(shutdown.clone()) => {
                                 decide_pending_reconnect(
                                     &mut pending_reconnect,
                                     false,
-                                    format!(
-                                        "fleetyd could not establish and authenticate the selected profile before the reconnect deadline. {}",
-                                        connection::explicit_repair_guidance()
-                                    ),
+                                    "fleetyd stopped before the reconnect completed".to_string(),
                                 );
-                                continue;
-                            }
-                        },
-                        _ = wait_stop(shutdown.clone()) => {
-                            decide_pending_reconnect(
-                                &mut pending_reconnect,
-                                false,
-                                "fleetyd stopped before the reconnect completed".to_string(),
-                            );
-                            settle_pending_reconnect_before_exit(&mut pending_reconnect).await;
-                            return Ok(());
-                        }
-                    }
-                } else {
-                    tokio::select! {
-                        result = fleety_tools::transport::connect(
-                            target.url(),
-                            target.token(),
-                        ) => result,
-                        _ = wait_stop(shutdown.clone()) => return Ok(()),
-                    }
-                };
-                match connection {
-                    Ok(conn) => {
-                        bo.reset();
-                        match serve(
-                            &target,
-                            session_owner.as_ref(),
-                            conn,
-                            shutdown.clone(),
-                            control.as_ref(),
-                            &mut pending_reconnect,
-                            reconnect_deadline,
-                        )
-                        .await
-                        {
-                            Outcome::Shutdown => return Ok(()),
-                            Outcome::Disconnected => {
-                                tracing::info!("fleetyd disconnected; will reconnect");
-                            }
-                            Outcome::Reconnect(request) => {
-                                tracing::info!(profile = %request.expected_profile, "profile changed; reconnecting immediately");
-                                pending_reconnect = Some(PendingReconnect::new(request));
-                                bo.reset();
-                                continue;
+                                settle_pending_reconnect_before_exit(&mut pending_reconnect).await;
+                                return Ok(());
                             }
                         }
+                    } else {
+                        tokio::select! {
+                            result = connection::open_candidate(
+                                &candidate,
+                                connection::open_budget_within(CONNECT_ENDPOINT_WAIT),
+                            ) => result,
+                            _ = wait_stop(shutdown.clone()) => return Ok(()),
+                        }
+                    };
+                    let (conn, sealed) = match opened {
+                        Ok(opened) => opened,
+                        Err(error) => {
+                            last_error = Some(error);
+                            continue;
+                        }
+                    };
+                    // The credential owner follows the endpoint that actually
+                    // opened, not the one we resolved from.
+                    let candidate_owner = match &session_owner {
+                        Some(SessionCredentialOwner::Existing(_)) => Some(
+                            SessionCredentialOwner::Existing(Box::new(candidate.clone())),
+                        ),
+                        Some(SessionCredentialOwner::FreshDefault) => {
+                            Some(SessionCredentialOwner::FreshDefault)
+                        }
+                        None => None,
+                    };
+                    // Snapshot the reconnect decision so a candidate that fails
+                    // before proving itself does not settle the request that a
+                    // later candidate can still satisfy.
+                    let decision_before = pending_reconnect
+                        .as_ref()
+                        .and_then(|pending| pending.decision.clone());
+                    let mut authenticated = false;
+                    let outcome = serve(
+                        &candidate,
+                        candidate_owner.as_ref(),
+                        conn,
+                        shutdown.clone(),
+                        control.as_ref(),
+                        &mut pending_reconnect,
+                        candidate_deadline,
+                        sealed,
+                        &mut authenticated,
+                    )
+                    .await;
+                    match outcome {
+                        Outcome::Shutdown => return Ok(()),
+                        Outcome::Reconnect(request) => {
+                            bo.reset();
+                            requested_reconnect = Some(request);
+                            served = true;
+                            break;
+                        }
+                        // Backoff resets only for an endpoint that authenticated,
+                        // so a socket that opens and never proves itself cannot
+                        // keep the retry loop hot.
+                        Outcome::Disconnected if authenticated => {
+                            bo.reset();
+                            served = true;
+                            tracing::info!("fleetyd disconnected; will reconnect");
+                            break;
+                        }
+                        Outcome::Disconnected => {
+                            // A candidate that got as far as freezing a result
+                            // owns this request: its credential commit already
+                            // happened, so the frozen outcome must survive to be
+                            // settled or retried, not be rolled back by the loop.
+                            let froze = pending_reconnect.as_ref().is_some_and(|pending| {
+                                pending.authenticated.is_some()
+                                    || pending
+                                        .decision
+                                        .as_ref()
+                                        .is_some_and(|decision| decision.accepted)
+                            });
+                            if froze {
+                                served = true;
+                                break;
+                            }
+                            // Otherwise drop the decision so a later endpoint can
+                            // still settle this request, but keep its reason: it
+                            // is the actionable half, and the aggregated failure
+                            // would otherwise say only that nothing worked.
+                            let reason = pending_reconnect
+                                .as_ref()
+                                .and_then(|pending| pending.decision.as_ref())
+                                .filter(|decision| !decision.accepted)
+                                .map(|decision| decision.message.clone());
+                            if let Some(pending) = pending_reconnect.as_mut() {
+                                pending.decision = decision_before;
+                            }
+                            last_error = Some(agent_core::CoreError::Message(
+                                reason.unwrap_or_else(|| {
+                                    "the endpoint did not complete an authenticated handshake"
+                                        .to_string()
+                                }),
+                            ));
+                        }
                     }
-                    Err(e) => {
-                        let failure = reconnect_connect_error(&target, &e.report().message);
-                        tracing::warn!(message = %failure, "connect failed; will retry");
-                        if let Some(expected_profile) = pending_reconnect
-                            .as_ref()
-                            .map(|pending| pending.request.expected_profile.clone())
-                        {
-                            decide_pending_reconnect(
+                }
+                if let Some(request) = requested_reconnect {
+                    tracing::info!(profile = %request.expected_profile, "profile changed; reconnecting immediately");
+                    pending_reconnect = Some(PendingReconnect::new(request));
+                    continue;
+                }
+                if !served {
+                    let message = last_error
+                        .map(|error| error.report().message)
+                        .unwrap_or_else(|| {
+                            "the reconnect deadline expired before an endpoint connected"
+                                .to_string()
+                        });
+                    let failure = reconnect_connect_error(&target, &message);
+                    tracing::warn!(message = %failure, "connect failed; will retry");
+                    if let Some(expected_profile) = pending_reconnect
+                        .as_ref()
+                        .map(|pending| pending.request.expected_profile.clone())
+                    {
+                        decide_pending_reconnect(
                                 &mut pending_reconnect,
                                 false,
                                 format!(
                                     "fleetyd left the previous Server, but could not connect to profile '{}': {}",
                                     expected_profile,
                                     failure
-                                ),
-                            );
-                        }
+                            ),
+                        );
                     }
                 }
             }
@@ -3028,6 +3205,7 @@ async fn wait_stop(shutdown: Option<tokio::sync::watch::Receiver<bool>>) {
 
 /// Run one connected session: send Hello, then serve frames until the link
 /// drops or a shutdown signal arrives.
+#[allow(clippy::too_many_arguments)]
 async fn serve(
     target: &Resolved,
     session_owner: Option<&SessionCredentialOwner>,
@@ -3036,13 +3214,25 @@ async fn serve(
     control: Option<&ControlGuard>,
     pending_reconnect: &mut Option<PendingReconnect>,
     reconnect_deadline: Option<tokio::time::Instant>,
+    // `sealed`: this connection runs inside the encrypted channel, committed
+    // with the endpoints so the profile refuses a downgrade next time.
+    sealed: bool,
+    // `authenticated`: set once the Server completes an authenticated
+    // `Welcome`. The caller reads it to decide whether this endpoint earned the
+    // attempt — one that never authenticates must not stand in for the
+    // endpoints behind it.
+    authenticated: &mut bool,
 ) -> Outcome {
     let url = target.url();
-    let pairing_code = session_owner.and_then(|_| {
-        std::env::var("FLEETY_PAIRING_CODE")
-            .ok()
-            .filter(|s| !s.is_empty())
-    });
+    // A pairing code has no handshake behind it, so it goes only to the address
+    // a person configured — never to one roaming promoted on its own.
+    let pairing_code = session_owner
+        .filter(|_| target.url() == target.configured_url())
+        .and_then(|_| {
+            std::env::var("FLEETY_PAIRING_CODE")
+                .ok()
+                .filter(|s| !s.is_empty())
+        });
     let expected_reconnect_fingerprint = match pending_reconnect
         .as_ref()
         .map(|pending| {
@@ -3152,7 +3342,15 @@ async fn serve(
     // when disabled — nothing is computed or sent.
     let presence_enabled = colocation::presence_enabled();
     let mut presence_tick: Option<tokio::time::Interval> = None;
-    let mut welcome_deadline = pending_reconnect.as_ref().and(reconnect_deadline);
+    // Always bounded. An owner-requested reconnect keeps its own tighter budget;
+    // every other session still needs a limit, or one silent endpoint hides
+    // every working endpoint behind it.
+    let mut welcome_deadline = Some(
+        pending_reconnect
+            .as_ref()
+            .and(reconnect_deadline)
+            .unwrap_or_else(|| tokio::time::Instant::now() + WELCOME_WAIT),
+    );
     let mut authenticated_welcome = false;
     loop {
         if pending_reconnect
@@ -3262,6 +3460,7 @@ async fn serve(
                 token,
                 server_version,
                 server_fingerprint,
+                server_endpoints,
                 ..
             } => {
                 if token
@@ -3312,6 +3511,8 @@ async fn serve(
                         session_owner,
                         fingerprint,
                         token.as_deref(),
+                        &server_endpoints,
+                        sealed,
                         pending_reconnect,
                     ) {
                         decide_pending_reconnect(
@@ -3339,6 +3540,8 @@ async fn serve(
                                 target,
                                 fp,
                                 token.as_deref(),
+                                &server_endpoints,
+                                sealed,
                             ) {
                                 Ok(true) => tracing::info!(
                                     "fleetyd identity and token committed to their exact profile owner"
@@ -3367,6 +3570,10 @@ async fn serve(
                 }
                 tracing::info!(%session_id, "registered with agent");
                 authenticated_welcome = true;
+                *authenticated = true;
+                // Welcome has arrived: the deadline has done its job. Leaving it
+                // armed would cut the live session short.
+                welcome_deadline = None;
                 if presence_enabled {
                     let mut interval = tokio::time::interval(std::time::Duration::from_secs(
                         colocation::interval_secs(),
@@ -3391,20 +3598,25 @@ async fn serve(
                         error.message
                     );
                 } else if target.sent_saved_profile_token() {
-                    tracing::warn!(
-                        "server rejected our saved token: {} — clearing only that profile token so the next connect can re-pair",
-                        error.message
-                    );
+                    tracing::warn!("server rejected our saved token: {}", error.message);
                 } else {
                     tracing::warn!(
                         "the selected Server requires authentication: {} — pair this saved profile before reconnecting",
                         error.message
                     );
                 }
-                if target.sent_saved_profile_token() {
+                // Clearing is a credential mutation, so it needs the same proof
+                // as any other: only a peer that opened the encrypted channel
+                // has shown it is the Server this profile is paired with. An
+                // unproven rejection fails this candidate and nothing else.
+                if target.sent_saved_profile_token() && sealed {
                     if let Err(e) = clear_session_owner_token(session_owner, target) {
                         tracing::warn!(report = ?e.report(), "could not clear the rejected token");
                     }
+                } else if target.sent_saved_profile_token() {
+                    tracing::warn!(
+                        "the endpoint rejected authentication before proving it is this profile's Server; the saved token was left untouched"
+                    );
                 }
                 decide_pending_reconnect(
                     pending_reconnect,
@@ -3478,6 +3690,16 @@ async fn serve(
                     return Outcome::Disconnected;
                 }
             }
+            // Channel-setup frames belong to the handshake. On a sealed link the
+            // transport strips them, so one arriving here means the peer is
+            // renegotiating mid-session or trying to seal a cleartext link.
+            ServerMsg::SecureAccept { .. } | ServerMsg::SecureFrame { .. } => {
+                tracing::warn!(
+                    "the Server sent a secure-channel frame outside the handshake; dropping the session"
+                );
+                conn.close().await;
+                return Outcome::Disconnected;
+            }
             _ => {}
         }
     }
@@ -3485,6 +3707,37 @@ async fn serve(
 
 #[cfg(test)]
 mod tests {
+
+    /// A reconnect that authenticated on a saved alternative must stay
+    /// retryable when its credential publication fails. Narrowing this to the
+    /// primary turns a storage hiccup into a permanent failure for exactly the
+    /// sessions roaming exists to serve.
+    #[test]
+    fn an_authenticated_alternative_still_counts_as_this_profiles_endpoint() {
+        let mut profile = connection::Profile {
+            url: "ws://192.168.1.20:8787".to_string(),
+            ..Default::default()
+        };
+        profile.endpoints = vec!["ws://100.64.0.8:8787".to_string()];
+        profile.configured_url = Some("ws://home.lan:8787".to_string());
+
+        assert!(authenticated_endpoint_belongs_to(
+            &profile,
+            "ws://192.168.1.20:8787"
+        ));
+        assert!(
+            authenticated_endpoint_belongs_to(&profile, "ws://100.64.0.8:8787"),
+            "a learned endpoint that authenticated is still this profile's"
+        );
+        assert!(
+            authenticated_endpoint_belongs_to(&profile, "ws://home.lan:8787"),
+            "so is the address the user configured"
+        );
+        assert!(
+            !authenticated_endpoint_belongs_to(&profile, "ws://198.51.100.9:8787"),
+            "an address this profile never held must not count"
+        );
+    }
     use super::*;
     use std::path::PathBuf;
     use std::sync::Mutex;
@@ -3969,7 +4222,8 @@ mod tests {
         let owner = session_credential_owner_in(&conns, &target).expect("capture owner A");
 
         assert!(
-            persist_authenticated_target_credentials(&owner, &target, " \t ", None).is_err(),
+            persist_authenticated_target_credentials(&owner, &target, " \t ", None, &[], false)
+                .is_err(),
             "a durable identity pin must contain non-whitespace bytes"
         );
         assert!(connection::load().expect("reload").profiles["a"]

@@ -108,7 +108,7 @@ fn acp_install_rejects_an_empty_settings_base() {
 }
 
 #[test]
-fn acp_install_unknown_editor_prints_generic_setup() {
+fn acp_install_unknown_editor_fails_with_the_generic_setup() {
     let home = TempHome::new("acp-install-generic");
     let output = Command::new(env!("CARGO_BIN_EXE_fleety"))
         .args(["acp", "install", "neovim"])
@@ -116,13 +116,34 @@ fn acp_install_unknown_editor_prints_generic_setup() {
         .env("USERPROFILE", &home.0)
         .output()
         .expect("run generic acp install");
-    assert!(
-        output.status.success(),
+    // Naming an editor asks for an install. Nothing was installed, so exiting 0
+    // told a script this had worked.
+    assert_eq!(
+        output.status.code(),
+        Some(2),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(String::from_utf8_lossy(&output.stdout).contains("No built-in auto-config"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("no built-in auto-config"), "{stderr}");
+    // The guidance a user needs is still right there.
+    assert!(stderr.contains("point any ACP-capable editor"), "{stderr}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).is_empty(),
+        "a failure must not write to stdout"
+    );
     assert!(!home.0.join(".config/zed/settings.json").exists());
+
+    // Naming no editor is the documented "print the setup" path and still
+    // succeeds on stdout.
+    let printed = Command::new(env!("CARGO_BIN_EXE_fleety"))
+        .args(["acp", "install"])
+        .env("HOME", &home.0)
+        .env("USERPROFILE", &home.0)
+        .output()
+        .expect("run generic acp install");
+    assert!(printed.status.success());
+    assert!(String::from_utf8_lossy(&printed.stdout).contains("point any ACP-capable editor"));
 }
 
 fn rejecting_ws_url() -> String {
@@ -175,6 +196,7 @@ fn welcome(token: Option<&str>) -> ServerMsg {
         audio_input: false,
         config_protocol: 0,
         server_fingerprint: Some("fingerprint-smoke".into()),
+        server_endpoints: Vec::new(),
         loopback_trusted: false,
         token: token.map(String::from),
     }
@@ -204,6 +226,7 @@ fn welcome_with_fingerprint_and_token(fingerprint: &str, token: Option<&str>) ->
         audio_input: false,
         config_protocol: 0,
         server_fingerprint: Some(fingerprint.into()),
+        server_endpoints: Vec::new(),
         loopback_trusted: false,
         token: token.map(String::from),
     }
@@ -218,6 +241,7 @@ fn doctor_welcome() -> ServerMsg {
         audio_input: false,
         config_protocol: CONFIG_PROTOCOL_VERSION,
         server_fingerprint: Some("doctor-server-id".into()),
+        server_endpoints: Vec::new(),
         loopback_trusted: true,
         token: None,
     }
@@ -255,34 +279,185 @@ fn raw_provider_snapshot(providers_json: &str) -> ServerMsg {
     }
 }
 
+type FakeWs = tokio_tungstenite::tungstenite::WebSocket<std::net::TcpStream>;
+
+fn read_raw(ws: &mut FakeWs) -> Option<ClientMsg> {
+    loop {
+        let frame = ws.read().ok()?;
+        if frame.is_close() {
+            return None;
+        }
+        let Ok(text) = frame.to_text() else {
+            continue;
+        };
+        if text.is_empty() {
+            continue;
+        }
+        return serde_json::from_str::<ClientMsg>(text).ok();
+    }
+}
+
+fn send_raw(ws: &mut FakeWs, msg: &ServerMsg) {
+    let json = serde_json::to_string(msg).expect("server msg");
+    let _ = ws.send(Message::Text(json));
+}
+
+/// Whether the client's handshake gets completed, and with which credential.
+///
+/// `Some((token, identity))` is a Server enrolled with this device: the
+/// handshake succeeds only if the client derived the same key, which is exactly
+/// what the roaming tests are asserting. `None` is a Server that understands the
+/// frame but holds no credential for this device — it refuses, and the client is
+/// expected to reconnect in the clear where that is still permitted.
+type FakeSecure = Option<(String, String)>;
+
+/// Outcome of the handshake phase on one fake connection.
+enum FakeHandshake {
+    /// Sealed from here on.
+    Sealed(Box<fleety_tools::secure::SecureSession>),
+    /// The client did not offer a handshake; this frame is already a control
+    /// frame and belongs to the first step.
+    Cleartext(Box<ClientMsg>),
+    /// Refused, or the client went away. This connection carries no steps.
+    Ended,
+}
+
+fn fake_handshake(ws: &mut FakeWs, secure: &FakeSecure) -> FakeHandshake {
+    match read_raw(ws) {
+        Some(ClientMsg::SecureHandshake { version, msg, .. }) => {
+            let Some((token, fingerprint)) = secure else {
+                // An older Server cannot parse the frame at all, so it just
+                // drops the link; the client then reconnects in the clear.
+                let _ = ws.close(None);
+                return FakeHandshake::Ended;
+            };
+            let (responder, reply) =
+                fleety_tools::secure::Responder::accept(version, token, fingerprint, &msg)
+                    .expect("the fake Server holds this device's token");
+            send_raw(
+                ws,
+                &ServerMsg::SecureAccept {
+                    version,
+                    msg: reply,
+                },
+            );
+            FakeHandshake::Sealed(Box::new(
+                responder.finish().expect("fake secure channel established"),
+            ))
+        }
+        Some(other) => FakeHandshake::Cleartext(Box::new(other)),
+        None => FakeHandshake::Ended,
+    }
+}
+
+/// Drive one fake-Server connection through `steps`, transparently handling the
+/// paired secure channel so assertions read the same either way: the frames
+/// returned are always the client's control frames, unsealed.
+///
+/// Returns `None` when the connection ended before any step ran, which is how a
+/// refused handshake reports "the client will be back in the clear".
+fn serve_ws_connection(
+    ws: &mut FakeWs,
+    secure: &FakeSecure,
+    steps: Vec<Vec<ServerMsg>>,
+) -> Option<Vec<ClientMsg>> {
+    let (mut session, mut pending) = match fake_handshake(ws, secure) {
+        FakeHandshake::Sealed(session) => (Some(*session), None),
+        FakeHandshake::Cleartext(first) => (None, Some(*first)),
+        FakeHandshake::Ended => return None,
+    };
+
+    let mut received = Vec::new();
+    for responses in steps {
+        let message = match pending.take() {
+            Some(message) => message,
+            None => match read_raw(ws) {
+                Some(ClientMsg::SecureFrame { payload }) => {
+                    let session = session.as_mut().expect("sealed frame on a cleartext link");
+                    let opened = session.open(&payload).expect("open the client's frame");
+                    serde_json::from_str::<ClientMsg>(&opened).expect("client msg")
+                }
+                Some(message) => message,
+                None => break,
+            },
+        };
+        received.push(message);
+        for response in responses {
+            match session.as_mut() {
+                Some(session) => {
+                    let json = serde_json::to_string(&response).expect("server msg");
+                    let payload = session.seal(&json).expect("seal");
+                    send_raw(ws, &ServerMsg::SecureFrame { payload });
+                }
+                None => send_raw(ws, &response),
+            }
+        }
+    }
+    let _ = ws.close(None);
+    Some(received)
+}
+
+/// A fake Server that cannot open a secure channel — an older build, or one that
+/// no longer holds this device's credential. A client permitted to fall back
+/// reconnects in the clear, so this accepts until a connection carries steps.
 fn start_ws_server(steps: Vec<Vec<ServerMsg>>) -> (String, mpsc::Receiver<Vec<ClientMsg>>) {
+    start_ws_server_with(steps, None)
+}
+
+fn start_ws_server_with(
+    steps: Vec<Vec<ServerMsg>>,
+    secure: FakeSecure,
+) -> (String, mpsc::Receiver<Vec<ClientMsg>>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ws server");
     let addr = listener.local_addr().expect("local addr");
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let (stream, _) = listener.accept().expect("accept ws");
-        let mut ws = accept(stream).expect("accept websocket");
-        let mut received = Vec::new();
-        for responses in steps {
-            let Ok(frame) = ws.read() else {
-                break;
+        let mut steps = Some(steps);
+        let received = loop {
+            let Ok((stream, _)) = listener.accept() else {
+                break Vec::new();
             };
-            let Ok(text) = frame.to_text() else {
-                break;
+            let Ok(mut ws) = accept(stream) else {
+                break Vec::new();
             };
-            let Ok(message) = serde_json::from_str::<ClientMsg>(text) else {
-                break;
+            let Some(pending) = steps.take() else {
+                break Vec::new();
             };
-            received.push(message);
-            for response in responses {
-                ws.send(Message::Text(
-                    serde_json::to_string(&response).expect("server msg"),
-                ))
-                .expect("send response");
+            match serve_ws_connection(&mut ws, &secure, pending.clone()) {
+                Some(received) => break received,
+                // The handshake was refused: the client reconnects in the clear.
+                None => steps = Some(pending),
             }
-        }
-        let _ = ws.close(None);
+        };
         tx.send(received).expect("send received frames");
+    });
+    (format!("ws://{addr}"), rx)
+}
+
+/// A fake Server on a real, non-loopback interface — the shape a learned
+/// endpoint has. `secure` is mandatory here because a learned endpoint is never
+/// allowed the cleartext fallback: it has to prove the credential or be dropped.
+fn start_non_loopback_ws_server(
+    steps: Vec<Vec<ServerMsg>>,
+    secure: FakeSecure,
+) -> (String, mpsc::Receiver<Vec<ClientMsg>>) {
+    let ip = if_addrs::get_if_addrs()
+        .expect("enumerate test interfaces")
+        .into_iter()
+        .find_map(|interface| match interface.ip() {
+            std::net::IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => Some(ip),
+            _ => None,
+        })
+        .expect("a non-loopback IPv4 interface is required for endpoint roaming smoke tests");
+    let listener = std::net::TcpListener::bind((ip, 0)).expect("bind non-loopback ws server");
+    let addr = listener.local_addr().expect("non-loopback local addr");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept non-loopback ws");
+        let mut ws = accept(stream).expect("accept non-loopback websocket");
+        let received = serve_ws_connection(&mut ws, &secure, steps).unwrap_or_default();
+        tx.send(received)
+            .expect("send non-loopback received frames");
     });
     (format!("ws://{addr}"), rx)
 }
@@ -1949,7 +2124,7 @@ fn connection_is_the_canonical_alias_of_server() {
         .pointer("/data/output")
         .and_then(serde_json::Value::as_str)
         .expect("connection use output");
-    assert!(output.contains("now using server 'office'"), "{output}");
+    assert!(output.contains("now using profile 'office'"), "{output}");
     assert!(
         output.contains("no running fleetyd owns this connection store")
             || output.contains("fleetyd accepted profile"),
@@ -2005,6 +2180,262 @@ fn profile_override_queries_b_without_changing_current_a() {
     assert!(
         b_section.contains("fingerprint = \"server-b-fingerprint\""),
         "B must receive its own TOFU pin: {after}"
+    );
+}
+
+#[test]
+fn saved_profile_falls_back_to_a_learned_endpoint_and_promotes_it() {
+    let home = TempHome::new("profile-endpoint-roaming");
+    // The learned endpoint holds this device's token, so it can complete the
+    // handshake. That is the precondition for being tried at all: an endpoint
+    // Fleety taught itself never gets the credential without proving it first.
+    let (reachable_url, rx) = start_non_loopback_ws_server(
+        vec![
+            vec![welcome_with_fingerprint("server-roaming")],
+            vec![ServerMsg::ServerStatusResult {
+                version: "roaming-server".into(),
+                uptime_secs: 1,
+                connected_devices: 0,
+                device_ids_json: "[]".into(),
+                extra_json: None,
+            }],
+        ],
+        Some(("roaming-token".to_string(), "server-roaming".to_string())),
+    );
+    let port = reachable_url
+        .rsplit_once(':')
+        .map(|(_, port)| port)
+        .expect("reachable endpoint port");
+    let old_url = format!("ws://127.0.0.1:{port}");
+    let connections = home.0.join(".fleety").join("connections.toml");
+    std::fs::create_dir_all(connections.parent().expect("parent")).expect("fleety home");
+    std::fs::write(
+        &connections,
+        format!(
+            "device_id = \"roaming-cli\"\ncurrent = \"home\"\n\n\
+             [profiles.home]\nurl = \"{old_url}\"\nendpoints = [\"{reachable_url}\"]\n\
+             token = \"roaming-token\"\nfingerprint = \"server-roaming\"\ngeneration = \"roaming-generation\"\n"
+        ),
+    )
+    .expect("seed roaming profile");
+
+    let (output, received) = run_against_profile(&["status"], &home, rx);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(matches!(
+        received.first(),
+        Some(ClientMsg::Hello { token, .. }) if token.as_deref() == Some("roaming-token")
+    ));
+    let saved = fleety_tools::connection::load_at(&connections).expect("load promoted CLI profile");
+    assert_eq!(saved.profiles["home"].url, reachable_url);
+    assert_eq!(saved.profiles["home"].endpoints, vec![old_url]);
+    // The fake Server only answers a handshake keyed by this exact token and
+    // identity, so the pin landing here is proof the session really was sealed
+    // — not merely that a connection was made.
+    assert!(
+        saved.profiles["home"].secure,
+        "roaming onto a learned endpoint must run inside the encrypted channel"
+    );
+}
+
+/// A latched profile must not have its saved token replayed over a plain
+/// connection — and `init` is exactly the command the "could not prove it is
+/// the Server" guidance sends people to, so it is the path an attacker who took
+/// over the address would steer them onto.
+/// Low 2: the profile returning to the configured address is covered, but the
+/// half the spec actually names — where the one-time code is *sent* — was not.
+/// A regression here hands a pairing code, in the clear, to an address the user
+/// never chose.
+#[test]
+fn pair_sends_its_code_to_the_configured_address_not_the_roamed_one() {
+    let home = TempHome::new("pair-configured-address");
+    // The address the user configured answers; the roamed primary is a dead
+    // port, so reaching it at all would be visible as a failure.
+    let (configured_url, rx) = start_ws_server(vec![vec![ServerMsg::Welcome {
+        session_id: "paired".into(),
+        conversation_id: "paired".into(),
+        protocol: PROTOCOL_VERSION,
+        server_version: String::new(),
+        audio_input: false,
+        config_protocol: CONFIG_PROTOCOL_VERSION,
+        server_fingerprint: Some("server-paired".into()),
+        server_endpoints: Vec::new(),
+        loopback_trusted: false,
+        token: Some("minted-token".into()),
+    }]]);
+    let connections = home.0.join(".fleety").join("connections.toml");
+    std::fs::create_dir_all(connections.parent().expect("parent")).expect("fleety home");
+    std::fs::write(
+        &connections,
+        format!(
+            "device_id = \"pair-configured\"\ncurrent = \"home\"\n\n\
+             [profiles.home]\nurl = \"ws://127.0.0.1:9\"\n\
+             configured_url = \"{configured_url}\"\ntoken = \"old-token\"\n\
+             fingerprint = \"server-paired\"\ngeneration = \"pair-generation\"\n"
+        ),
+    )
+    .expect("seed roamed profile");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_fleety"))
+        .args(["pair", "abc12345"])
+        .env("HOME", &home.0)
+        .env("USERPROFILE", &home.0)
+        .env("FLEETY_MDNS_DISABLED", "1")
+        .env_remove("FLEETY_AGENT_URL")
+        .env_remove("FLEETY_TOKEN")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run fleety pair");
+
+    let received = rx.recv_timeout(Duration::from_secs(10)).unwrap_or_default();
+    assert!(
+        matches!(
+            received.first(),
+            Some(ClientMsg::Hello { pairing_code, token, .. })
+                if pairing_code.as_deref() == Some("abc12345") && token.is_none()
+        ),
+        "the configured address must receive the code, and no old token: {received:?}"
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let saved = fleety_tools::connection::load_at(&connections).expect("reload profile");
+    assert_eq!(
+        saved.profiles["home"].url, configured_url,
+        "the profile must end up on the address the pairing happened at"
+    );
+}
+
+/// `fleety … | head` is an ordinary thing to type. Rust masks SIGPIPE, so the
+/// print macros panic on the closed pipe — a crash, exit 101, and a backtrace
+/// for something the user did nothing wrong in.
+/// `--help` is the only place a user can discover what a command takes, so an
+/// argument printed without a description teaches nothing — and two of them
+/// delete a credential or refuse to pick a replacement.
+#[test]
+fn every_command_argument_carries_a_description_in_help() {
+    for path in [
+        &["init"][..],
+        &["pair"][..],
+        &["resume"][..],
+        &["connection", "add"][..],
+        &["connection", "remove"][..],
+        &["connection", "set-url"][..],
+        &["provider", "add"][..],
+        &["provider", "login"][..],
+        &["model", "set"][..],
+        &["completion"][..],
+    ] {
+        let mut args = path.to_vec();
+        args.push("--help");
+        let output = run(&args);
+        assert!(output.status.success(), "{path:?} --help failed");
+        let help = String::from_utf8_lossy(&output.stdout);
+
+        // An argument line with nothing after the value placeholder is a
+        // declaration whose description was never written.
+        for line in help.lines() {
+            let trimmed = line.trim_end();
+            let is_argument = trimmed.starts_with("  <")
+                || trimmed.starts_with("  [")
+                || trimmed.starts_with("      --")
+                || trimmed.starts_with("  -");
+            if !is_argument || trimmed.contains("--help") || trimmed.contains("--version") {
+                continue;
+            }
+            let described = trimmed
+                .split_once("  ")
+                .map(|(_, rest)| rest.trim_start().len() > 2)
+                .unwrap_or(false)
+                || trimmed.split_whitespace().count() > 2;
+            assert!(
+                described,
+                "{path:?} --help has an undescribed argument: {trimmed:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_closed_pipe_ends_quietly_instead_of_panicking() {
+    for args in [&["config", "list"][..], &["completion", "zsh"][..]] {
+        let home = TempHome::new("broken-pipe");
+        let mut child = Command::new(env!("CARGO_BIN_EXE_fleety"))
+            .args(args)
+            .env("HOME", &home.0)
+            .env("USERPROFILE", &home.0)
+            .env_remove("FLEETY_AGENT_URL")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("run fleety");
+        // Drop the read end immediately: the next write hits a closed pipe.
+        drop(child.stdout.take());
+        let output = child.wait_with_output().expect("await fleety");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("panicked"),
+            "{args:?} panicked on a closed pipe: {stderr}"
+        );
+        assert_ne!(
+            output.status.code(),
+            Some(101),
+            "{args:?} exited as a panic on a closed pipe"
+        );
+    }
+}
+
+#[test]
+fn init_refuses_to_replay_a_latched_profiles_token_without_a_pairing_code() {
+    let home = TempHome::new("init-latched");
+    // The fake Server is never contacted, so a dead port is the point.
+    let url = "ws://127.0.0.1:9";
+    let connections = home.0.join(".fleety").join("connections.toml");
+    std::fs::create_dir_all(connections.parent().expect("parent")).expect("fleety home");
+    std::fs::write(
+        &connections,
+        format!(
+            "device_id = \"init-latched\"\ncurrent = \"home\"\n\n\
+             [profiles.home]\nurl = \"{url}\"\ntoken = \"latched-token\"\n\
+             fingerprint = \"server-a\"\nsecure = true\ngeneration = \"latched-generation\"\n"
+        ),
+    )
+    .expect("seed latched profile");
+    let before = std::fs::read(&connections).expect("read profile before init");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_fleety"))
+        .args(["init", url, "--name", "home"])
+        .env("HOME", &home.0)
+        .env("USERPROFILE", &home.0)
+        .env("FLEETY_MDNS_DISABLED", "1")
+        .env_remove("FLEETY_AGENT_URL")
+        .env_remove("FLEETY_TOKEN")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run fleety init");
+
+    assert!(
+        !output.status.success(),
+        "init must refuse before opening a plain connection: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--pairing-code"),
+        "the refusal must name the way forward: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&connections).expect("read profile after init"),
+        before,
+        "a refused init must not touch the profile"
     );
 }
 
@@ -4522,4 +4953,92 @@ fn generated_help_and_documented_command_inventory_cannot_drift() {
     let completion_help = String::from_utf8(completion_help.stdout).expect("completion help");
     assert!(completion_help.contains("fleety completion bash >"));
     assert!(completion_help.contains("fleety completion powershell |"));
+}
+
+/// `--help` is the only place a user can discover what a command takes, and
+/// three separate rounds of review found arguments printing a blank column —
+/// including credential-bearing ones. This walks every help page the binary can
+/// produce and fails on any argument, option, or subcommand with no
+/// description, so the next one is caught here instead of by a reader.
+#[test]
+fn every_help_page_describes_every_argument_and_subcommand() {
+    fn help_lines(path: &[String]) -> Vec<String> {
+        let home = TempHome::new("help-sweep");
+        let mut args: Vec<&str> = path.iter().map(String::as_str).collect();
+        args.push("--help");
+        let out = Command::new(env!("CARGO_BIN_EXE_fleety"))
+            .args(&args)
+            .env("HOME", &home.0)
+            .env("USERPROFILE", &home.0)
+            .env_remove("FLEETY_AGENT_URL")
+            .output()
+            .expect("run fleety --help");
+        let text = if out.stdout.is_empty() {
+            String::from_utf8_lossy(&out.stderr).into_owned()
+        } else {
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        text.lines().map(str::to_string).collect()
+    }
+
+    let mut undescribed: Vec<String> = Vec::new();
+    let mut pages = 0usize;
+    let mut queue: Vec<Vec<String>> = vec![Vec::new()];
+    let mut seen: Vec<String> = Vec::new();
+    while let Some(path) = queue.pop() {
+        let key = path.join(" ");
+        if seen.contains(&key) || path.len() > 4 {
+            continue;
+        }
+        seen.push(key.clone());
+        pages += 1;
+        let lines = help_lines(&path);
+        let mut section = String::new();
+        for (index, line) in lines.iter().enumerate() {
+            let trimmed = line.trim_end();
+            if trimmed.ends_with(':') && !trimmed.starts_with(' ') {
+                section = trimmed.trim_end_matches(':').to_string();
+                continue;
+            }
+            // Only the entry lines themselves are indented exactly two spaces;
+            // a wrapped description is indented further.
+            let indent = line.len() - line.trim_start().len();
+            if indent != 2 || line.trim().is_empty() {
+                continue;
+            }
+            let body = line.trim();
+            // Clap separates an entry from its description by two or more
+            // spaces, or wraps the description onto a more-indented next line.
+            let has_inline = body
+                .find("  ")
+                .is_some_and(|at| !body[at..].trim().is_empty());
+            let has_wrapped = lines.get(index + 1).is_some_and(|next| {
+                !next.trim().is_empty() && (next.len() - next.trim_start().len()) > 2
+            });
+            let described = has_inline || has_wrapped;
+            match section.as_str() {
+                "Commands" => {
+                    let name = body.split_whitespace().next().unwrap_or_default();
+                    if name == "help" {
+                        continue;
+                    }
+                    queue.push([path.clone(), vec![name.to_string()]].concat());
+                    if !described {
+                        undescribed.push(format!("`fleety {key}` subcommand `{name}`"));
+                    }
+                }
+                "Arguments" | "Options" if !described => {
+                    undescribed.push(format!("`fleety {key}` -> {body}"));
+                }
+                _ => {}
+            }
+        }
+    }
+    assert!(pages > 40, "the sweep only reached {pages} help pages");
+    assert!(
+        undescribed.is_empty(),
+        "{} help entries print no description:\n{}",
+        undescribed.len(),
+        undescribed.join("\n")
+    );
 }

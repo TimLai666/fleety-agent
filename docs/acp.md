@@ -14,7 +14,7 @@ editor  ──ACP (stdio, JSON-RPC)──▶  `fleety acp`  ──WebSocket─�
 
 - The editor launches **`fleety acp`** as a subprocess and talks JSON-RPC over
   stdin/stdout. It is the **same `fleety` binary** you use for `fleety ask` /
-  `fleety tui` / `fleety config` — `acp` is just another subcommand.
+  `fleety chat` / `fleety config` — `acp` is just another subcommand.
 - `fleety acp` **runs no agent itself**. It translates ACP ↔ the fleety-server
   WebSocket protocol. The real agent (model calls, tools, memory, audit) lives in
   **fleety-server**, which the adapter connects to per prompt.
@@ -152,7 +152,7 @@ of returning a misleading `end_turn` after partial output.
 Because the editor only runs a thin adapter, the actual agent can live elsewhere:
 set `FLEETY_AGENT_URL` (in the editor's `env`, or via `fleety acp install --server
 <url>`) to point at a server on another host. The same server can be shared by
-Zed, `fleety tui`, scheduled runs, etc. Use `wss://` + TLS for anything beyond
+Zed, `fleety chat`, scheduled runs, etc. Use `wss://` + TLS for anything beyond
 loopback. `fleety acp install --server <url>` writes only the transient endpoint;
 an authenticated endpoint also needs an explicit `FLEETY_TOKEN`, or a saved
 current profile with the raw server override omitted.

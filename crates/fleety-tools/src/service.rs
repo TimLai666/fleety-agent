@@ -372,11 +372,27 @@ fn exec_line(exec: &str, args: &[String]) -> String {
     }
 }
 
+/// One line per service lifecycle verb, so `--help` says what each one does
+/// instead of repeating the same sentence eleven times. `service` is the bare
+/// noun ("Server", "Daemon") — the templates supply their own articles. The two
+/// binaries differ in what `install` and `update` additionally do, so those stay
+/// at the call site.
+pub fn lifecycle_about(verb: &str, service: &str) -> String {
+    match verb {
+        "uninstall" => format!("Remove the installed {service} service definition"),
+        "start" => format!("Start the installed {service} service now"),
+        "stop" => format!("Stop the running {service} service"),
+        "restart" => format!("Restart the {service} service"),
+        "enable" => format!("Start the {service} automatically at boot or login"),
+        "disable" => format!("Stop starting the {service} automatically"),
+        "status" => format!("Report whether the {service} is installed, enabled, and running"),
+        other => format!("{service} service: {other}"),
+    }
+}
+
 fn home_join(rel: &str) -> PathBuf {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(rel)
+    let home = crate::device::home_dir();
+    home.join(rel)
 }
 
 fn xml_escape(s: &str) -> String {
@@ -1008,6 +1024,42 @@ impl PushPath for Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_lifecycle_verb_gets_its_own_readable_sentence() {
+        // All eleven verbs used to share one sentence, so `--help` told a user
+        // nothing about which one to run.
+        let verbs = [
+            "uninstall",
+            "start",
+            "stop",
+            "restart",
+            "enable",
+            "disable",
+            "status",
+        ];
+        let mut seen: Vec<String> = Vec::new();
+        for verb in verbs {
+            let about = lifecycle_about(verb, "Daemon");
+            assert!(
+                !seen.contains(&about),
+                "{verb} repeats an earlier description: {about}"
+            );
+            // The noun carries no article of its own, so the templates must not
+            // produce "the installed the Daemon service".
+            assert!(!about.contains("the the"), "{about}");
+            assert!(
+                !about.contains("the Daemon service:"),
+                "{verb} fell through to the generic arm: {about}"
+            );
+            assert!(
+                about.len() > verb.len() + 10,
+                "{verb} says too little: {about}"
+            );
+            seen.push(about);
+        }
+        assert!(lifecycle_about("start", "Server").contains("Server"));
+    }
 
     #[test]
     fn successful_probe_exit_classification_distinguishes_alive_and_dead() {

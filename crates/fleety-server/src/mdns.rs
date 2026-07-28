@@ -75,6 +75,60 @@ fn port_from(bind_addr: &str) -> u16 {
         .unwrap_or(8787)
 }
 
+fn usable_endpoint_ip(ip: IpAddr) -> bool {
+    !ip.is_loopback()
+        && !ip.is_unspecified()
+        && !ip.is_multicast()
+        && !matches!(ip, IpAddr::V6(v6) if v6.segments()[0] & 0xffc0 == 0xfe80)
+}
+
+/// Convert current interface addresses into stable WebSocket endpoints. This is
+/// deliberately interface-generic: an address may belong to Ethernet, Wi-Fi,
+/// a user-installed overlay, or another network device.
+fn endpoints_for_ips(bind_addr: &str, ips: impl IntoIterator<Item = IpAddr>) -> Vec<String> {
+    let Ok(bind) = bind_addr.parse::<SocketAddr>() else {
+        return Vec::new();
+    };
+    let mut endpoints: Vec<_> = if bind.ip().is_unspecified() {
+        ips.into_iter()
+            .filter(|ip| usable_endpoint_ip(*ip))
+            .map(|ip| format!("ws://{}", SocketAddr::new(ip, bind.port())))
+            .collect()
+    } else if usable_endpoint_ip(bind.ip()) {
+        vec![format!("ws://{bind}")]
+    } else {
+        Vec::new()
+    };
+    endpoints.sort();
+    endpoints.dedup();
+    endpoints.truncate(16);
+    endpoints
+}
+
+pub fn authenticated_endpoints(bind_addr: &str) -> Vec<String> {
+    // `FLEETY_MDNS_HOST_IP` is how an operator confines which address this
+    // Server hands out. Enumerating every interface here would quietly undo
+    // that, including for VPN and overlay addresses.
+    if let Ok(pinned) = std::env::var("FLEETY_MDNS_HOST_IP") {
+        let pinned = pinned.trim();
+        if !pinned.is_empty() {
+            return match pinned.parse::<IpAddr>() {
+                Ok(ip) => endpoints_for_ips(bind_addr, [ip]),
+                Err(_) => Vec::new(),
+            };
+        }
+    }
+    let ips = if_addrs::get_if_addrs()
+        .map(|interfaces| {
+            interfaces
+                .into_iter()
+                .map(|interface| interface.ip())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    endpoints_for_ips(bind_addr, ips)
+}
+
 /// Spawn the mDNS advertisement task. Holds the `ServiceDaemon` alive for the
 /// life of the process via a leak (it's a one-per-process resource). Returns
 /// immediately; failures are logged and don't stop the server.
@@ -185,6 +239,25 @@ mod tests {
     fn port_parsing_picks_addr_port_then_falls_back() {
         assert_eq!(port_from("127.0.0.1:9999"), 9999);
         assert_eq!(port_from("garbage"), 8787);
+    }
+
+    #[test]
+    fn authenticated_endpoints_include_all_usable_interfaces_without_overlay_logic() {
+        let endpoints = endpoints_for_ips(
+            "0.0.0.0:8787",
+            [
+                "127.0.0.1".parse::<IpAddr>().expect("loopback"),
+                "192.168.1.20".parse::<IpAddr>().expect("lan"),
+                "100.64.0.8".parse::<IpAddr>().expect("overlay"),
+            ],
+        );
+        assert_eq!(
+            endpoints,
+            vec![
+                "ws://100.64.0.8:8787".to_string(),
+                "ws://192.168.1.20:8787".to_string(),
+            ]
+        );
     }
 
     #[test]

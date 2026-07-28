@@ -41,6 +41,7 @@ pub mod oauth;
 pub mod provider_service;
 pub mod providers_config;
 pub mod restart;
+pub mod secure;
 pub mod service;
 mod terminal;
 pub mod transport;

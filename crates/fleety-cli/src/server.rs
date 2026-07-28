@@ -40,15 +40,15 @@ pub enum Cmd {
     Help,
 }
 
-const USAGE: &str = "usage: fleety server <add|use|list|show|current|rename|remove|set-url>\n\
+const USAGE: &str = "usage: fleety connection <add|use|list|show|current|rename|remove|set-url>\n\
      \x20 add <name> <ws-url> [--label <text>] [--use]\n\
-     \x20 use <name>              switch the current server\n\
-     \x20 list                    all servers (* = current)\n\
-     \x20 show [<name>]           details for one server (default: current)\n\
-     \x20 current                 the current server\n\
-     \x20 rename <old> <new>      rename a server\n\
-     \x20 remove <name> [--force] delete a non-current server\n\
-     \x20 set-url <name> <ws-url> change a server's url";
+     \x20 use <name>              switch the current profile\n\
+     \x20 list                    all profiles (* = current)\n\
+     \x20 show [<name>]           details for one profile (default: current)\n\
+     \x20 current                 the current profile\n\
+     \x20 rename <old> <new>      rename a profile\n\
+     \x20 remove <name> [--force] delete a non-current profile\n\
+     \x20 set-url <name> <ws-url> change a profile's url";
 
 /// Parse `server <args...>`. Pure; a missing required argument or unknown flag
 /// is an error (so a typo never silently no-ops).
@@ -61,8 +61,8 @@ pub fn parse(args: &[String]) -> Result<Cmd> {
     };
     match sub {
         Some("add") => {
-            let name = need(rest.first(), "server name")?;
-            let url = need(rest.get(1), "server url")?;
+            let name = need(rest.first(), "profile name")?;
+            let url = need(rest.get(1), "profile URL")?;
             let mut label = None;
             let mut use_current = false;
             let mut i = 2;
@@ -78,7 +78,7 @@ pub fn parse(args: &[String]) -> Result<Cmd> {
                     }
                     other => {
                         return Err(CoreError::Message(format!(
-                            "unknown flag '{other}' for `server add`\n{USAGE}"
+                            "unknown flag '{other}' for `connection add`\n{USAGE}"
                         )))
                     }
                 }
@@ -90,51 +90,51 @@ pub fn parse(args: &[String]) -> Result<Cmd> {
                 use_current,
             })
         }
-        Some("use") if rest.len() == 1 => Ok(Cmd::Use(need(rest.first(), "server name")?)),
+        Some("use") if rest.len() == 1 => Ok(Cmd::Use(need(rest.first(), "profile name")?)),
         Some("use") => Err(CoreError::Message(format!(
-            "`server use` needs exactly one name\n{USAGE}"
+            "`connection use` needs exactly one name\n{USAGE}"
         ))),
         Some("list") if rest.is_empty() => Ok(Cmd::List),
         Some("list") => Err(CoreError::Message(format!(
-            "`server list` takes no arguments\n{USAGE}"
+            "`connection list` takes no arguments\n{USAGE}"
         ))),
         Some("show") if rest.len() <= 1 => Ok(Cmd::Show(rest.first().cloned())),
         Some("show") => Err(CoreError::Message(format!(
-            "`server show` takes at most one name\n{USAGE}"
+            "`connection show` takes at most one name\n{USAGE}"
         ))),
         Some("current") if rest.is_empty() => Ok(Cmd::Current),
         Some("current") => Err(CoreError::Message(format!(
-            "`server current` takes no arguments\n{USAGE}"
+            "`connection current` takes no arguments\n{USAGE}"
         ))),
         Some("rename") if rest.len() == 2 => Ok(Cmd::Rename {
             old: need(rest.first(), "old name")?,
             new: need(rest.get(1), "new name")?,
         }),
         Some("rename") => Err(CoreError::Message(format!(
-            "`server rename` needs exactly two names\n{USAGE}"
+            "`connection rename` needs exactly two names\n{USAGE}"
         ))),
         Some("remove") if rest.len() == 1 || (rest.len() == 2 && rest[1] == "--force") => {
-            let name = need(rest.first(), "server name")?;
+            let name = need(rest.first(), "profile name")?;
             let force = rest.get(1).is_some();
             Ok(Cmd::Remove { name, force })
         }
         Some("remove") => Err(CoreError::Message(format!(
-            "`server remove` accepts only <name> [--force]\n{USAGE}"
+            "`connection remove` accepts only <name> [--force]\n{USAGE}"
         ))),
         Some("set-url") if rest.len() == 2 => Ok(Cmd::SetUrl {
-            name: need(rest.first(), "server name")?,
-            url: need(rest.get(1), "server url")?,
+            name: need(rest.first(), "profile name")?,
+            url: need(rest.get(1), "profile URL")?,
         }),
         Some("set-url") => Err(CoreError::Message(format!(
-            "`server set-url` needs exactly a name and URL\n{USAGE}"
+            "`connection set-url` needs exactly a name and URL\n{USAGE}"
         ))),
         Some("help" | "--help" | "-h") if rest.is_empty() => Ok(Cmd::Help),
         Some("help" | "--help" | "-h") => Err(CoreError::Message(format!(
-            "server help takes no arguments\n{USAGE}"
+            "connection help takes no arguments\n{USAGE}"
         ))),
         None => Err(CoreError::Message(USAGE.to_string())),
         Some(other) => Err(CoreError::Message(format!(
-            "unknown `server` subcommand '{other}'\n{USAGE}"
+            "unknown `connection` subcommand '{other}'\n{USAGE}"
         ))),
     }
 }
@@ -183,15 +183,15 @@ pub fn apply_at(path: &Path, cmd: Cmd, _env_url: Option<String>) -> Result<Strin
             label,
             use_current,
         } => {
-            check_display_field("server name", &name)?;
+            check_display_field("profile name", &name)?;
             if let Some(label) = &label {
-                check_display_field("server label", label)?;
+                check_display_field("profile label", label)?;
             }
             check_ws_url(&url)?;
             connection::mutate_at(path, |conns| {
                 if conns.profiles.contains_key(&name) {
                     return Err(CoreError::Message(format!(
-                        "server '{name}' already exists — change it with `fleety server set-url {name} <url>` or pick another name"
+                        "profile '{name}' already exists — change it with `fleety connection set-url {name} <url>` or pick another name"
                     )));
                 }
                 let becomes_current = use_current || conns.current.is_none();
@@ -199,6 +199,9 @@ pub fn apply_at(path: &Path, cmd: Cmd, _env_url: Option<String>) -> Result<Strin
                     name.clone(),
                     Profile {
                         url,
+                        endpoints: Vec::new(),
+                        configured_url: None,
+                        secure: false,
                         token: None,
                         label,
                         fingerprint: None,
@@ -209,32 +212,34 @@ pub fn apply_at(path: &Path, cmd: Cmd, _env_url: Option<String>) -> Result<Strin
                     conns.current = Some(name.clone());
                 }
                 Ok(if becomes_current {
-                    format!("added server '{name}' and switched to it")
+                    format!("added profile '{name}' and switched to it")
                 } else {
-                    format!("added server '{name}' (use it with `fleety server use {name}`)")
+                    format!("added profile '{name}' (use it with `fleety connection use {name}`)")
                 })
             })
         }
         Cmd::Use(name) => {
-            check_display_field("server name", &name)?;
+            check_display_field("profile name", &name)?;
             connection::mutate_at(path, |conns| {
                 if !conns.profiles.contains_key(&name) {
                     return Err(unknown_server(&name, conns));
                 }
                 conns.current = Some(name.clone());
-                Ok(format!("now using server '{name}'"))
+                Ok(format!("now using profile '{name}'"))
             })
         }
         Cmd::List => Ok(render_list(&connection::load_at(path)?)),
         Cmd::Show(name) => {
             if let Some(name) = &name {
-                check_display_field("server name", name)?;
+                check_display_field("profile name", name)?;
             }
             let conns = connection::load_at(path)?;
             let name = match name.or_else(|| conns.current.clone()) {
                 Some(n) => n,
                 None => {
-                    return Ok("(no current server — add one with `fleety server add`)".to_string())
+                    return Ok(
+                        "(no current profile — add one with `fleety connection add`)".to_string(),
+                    )
                 }
             };
             let p = conns
@@ -251,7 +256,7 @@ pub fn apply_at(path: &Path, cmd: Cmd, _env_url: Option<String>) -> Result<Strin
             let conns = connection::load_at(path)?;
             let name = match &conns.current {
                 Some(n) => n.clone(),
-                None => return Ok("(no current server)".to_string()),
+                None => return Ok("(no current profile)".to_string()),
             };
             let url = conns
                 .profiles
@@ -265,11 +270,13 @@ pub fn apply_at(path: &Path, cmd: Cmd, _env_url: Option<String>) -> Result<Strin
             })
         }
         Cmd::Rename { old, new } => {
-            check_display_field("server name", &old)?;
-            check_display_field("server name", &new)?;
+            check_display_field("profile name", &old)?;
+            check_display_field("profile name", &new)?;
             connection::mutate_at(path, |conns| {
                 if conns.profiles.contains_key(&new) {
-                    return Err(CoreError::Message(format!("server '{new}' already exists")));
+                    return Err(CoreError::Message(format!(
+                        "profile '{new}' already exists"
+                    )));
                 }
                 let profile = conns
                     .profiles
@@ -279,29 +286,29 @@ pub fn apply_at(path: &Path, cmd: Cmd, _env_url: Option<String>) -> Result<Strin
                 if conns.current.as_deref() == Some(&old) {
                     conns.current = Some(new.clone());
                 }
-                Ok(format!("renamed server '{old}' → '{new}'"))
+                Ok(format!("renamed profile '{old}' → '{new}'"))
             })
         }
         Cmd::Remove {
             name,
             force: _force,
         } => {
-            check_display_field("server name", &name)?;
+            check_display_field("profile name", &name)?;
             connection::mutate_at(path, |conns| {
                 if !conns.profiles.contains_key(&name) {
                     return Err(unknown_server(&name, conns));
                 }
                 if conns.current.as_deref() == Some(&name) {
                     return Err(CoreError::Message(format!(
-                        "'{name}' is the current server — explicitly switch with `fleety server use <replacement>` before removing it; --force never chooses a server for you"
+                        "'{name}' is the current profile — explicitly switch with `fleety connection use <replacement>` before removing it; --force never chooses a profile for you"
                     )));
                 }
                 conns.profiles.remove(&name);
-                Ok(format!("removed server '{name}'"))
+                Ok(format!("removed profile '{name}'"))
             })
         }
         Cmd::SetUrl { name, url } => {
-            check_display_field("server name", &name)?;
+            check_display_field("profile name", &name)?;
             check_ws_url(&url)?;
             connection::mutate_at(path, |conns| {
                 let Some(profile) = conns.profiles.get_mut(&name) else {
@@ -314,7 +321,7 @@ pub fn apply_at(path: &Path, cmd: Cmd, _env_url: Option<String>) -> Result<Strin
                          re-pair with `fleety --profile <name> pair <code>` before using this profile"
                     )
                 } else {
-                    format!("set url for server '{name}'")
+                    format!("set url for profile '{name}'")
                 })
             })
         }
@@ -326,11 +333,11 @@ fn unknown_server(name: &str, conns: &Connections) -> CoreError {
     let known: Vec<&str> = conns.profiles.keys().map(String::as_str).collect();
     if known.is_empty() {
         CoreError::Message(format!(
-            "no server named '{name}' (none defined — add one with `fleety server add`)"
+            "no profile named '{name}' (none defined — add one with `fleety connection add`)"
         ))
     } else {
         CoreError::Message(format!(
-            "no server named '{name}' (have: {})",
+            "no profile named '{name}' (have: {})",
             known.join(", ")
         ))
     }
@@ -339,7 +346,7 @@ fn unknown_server(name: &str, conns: &Connections) -> CoreError {
 fn render_list(conns: &Connections) -> String {
     let mut out = String::new();
     if conns.profiles.is_empty() {
-        out.push_str("(no servers — add one with `fleety server add <name> <ws-url>`)");
+        out.push_str("(no profiles — add one with `fleety connection add <name> <ws-url>`)");
         return out;
     }
     for (name, p) in &conns.profiles {
@@ -358,18 +365,29 @@ fn render_list(conns: &Connections) -> String {
         } else {
             "no token"
         };
+        // Pad by display width, not character count: a CJK name is two columns
+        // per character and `{:<16}` would shift every following column.
+        let shown = safe_field(name);
+        let pad = 16usize.saturating_sub(crate::workspace::display_width(&shown));
+        // `--label` promises "a human-readable name shown in listings", so the
+        // listing has to show it — it was only visible from `connection show`.
+        let label = match p.label.as_deref().filter(|label| !label.is_empty()) {
+            Some(label) => format!("  {}", safe_field(label)),
+            None => String::new(),
+        };
         out.push_str(&format!(
-            "{marker} {:<16} {url}  [{auth}]\n",
-            safe_field(name)
+            "{marker} {shown}{:pad$} {url}  [{auth}]{label}\n",
+            "",
+            pad = pad
         ));
     }
-    out.push_str("\n(* = current; switch with `fleety server use <name>`)");
+    out.push_str("\n(* = current; switch with `fleety connection use <name>`)");
     out
 }
 
 fn render_show(name: &str, p: &Profile, is_current: bool) -> String {
     let mut out = format!(
-        "server '{}'{}\n",
+        "profile '{}'{}\n",
         safe_field(name),
         if is_current { " (current)" } else { "" }
     );
@@ -379,6 +397,33 @@ fn render_show(name: &str, p: &Profile, is_current: bool) -> String {
         safe_endpoint(&p.url)
     };
     out.push_str(&format!("  url:          {endpoint}\n"));
+    // Roaming can move `url` to an address the user never typed, and the latch
+    // decides which remediations work. Both have to be visible, or a refusal
+    // that says "this profile requires an encrypted channel" cannot be checked.
+    if let Some(configured) = &p.configured_url {
+        out.push_str(&format!(
+            "  configured:   {} (roamed; pairing still uses this)\n",
+            safe_endpoint(configured)
+        ));
+    }
+    if !p.endpoints.is_empty() {
+        out.push_str(&format!(
+            "  alternates:   {}\n",
+            p.endpoints
+                .iter()
+                .map(|endpoint| safe_endpoint(endpoint))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    out.push_str(&format!(
+        "  channel:      {}\n",
+        if p.secure {
+            "encrypted (this Server has proven it; cleartext is refused)"
+        } else {
+            "cleartext until this Server proves it can encrypt"
+        }
+    ));
     if let Some(label) = &p.label {
         out.push_str(&format!("  label:        {}\n", safe_field(label)));
     }
@@ -443,7 +488,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let daemon_notice = match reconnect_profile.as_deref() {
         Some(profile) => Some(notify_daemon_reconnect(profile).map_err(|error| {
             CoreError::Message(format!(
-                "server profile '{profile}' was saved, but fleetyd was not notified: {}",
+                "profile '{profile}' was saved, but fleetyd was not notified: {}",
                 error.report().message
             ))
         })?),
@@ -549,10 +594,40 @@ mod tests {
                 .expect_err("unsafe endpoint must be rejected")
                 .to_string();
             assert!(
-                error.contains("server url") || error.contains("endpoint"),
+                error.contains("profile URL") || error.contains("endpoint"),
                 "actionable error for {invalid:?}: {error}"
             );
         }
+    }
+
+    /// Roaming moves `url` to an address the user never typed and the latch
+    /// decides which remediations work, so both have to be visible — a refusal
+    /// that names the encrypted channel is unverifiable otherwise.
+    #[test]
+    fn show_surfaces_the_configured_address_alternates_and_channel_state() {
+        let profile = Profile {
+            url: "ws://100.64.0.8:8787".into(),
+            configured_url: Some("ws://home.lan:8787".into()),
+            endpoints: vec!["ws://192.168.1.20:8787".into()],
+            secure: true,
+            token: Some("tok".into()),
+            ..Default::default()
+        };
+
+        let rendered = render_show("home", &profile, true);
+
+        assert!(rendered.contains("ws://home.lan:8787"), "{rendered}");
+        assert!(rendered.contains("roamed"), "{rendered}");
+        assert!(rendered.contains("ws://192.168.1.20:8787"), "{rendered}");
+        assert!(rendered.contains("encrypted"), "{rendered}");
+
+        let plain = Profile {
+            url: "ws://home.lan:8787".into(),
+            ..Default::default()
+        };
+        let rendered = render_show("home", &plain, false);
+        assert!(!rendered.contains("roamed"), "{rendered}");
+        assert!(rendered.contains("cleartext until"), "{rendered}");
     }
 
     #[test]
@@ -560,6 +635,9 @@ mod tests {
         let name = "bad\n\u{1b}[31mname".to_string();
         let profile = Profile {
             url: "wss://user:password@example.test/ws?token=secret#fragment".into(),
+            endpoints: Vec::new(),
+            configured_url: None,
+            secure: false,
             token: Some("stored-token".into()),
             label: Some("label\r\n\u{1b}[2Jclear".into()),
             fingerprint: Some("fp\n\u{1b}[1mvalue".into()),
@@ -597,6 +675,43 @@ mod tests {
             );
         }
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn list_shows_the_label_because_that_is_what_it_is_for() {
+        // `--label` is documented as "a human-readable name shown in listings",
+        // but only `connection show` printed it.
+        let labelled = Profile {
+            url: "ws://10.0.0.4:8787".into(),
+            label: Some("Lab box".into()),
+            ..Profile::default()
+        };
+        let bare = Profile {
+            url: "ws://10.0.0.5:8787".into(),
+            ..Profile::default()
+        };
+        let mut conns = Connections {
+            current: Some("lab".into()),
+            ..Connections::default()
+        };
+        conns.profiles.insert("lab".into(), labelled);
+        conns.profiles.insert("bare".into(), bare);
+
+        let list = render_list(&conns);
+        let lab_line = list
+            .lines()
+            .find(|line| line.contains("lab "))
+            .unwrap_or_default();
+        assert!(lab_line.contains("Lab box"), "label missing from {list:?}");
+        // A profile with no label gains no stray column.
+        let bare_line = list
+            .lines()
+            .find(|line| line.contains("bare"))
+            .unwrap_or_default();
+        assert!(
+            bare_line.trim_end().ends_with("[no token]"),
+            "unlabelled row changed shape: {bare_line:?}"
+        );
     }
 
     #[test]

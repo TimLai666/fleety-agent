@@ -173,10 +173,28 @@ mDNS keeps the advertised Server fingerprint only as an untrusted picker hint.
 Automatic discovery never creates a connection target, sends a token or pairing
 code, accepts control frames, or changes a profile. Select a LAN server through
 bare `fleety init` and pair it first. A saved current profile with an explicit
-URL still reconnects automatically without scanning. A token-only profile with
-no URL, or a saved endpoint that stops answering, requires explicit endpoint
-selection and re-pairing. Changing a profile URL clears its old token and
-fingerprint first.
+URL reconnects automatically without scanning.
+
+A paired profile opens its connection with an encrypted handshake keyed by the
+device token it already holds, so the Server proves which Server it is *before*
+anything is sent to it — the token itself never travels, and provider keys, OAuth
+credentials, and tool traffic are unreadable to anyone on the network in between.
+An address Fleety learned by itself always has to pass that proof; the address you
+configured yourself keeps working against a Server that has not been updated yet,
+until the first time that Server completes the handshake, after which the profile
+refuses the old path for good. That channel needs the WebSocket upgrade — the
+SSE fallback cannot carry it — so a paired profile behind a proxy that blocks
+WebSockets stays on the old path, and stops connecting entirely once it has seen
+the encrypted one work.
+
+After that profile authenticates, the Server may report its other active IP endpoints; Fleety saves only compatible
+IP-literal endpoints under the same pinned identity and tries them on later
+reconnects. This is network-overlay agnostic: a user-installed Tailscale address
+works when its interface was already active during an authenticated session, but
+Fleety does not install or query Tailscale. A token-only profile with no URL, or
+a new address that was never learned, still requires explicit endpoint selection
+and re-pairing. Changing a profile URL clears its old token, fingerprint, and
+learned endpoints first.
 
 So on one machine bare `fleety` or `fleety chat` just works. For a remote server the easiest path
 is bare `fleety init` on a TTY: it scans the LAN, lists every announced server by

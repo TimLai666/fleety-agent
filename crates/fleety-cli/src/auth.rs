@@ -1,4 +1,4 @@
-//! `fleety auth` — sign in to ChatGPT (Codex OAuth) for the **connected
+//! `fleety provider login` — sign in to ChatGPT (Codex OAuth) for the **connected
 //! server**: the PKCE browser flow runs here (the authorization page must open
 //! in front of the user), but the exchanged tokens are delivered over the
 //! authenticated connection and stored on the server — the machine whose
@@ -29,7 +29,8 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Dispatch `fleety auth <sub>`. Codex credentials are per provider, so `login`
+/// Dispatch the provider auth subcommands (`fleety provider login|logout|status`,
+/// and the hidden `fleety auth` alias). Codex credentials are per provider, so `login`
 /// and `logout` take the provider name; `status` takes an optional one (no name
 /// lists every `oauth:codex` provider).
 pub async fn run(args: &[String]) -> Result<()> {
@@ -42,7 +43,7 @@ pub async fn run(args: &[String]) -> Result<()> {
                     no_browser = true;
                 } else if arg.starts_with('-') || provider.is_some() {
                     return Err(CoreError::Message(format!(
-                        "unexpected auth login argument '{arg}'. Usage: fleety auth login <provider> [--no-browser]"
+                        "unexpected provider login argument '{arg}'. Usage: fleety provider login <provider> [--no-browser]"
                     )));
                 } else {
                     provider = Some(arg.clone());
@@ -60,17 +61,17 @@ pub async fn run(args: &[String]) -> Result<()> {
         }
         Some("help" | "--help" | "-h") if args.len() == 1 => {
             println!(
-                "usage: fleety auth <login <provider> | logout <provider> | status [<provider>]> \
+                "usage: fleety provider <login <provider> | logout <provider> | status [<provider>]> \
                  [--no-browser]"
             );
             Ok(())
         }
         None => Err(CoreError::Message(
-            "usage: fleety auth <login <provider> | logout <provider> | status [<provider>]> [--no-browser]"
+            "usage: fleety provider <login <provider> | logout <provider> | status [<provider>]> [--no-browser]"
                 .to_string(),
         )),
         Some(other) => Err(CoreError::Message(format!(
-            "unknown auth command '{other}'. Usage: fleety auth <login|logout|status>"
+            "unknown provider auth command '{other}'. Usage: fleety provider <login|logout|status>"
         ))),
     }
 }
@@ -78,8 +79,8 @@ pub async fn run(args: &[String]) -> Result<()> {
 /// A missing-provider usage error naming an example. Pure.
 fn usage_error(sub: &str) -> CoreError {
     CoreError::Message(format!(
-        "`fleety auth {sub}` needs a provider name (an oauth:codex provider), e.g. \
-         `fleety auth {sub} my-codex`. List them with `fleety auth status`."
+        "`fleety provider {sub}` needs a provider name (an oauth:codex provider), e.g. \
+         `fleety provider {sub} my-codex`. List them with `fleety provider status`."
     ))
 }
 
@@ -89,13 +90,12 @@ fn validate_codex_provider(cfg: &ProvidersConfig, provider: &str) -> Result<()> 
     match cfg.providers.get(provider) {
         Some(p) if p.kind.eq_ignore_ascii_case("oauth:codex") => Ok(()),
         Some(p) => Err(CoreError::Message(format!(
-            "provider '{provider}' is type '{}', not oauth:codex — `fleety auth` signs in only \
+            "provider '{provider}' is type '{}', not oauth:codex — `fleety provider login` signs in only \
              Codex providers",
             p.kind
         ))),
         None => Err(CoreError::Message(format!(
-            "no such provider '{provider}' on the server — add it first with `fleety config` \
-             (Providers, type oauth:codex)"
+            "no such provider '{provider}' on the server — add it first with `fleety provider add {provider} --type oauth:codex`"
         ))),
     }
 }
@@ -131,7 +131,7 @@ fn credential_support_err(config_protocol: u32) -> Option<CoreError> {
         CoreError::Message(
             "the connected server is too old to store per-provider Codex credentials — update it \
              first (run `fleety update` on the server host, or let fleet convergence catch it up), \
-             then re-run `fleety auth login <provider>`"
+             then re-run `fleety provider login <provider>`"
                 .to_string(),
         )
     })
@@ -217,7 +217,7 @@ fn legacy_local_note(path: &std::path::Path) -> Option<String> {
         let path = terminal_safe_path(path);
         format!(
             "Note: the local token file at {} is no longer read by any flow; re-run \
-             `fleety auth login` to store credentials on the server (login also cleans it up).",
+             `fleety provider login` to store credentials on the server (login also cleans it up).",
             path
         )
     })
@@ -284,7 +284,7 @@ async fn login_with_target(
         return Err(CoreError::Message(
             "Codex OAuth client id is not configured. Set it with \
              `fleety config set FLEETY_CODEX_CLIENT_ID <id>` (the Codex CLI public client id), \
-             then re-run `fleety auth login`."
+             then re-run `fleety provider login`."
                 .into(),
         ));
     }
@@ -382,7 +382,7 @@ async fn login_with_target(
         connect_hello_for_auth_target(&target).await.map_err(|e| {
             CoreError::Message(format!(
                 "authorization succeeded, but the server could not be reached to store it: {} — \
-             re-run `fleety auth login` once the connection is back",
+             re-run `fleety provider login` once the connection is back",
                 e.report().message
             ))
         })?;
@@ -445,7 +445,7 @@ pub async fn status(provider: Option<String>) -> Result<()> {
                 println!(
                     "No oauth:codex providers configured on server {label}. Add one with \
                      `fleety config` (Providers, type oauth:codex), then \
-                     `fleety auth login <provider>`."
+                     `fleety provider login <provider>`."
                 );
                 return Ok(());
             }
@@ -569,7 +569,7 @@ fn bind_loopback(port: u16) -> Result<TcpListener> {
         CoreError::Message(format!(
             "the OAuth loopback port {port} is already in use ({e}). The Codex redirect URI is \
              registered to this fixed port, so login cannot use a different one. Free it — close a \
-             stuck earlier `fleety auth login`, or stop whatever else is bound to port {port} — and \
+             stuck earlier `fleety provider login`, or stop whatever else is bound to port {port} — and \
              then retry."
         ))
     })
@@ -758,7 +758,7 @@ fn parse_callback(request_line: &str, expected_state: &str) -> Result<String> {
     }
     if state.as_deref() != Some(expected_state) {
         return Err(CoreError::Message(
-            "authorization state did not match; aborting login (possible CSRF). Re-run `fleety auth login`."
+            "authorization state did not match; aborting login (possible CSRF). Re-run `fleety provider login`."
                 .into(),
         ));
     }
@@ -804,13 +804,13 @@ fn hex_value(byte: u8) -> Option<u8> {
 
 fn invalid_callback_encoding(parameter: &str) -> CoreError {
     CoreError::Message(format!(
-        "authorization redirect contained invalid {parameter} form encoding; aborting login. Re-run `fleety auth login`."
+        "authorization redirect contained invalid {parameter} form encoding; aborting login. Re-run `fleety provider login`."
     ))
 }
 
 fn duplicate_callback_parameter(parameter: &str) -> CoreError {
     CoreError::Message(format!(
-        "authorization redirect contained duplicate {parameter} parameters; aborting login. Re-run `fleety auth login`."
+        "authorization redirect contained duplicate {parameter} parameters; aborting login. Re-run `fleety provider login`."
     ))
 }
 
@@ -860,7 +860,7 @@ fn wait_for_code_with_timeout(
 
 fn callback_timeout(timeout: std::time::Duration) -> CoreError {
     CoreError::Message(format!(
-        "OAuth callback did not arrive within {} seconds. Close any stale browser tab and re-run `fleety auth login`",
+        "OAuth callback did not arrive within {} seconds. Close any stale browser tab and re-run `fleety provider login`",
         timeout.as_secs()
     ))
 }
@@ -1142,7 +1142,7 @@ mod tests {
                 "parameter missing from: {message}"
             );
             assert!(
-                message.contains("fleety auth login"),
+                message.contains("fleety provider login"),
                 "remediation missing from: {message}"
             );
         }
@@ -1164,7 +1164,7 @@ mod tests {
                 "duplicate parameter was not identified: {message}"
             );
             assert!(
-                message.contains("fleety auth login"),
+                message.contains("fleety provider login"),
                 "remediation missing from: {message}"
             );
         }

@@ -501,8 +501,8 @@ so the surface is complete.
 | `fleety init <url>` | Save the agent URL into `~/.fleety/config.json`. |
 | `fleety pair <code>` | Enroll this device with a code minted by `pair_create` somewhere else. |
 | `fleety ask "..."` | One-shot conversation. Multimodal: `--image PATH`, `--audio PATH`, `--video PATH`, `--file PATH` (read once, base64-encoded, attached). |
-| `fleety tui` | Interactive multi-pane TUI. **Ctrl+V** pastes a clipboard image (re-encoded to PNG) or a single-line file path as an attachment; **Ctrl+X** clears staged attachments. See [TUI input](#tui-input) for the composer and mouse keys. |
-| `fleety resume <conv> [after_seq]` | Replay a conversation. |
+| `fleety chat` | Interactive multi-pane TUI. **Ctrl+V** pastes a clipboard image (re-encoded to PNG) or a single-line file path as an attachment; **Ctrl+X** clears staged attachments. See [TUI input](#tui-input) for the composer and mouse keys. |
+| `fleety conversations resume <conv> [after_seq]` | Replay a conversation. |
 | `fleety status` | Version, uptime, connected devices, sidecar health (insyra binary path / missing). |
 | `fleety audit list [N]` / `fleety audit show <i>` | Browse the audit log; `5m ago` relative time. |
 | `fleety rollback list` / `fleety rollback apply <id>` | Inspect and restore backups. |

@@ -529,10 +529,8 @@ pub fn config_path() -> PathBuf {
     if let Ok(p) = std::env::var("FLEETY_CONFIG") {
         return PathBuf::from(p);
     }
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".fleety").join("config.toml")
+    let home = crate::device::home_dir();
+    home.join(".fleety").join("config.toml")
 }
 
 /// Stored config: (scope, key) → value.
@@ -565,6 +563,7 @@ pub fn load(path: &std::path::Path) -> ConfigMap {
 
 /// Persist config to `path` (TOML, sectioned by scope).
 pub fn save(path: &std::path::Path, map: &ConfigMap) -> Result<()> {
+    crate::device::ensure_writable_path(path, "config.toml")?;
     // Serialize all writes: config.toml is written rarely + small, so one lock
     // across the tmp+rename keeps a concurrent apply from interleaving.
     static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -960,6 +959,14 @@ pub fn clap_command_for_cli() -> ClapCommand {
     config_clap_command(true, true, true, true, false)
 }
 
+/// One wording per argument, shared by every binary that builds this tree
+/// (`fleety config`, `fleety-server config`, `fleetyd config`). `--help` is the
+/// only place a user can discover what these take, and it printed nothing.
+const SETTING_KEY_HELP: &str = "Which setting to act on, as listed by `config list`";
+const PROVIDER_NAME_HELP: &str = "The provider name";
+const WHICH_PROVIDER_HELP: &str = "Which provider to act on";
+const MODEL_ROLE_HELP: &str = "Which model role to act on";
+
 fn config_clap_command(
     provider_auth: bool,
     providers: bool,
@@ -973,14 +980,14 @@ fn config_clap_command(
             ClapCommand::new("list").about("List settings"),
             ClapCommand::new("get")
                 .about("Read a setting")
-                .arg(Arg::new("key").required(true)),
+                .arg(Arg::new("key").required(true).help(SETTING_KEY_HELP)),
             ClapCommand::new("set")
                 .about("Set a setting")
-                .arg(Arg::new("key").required(true))
-                .arg(Arg::new("value").required(true)),
+                .arg(Arg::new("key").required(true).help(SETTING_KEY_HELP))
+                .arg(Arg::new("value").required(true).help("The new value")),
             ClapCommand::new("unset")
                 .about("Unset a setting")
-                .arg(Arg::new("key").required(true)),
+                .arg(Arg::new("key").required(true).help(SETTING_KEY_HELP)),
             ClapCommand::new("open")
                 .about("Open the shared Settings workspace")
                 .visible_alias("edit"),
@@ -1006,20 +1013,20 @@ fn provider_clap_command(
             provider_fields(
                 ClapCommand::new("add")
                     .about("Add a provider")
-                    .arg(Arg::new("name").required(true)),
+                    .arg(Arg::new("name").required(true).help(PROVIDER_NAME_HELP)),
                 true,
                 include_url_alias,
             ),
             provider_fields(
                 ClapCommand::new("set")
                     .about("Update a provider")
-                    .arg(Arg::new("name").required(true)),
+                    .arg(Arg::new("name").required(true).help(PROVIDER_NAME_HELP)),
                 false,
                 include_url_alias,
             ),
             ClapCommand::new("remove")
                 .about("Remove a provider")
-                .arg(Arg::new("name").required(true)),
+                .arg(Arg::new("name").required(true).help(PROVIDER_NAME_HELP)),
             ClapCommand::new("list").about("List providers"),
         ]);
     if include_edit {
@@ -1029,18 +1036,28 @@ fn provider_clap_command(
         command = command.subcommands([
             ClapCommand::new("login")
                 .about("Sign in an OAuth provider")
-                .arg(Arg::new("provider").required(true))
+                .arg(
+                    Arg::new("provider")
+                        .required(true)
+                        .help(WHICH_PROVIDER_HELP),
+                )
                 .arg(
                     Arg::new("no-browser")
                         .long("no-browser")
-                        .action(ArgAction::SetTrue),
+                        .action(ArgAction::SetTrue)
+                        .help("Print the sign-in URL instead of opening a browser"),
                 ),
             ClapCommand::new("logout")
                 .about("Sign out an OAuth provider")
-                .arg(Arg::new("provider").required(true)),
-            ClapCommand::new("status")
-                .about("Show OAuth status")
-                .arg(Arg::new("provider")),
+                .arg(
+                    Arg::new("provider")
+                        .required(true)
+                        .help(WHICH_PROVIDER_HELP),
+                ),
+            ClapCommand::new("status").about("Show OAuth status").arg(
+                Arg::new("provider")
+                    .help("Which provider to report on (default: every OAuth provider)"),
+            ),
         ]);
     }
     command
@@ -1051,7 +1068,10 @@ fn provider_fields(
     kind_required: bool,
     include_url_alias: bool,
 ) -> ClapCommand {
-    let base_url = Arg::new("base-url").long("base-url").value_name("URL");
+    let base_url = Arg::new("base-url")
+        .long("base-url")
+        .value_name("URL")
+        .help("The provider's API base URL");
     let base_url = if include_url_alias {
         base_url.visible_alias("url")
     } else {
@@ -1062,10 +1082,22 @@ fn provider_fields(
             Arg::new("type")
                 .long("type")
                 .value_name("TYPE")
-                .required(kind_required),
+                .required(kind_required)
+                .value_parser(
+                    crate::providers_config::provider_types()
+                        .iter()
+                        .map(|kind| kind.name)
+                        .collect::<Vec<_>>(),
+                )
+                .help("The provider kind: api or oauth:codex"),
         )
         .arg(base_url)
-        .arg(Arg::new("key").long("key").value_name("KEY"))
+        .arg(
+            Arg::new("key")
+                .long("key")
+                .value_name("KEY")
+                .help("The provider API key; stored on the Server, never echoed back"),
+        )
 }
 
 fn model_clap_command(include_catalog: bool) -> ClapCommand {
@@ -1076,41 +1108,63 @@ fn model_clap_command(include_catalog: bool) -> ClapCommand {
             ClapCommand::new("list").about("List model roles"),
             ClapCommand::new("show")
                 .about("Show a model role")
-                .arg(Arg::new("role")),
+                .arg(Arg::new("role").help("Which model role to show (default: every role)")),
             ClapCommand::new("unset")
                 .about("Unset a model role")
-                .arg(Arg::new("role").required(true)),
+                .arg(Arg::new("role").required(true).help(MODEL_ROLE_HELP)),
             ClapCommand::new("set")
                 .about("Set a model role")
-                .arg(Arg::new("role").required(true))
+                .arg(Arg::new("role").required(true).help(MODEL_ROLE_HELP))
                 .arg(
                     Arg::new("member")
                         .long("member")
                         .value_name("PROVIDER/MODEL")
                         .required(true)
-                        .action(ArgAction::Append),
+                        .action(ArgAction::Append)
+                        .help("A provider/model pair for this role (repeatable, in order)"),
                 )
-                .arg(Arg::new("stream").long("stream").action(ArgAction::Count))
+                .arg(
+                    Arg::new("stream")
+                        .long("stream")
+                        .action(ArgAction::Count)
+                        .help("Whether the preceding --member streams its reply"),
+                )
                 .arg(
                     Arg::new("modalities")
                         .long("modalities")
                         .value_name("LIST")
-                        .action(ArgAction::Append),
+                        .action(ArgAction::Append)
+                        .help("Modalities the preceding --member accepts (repeatable)"),
                 )
                 .arg(
                     Arg::new("effort")
                         .long("effort")
                         .value_name("LEVEL")
-                        .action(ArgAction::Append),
+                        .action(ArgAction::Append)
+                        .help("Reasoning effort for the preceding --member (repeatable)"),
                 )
-                .arg(Arg::new("strategy").long("strategy").value_name("STRATEGY")),
+                .arg(
+                    Arg::new("strategy")
+                        .long("strategy")
+                        .value_name("STRATEGY")
+                        .help("How to choose among this role's members"),
+                ),
         ]);
     if include_catalog {
         command = command.subcommand(
             ClapCommand::new("catalog")
                 .about("Fetch a Provider's available model IDs")
-                .arg(Arg::new("provider").required(true))
-                .arg(Arg::new("role").long("role").value_name("ROLE")),
+                .arg(
+                    Arg::new("provider")
+                        .required(true)
+                        .help(WHICH_PROVIDER_HELP),
+                )
+                .arg(
+                    Arg::new("role")
+                        .long("role")
+                        .value_name("ROLE")
+                        .help("Filter the catalog to what this role can use"),
+                ),
         );
     }
     command
@@ -1166,7 +1220,7 @@ pub fn rows(map: &ConfigMap) -> Vec<(String, String, String, String)> {
 
 /// The scopes a local CLI edits — its own device behavior. Server/Daemon
 /// settings are edited on their own hosts (the server remotely, the daemon via
-/// `fleetyd config`), not through `fleety config --target local`.
+/// `fleetyd config`), not through `fleety config --owner cli`.
 pub const LOCAL_SCOPES: &[Scope] = CLI_SCOPES;
 
 /// Display rows restricted to `scopes` (same shape as [`rows`]).
@@ -1203,7 +1257,7 @@ pub fn ensure_scope(key: &str, scopes: &[Scope]) -> Result<()> {
                 Scope::Cli => "through the CLI owner",
             };
             Err(CoreError::Message(format!(
-                "'{key}' is a {} setting — edit it {where_to}, not via `--target local`",
+                "'{key}' is a {} setting — edit it {where_to}, not via `--owner cli`",
                 s.scope.as_str()
             )))
         }
@@ -1786,7 +1840,7 @@ pub fn run_providers_at(path: &std::path::Path, args: &[String]) -> Result<Strin
                         mask_key(&p.key)
                     )),
                     None => out.push_str(&format!(
-                        "  {name:<16} [{}]  (token via `fleety auth login {name}`)\n",
+                        "  {name:<16} [{}]  (token via `fleety provider login {name}`)\n",
                         p.kind
                     )),
                 }

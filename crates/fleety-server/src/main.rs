@@ -79,10 +79,8 @@ fn agent_home() -> PathBuf {
     if let Ok(path) = std::env::var("FLEETY_AGENT_HOME") {
         return PathBuf::from(path);
     }
-    let base = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(base).join(".fleety").join("agent")
+    let base = fleety_tools::device::home_dir();
+    base.join(".fleety").join("agent")
 }
 
 /// Workspace the read-only tools operate on (`FLEETY_WORKSPACE`, else cwd).
@@ -116,7 +114,9 @@ fn policy_from_env() -> agent_core::Policy {
 }
 
 fn command() -> Command {
-    let lifecycle = |name| Command::new(name).about("Manage the installed Server service");
+    let lifecycle = |name: &'static str| {
+        Command::new(name).about(fleety_tools::service::lifecycle_about(name, "Server"))
+    };
     Command::new("fleety-server")
         .version(agent_core::VERSION)
         .about("Fleety Agent Server")
@@ -129,17 +129,28 @@ fn command() -> Command {
         )
         .subcommands([
             lifecycle("run-service").hide(true),
-            lifecycle("install"),
+            Command::new("install")
+                .about("Install the Server as a system service and enable autostart"),
             lifecycle("uninstall"),
             lifecycle("start"),
             lifecycle("stop"),
-            lifecycle("restart").arg(Arg::new("force").long("force").action(ArgAction::SetTrue)),
+            Command::new("restart")
+                .about(
+                    "Restart the Server; it waits for an in-flight turn to finish unless --force",
+                )
+                .arg(
+                    Arg::new("force")
+                        .long("force")
+                        .action(ArgAction::SetTrue)
+                        .help("Restart immediately instead of waiting for the current turn"),
+                ),
             lifecycle("enable"),
             lifecycle("disable"),
             lifecycle("status"),
-            lifecycle("up"),
-            lifecycle("down"),
-            lifecycle("update"),
+            Command::new("up").about("Install, enable, and start the Server in one step"),
+            Command::new("down").about("Stop the Server, leaving it installed and enabled"),
+            Command::new("update")
+                .about("Update the fleety-server binary, then restart the service"),
             Command::new("backup")
                 .about("Back up or restore Server state")
                 .subcommand_required(true)
@@ -284,9 +295,36 @@ async fn wait_stop(shutdown: Option<tokio::sync::watch::Receiver<bool>>) {
 /// changes. Clients pin it at pairing and use it to re-find this exact server
 /// when its address moves. Empty until initialized.
 static SERVER_FINGERPRINT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static SERVER_LISTEN_ADDR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 pub fn server_fingerprint() -> &'static str {
     SERVER_FINGERPRINT.get().map(String::as_str).unwrap_or("")
+}
+
+pub fn authenticated_server_endpoints() -> Vec<String> {
+    SERVER_LISTEN_ADDR
+        .get()
+        .map(|addr| mdns::authenticated_endpoints(addr))
+        .unwrap_or_default()
+}
+
+/// Give this process a Server identity if it does not have one yet, and return
+/// it. The secure channel binds to this identity, so a test that exercises the
+/// handshake needs one; production sets it from `<agent-home>/server-id` at
+/// startup, and whichever value wins here is the one both sides then use.
+#[cfg(test)]
+pub(crate) fn test_server_fingerprint() -> &'static str {
+    let _ = SERVER_FINGERPRINT.set("test-server-identity".to_string());
+    server_fingerprint()
+}
+
+/// Give this process a listen address if it does not have one, so a test can
+/// see the endpoint list a real Server would advertise. Production sets it from
+/// the actual listener.
+#[cfg(test)]
+pub(crate) fn test_server_listen_addr() -> Vec<String> {
+    let _ = SERVER_LISTEN_ADDR.set("0.0.0.0:8787".to_string());
+    authenticated_server_endpoints()
 }
 
 fn init_server_fingerprint(home: &std::path::Path) {
@@ -718,6 +756,11 @@ async fn run_server(shutdown: Option<tokio::sync::watch::Receiver<bool>>) {
             return;
         }
     };
+    let listen_addr = listener
+        .local_addr()
+        .map(|value| value.to_string())
+        .unwrap_or_else(|_| addr.clone());
+    let _ = SERVER_LISTEN_ADDR.set(listen_addr.clone());
     tracing::info!(%addr, "listening");
     if addr.starts_with("127.0.0.1") || addr.starts_with("localhost") {
         tracing::info!(
@@ -727,7 +770,7 @@ async fn run_server(shutdown: Option<tokio::sync::watch::Receiver<bool>>) {
     }
     // Announce ourselves via mDNS so daemons / the CLI on the same LAN can
     // find us without a hand-typed URL. No-op when disabled.
-    mdns::spawn_advertise(&addr);
+    mdns::spawn_advertise(&listen_addr);
 
     // Serve WebSocket + (added by this change) the SSE+POST fallback through one
     // axum app on this port. `conn::handle_conn` (raw-TCP WebSocket) stays for the

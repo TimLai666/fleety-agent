@@ -59,6 +59,9 @@ url   = "ws://192.168.1.10:8787"
 token = "…"              # 該 server 對本裝置發的 token(per-server keyed,見 M6)
 label = "客廳那台"        # 選填
 fingerprint = "…"        # server 憑證/身分指紋,做 pinning 防漂移(見 M6 安全)
+endpoints = [             # 已驗證連線中由同一 Server 回報的其他可用 IP
+  "ws://100.64.0.8:8787",
+]
 
 [profiles.office]
 url   = "wss://office.example:8787"
@@ -68,7 +71,18 @@ token = "…"
 - 檔案權限 **0600**(集中多把 token,見 §9 安全)。
 - 型別在 `fleety-tools` 共用模組(CLI + daemon 同一 resolver,見 M6):
   `Connections { device_id, current: Option<String>, profiles: BTreeMap<String, Profile> }`;
-  `Profile { url, token: Option<String>, label: Option<String>, fingerprint: Option<String> }`。
+  `Profile { url, token: Option<String>, label: Option<String>, fingerprint: Option<String>,
+  endpoints: Vec<String>, configured_url: Option<String>, secure: bool }`。`url` 是上次成功端點；`endpoints` 是同一 pinned identity
+  在已驗證連線中回報的備援端點，不包含任何特定 VPN 或 overlay 整合。
+  `configured_url` 記錄使用者自己設定的位址（roaming 移動 `url` 之後才會出現），
+  配對一律送到它，且它會原樣被嘗試 —— Server 廣播的位址則必須是 IP literal。
+  `secure` 記錄該 Server 已證明支援加密控制通道，之後不再接受明文路徑。
+- **加密控制通道**：已配對 profile 以既有 device token 導出 PSK（HKDF-SHA256，
+  綁定 pinned fingerprint），跑 Noise `NNpsk0` 握手。握手成功本身就是對方持有該
+  token 的證明，token 不上線路，之後所有 frame（含 `Welcome`、endpoint 清單、
+  設定值與憑證）都加密且防竄改。學來的 endpoint 一律必須通過握手；使用者自己
+  設定的 endpoint 在該 profile 尚未見過安全 Server 前可回退明文，見過之後永久
+  不再降級。配對與同主機 loopback 沒有預先共享的 token，維持原路徑。
 - 取代現行 `config.json` 的 `agent_url`/`token`/`device_id` 三個欄位與
   `write_config`/`saved_token`/`agent_url` 的讀寫。
 

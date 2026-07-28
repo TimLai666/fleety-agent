@@ -6,7 +6,7 @@
 //! - **Providers** are endpoints/accounts, tagged by `type` (an extensible
 //!   registry — see [`provider_types`]). `type = "api"` carries a `base_url` and
 //!   optional `key`; `type = "oauth:codex"` sources a per-provider OAuth token
-//!   from `fleety auth login` and carries no `base_url`/`key`.
+//!   from `fleety provider login` and carries no `base_url`/`key`.
 //! - **Model roles** are fixed `main` and `cheap`; each is a pool with a
 //!   [`Strategy`] and a list of [`Member`]s, where a member is the full build
 //!   unit — it names a provider plus the `model` and the call-time traits
@@ -187,10 +187,8 @@ pub fn providers_path() -> PathBuf {
     if let Ok(p) = std::env::var("FLEETY_PROVIDERS") {
         return PathBuf::from(p);
     }
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".fleety").join("providers.toml")
+    let home = crate::device::home_dir();
+    home.join(".fleety").join("providers.toml")
 }
 
 /// Load and parse a `providers.toml` at `path`, failing soft: a missing file or
@@ -346,6 +344,7 @@ pub fn validate(cfg: &ProvidersConfig) -> Result<()> {
 /// in the same directory). The config is validated first; an invalid config is
 /// not written — the write path is not fail-soft.
 pub fn write_providers(path: &Path, cfg: &ProvidersConfig) -> Result<()> {
+    crate::device::ensure_writable_path(path, "providers.toml")?;
     validate(cfg)?;
     let text = toml::to_string_pretty(cfg)
         .map_err(|e| CoreError::Message(format!("serialize providers.toml: {e}")))?;

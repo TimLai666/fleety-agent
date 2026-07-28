@@ -115,6 +115,34 @@ impl AuthStore {
         state.tokens.get(token).cloned()
     }
 
+    /// The device token a secure-channel opening selected, or None when no
+    /// enrolled device matches.
+    ///
+    /// `key_id` is the public, non-reversible handle the client derived from the
+    /// token it holds. Answering requires holding the same token, which is what
+    /// lets a client tell this Server apart from anything that merely took over
+    /// its address. A miss is not an error: it means this device is not (or is
+    /// no longer) enrolled here, and the client is told to re-pair.
+    pub fn token_for_key_id(&self, key_id: &str, server_fingerprint: &str) -> Option<String> {
+        let matches = |token: &str| {
+            fleety_tools::secure::key_id(token, server_fingerprint)
+                .is_ok_and(|derived| derived == key_id)
+        };
+        if let Some(bootstrap) = &self.bootstrap {
+            if matches(bootstrap) {
+                return Some(bootstrap.clone());
+            }
+        }
+        // Copy the candidates out before deriving. An unauthenticated peer picks
+        // when this runs and how often, so the key derivation must not happen
+        // while every other auth operation waits on this lock.
+        let tokens: Vec<String> = {
+            let state = self.state.lock().ok()?;
+            state.tokens.keys().cloned().collect()
+        };
+        tokens.into_iter().find(|token| matches(token))
+    }
+
     /// Mint a short-lived pairing code.
     pub fn create_pairing(&self) -> Result<String> {
         let full = uuid::Uuid::new_v4().simple().to_string();

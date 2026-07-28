@@ -27,6 +27,11 @@ use tokio::sync::{mpsc, Mutex};
 use crate::auth::AuthStore;
 use crate::bridge::{DeviceTools, Handles, Hub, Pending};
 use crate::conn::{run_connection, ClientInbound, FrameWriter};
+
+/// How many opening frames are inspected for the `Hello` device id used in
+/// connection logs. A sealed connection never exposes one, so this bound is what
+/// keeps the peek from re-parsing the whole session.
+const HELLO_PEEK_FRAMES: u32 = 3;
 use crate::storage::Storage;
 
 /// One live SSE+POST session: where to inject upstream messages, plus the
@@ -181,6 +186,7 @@ async fn own_socket(
     // The wire device id from the Hello frame, for the liveness log only (the
     // resolved identity lives in run_connection, above this task).
     let mut hello_device: Option<String> = None;
+    let mut frames_seen: u32 = 0;
     loop {
         tokio::select! {
             out = out_rx.recv() => match out {
@@ -197,7 +203,12 @@ async fn own_socket(
                 last_seen = std::time::Instant::now();
                 match frame {
                     Some(Ok(Message::Text(text))) => {
-                        if hello_device.is_none() {
+                        frames_seen = frames_seen.saturating_add(1);
+                        // Only the opening frames: on a sealed connection the
+                        // Hello travels inside a `SecureFrame` and this can never
+                        // match, so without a bound every frame would be parsed a
+                        // second time just to fill a log field.
+                        if hello_device.is_none() && frames_seen <= HELLO_PEEK_FRAMES {
                             if let Ok(ClientMsg::Hello { device_id, .. }) =
                                 serde_json::from_str::<ClientMsg>(text.as_str())
                             {

@@ -752,18 +752,27 @@ pub fn on_key(state: &mut WorkspaceState, key: KeyEvent, context: KeyContext) ->
         }
         return KeyOutcome::Consumed(Vec::new());
     }
+    // Unsaved work is asked about before anything navigates away. Going Back
+    // first meant that a Settings route reached from Chat — which has history —
+    // popped straight out and dropped every staged owner change without a word.
     if key.code == KeyCode::Esc
+        && !context.text_input_focused
+        && (context.has_unsent_input || context.has_dirty_owner)
+    {
+        return KeyOutcome::Consumed(
+            state.reduce(Action::Navigate(Route::Modal(Modal::ConfirmExit))),
+        );
+    }
+    // A focused editor owns Esc: it means "cancel this edit", which is what the
+    // footer promises, not "leave the route".
+    if key.code == KeyCode::Esc
+        && !context.text_input_focused
         && (matches!(
             state.route,
             Route::Modal(_) | Route::CommandPalette | Route::ConnectionPicker
         ) || !state.history.is_empty())
     {
         return KeyOutcome::Consumed(state.reduce(Action::Back));
-    }
-    if key.code == KeyCode::Esc && (context.has_unsent_input || context.has_dirty_owner) {
-        return KeyOutcome::Consumed(
-            state.reduce(Action::Navigate(Route::Modal(Modal::ConfirmExit))),
-        );
     }
     KeyOutcome::Forward
 }
@@ -971,7 +980,7 @@ fn header_line(state: &WorkspaceState, width: u16) -> Line<'static> {
     ))
 }
 
-fn display_width(value: &str) -> usize {
+pub(crate) fn display_width(value: &str) -> usize {
     Line::from(value).width()
 }
 
@@ -1304,6 +1313,54 @@ mod tests {
             Some("openai")
         );
         assert_eq!(session.workspace.context.model.as_deref(), Some("gpt-b"));
+    }
+
+    /// Settings reached from Chat has history, so Back used to win over the
+    /// unsaved-work confirmation and drop every staged owner change silently.
+    #[test]
+    fn leaving_settings_with_staged_work_confirms_before_it_navigates() {
+        let mut state = WorkspaceState::new(Route::Chat);
+        let _ = state.reduce(Action::Navigate(Route::Settings(SettingsPage::Server)));
+        assert!(!state.history.is_empty(), "this is the path with history");
+
+        let dirty = KeyContext {
+            turn_in_flight: false,
+            has_unsent_input: false,
+            has_dirty_owner: true,
+            text_input_focused: false,
+        };
+        let key = ratatui::crossterm::event::KeyEvent::new(
+            KeyCode::Esc,
+            ratatui::crossterm::event::KeyModifiers::NONE,
+        );
+        let _ = on_key(&mut state, key, dirty);
+        assert!(
+            matches!(state.route, Route::Modal(Modal::ConfirmExit)),
+            "staged work must be confirmed before leaving, got {:?}",
+            state.route
+        );
+    }
+
+    /// A focused editor owns Esc — the footer says "Esc cancel", and the panel
+    /// can only honour that if the workspace does not consume the key first.
+    #[test]
+    fn a_focused_editor_keeps_escape_for_itself() {
+        let mut state = WorkspaceState::new(Route::Chat);
+        let _ = state.reduce(Action::Navigate(Route::Settings(SettingsPage::Server)));
+        let editing = KeyContext {
+            turn_in_flight: false,
+            has_unsent_input: false,
+            has_dirty_owner: true,
+            text_input_focused: true,
+        };
+        let key = ratatui::crossterm::event::KeyEvent::new(
+            KeyCode::Esc,
+            ratatui::crossterm::event::KeyModifiers::NONE,
+        );
+        assert!(
+            matches!(on_key(&mut state, key, editing), KeyOutcome::Forward),
+            "the editor must receive Esc"
+        );
     }
 
     #[test]

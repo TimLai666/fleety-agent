@@ -111,7 +111,7 @@ pub fn resolve_target(target: Target, args: &[String], device_id: &str) -> Resul
                 Owner::Cli => "cli",
             };
             return Err(CoreError::Message(format!(
-                "this setting is owned by {owner_name}; choose --target {owner_name}"
+                "this setting is owned by {owner_name}; choose `--owner {owner_name}`"
             )));
         }
     }
@@ -189,16 +189,25 @@ pub(crate) async fn provider_edit_remote_on_target(
     expected_fingerprint: Option<&str>,
     input: &mut crate::workspace::WorkspaceInput,
 ) -> Result<()> {
-    let (tx, rx, config_protocol, fingerprint) = crate::connect_hello_for_auth_target(target)
-        .await
-        .map_err(provider_editor_connect_error)?;
+    let (tx, rx, config_protocol, fingerprint, committed_target) =
+        crate::connect_hello_for_auth_target_refreshed(target)
+            .await
+            .map_err(provider_editor_connect_error)?;
     crate::provider_service::validate_server_identity(
         expected_fingerprint,
         fingerprint.as_deref(),
         "Provider editor launch",
     )
     .map_err(crate::provider_service::issue_as_error)?;
-    provider_edit_remote_loop(tx, rx, config_protocol, target.clone(), fingerprint, input).await
+    provider_edit_remote_loop(
+        tx,
+        rx,
+        config_protocol,
+        committed_target,
+        fingerprint,
+        input,
+    )
+    .await
 }
 
 async fn provider_edit_remote_loop(
@@ -435,7 +444,7 @@ pub fn run(args: &[String]) -> Result<()> {
     if matches!(args.first().map(String::as_str), Some("provider" | "model")) {
         return Err(CoreError::Message(
             "provider and model configuration is owned by the server; use `fleety config \
-             --target server ...` (the CLI never edits providers.toml directly)"
+             --owner server ...` (the CLI never edits providers.toml directly)"
                 .to_string(),
         ));
     }

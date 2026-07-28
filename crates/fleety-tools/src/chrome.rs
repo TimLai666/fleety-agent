@@ -305,10 +305,11 @@ fn managed_dir() -> PathBuf {
             return PathBuf::from(d);
         }
     }
-    let base = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir());
+    let base = if crate::device::home_is_known() {
+        crate::device::home_dir()
+    } else {
+        std::env::temp_dir()
+    };
     base.join(".fleety").join("chrome")
 }
 

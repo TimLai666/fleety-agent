@@ -267,7 +267,7 @@ fn build_codex_responses(
             %label,
             "oauth:codex configured via env has no provider name to sign in as; it cannot \
              authenticate — add a named oauth:codex provider in providers.toml and \
-             `fleety auth login <provider>`"
+             `fleety provider login <provider>`"
         );
     }
     let auth_src = fleety_tools::oauth::OAuthCodexAuth::new(codex_token_path(provider_name), &cfg);

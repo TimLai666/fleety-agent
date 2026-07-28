@@ -209,7 +209,10 @@ pub fn command() -> ClapCommand {
         .arg(
             Arg::new("warnings")
                 .long("warnings")
-                .help("Show compatibility and deprecation warnings")
+                .help(
+                    "Print compatibility warnings even when stderr is redirected \
+                     (a terminal always sees them)",
+                )
                 .action(ArgAction::SetTrue)
                 .global(true),
         )
@@ -249,12 +252,79 @@ fn leaf(name: &'static str, about: &'static str) -> ClapCommand {
     ClapCommand::new(name).about(about)
 }
 
+/// The provider subtree's positional is a provider name, not a connection
+/// profile — the shared table's `name` would say the wrong noun.
+fn provider_name() -> Arg {
+    Arg::new("name")
+        .required(true)
+        .help(describe("provider_name"))
+}
+
+/// A boolean flag, described from the same table as everything else.
+fn flag(name: &'static str) -> Arg {
+    Arg::new(name)
+        .long(name)
+        .action(ArgAction::SetTrue)
+        .help(describe(name))
+}
+
 fn positional(name: &'static str, required: bool) -> Arg {
-    Arg::new(name).required(required)
+    Arg::new(name).required(required).help(describe(name))
 }
 
 fn option(name: &'static str) -> Arg {
-    Arg::new(name).long(name).value_name("VALUE")
+    Arg::new(name)
+        .long(name)
+        .value_name("VALUE")
+        .help(describe(name))
+}
+
+/// What each argument means, in one line, keyed by its name.
+///
+/// `--help` is the only place a user can discover what a command takes, and it
+/// was describing nothing — including `--clear-key`, which deletes a credential
+/// off the Server, and `--force`, whose whole point is what it will *not* do.
+fn describe(name: &'static str) -> &'static str {
+    match name {
+        "after_seq" => "Resume after this sequence number (default: from the start)",
+        "audio" => "Attach an audio file (repeatable)",
+        "image" => "Attach an image file (repeatable)",
+        "backup_id" => "Which backup to restore",
+        "base-url" => "The provider's API base URL",
+        "clear-key" => "Delete the stored API key from the Server",
+        "no-browser" => "Print the sign-in URL instead of opening a browser",
+        "code" => "The pairing code the Server issued",
+        "conversation_id" => "Which conversation to act on",
+        "editor" => "Which editor to install the ACP adapter for",
+        "effort" => "Reasoning effort for the preceding --member (repeatable)",
+        "file" => "Attach a file (repeatable)",
+        "force" => "Skip the confirmation prompt; it never picks a replacement for you",
+        "use" => "Make this the current profile once it is added",
+        "index" => "Which entry to act on, as shown by the matching list command",
+        "key" => "The provider API key; stored on the Server, never echoed back",
+        "label" => "A human-readable name shown in listings",
+        "legacy_limit" | "legacy_list_limit" | "limit" => "How many entries to show",
+        "member" => "A provider/model pair for this role (repeatable, in order)",
+        "modalities" => "Modalities the preceding --member accepts (repeatable)",
+        "name" => "The profile name",
+        "new" => "The new name",
+        "old" => "The current name",
+        "pairing-code" => "Enroll with this pairing code instead of a stored token",
+        "provider" => "Which provider to act on",
+        "provider_name" => "The provider name",
+        "role" => "Which model role to act on",
+        "server" => "The Server this adapter connects to",
+        "shell" => "Which shell to emit a completion script for",
+        "strategy" => "How to choose among this role's members",
+        "text" => "The prompt to send (everything after the command)",
+        "stream" => "Whether the preceding --member streams its reply",
+        "type" => "The provider kind: api or oauth:codex",
+        "video" => "Attach a video file (repeatable)",
+        "ws_url" => "The Server's WebSocket URL, e.g. ws://192.168.1.20:8787",
+        // Anything without a description is a bug in this table, not a reason
+        // to print a blank line where the explanation belongs.
+        other => other,
+    }
 }
 
 fn url_override(name: &'static str, short: char) -> Arg {
@@ -278,14 +348,16 @@ fn ask_command() -> ClapCommand {
             Arg::new("text")
                 .value_name("TEXT")
                 .num_args(0..)
-                .action(ArgAction::Append),
+                .action(ArgAction::Append)
+                .help(describe("text")),
         )
         .arg(
             Arg::new("image")
                 .short('i')
                 .long("image")
                 .value_name("PATH")
-                .action(ArgAction::Append),
+                .action(ArgAction::Append)
+                .help(describe("image")),
         )
         .arg(option("audio").action(ArgAction::Append))
         .arg(option("video").action(ArgAction::Append))
@@ -316,7 +388,7 @@ fn conversations_command() -> ClapCommand {
 }
 
 fn connection_command() -> ClapCommand {
-    leaf("connection", "Manage named Server profiles")
+    leaf("connection", "Manage saved connection profiles")
         .visible_alias("server")
         .subcommand_required(true)
         .subcommands([
@@ -324,7 +396,7 @@ fn connection_command() -> ClapCommand {
                 .arg(positional("name", true))
                 .arg(positional("ws_url", true))
                 .arg(option("label"))
-                .arg(Arg::new("use").long("use").action(ArgAction::SetTrue)),
+                .arg(flag("use")),
             leaf("use", "Select the current profile").arg(positional("name", true)),
             leaf("list", "List profiles"),
             leaf("show", "Show one profile").arg(positional("name", false)),
@@ -334,7 +406,7 @@ fn connection_command() -> ClapCommand {
                 .arg(positional("new", true)),
             leaf("remove", "Remove a profile")
                 .arg(positional("name", true))
-                .arg(Arg::new("force").long("force").action(ArgAction::SetTrue)),
+                .arg(flag("force")),
             leaf("set-url", "Change a profile URL")
                 .arg(positional("name", true))
                 .arg(positional("ws_url", true)),
@@ -345,28 +417,17 @@ fn provider_command(name: &'static str) -> ClapCommand {
     leaf(name, "Manage Server-owned providers and OAuth")
         .subcommand_required(true)
         .subcommands([
-            provider_fields(
-                leaf("add", "Add a provider").arg(positional("name", true)),
-                true,
-            ),
-            provider_fields(
-                leaf("set", "Update a provider").arg(positional("name", true)),
-                false,
-            )
-            .arg(
-                Arg::new("clear-key")
-                    .long("clear-key")
-                    .action(ArgAction::SetTrue)
-                    .conflicts_with("key"),
-            )
-            .hide(true),
+            provider_fields(leaf("add", "Add a provider").arg(provider_name()), true),
+            provider_fields(leaf("set", "Update a provider").arg(provider_name()), false)
+                .arg(flag("clear-key").conflicts_with("key"))
+                .hide(true),
             leaf("edit", "Open the provider editor"),
-            leaf("remove", "Remove a provider").arg(positional("name", true)),
+            leaf("remove", "Remove a provider").arg(provider_name()),
             leaf("list", "List providers"),
             leaf("login", "Sign in an OAuth provider")
                 .arg(positional("provider", true))
                 .arg(
-                    Arg::new("no-browser")
+                    flag("no-browser")
                         .long("no-browser")
                         .action(ArgAction::SetTrue),
                 ),
@@ -375,9 +436,24 @@ fn provider_command(name: &'static str) -> ClapCommand {
         ])
 }
 
+/// The provider types this build knows, straight from the registry so the
+/// parser, `--help`, and the Server can never disagree.
+fn provider_type_names() -> Vec<&'static str> {
+    fleety_tools::providers_config::provider_types()
+        .iter()
+        .map(|kind| kind.name)
+        .collect()
+}
+
 fn provider_fields(command: ClapCommand, kind_required: bool) -> ClapCommand {
     command
-        .arg(option("type").required(kind_required))
+        .arg(
+            option("type")
+                .required(kind_required)
+                // A closed set belongs in the parser: a bad `--type` used to
+                // travel to the Server and come back as a connection failure.
+                .value_parser(provider_type_names()),
+        )
         .arg(option("base-url"))
         .arg(option("key"))
 }
@@ -438,20 +514,29 @@ fn daemon_command() -> ClapCommand {
         .subcommand_required(true)
         .subcommands(
             [
-                "install",
-                "uninstall",
-                "start",
-                "stop",
-                "restart",
-                "enable",
-                "disable",
-                "status",
-                "up",
-                "down",
-                "update",
+                (
+                    "install",
+                    "Install the Daemon as a system service and provision the data-analysis sidecar",
+                ),
+                ("uninstall", "Remove the installed Daemon service definition"),
+                ("start", "Start the installed Daemon service now"),
+                ("stop", "Stop the running Daemon service"),
+                ("restart", "Restart the Daemon service"),
+                ("enable", "Start the Daemon automatically at boot or login"),
+                ("disable", "Stop starting the Daemon automatically"),
+                (
+                    "status",
+                    "Report whether the Daemon is installed, enabled, and running",
+                ),
+                ("up", "Alias for start"),
+                ("down", "Alias for stop"),
+                (
+                    "update",
+                    "Update the fleetyd binary, then restart the service",
+                ),
             ]
             .into_iter()
-            .map(|name| leaf(name, "Daemon lifecycle action")),
+            .map(|(name, about)| leaf(name, about)),
         )
 }
 
@@ -489,7 +574,7 @@ fn auth_compat_command() -> ClapCommand {
             leaf("login", "Sign in")
                 .arg(positional("provider", true))
                 .arg(
-                    Arg::new("no-browser")
+                    flag("no-browser")
                         .long("no-browser")
                         .action(ArgAction::SetTrue),
                 ),

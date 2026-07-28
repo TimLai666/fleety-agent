@@ -182,6 +182,90 @@ mDNS TXT metadata SHALL be treated as an untrusted discovery hint, not as Server
 - **WHEN** its endpoint returns `Welcome` with an empty or whitespace-only minted token
 - **THEN** the Daemon SHALL preserve the valid token, close the session, execute no control frame, and settle any pending reconnect as failure
 
+### Requirement: Paired profiles roam across authenticated Server endpoints
+
+After authentication, `Welcome` SHALL advertise a bounded list of syntactically valid WebSocket endpoints derived from the Server's listening port and usable non-loopback network interfaces. Fleety SHALL remain network-overlay agnostic and SHALL NOT invoke, install, configure, or require Tailscale or another overlay product. A durable named／current profile SHALL store deduplicated endpoints learned from its authenticated Server session. CLI one-shot connections and Daemon reconnects SHALL try the last successful endpoint first and then the stored candidates. A candidate SHALL become the primary saved URL only after `Welcome` returns the profile's pinned Server identity. Transient raw／environment targets SHALL NOT persist learned endpoints.
+
+#### Scenario: LAN enrollment learns an overlay endpoint without using it
+
+- **GIVEN** the Server listens on `0.0.0.0:8787` with interfaces `192.168.1.20` and `100.64.0.8`
+- **WHEN** profile `home` pairs through `ws://192.168.1.20:8787`
+- **THEN** authenticated `Welcome` SHALL let `home` store both endpoints without requiring a previous connection through `100.64.0.8`
+
+#### Scenario: leaving LAN reconnects through a learned endpoint
+
+- **GIVEN** `home` last succeeded at `ws://192.168.1.20:8787` and stores learned endpoint `ws://100.64.0.8:8787`
+- **WHEN** the LAN endpoint is unreachable and the second endpoint returns the pinned Server identity
+- **THEN** CLI and Daemon SHALL connect through `ws://100.64.0.8:8787` and promote it as the primary endpoint
+
+#### Scenario: an unknown later endpoint cannot be inferred
+
+- **GIVEN** the Server exposes a new endpoint only after the client has left every previously reachable network
+- **WHEN** the profile has never received or explicitly configured that endpoint
+- **THEN** Fleety SHALL NOT claim automatic discovery and SHALL keep retrying only its saved endpoints
+
+#### Scenario: identity mismatch cannot promote a learned endpoint
+
+- **GIVEN** a stored candidate answers with a Server fingerprint different from the profile pin
+- **WHEN** CLI or Daemon attempts that candidate
+- **THEN** it SHALL reject the session, execute no control action, and SHALL NOT promote or persist credentials from that candidate
+
+### Requirement: Endpoint roaming never widens what a credential reaches
+
+A profile SHALL distinguish addresses by provenance. An address the user configured SHALL be recorded separately and SHALL remain attemptable exactly as stored, whatever its host form. An address a Server advertised SHALL be accepted only as an IP literal that preserves the connected endpoint's scheme, port, path, and query, and SHALL be attempted exactly as stored so an authenticated session is never refused by the client's own ownership checks. Only a session that completed the encrypted handshake SHALL add endpoints to a profile: a fingerprint is public, so a cleartext session that presents the pinned one SHALL be able to promote the endpoint it is already on but SHALL NOT teach the profile new addresses. Pairing SHALL send its pairing code only to the endpoint the user configured, never to one roaming promoted. A deliberate re-pair SHALL clear the learned endpoints and the secure-channel record along with the credential they were earned with, so a profile can always be recovered onto a Server that speaks a different protocol version.
+
+#### Scenario: a cleartext session cannot seed addresses
+
+- **GIVEN** a profile that has never observed its Server complete the handshake
+- **WHEN** an endpoint answers in the clear with the profile's pinned fingerprint and advertises further endpoints
+- **THEN** Fleety SHALL NOT store those endpoints
+
+#### Scenario: pairing follows the configured address
+
+- **GIVEN** roaming has promoted a learned endpoint to be the profile's primary
+- **WHEN** the user runs `fleety pair <code>`
+- **THEN** the pairing code SHALL be sent to the endpoint the user originally configured, and the profile SHALL return to that endpoint so a Server-advertised address never inherits the standing of one the user chose
+
+#### Scenario: a Server that cannot key the channel is refused, not downgraded
+
+- **GIVEN** an endpoint answers the handshake by stating it holds no credential for this device
+- **WHEN** the client receives that answer
+- **THEN** it SHALL fail with re-pair guidance and SHALL NOT retry that endpoint in the clear
+
+### Requirement: A paired profile proves the Server before revealing a credential
+
+A paired profile SHALL open its control channel with a mutually authenticated, encrypted handshake keyed by the per-device token it already holds and bound to the Server identity it is pinned to. The device token SHALL NOT be transmitted, and every subsequent control frame SHALL be encrypted and integrity-protected, including `Welcome`, the advertised endpoint list, configuration values, and credential frames. The negotiated channel version and key handle SHALL be bound into the handshake so a modified advertisement aborts it rather than negotiating a weaker path. Each candidate endpoint SHALL be given one bounded attempt covering transport connect, handshake, `Hello`, authenticated `Welcome`, and identity validation together; a candidate that fails any step SHALL be abandoned in favour of the next without mutating any saved credential, identity pin, endpoint list, or primary URL. An endpoint the profile learned rather than the user configured SHALL NOT fall back to the cleartext path. The endpoint the user configured MAY fall back while its profile has never observed this Server complete the handshake; once observed, the profile SHALL record that support and SHALL refuse the cleartext path thereafter. Pairing, same-host loopback trust, and targets with no saved credential have no pre-shared secret to key a handshake with and remain on the existing path.
+
+#### Scenario: a saved endpoint that cannot prove itself receives nothing
+
+- **GIVEN** profile `home` stores a learned endpoint whose address has since been taken over by another host
+- **WHEN** Fleety attempts that endpoint
+- **THEN** it SHALL send no device token, SHALL refuse the endpoint when the handshake is not completed, SHALL leave the saved token, identity pin, and endpoint list unchanged, and SHALL continue to the next candidate
+
+#### Scenario: an unauthenticated rejection cannot unpair the device
+
+- **GIVEN** a candidate endpoint answers an attempt with an authentication rejection before proving the Server identity
+- **WHEN** the CLI or Daemon observes that rejection
+- **THEN** it SHALL treat it as this candidate failing only, SHALL NOT clear the profile token, and SHALL continue to the next candidate
+
+#### Scenario: jamming the handshake cannot win a downgrade
+
+- **GIVEN** profile `home` has previously completed the encrypted handshake with its Server
+- **WHEN** a later attempt to any of its endpoints does not complete the handshake
+- **THEN** Fleety SHALL fail with actionable guidance instead of connecting in the clear
+
+#### Scenario: an endpoint that stalls does not hide the ones behind it
+
+- **GIVEN** the first candidate accepts the connection and then never completes the handshake
+- **WHEN** the per-candidate deadline elapses
+- **THEN** Fleety SHALL abandon that candidate and attempt the remaining endpoints before reporting one aggregated failure
+
+#### Scenario: diagnostics report which endpoint answered without changing anything
+
+- **GIVEN** a profile whose configured endpoint is unreachable and whose learned endpoint is serving
+- **WHEN** `fleety doctor` runs
+- **THEN** it SHALL report the Server as reachable and name the redacted endpoint that answered, and SHALL NOT promote it, persist a credential, pin an identity, or record secure-channel support
+
 ### Requirement: Persisted profile switching reconnects the active Daemon
 
 After any operation changes the persisted current profile selection, endpoint, or paired credential, the CLI SHALL notify the running local `fleetyd` through its owner control path. This includes implicit first-profile selection, `connection use`, current-profile rename／set-url, pairing, guided init, Settings URL save, and interactive profile switch. Removing any current profile SHALL fail until the user explicitly selects its replacement; `--force` SHALL NOT choose a replacement from profile ordering. Each request SHALL remain durable through consumption until its terminal result is observed, SHALL NOT be silently overwritten by a later request, and SHALL receive exactly one durable success or failure settlement for its nonce; this does not promise exactly-once transport connection attempts. A later caller SHALL validate any accepted result's success proof before preserving an older terminal active record as a nonce-addressed receipt; every caller SHALL return only the settlement for the nonce it submitted. Success SHALL be settled only after the selected Server sends `Welcome`, authentication completes, its identity matches the saved pin, every returned token and identity pin is atomically persisted and file／publication-synced under the selected profile's owner lease, that lease is released, the accepted journal append reports durability, a nonce-addressed durable success proof exists, and the persisted owner snapshot still matches that committed credential at the settlement boundary. A publication retry SHALL revalidate the frozen committed target and fingerprint; owner drift SHALL settle failure, while a storage error SHALL retain retryable state. A caller SHALL reject an accepted journal record or receipt without its matching success proof. A restart SHALL convert a surviving accepted journal without proof into failure, and successful delivery SHALL reap the proof after removing its terminal carrier; startup SHALL reap orphan proofs left by interrupted cleanup. Resolve, connect, `Hello`, authentication, identity, credential persistence, owner drift, stop, restart, and bounded-handshake failures SHALL settle failure. Notification failure SHALL preserve the saved profile but report a recoverable incomplete state rather than claiming the switch is fully active. Settings SHALL bound both connection upgrade and `Welcome` wait and SHALL discard the old transport and snapshots on failure.
@@ -285,7 +369,7 @@ The profile URL, token, and fingerprint used for reconnect SHALL be read togethe
 
 ### Requirement: Connection profiles are the single persistent source of the connection target
 
-The connection target (which server + its token) SHALL live in one file, `~/.fleety/connections.toml`, holding a device-wide `device_id`, a `current` profile name, and named `profiles` each carrying `url`, an optional `token`, an optional `label`, an optional server `fingerprint`, and an internal lifecycle `generation`. A newly created or explicitly selected durable profile SHALL receive a non-empty generation before it grants mutation authority; raw URL and environment targets SHALL NOT trigger generation writes. Deleting and recreating a profile SHALL mint a different generation even when all user-visible fields are identical. The file SHALL be written atomically (temp + rename) with `0600` permissions. Loading a missing file SHALL yield an empty set (not an error); loading a present-but-unparseable file SHALL return an explicit error rather than being silently treated as empty. `FLEETY_AGENT_URL` SHALL NOT be a registry setting — `config set FLEETY_AGENT_URL` returns an unknown-key error and the value is never seeded from `config.toml`.
+The connection target (which server + its token) SHALL live in one file, `~/.fleety/connections.toml`, holding a device-wide `device_id`, a `current` profile name, and named `profiles` each carrying `url`, an optional list of alternate `endpoints` learned from that Server, an optional `configured_url` recording the address the user chose when roaming has moved `url`, a `secure` flag recording that this Server has proven it can open the encrypted control channel, an optional `token`, an optional `label`, an optional server `fingerprint`, and an internal lifecycle `generation`. A newly created or explicitly selected durable profile SHALL receive a non-empty generation before it grants mutation authority; raw URL and environment targets SHALL NOT trigger generation writes. Deleting and recreating a profile SHALL mint a different generation even when all user-visible fields are identical. The file SHALL be written atomically (temp + rename) with `0600` permissions. Loading a missing file SHALL yield an empty set (not an error); loading a present-but-unparseable file SHALL return an explicit error rather than being silently treated as empty. `FLEETY_AGENT_URL` SHALL NOT be a registry setting — `config set FLEETY_AGENT_URL` returns an unknown-key error and the value is never seeded from `config.toml`.
 
 #### Scenario: profiles round-trip with restricted permissions
 

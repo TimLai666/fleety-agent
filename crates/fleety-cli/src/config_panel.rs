@@ -1002,8 +1002,17 @@ fn render_in_area(f: &mut Frame, p: &Panel, area: ratatui::layout::Rect) {
         body_title.push_str(" · device ");
         body_title.push_str(&crate::terminal_safe_text(&p.daemon_device_id));
     }
+    // Keep the selection on screen. Without this the Server page's 24 rows were
+    // drawn unscrolled into ~10 visible lines: the marker walked off the bottom,
+    // Down kept "working" with nothing changing, and Enter edited a row the user
+    // could not see. Same offset rule as the Provider panel.
+    let inner_height = chunks[1].height.saturating_sub(2);
+    let selected_line = p.sel as u16;
+    let offset = (selected_line + 1).saturating_sub(inner_height);
     f.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title(body_title)),
+        Paragraph::new(lines)
+            .block(Block::bordered().title(body_title))
+            .scroll((offset, 0)),
         chunks[1],
     );
 
@@ -1087,8 +1096,16 @@ fn active_owner_error(panel: &Panel) -> Option<&crate::workspace::WorkspaceError
     }
 }
 
+/// Whether the Connection region holds edits the user has not saved. Its state
+/// lives in `conns` rather than a staged map, so this is the comparison the
+/// other regions get from their staged sets.
+fn connection_dirty(panel: &Panel) -> bool {
+    panel.conns != panel.persisted_conns
+}
+
 fn region_state_label(panel: &Panel, region: Region) -> &'static str {
     match region {
+        Region::Connection if connection_dirty(panel) => "dirty",
         Region::Connection => "available",
         Region::Cli if panel.apply_cli_now => "applying",
         Region::Cli if panel.local_apply_error.is_some() => "failed",
@@ -1575,6 +1592,12 @@ fn save_connection_url_edits_at(
         let mut reconnect_profile = None;
         for (name, edited) in &pending.profiles {
             let Some(before) = baseline.profiles.get(name) else {
+                // Not in the baseline: a row the panel offered but the file has
+                // never held — the discovered loopback Server. Saving it is how
+                // the user accepts it, so add it rather than skipping silently.
+                if !live.profiles.contains_key(name) {
+                    live.profiles.insert(name.clone(), edited.clone());
+                }
                 continue;
             };
             if edited.url == before.url {
@@ -1750,24 +1773,21 @@ async fn run_settings(
         }
     }
 
-    let mut conns = connection::load()?;
+    let conns = connection::load()?;
     // Offer the local server (like guided init): if one answers on loopback and
     // no saved profile already targets it, inject a `local` entry so it shows in
     // the Connection region. Kept in memory — only persisted if the user saves.
     let local_url = crate::local_server_url();
-    if !has_local_profile(&conns, &local_url)
+    // A loopback Server that answers is offered as a row, but it is not on disk.
+    // Injecting it before `Panel::new` made the panel record it as *persisted*:
+    // selecting it resolved against the real file and failed forever, saving an
+    // edit to it claimed another process had removed it, and nothing marked the
+    // row as unsaved. Inject it after the baseline so it reads as what it is.
+    let discovered_local = (!has_local_profile(&conns, &local_url)
         && crate::probe_local_server(&local_url, std::time::Duration::from_secs(1))
             .await
-            .is_some()
-    {
-        conns
-            .profiles
-            .entry("local".to_string())
-            .or_insert_with(|| connection::Profile {
-                url: local_url.clone(),
-                ..Default::default()
-            });
-    }
+            .is_some())
+    .then(|| local_url.clone());
     let local_map = fleety_tools::config::load(&fleety_tools::config::config_path());
     let mut app = Panel::new(
         conns,
@@ -1775,6 +1795,15 @@ async fn run_settings(
         RemoteRegionState::new(daemon_supported, daemon_entries, daemon_revision),
         RemoteRegionState::new(server_supported, entries, revision),
     );
+    if let Some(url) = discovered_local {
+        app.conns
+            .profiles
+            .entry("local".to_string())
+            .or_insert_with(|| connection::Profile {
+                url,
+                ..Default::default()
+            });
+    }
     app.daemon_device_id = daemon_device_id.clone();
     if let Some(target) = active_target.as_ref() {
         app.activate_target(target);
@@ -1862,6 +1891,7 @@ async fn run_settings(
             turn_in_flight: false,
             has_unsent_input: false,
             has_dirty_owner: app.local_dirty
+                || connection_dirty(&app)
                 || !app.daemon_staged.is_empty()
                 || !app.staged.is_empty(),
             text_input_focused: app.edit.is_some() || app.tz_pick.is_some(),
@@ -2264,6 +2294,89 @@ mod tests {
     use tokio::sync::oneshot;
     use tokio_tungstenite::tungstenite::Message;
 
+    /// Accept a client, refusing the paired secure handshake if it opens with
+    /// one and waiting for the cleartext reconnect.
+    ///
+    /// These fakes hold no device token, so refusing is exactly what a Server
+    /// with no credential for this device does — and the profiles under test are
+    /// still permitted to fall back, so the client comes straight back. Clients
+    /// whose target has nothing to key a handshake with never offer one, and go
+    /// straight through. Either way the socket returned has `Hello` next.
+    async fn accept_cleartext_client(
+        listener: &tokio::net::TcpListener,
+    ) -> tokio_tungstenite::WebSocketStream<tokio::net::TcpStream> {
+        loop {
+            let (stream, _) = listener.accept().await.expect("accept client connection");
+            let mut ws = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("accept client websocket");
+            // Peek without consuming is impossible over WebSocket framing, so
+            // decide from the first frame: a handshake is refused and the
+            // connection dropped, anything else means this client never offered
+            // one and the frame it sent is still the first thing to be read.
+            let Some(Ok(frame)) = ws.next().await else {
+                continue;
+            };
+            let is_handshake = frame
+                .to_text()
+                .ok()
+                .and_then(|text| serde_json::from_str::<ClientMsg>(text).ok())
+                .is_some_and(|msg| matches!(msg, ClientMsg::SecureHandshake { .. }));
+            if !is_handshake {
+                return replay_first_frame(ws, frame).await;
+            }
+            let _ = ws.close(None).await;
+        }
+    }
+
+    /// A cleartext client's first frame has already been read off the socket.
+    /// Loop it back through a local pair so the fake can keep using its normal
+    /// read sequence, rather than every fake growing a pushback slot.
+    async fn replay_first_frame(
+        upstream: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+        first: Message,
+    ) -> tokio_tungstenite::WebSocketStream<tokio::net::TcpStream> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind replay listener");
+        let addr = listener.local_addr().expect("replay address");
+        tokio::spawn(async move {
+            let (client, _) = tokio::net::TcpStream::connect(addr)
+                .await
+                .map(|stream| (stream, ()))
+                .expect("connect replay client");
+            let Ok(mut inner) = tokio_tungstenite::client_async(format!("ws://{addr}"), client)
+                .await
+                .map(|(ws, _)| ws)
+            else {
+                return;
+            };
+            let _ = inner.send(first).await;
+            let (mut up_tx, mut up_rx) = upstream.split();
+            let (mut in_tx, mut in_rx) = inner.split();
+            loop {
+                tokio::select! {
+                    frame = up_rx.next() => match frame {
+                        Some(Ok(frame)) => {
+                            if in_tx.send(frame).await.is_err() { return; }
+                        }
+                        _ => return,
+                    },
+                    frame = in_rx.next() => match frame {
+                        Some(Ok(frame)) => {
+                            if up_tx.send(frame).await.is_err() { return; }
+                        }
+                        _ => return,
+                    },
+                }
+            }
+        });
+        let (stream, _) = listener.accept().await.expect("accept replay");
+        tokio_tungstenite::accept_async(stream)
+            .await
+            .expect("accept replay websocket")
+    }
+
     async fn start_close_observer() -> (String, oneshot::Receiver<bool>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -2271,10 +2384,7 @@ mod tests {
         let addr = listener.local_addr().expect("close observer address");
         let (closed_tx, closed_rx) = oneshot::channel();
         tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept old connection");
-            let mut ws = tokio_tungstenite::accept_async(stream)
-                .await
-                .expect("accept old websocket");
+            let mut ws = accept_cleartext_client(&listener).await;
             let closed = matches!(ws.next().await, Some(Ok(Message::Close(_))) | None);
             let _ = closed_tx.send(closed);
         });
@@ -2288,10 +2398,7 @@ mod tests {
         let addr = listener.local_addr().expect("welcome server address");
         let (hello_tx, hello_rx) = oneshot::channel();
         tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept new connection");
-            let mut ws = tokio_tungstenite::accept_async(stream)
-                .await
-                .expect("accept new websocket");
+            let mut ws = accept_cleartext_client(&listener).await;
             let frame = ws
                 .next()
                 .await
@@ -2309,6 +2416,7 @@ mod tests {
                     audio_input: false,
                     config_protocol: fleety_protocol::CONFIG_PROTOCOL_VERSION,
                     server_fingerprint: Some("fingerprint-a".into()),
+                    server_endpoints: Vec::new(),
                     loopback_trusted: false,
                     token: None,
                 })
@@ -2329,10 +2437,7 @@ mod tests {
         let addr = listener.local_addr().expect("snapshot server address");
         let (requests_tx, requests_rx) = oneshot::channel();
         tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept snapshot connection");
-            let mut ws = tokio_tungstenite::accept_async(stream)
-                .await
-                .expect("accept snapshot websocket");
+            let mut ws = accept_cleartext_client(&listener).await;
             let mut requests = Vec::new();
             for step in 0..3 {
                 let frame = ws
@@ -2354,6 +2459,7 @@ mod tests {
                         audio_input: false,
                         config_protocol: fleety_protocol::CONFIG_PROTOCOL_VERSION,
                         server_fingerprint: Some("fingerprint-a".into()),
+                        server_endpoints: Vec::new(),
                         loopback_trusted: false,
                         token: None,
                     },
@@ -2436,6 +2542,7 @@ mod tests {
                         audio_input: false,
                         config_protocol: fleety_protocol::CONFIG_PROTOCOL_VERSION,
                         server_fingerprint: Some("fingerprint-a".into()),
+                        server_endpoints: Vec::new(),
                         loopback_trusted: false,
                         token: None,
                     },
@@ -3106,10 +3213,7 @@ mod tests {
             .expect("bind apply failure server");
         let address = listener.local_addr().expect("apply failure address");
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept apply client");
-            let mut websocket = tokio_tungstenite::accept_async(stream)
-                .await
-                .expect("accept websocket");
+            let mut websocket = accept_cleartext_client(&listener).await;
             let frame = websocket
                 .next()
                 .await
@@ -3455,6 +3559,29 @@ mod tests {
             tx.close().await;
         }
         std::fs::remove_file(path).expect("remove mixed protocol fixture");
+    }
+
+    /// The Connection region kept its edits in `conns` rather than a staged map,
+    /// so it was the one Settings page whose unsaved value was neither badged
+    /// nor protected by the exit confirmation — `q` discarded it silently.
+    #[test]
+    fn an_edited_connection_url_is_badged_dirty_and_blocks_a_silent_exit() {
+        let mut panel = panel_with_entries(Vec::new());
+        assert_eq!(region_state_label(&panel, Region::Connection), "available");
+        assert!(!connection_dirty(&panel));
+
+        panel
+            .conns
+            .profiles
+            .entry("home".to_string())
+            .or_default()
+            .url = "ws://edited.example:8787".to_string();
+
+        assert!(
+            connection_dirty(&panel),
+            "an unsaved edit must count as dirty"
+        );
+        assert_eq!(region_state_label(&panel, Region::Connection), "dirty");
     }
 
     #[tokio::test]
@@ -3943,10 +4070,7 @@ mod tests {
             .expect("bind apply server");
         let address = listener.local_addr().expect("apply address");
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept apply client");
-            let mut websocket = tokio_tungstenite::accept_async(stream)
-                .await
-                .expect("accept websocket");
+            let mut websocket = accept_cleartext_client(&listener).await;
             let frame = websocket
                 .next()
                 .await
@@ -4023,10 +4147,7 @@ mod tests {
         };
         let expected_target = target.clone();
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept refresh client");
-            let mut websocket = tokio_tungstenite::accept_async(stream)
-                .await
-                .expect("accept refresh websocket");
+            let mut websocket = accept_cleartext_client(&listener).await;
             for step in 0..2 {
                 let frame = websocket
                     .next()
@@ -4221,10 +4342,7 @@ mod tests {
             .expect("bind apply server");
         let address = listener.local_addr().expect("apply address");
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.expect("accept apply client");
-            let mut websocket = tokio_tungstenite::accept_async(stream)
-                .await
-                .expect("accept websocket");
+            let mut websocket = accept_cleartext_client(&listener).await;
             let frame = websocket
                 .next()
                 .await

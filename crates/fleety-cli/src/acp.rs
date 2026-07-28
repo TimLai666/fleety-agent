@@ -143,9 +143,11 @@ pub fn cwd_to_origin(cwd: Option<&str>) -> fleety_protocol::OriginContext {
             .ok(),
         os: Some(std::env::consts::OS.to_string()),
         cwd: cwd.map(str::to_string),
-        home: std::env::var("HOME")
-            .ok()
-            .or_else(|| std::env::var("USERPROFILE").ok()),
+        home: fleety_tools::device::home_is_known().then(|| {
+            fleety_tools::device::home_dir()
+                .to_string_lossy()
+                .into_owned()
+        }),
     }
 }
 
@@ -743,14 +745,12 @@ pub fn install(target: Option<String>, server: Option<String>) -> agent_core::Re
     }
     match target.as_deref().map(str::to_ascii_lowercase).as_deref() {
         Some("zed") => install_zed(server),
-        Some(other) => {
-            println!(
-                "No built-in auto-config for editor '{}' (supported: zed).\n",
-                crate::terminal_safe_text(other)
-            );
-            print_generic(server.as_deref());
-            Ok(())
-        }
+        // An unsupported editor never reaches here: `unsupported_editor` turns
+        // it into a usage error before install runs, because naming an editor
+        // is a request to install for it and nothing gets installed.
+        Some(other) => Err(agent_core::CoreError::Message(unsupported_editor_message(
+            other,
+        ))),
         None => {
             print_generic(server.as_deref());
             Ok(())
@@ -760,29 +760,60 @@ pub fn install(target: Option<String>, server: Option<String>) -> agent_core::Re
 
 /// Print the editor-agnostic ACP setup: the command any ACP client launches.
 fn print_generic(server: Option<&str>) {
-    let cmd = current_exe_str();
-    println!("Fleety is an ACP agent — point any ACP-capable editor at this command:\n");
-    println!("    command: {}", crate::terminal_safe_text(&cmd));
-    println!("    args:    [\"acp\"]");
-    match server {
-        Some(s) => {
-            println!(
-                "    env:     FLEETY_AGENT_URL={}",
-                crate::terminal_safe_endpoint(s)
-            );
-            println!(
-                "             This endpoint is transient. Add a non-empty FLEETY_TOKEN for authentication,\n\
-                 or omit FLEETY_AGENT_URL to use the saved current profile.\n"
-            );
-        }
-        None => println!(
-            "    env:     (none — uses the saved current profile, then the trusted local default)\n"
-        ),
+    println!("{}", generic_setup(server));
+}
+
+/// The editors `install` can configure by itself.
+const SUPPORTED_EDITORS: [&str; 1] = ["zed"];
+
+/// `Some(usage message)` when `editor` names something this binary cannot
+/// configure. `fleety acp install <editor>` used to print advice and exit 0, so
+/// a script could not tell an install from a no-op.
+pub fn unsupported_editor(editor: Option<&str>, server: Option<&str>) -> Option<String> {
+    let editor = editor?.to_ascii_lowercase();
+    if SUPPORTED_EDITORS.contains(&editor.as_str()) {
+        return None;
     }
-    println!("Auto-configure a supported editor:");
-    println!("    fleety acp install zed [--server ws://host:8787]\n");
-    println!("For other editors (JetBrains, neovim, Emacs, …), set their custom-ACP-agent");
-    println!("command to the above — ACP is a shared protocol, the same agent works for all.");
+    Some(format!(
+        "{}\n\n{}",
+        unsupported_editor_message(&editor),
+        generic_setup(server)
+    ))
+}
+
+fn unsupported_editor_message(editor: &str) -> String {
+    format!(
+        "no built-in auto-config for editor '{}' (supported: {}); run `fleety acp install` with \
+         no editor for the settings any ACP client needs",
+        crate::terminal_safe_text(editor),
+        SUPPORTED_EDITORS.join(", ")
+    )
+}
+
+/// The editor-agnostic ACP setup: the command any ACP client launches.
+fn generic_setup(server: Option<&str>) -> String {
+    let cmd = current_exe_str();
+    let env = match server {
+        Some(s) => format!(
+            "    env:     FLEETY_AGENT_URL={}\n\
+             \x20            This endpoint is transient. Add a non-empty FLEETY_TOKEN for authentication,\n\
+             \x20            or omit FLEETY_AGENT_URL to use the saved current profile.\n",
+            crate::terminal_safe_endpoint(s)
+        ),
+        None => "    env:     (none — uses the saved current profile, then the trusted local default)\n"
+            .to_string(),
+    };
+    format!(
+        "Fleety is an ACP agent — point any ACP-capable editor at this command:\n\n\
+         \x20   command: {}\n\
+         \x20   args:    [\"acp\"]\n\
+         {env}\n\
+         Auto-configure a supported editor:\n\
+         \x20   fleety acp install zed [--server ws://host:8787]\n\n\
+         For other editors (JetBrains, neovim, Emacs, …), set their custom-ACP-agent\n\
+         command to the above — ACP is a shared protocol, the same agent works for all.",
+        crate::terminal_safe_text(&cmd)
+    )
 }
 
 /// Register this binary as a custom ACP agent in Zed. Edits `settings.json` in
@@ -1240,60 +1271,64 @@ const ACP_CANCEL_WELCOME_TIMEOUT: std::time::Duration = std::time::Duration::fro
 const ACP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const ACP_CANCEL_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-async fn connect_websocket(
+/// Open an authenticated ACP session on whichever saved endpoint answers.
+///
+/// ACP used to dial `target.url()` directly with a bare WebSocket, which made it
+/// the one client surface that could neither roam onto a saved alternative nor
+/// open the encrypted channel. It now goes through the same handshake as every
+/// other surface, so the policy and the per-candidate deadline are identical.
+async fn open_acp_session(
     target: &fleety_tools::connection::Resolved,
-    timeout: std::time::Duration,
-) -> agent_core::Result<
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-> {
-    use agent_core::CoreError;
-
-    let endpoint = crate::terminal_safe_endpoint(target.url());
-    tokio::time::timeout(timeout, tokio_tungstenite::connect_async(target.url()))
-        .await
-        .map_err(|_| CoreError::Provider(format!("timed out connecting to {endpoint}")))?
-        .map(|(websocket, _)| websocket)
-        .map_err(|error| {
-            CoreError::Provider(format!(
-                "cannot connect to {endpoint}: {}",
-                crate::terminal_safe_text(&error.to_string())
-            ))
-        })
+    local_tools_json: Option<String>,
+    wait: std::time::Duration,
+) -> agent_core::Result<(
+    fleety_tools::transport::Sender,
+    fleety_tools::transport::Receiver,
+    fleety_tools::connection::Resolved,
+)> {
+    fleety_tools::connection::connect_first_healthy(target, wait, move |session| {
+        let local_tools_json = local_tools_json.clone();
+        async move {
+            let fleety_tools::connection::CandidateSession {
+                connection,
+                target,
+                sealed,
+            } = session;
+            let (mut tx, mut rx) = connection.split();
+            let hello = hello_json(target.token(), local_tools_json)
+                .map_err(|e| agent_core::CoreError::Message(format!("serialize hello: {e}")))?;
+            tx.send_text(hello).await?;
+            let committed = receive_authenticated_welcome(&mut rx, &target, sealed).await?;
+            Ok((tx, rx, committed))
+        }
+    })
+    .await
 }
 
-async fn receive_authenticated_welcome<S, E>(
-    rx: &mut S,
+/// The caller bounds this: `connect_first_healthy` gives each candidate one
+/// deadline covering the connect, the handshake, and this reply together.
+async fn receive_authenticated_welcome(
+    rx: &mut fleety_tools::transport::Receiver,
     target: &fleety_tools::connection::Resolved,
-    timeout: std::time::Duration,
-) -> agent_core::Result<fleety_tools::connection::Resolved>
-where
-    S: futures::Stream<Item = Result<tokio_tungstenite::tungstenite::Message, E>> + Unpin,
-    E: std::fmt::Display,
-{
+    sealed: bool,
+) -> agent_core::Result<fleety_tools::connection::Resolved> {
     use agent_core::CoreError;
-    use futures::StreamExt;
 
-    let frame = tokio::time::timeout(timeout, rx.next())
-        .await
-        .map_err(|_| {
-            CoreError::Message(
-                "timed out waiting for the Server to authenticate the ACP session".to_string(),
-            )
-        })?
-        .ok_or_else(|| {
-            CoreError::Message(
-                "the Server closed before authenticating the ACP session".to_string(),
-            )
-        })?
-        .map_err(|error| CoreError::Provider(format!("receive Welcome: {error}")))?;
-    let welcome = frame
-        .to_text()
-        .ok()
-        .and_then(|text| serde_json::from_str::<fleety_protocol::ServerMsg>(text).ok());
+    let frame = rx.recv_text().await.ok_or_else(|| {
+        CoreError::Message("the Server closed before authenticating the ACP session".to_string())
+    })?;
+    let welcome = serde_json::from_str::<fleety_protocol::ServerMsg>(&frame).ok();
     match welcome {
         Some(fleety_protocol::ServerMsg::Welcome {
-            server_fingerprint, ..
-        }) => crate::verify_and_pin_welcome_identity(server_fingerprint.as_deref(), target),
+            server_fingerprint,
+            server_endpoints,
+            ..
+        }) => crate::verify_and_learn_welcome_identity(
+            server_fingerprint.as_deref(),
+            &server_endpoints,
+            target,
+            sealed,
+        ),
         other => Err(CoreError::Message(crate::hello_failure_message_for_target(
             other.as_ref(),
             target,
@@ -1487,8 +1522,6 @@ impl<R: tokio::io::AsyncBufRead + Unpin + Send> WsBridge<R> {
         resume: bool,
     ) -> agent_core::Result<Vec<String>> {
         use agent_core::CoreError;
-        use futures::{SinkExt, StreamExt};
-        use tokio_tungstenite::tungstenite::Message as WsMessage;
 
         // A stale cancel (e.g. one that arrived while idle) must not poison
         // this turn: the flag only reflects cancels seen while it runs.
@@ -1501,8 +1534,6 @@ impl<R: tokio::io::AsyncBufRead + Unpin + Send> WsBridge<R> {
             .lock()
             .map_err(|_| CoreError::Message("ACP connection state is unavailable".to_string()))?
             .clone();
-        let ws = connect_websocket(&target, ACP_CONNECT_TIMEOUT).await?;
-        let (mut tx, mut rx) = ws.split();
         // Advertise the editor-backed tools gated by what the editor supports, so
         // the server offers the agent `editor_*` tools routed back to us.
         let editor_specs = self
@@ -1515,14 +1546,12 @@ impl<R: tokio::io::AsyncBufRead + Unpin + Send> WsBridge<R> {
         } else {
             serde_json::to_string(&editor_specs).ok()
         };
-        let hello = hello_json(target.token(), local_tools_json)
-            .map_err(|e| CoreError::Message(format!("serialize hello: {e}")))?;
-        tx.send(WsMessage::Text(hello))
-            .await
-            .map_err(|e| CoreError::Provider(format!("send hello: {e}")))?;
-
-        let committed_target =
-            receive_authenticated_welcome(&mut rx, &target, ACP_WELCOME_TIMEOUT).await?;
+        let (mut tx, mut rx, committed_target) = open_acp_session(
+            &target,
+            local_tools_json,
+            ACP_CONNECT_TIMEOUT + ACP_WELCOME_TIMEOUT,
+        )
+        .await?;
         *self
             .target
             .lock()
@@ -1545,7 +1574,7 @@ impl<R: tokio::io::AsyncBufRead + Unpin + Send> WsBridge<R> {
             })
         }
         .map_err(|e| CoreError::Message(format!("serialize message: {e}")))?;
-        tx.send(WsMessage::Text(outbound))
+        tx.send_text(outbound)
             .await
             .map_err(|e| CoreError::Provider(format!("send message: {e}")))?;
 
@@ -1559,7 +1588,7 @@ impl<R: tokio::io::AsyncBufRead + Unpin + Send> WsBridge<R> {
         // the turn with Done — which ends this loop normally, and the flag
         // turns the prompt's stop reason into "cancelled".
         enum Race {
-            Server(Option<Result<WsMessage, tokio_tungstenite::tungstenite::Error>>),
+            Server(Option<String>),
             EditorReady(bool),
         }
         let mut cancel_sent = false;
@@ -1572,7 +1601,7 @@ impl<R: tokio::io::AsyncBufRead + Unpin + Send> WsBridge<R> {
                 if let Ok(t) = serde_json::to_string(&fleety_protocol::ClientMsg::CancelTurn {
                     conversation_id: Some(conversation.to_string()),
                 }) {
-                    let _ = tx.send(WsMessage::Text(t)).await;
+                    let _ = tx.send_text(t).await;
                 }
             }
             // Race the server socket against editor input. The editor side
@@ -1584,7 +1613,7 @@ impl<R: tokio::io::AsyncBufRead + Unpin + Send> WsBridge<R> {
                 let race = {
                     use tokio::io::AsyncBufReadExt;
                     tokio::select! {
-                        f = rx.next() => Race::Server(f),
+                        f = rx.recv_text() => Race::Server(f),
                         b = r.fill_buf() => Race::EditorReady(matches!(b, Ok(x) if !x.is_empty())),
                     }
                 };
@@ -1617,34 +1646,15 @@ impl<R: tokio::io::AsyncBufRead + Unpin + Send> WsBridge<R> {
                     }
                 }
             } else {
-                Some(rx.next().await)
+                Some(rx.recv_text().await)
             };
             let Some(next) = server_frame else { continue };
-            let Some(frame) = next else {
+            let Some(text) = next else {
                 return Err(CoreError::Message(
                     "the Server disconnected before completing the ACP turn".to_string(),
                 ));
             };
-            let frame =
-                frame.map_err(|error| CoreError::Provider(format!("receive ACP turn: {error}")))?;
-            if frame.is_ping() || frame.is_pong() {
-                continue;
-            }
-            if frame.is_close() {
-                return Err(CoreError::Message(
-                    "the Server disconnected before completing the ACP turn".to_string(),
-                ));
-            }
-            if !frame.is_text() {
-                return Err(CoreError::Message(
-                    "the Server sent an unsupported WebSocket frame during the ACP turn"
-                        .to_string(),
-                ));
-            }
-            let text = frame.to_text().map_err(|_| {
-                CoreError::Message("the Server sent invalid text during the ACP turn".to_string())
-            })?;
-            let msg = serde_json::from_str::<fleety_protocol::ServerMsg>(text).map_err(|_| {
+            let msg = serde_json::from_str::<fleety_protocol::ServerMsg>(&text).map_err(|_| {
                 CoreError::Message(
                     "the Server sent a malformed protocol message during the ACP turn".to_string(),
                 )
@@ -1707,7 +1717,7 @@ impl<R: tokio::io::AsyncBufRead + Unpin + Send> WsBridge<R> {
                     let text = serde_json::to_string(&reply).map_err(|error| {
                         CoreError::Message(format!("serialize tool reply: {error}"))
                     })?;
-                    tx.send(WsMessage::Text(text)).await.map_err(|error| {
+                    tx.send_text(text).await.map_err(|error| {
                         CoreError::Provider(format!("send tool reply: {error}"))
                     })?;
                 }
@@ -1739,7 +1749,7 @@ impl<R: tokio::io::AsyncBufRead + Unpin + Send> WsBridge<R> {
                     let text = serde_json::to_string(&reply).map_err(|error| {
                         CoreError::Message(format!("serialize approval reply: {error}"))
                     })?;
-                    tx.send(WsMessage::Text(text)).await.map_err(|error| {
+                    tx.send_text(text).await.map_err(|error| {
                         CoreError::Provider(format!("send approval reply: {error}"))
                     })?;
                 }
@@ -1769,8 +1779,6 @@ impl<R: tokio::io::AsyncBufRead + Unpin + Send> AcpBridge for WsBridge<R> {
     }
 
     async fn cancel(&self, session_id: &str) {
-        use futures::{SinkExt, StreamExt};
-        use tokio_tungstenite::tungstenite::Message as WsMessage;
         // Flag first: were a turn somehow in flight for this session, its
         // loop would forward the cancel on the live connection.
         if !session_id.is_empty() {
@@ -1787,8 +1795,14 @@ impl<R: tokio::io::AsyncBufRead + Unpin + Send> AcpBridge for WsBridge<R> {
             Ok(target) => target.clone(),
             Err(_) => return,
         };
-        let ws = match connect_websocket(&target, ACP_CANCEL_CONNECT_TIMEOUT).await {
-            Ok(websocket) => websocket,
+        let opened = open_acp_session(
+            &target,
+            None,
+            ACP_CANCEL_CONNECT_TIMEOUT + ACP_CANCEL_WELCOME_TIMEOUT,
+        )
+        .await;
+        let (mut tx, _rx, committed_target) = match opened {
+            Ok(session) => session,
             Err(error) => {
                 tracing::warn!(
                     endpoint = %crate::terminal_safe_endpoint(target.url()),
@@ -1798,25 +1812,16 @@ impl<R: tokio::io::AsyncBufRead + Unpin + Send> AcpBridge for WsBridge<R> {
                 return;
             }
         };
-        let (mut tx, mut rx) = ws.split();
-        let conversation_id = (!session_id.is_empty()).then(|| session_id.to_string());
-        if let (Ok(hello), Ok(cancel)) = (
-            hello_json(target.token(), None),
-            serde_json::to_string(&fleety_protocol::ClientMsg::CancelTurn { conversation_id }),
-        ) {
-            if tx.send(WsMessage::Text(hello)).await.is_ok() {
-                let authenticated =
-                    receive_authenticated_welcome(&mut rx, &target, ACP_CANCEL_WELCOME_TIMEOUT)
-                        .await;
-                if let Ok(committed_target) = authenticated {
-                    if let Ok(mut stored) = self.target.lock() {
-                        *stored = committed_target;
-                    }
-                    let _ = tx.send(WsMessage::Text(cancel)).await;
-                }
-            }
+        if let Ok(mut stored) = self.target.lock() {
+            *stored = committed_target;
         }
-        let _ = tx.close().await;
+        let conversation_id = (!session_id.is_empty()).then(|| session_id.to_string());
+        if let Ok(cancel) =
+            serde_json::to_string(&fleety_protocol::ClientMsg::CancelTurn { conversation_id })
+        {
+            let _ = tx.send_text(cancel).await;
+        }
+        tx.close().await;
     }
 
     fn take_cancelled(&self, session_id: &str) -> bool {
@@ -2843,6 +2848,7 @@ mod tests {
             audio_input: false,
             config_protocol: 0,
             server_fingerprint: Some("acp-server".to_string()),
+            server_endpoints: Vec::new(),
             loopback_trusted: false,
             token: None,
         }
@@ -3136,36 +3142,51 @@ mod tests {
         assert_eq!(frames.last().unwrap()["result"]["stopReason"], "end_turn");
     }
 
+    /// An endpoint that upgrades and then says nothing must not hold the turn
+    /// open. The bound now lives in the shared handshake driver, which is the
+    /// same one every other client surface uses.
     #[tokio::test]
-    async fn authenticated_welcome_wait_is_bounded_for_a_silent_endpoint() {
+    async fn a_silent_endpoint_cannot_hold_an_acp_session_open() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind silent server");
+        let address = listener.local_addr().expect("silent server address");
+        let silent = tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                return;
+            };
+            use futures::StreamExt;
+            let _ = ws.next().await;
+            std::future::pending::<()>().await;
+        });
         let target = fleety_tools::connection::Resolved::unowned(
-            "ws://silent.invalid:8787".to_string(),
+            format!("ws://{address}"),
             None,
             fleety_tools::connection::Source::OverrideUrl,
         );
-        let mut silent = futures::stream::pending::<
-            Result<tokio_tungstenite::tungstenite::Message, tokio_tungstenite::tungstenite::Error>,
-        >();
 
-        let error = receive_authenticated_welcome(
-            &mut silent,
-            &target,
-            std::time::Duration::from_millis(20),
-        )
-        .await
-        .expect_err("a silent endpoint must time out");
+        let outcome = open_acp_session(&target, None, std::time::Duration::from_millis(200)).await;
+        silent.abort();
+        let Err(error) = outcome else {
+            panic!("a silent endpoint must not hold the session open");
+        };
         assert!(
             error
                 .report()
                 .message
-                .contains("timed out waiting for the Server to authenticate"),
+                .contains("never completed the handshake"),
             "{}",
             error.report().message
         );
     }
 
+    /// A stalled upgrade is bounded too, and the failure never echoes the
+    /// credentials or query values embedded in the endpoint.
     #[tokio::test]
-    async fn websocket_upgrade_wait_is_bounded_and_redacts_the_endpoint() {
+    async fn a_stalled_upgrade_is_bounded_and_never_echoes_endpoint_secrets() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind stalled upgrade server");
@@ -3180,15 +3201,14 @@ mod tests {
             fleety_tools::connection::Source::OverrideUrl,
         );
 
-        let error = connect_websocket(&target, std::time::Duration::from_millis(20))
-            .await
-            .expect_err("a stalled WebSocket upgrade must time out");
+        let outcome = open_acp_session(&target, None, std::time::Duration::from_millis(200)).await;
         stalled.abort();
+        let Err(error) = outcome else {
+            panic!("a stalled WebSocket upgrade must be bounded");
+        };
         let message = error.report().message;
-        assert!(message.contains("timed out connecting to"));
-        assert!(message.contains("/acp"));
-        assert!(!message.contains("password"));
-        assert!(!message.contains("secret"));
-        assert!(!message.contains("fragment"));
+        assert!(!message.contains("password"), "{message}");
+        assert!(!message.contains("secret"), "{message}");
+        assert!(!message.contains("fragment"), "{message}");
     }
 }

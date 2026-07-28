@@ -401,7 +401,10 @@ mod tests {
     #[tokio::test]
     async fn complete_returns_actionable_error_when_logged_out_without_calling() {
         let auth = Arc::new(StubAuth {
-            creds: Err("not signed in to ChatGPT; run `fleety auth login` to authenticate".into()),
+            creds: Err(
+                "not signed in to ChatGPT; run `fleety provider login <provider>` to authenticate"
+                    .into(),
+            ),
         });
         // An unroutable base URL: if it tried to POST it would error differently.
         let provider = CodexResponses::new("http://127.0.0.1:1/responses", "m", auth);
@@ -409,7 +412,7 @@ mod tests {
             .complete(&[Message::user("hi")], &[])
             .await
             .expect_err("logged out");
-        assert!(err.report().message.contains("auth login"));
+        assert!(err.report().message.contains("provider login"));
     }
 
     #[test]

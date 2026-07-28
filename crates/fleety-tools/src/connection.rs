@@ -28,29 +28,29 @@ pub const DEFAULT_URL: &str = "ws://127.0.0.1:8787";
 pub fn validate_ws_url(url: &str) -> Result<()> {
     if url.chars().any(char::is_control) {
         return Err(CoreError::Message(
-            "server url cannot contain terminal control characters".to_string(),
+            "profile URL cannot contain terminal control characters".to_string(),
         ));
     }
     let parsed = reqwest::Url::parse(url).map_err(|_| {
-        CoreError::Message("server url is invalid (e.g. ws://192.168.1.10:8787)".to_string())
+        CoreError::Message("profile URL is invalid (e.g. ws://192.168.1.10:8787)".to_string())
     })?;
     if matches!(parsed.scheme(), "http" | "https") {
         Err(CoreError::Message(
-            "server url is http(s) — use the WebSocket scheme (ws:// or wss://)".to_string(),
+            "profile URL is http(s) — use the WebSocket scheme (ws:// or wss://)".to_string(),
         ))
     } else if !matches!(parsed.scheme(), "ws" | "wss") || parsed.host_str().is_none() {
         Err(CoreError::Message(
-            "server url must contain a host and use ws:// or wss:// (e.g. ws://192.168.1.10:8787)"
+            "profile URL must contain a host and use ws:// or wss:// (e.g. ws://192.168.1.10:8787)"
                 .to_string(),
         ))
     } else if !parsed.username().is_empty() || parsed.password().is_some() {
         Err(CoreError::Message(
-            "server url cannot contain credentials; pair the profile to store authentication safely"
+            "profile URL cannot contain credentials; pair the profile to store authentication safely"
                 .to_string(),
         ))
     } else if parsed.fragment().is_some() {
         Err(CoreError::Message(
-            "server url cannot contain a fragment; use only the WebSocket endpoint path and optional query"
+            "profile URL cannot contain a fragment; use only the WebSocket endpoint path and optional query"
                 .to_string(),
         ))
     } else {
@@ -66,6 +66,23 @@ pub fn validate_ws_url(url: &str) -> Result<()> {
 pub struct Profile {
     #[serde(default)]
     pub url: String,
+    /// Alternate endpoints learned from this exact Server after authenticated
+    /// Welcome. The primary `url` remains the last successful endpoint.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub endpoints: Vec<String>,
+    /// The endpoint the user actually configured, when roaming has since moved
+    /// `url` somewhere else. Pairing sends a credential that no handshake can
+    /// protect, so it must go to an address a person chose, never to one Fleety
+    /// promoted on its own. Absent means `url` is still that address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured_url: Option<String>,
+    /// Set once this Server has proven it can open the encrypted control
+    /// channel. From then on this profile refuses the cleartext path, so an
+    /// attacker cannot earn a downgrade merely by making the handshake fail.
+    /// Absent on profiles paired before the channel existed, which is what
+    /// lets them keep reaching a Server that has not been updated yet.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub secure: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -80,6 +97,9 @@ impl Default for Profile {
     fn default() -> Self {
         Self {
             url: String::new(),
+            endpoints: Vec::new(),
+            configured_url: None,
+            secure: false,
             token: None,
             label: None,
             fingerprint: None,
@@ -128,10 +148,8 @@ pub fn connections_path() -> PathBuf {
 
 /// `~/.fleety` (HOME/USERPROFILE based), the shared per-user Fleety directory.
 pub fn fleety_dir() -> PathBuf {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".fleety")
+    let home = crate::device::home_dir();
+    home.join(".fleety")
 }
 
 /// Load connections from `path`. A missing file yields an empty [`Connections`]
@@ -248,6 +266,7 @@ where
 /// file before replacement, then sync the published file/directory metadata.
 /// Unix permissions remain `0600` because the file may hold bearer tokens.
 pub fn save_at(path: &Path, conns: &Connections) -> Result<()> {
+    crate::device::ensure_writable_path(path, "connections.toml")?;
     let mut conns = conns.clone();
     ensure_profile_generations(&mut conns);
     save_at_with_sync(
@@ -596,6 +615,9 @@ pub fn migrate_from_config_json_at(dir: &Path) -> Result<Migration> {
             "default".to_string(),
             Profile {
                 url: agent_url.unwrap_or_default(),
+                endpoints: Vec::new(),
+                configured_url: None,
+                secure: false,
                 token,
                 label: None,
                 fingerprint: None,
@@ -792,6 +814,59 @@ impl Resolved {
         self.url.clone()
     }
 
+    /// Ordered transport attempts for this immutable resolution. Transient
+    /// targets remain single-endpoint; durable profiles try their last
+    /// successful URL first and then their authenticated learned candidates.
+    pub fn connection_attempts(&self) -> Vec<Self> {
+        let mut urls = vec![self.url.clone()];
+        // Roaming is only safe when the credential in play can key a handshake.
+        // A caller-supplied `FLEETY_TOKEN`, or a pairing code on a profile with
+        // no token of its own, would otherwise be offered in the clear to
+        // addresses Fleety learned rather than the user chose.
+        if self.secure_channel_key().is_some() {
+            if let Some(owner) = self.owner.as_ref().or(self.diagnostic_owner.as_ref()) {
+                // The address the user configured comes first among the
+                // alternatives: it is the only one a person vouched for, and a
+                // bounded sweep must not spend its whole budget on Server-
+                // nominated addresses before reaching it. Kept exactly as
+                // stored, because the owner checks compare these strings.
+                if let Some(configured) = owner.profile.configured_url.as_ref() {
+                    if compatible_configured_endpoint(&self.url, configured).is_some()
+                        && !urls.contains(configured)
+                    {
+                        urls.push(configured.clone());
+                    }
+                }
+                // L2: attempt Server-taught entries as stored too. Normalising
+                // here would authenticate and then be refused by our own commit
+                // path, which compares the stored strings.
+                let mut seen: Vec<String> = Vec::new();
+                for endpoint in owner.profile.endpoints.iter() {
+                    let Some(normalized) = normalized_authenticated_endpoints(
+                        &self.url,
+                        std::slice::from_ref(endpoint),
+                    )
+                    .into_iter()
+                    .next() else {
+                        continue;
+                    };
+                    if seen.contains(&normalized) || urls.contains(endpoint) {
+                        continue;
+                    }
+                    seen.push(normalized);
+                    urls.push(endpoint.clone());
+                }
+            }
+        }
+        urls.into_iter()
+            .map(|url| {
+                let mut candidate = self.clone();
+                candidate.url = url;
+                candidate
+            })
+            .collect()
+    }
+
     pub fn token_owned(&self) -> Option<String> {
         self.token.clone()
     }
@@ -877,13 +952,13 @@ pub fn resolve(
         Target::Named(name) => {
             let p = conns.profiles.get(name).ok_or_else(|| {
                 CoreError::Message(format!(
-                    "no server profile named '{name}' — see `fleety server list`"
+                    "no server profile named '{name}' — see `fleety connection list`"
                 ))
             })?;
             if p.url.is_empty() {
                 return Err(CoreError::Message(format!(
                     "server profile '{name}' has no url; set one with \
-                     `fleety server set-url {name} <ws-url>`"
+                     `fleety connection set-url {name} <ws-url>`"
                 )));
             }
             validate_ws_url(&p.url)?;
@@ -1192,7 +1267,10 @@ fn resolved_profile_owner<'a>(
             )))
         }
     };
-    if source_name != &owner.name || target.url != owner.profile.url {
+    let target_is_profile_endpoint = target.url == owner.profile.url
+        || owner.profile.configured_url.as_deref() == Some(target.url.as_str())
+        || owner.profile.endpoints.iter().any(|url| url == &target.url);
+    if source_name != &owner.name || !target_is_profile_endpoint {
         return Err(CoreError::Message(format!(
             "server profile provenance changed during connection; {action} was not applied"
         )));
@@ -1238,7 +1316,10 @@ pub fn validate_resolved_profile_owner<'a>(
             )))
         }
     };
-    if source_name != &owner.name || target.url != owner.profile.url {
+    let target_is_profile_endpoint = target.url == owner.profile.url
+        || owner.profile.configured_url.as_deref() == Some(target.url.as_str())
+        || owner.profile.endpoints.iter().any(|url| url == &target.url);
+    if source_name != &owner.name || !target_is_profile_endpoint {
         return Err(CoreError::Message(format!(
             "server profile provenance changed during connection; {action} was not applied"
         )));
@@ -1262,6 +1343,480 @@ pub fn validate_resolved_profile_owner<'a>(
         )));
     }
     Ok(profile)
+}
+
+/// Whether a candidate endpoint is allowed to talk in the clear.
+///
+/// The distinction exists because two very different endpoints share one code
+/// path: the address the user configured themselves, and an address Fleety
+/// learned on its own. The first may predate the encrypted channel and still
+/// has to work; the second was never chosen by anyone, so it has to earn trust
+/// cryptographically before it is told anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelPolicy {
+    /// The peer must open the encrypted channel. Anything less is refused and
+    /// the endpoint is abandoned — no credential is revealed either way.
+    SecureRequired,
+    /// Open the encrypted channel when the Server can, and fall back to the
+    /// old cleartext path when it cannot. Only ever the endpoint the user
+    /// configured, and only until this profile has seen this Server prove it
+    /// speaks the channel — after that the profile is pinned to secure.
+    SecurePreferred,
+    /// No pre-shared credential exists to key a handshake with, so there is
+    /// nothing to prove and nothing at stake: raw URLs, `FLEETY_AGENT_URL`,
+    /// same-host loopback trust, and profiles that have never been paired.
+    Cleartext,
+}
+
+impl Resolved {
+    /// The address a person chose for this profile, if roaming has since moved
+    /// the working endpoint elsewhere. Pairing must use this one.
+    pub fn configured_url(&self) -> &str {
+        let owner = self.owner.as_ref().or(self.diagnostic_owner.as_ref());
+        match owner {
+            // Falling back to `self.url` would compare a candidate with itself,
+            // which is always true and protects nothing.
+            Some(owner) => owner
+                .profile
+                .configured_url
+                .as_deref()
+                .unwrap_or(&owner.profile.url),
+            None => &self.url,
+        }
+    }
+
+    /// The saved credential this candidate may key its handshake with.
+    ///
+    /// Only a durable profile's *own* token counts. A caller-supplied
+    /// `FLEETY_TOKEN` is deliberately excluded: it is not necessarily this
+    /// device's paired credential, and letting it key a channel would hand a
+    /// transient target the authority the resolver withheld from it.
+    fn secure_channel_key(&self) -> Option<(&str, &str)> {
+        if !self.sent_saved_profile_token() {
+            return None;
+        }
+        // Read-only diagnostics keep their snapshot here rather than in `owner`,
+        // and they must open the same channel as everything else.
+        let owner = self.owner.as_ref().or(self.diagnostic_owner.as_ref())?;
+        let token = self.token.as_deref().filter(|t| !t.trim().is_empty())?;
+        let fingerprint = owner
+            .profile
+            .fingerprint
+            .as_deref()
+            .filter(|f| !f.trim().is_empty())?;
+        Some((token, fingerprint))
+    }
+
+    /// How this candidate is allowed to connect.
+    pub fn channel_policy(&self) -> ChannelPolicy {
+        let owner = self.owner.as_ref().or(self.diagnostic_owner.as_ref());
+        // The latch is the first question, before whether a key can be derived.
+        // A profile that has seen this Server speak the channel must never be
+        // served in the clear — including when *this* target cannot key the
+        // handshake, which is exactly when something would otherwise be sent
+        // that the latch exists to protect.
+        let latched = owner.is_some_and(|owner| owner.profile.secure);
+        if latched {
+            return ChannelPolicy::SecureRequired;
+        }
+        if self.secure_channel_key().is_none() {
+            // Nothing to prove and nothing to reveal: no saved credential is in
+            // play on this target.
+            return ChannelPolicy::Cleartext;
+        }
+        let Some(owner) = owner else {
+            return ChannelPolicy::Cleartext;
+        };
+        // A candidate whose URL is not the profile's own primary is one Fleety
+        // learned rather than one the user set, so it never gets the fallback.
+        if self.url == owner.profile.url {
+            ChannelPolicy::SecurePreferred
+        } else {
+            ChannelPolicy::SecureRequired
+        }
+    }
+}
+
+/// The alternative list a session would write, given what the profile already
+/// holds and what this session reported.
+///
+/// Retention order decides what survives once the list is full: the endpoint we
+/// roamed away from stays reachable, then the interfaces this authenticated
+/// session actually reported, and only then entries no live session has
+/// confirmed since.
+fn merged_profile_endpoints(
+    previous_primary: &str,
+    saved: &[String],
+    learned: &[String],
+    new_primary: &str,
+) -> Vec<String> {
+    let mut alternatives = Vec::new();
+    for endpoint in std::iter::once(previous_primary.to_string())
+        .chain(learned.iter().cloned())
+        .chain(saved.iter().cloned())
+    {
+        if endpoint != new_primary && !alternatives.contains(&endpoint) {
+            alternatives.push(endpoint);
+        }
+    }
+    alternatives.truncate(MAX_PROFILE_ALTERNATIVE_ENDPOINTS);
+    alternatives
+}
+
+/// How much of `wait` an entire candidate sweep may consume, as a multiple of
+/// one attempt. Large enough to try the endpoints that matter, small enough that
+/// a caller is never left waiting for the full alternative list.
+const MAX_CANDIDATE_SWEEP_MULTIPLE: u32 = 3;
+
+/// How many alternative endpoints a profile keeps beside its primary `url`.
+const MAX_PROFILE_ALTERNATIVE_ENDPOINTS: usize = 15;
+
+fn usable_learned_ip(ip: std::net::IpAddr) -> bool {
+    !ip.is_loopback()
+        && !ip.is_unspecified()
+        && !ip.is_multicast()
+        && !matches!(
+            ip,
+            std::net::IpAddr::V6(v6) if v6.segments()[0] & 0xffc0 == 0xfe80
+        )
+}
+
+/// Saved endpoints this target may attempt.
+///
+/// Entries a Server taught the profile must be IP literals — that is the rule
+/// for what a Server is allowed to teach. The one exception is the head of the
+/// list, which is the primary we roamed away from: the user configured that
+/// address themselves, so it may legitimately be a hostname, and re-applying
+/// the teaching rule to it would leave it saved but never tried again.
+/// A user-configured endpoint stays attemptable as long as it still names the
+/// same service: only the host may differ from the endpoint in hand.
+fn compatible_configured_endpoint(connected_url: &str, candidate: &str) -> Option<String> {
+    if validate_ws_url(candidate).is_err() {
+        return None;
+    }
+    let connected = reqwest::Url::parse(connected_url).ok()?;
+    let parsed = reqwest::Url::parse(candidate).ok()?;
+    if parsed.scheme() != connected.scheme()
+        || parsed.port_or_known_default() != connected.port_or_known_default()
+        || parsed.path() != connected.path()
+        || parsed.query() != connected.query()
+    {
+        return None;
+    }
+    Some(parsed.to_string().trim_end_matches('/').to_string())
+}
+
+/// Validate endpoint candidates received inside an authenticated Welcome.
+/// Candidates may change only the host; scheme, port, path, and query remain
+/// bound to the endpoint that authenticated the Server.
+pub fn normalized_authenticated_endpoints(
+    connected_url: &str,
+    advertised: &[String],
+) -> Vec<String> {
+    let Ok(connected) = reqwest::Url::parse(connected_url) else {
+        return Vec::new();
+    };
+    let mut accepted = Vec::new();
+    for candidate in advertised.iter().take(16) {
+        if validate_ws_url(candidate).is_err() {
+            continue;
+        }
+        let Ok(parsed) = reqwest::Url::parse(candidate) else {
+            continue;
+        };
+        // `host_str` keeps the brackets around an IPv6 literal, and the Server
+        // advertises exactly that form, so strip them before parsing — otherwise
+        // every IPv6 endpoint is silently discarded.
+        let Some(ip) = parsed
+            .host_str()
+            .map(|host| host.trim_start_matches('[').trim_end_matches(']'))
+            .and_then(|host| host.parse::<std::net::IpAddr>().ok())
+        else {
+            continue;
+        };
+        if !usable_learned_ip(ip)
+            || parsed.scheme() != connected.scheme()
+            || parsed.port_or_known_default() != connected.port_or_known_default()
+            || parsed.path() != connected.path()
+            || parsed.query() != connected.query()
+        {
+            continue;
+        }
+        let normalized = parsed.to_string().trim_end_matches('/').to_string();
+        if !accepted.contains(&normalized) {
+            accepted.push(normalized);
+        }
+    }
+    accepted
+}
+
+/// How much of one candidate's budget the open may spend.
+///
+/// The open and the handshake that follows it share a single deadline, so the
+/// open takes half and leaves the rest. Both the client sweep and the daemon's
+/// own candidate loop call this, because the two halves drifting apart is
+/// exactly how an endpoint that had in fact opened ended up blamed for a
+/// timeout it did not cause.
+pub fn open_budget_within(share: std::time::Duration) -> std::time::Duration {
+    share / 2
+}
+
+/// Open one candidate endpoint under its own policy, returning the connection
+/// and whether it is sealed. Nothing that identifies or authenticates this
+/// device is said to a peer that has not earned it.
+///
+/// Public because the daemon cannot use [`connect_first_healthy`]: its session
+/// *is* the long-lived loop, so it drives its own candidate advance. It must
+/// still open every endpoint through exactly this policy.
+pub async fn open_candidate(
+    candidate: &Resolved,
+    wait: std::time::Duration,
+) -> Result<(crate::transport::Connection, bool)> {
+    // The deadline covers the transport connect too, not just the handshake.
+    // A peer that completes the TCP accept and then never finishes the
+    // WebSocket upgrade would otherwise stall here forever, and every endpoint
+    // behind it would never be tried.
+    tokio::time::timeout(wait, open_candidate_inner(candidate, wait))
+        .await
+        .unwrap_or_else(|_| {
+            Err(CoreError::Message(
+                "the endpoint accepted the connection but never finished opening it".to_string(),
+            ))
+        })
+}
+
+async fn open_candidate_inner(
+    candidate: &Resolved,
+    wait: std::time::Duration,
+) -> Result<(crate::transport::Connection, bool)> {
+    let policy = candidate.channel_policy();
+    // `secure_channel_key` is exactly what makes a policy non-cleartext, so
+    // its absence and `Cleartext` are the same case.
+    let Some((token, fingerprint)) = candidate.secure_channel_key() else {
+        if policy == ChannelPolicy::Cleartext {
+            let connection = crate::transport::connect(candidate.url(), candidate.token()).await?;
+            return Ok((connection, false));
+        }
+        // Latched, but this target has no credential to key the channel with.
+        // Which remediation is right depends on why — and pointing someone at a
+        // re-pair when the real cause is an override would clear the latch and
+        // the learned endpoints for nothing.
+        return Err(CoreError::Message(
+            if candidate.sent_caller_explicit_token() {
+                "this profile requires an encrypted channel with its Server, which FLEETY_TOKEN \
+                 cannot open. Unset FLEETY_TOKEN to use the profile's own paired credential"
+                    .to_string()
+            } else {
+                "this profile requires an encrypted channel with its Server, and it has no paired \
+                 credential to open one. Re-pair with `fleety init <ws-url> --name <profile> \
+                 --pairing-code <code>`"
+                    .to_string()
+            },
+        ));
+    };
+    // Half the budget for the handshake, half kept in reserve: a peer that
+    // accepts the socket and then says nothing must not be able to consume the
+    // whole attempt and leave no time for the fallback it is entitled to.
+    let handshake_wait = wait / 2;
+    match crate::transport::connect_secure(candidate.url(), token, fingerprint, handshake_wait)
+        .await?
+    {
+        crate::transport::SecureChannel::Established(connection) => Ok((connection, true)),
+        crate::transport::SecureChannel::Unsupported { detail } => {
+            if policy == ChannelPolicy::SecureRequired {
+                return Err(CoreError::Message(format!(
+                    "this saved endpoint could not prove it is the Server this profile is paired \
+                     with ({detail}) — update the Server, or re-pair with `fleety init`"
+                )));
+            }
+            // The endpoint the user configured, on a profile that has never
+            // seen this Server speak the encrypted channel: the old path is
+            // still how an un-updated Server is reached.
+            let connection = crate::transport::connect(candidate.url(), candidate.token()).await?;
+            Ok((connection, false))
+        }
+    }
+}
+
+/// One candidate endpoint that opened, handed to the caller's handshake.
+pub struct CandidateSession {
+    pub connection: crate::transport::Connection,
+    /// The endpoint that actually opened — not necessarily the profile's
+    /// primary, so callers must carry this forward rather than the target they
+    /// started from.
+    pub target: Resolved,
+    /// Whether this session runs inside the encrypted channel. Persisting it
+    /// is what pins the profile against a later downgrade.
+    pub sealed: bool,
+}
+
+/// Try each of this target's endpoints in turn, and hand the first one that
+/// completes *the caller's whole handshake* back to the caller.
+///
+/// The point is that "connected" is not the bar. A candidate that accepts the
+/// socket and then goes silent, answers as the wrong Server, or refuses
+/// authentication must not consume the attempt — otherwise one dead or hostile
+/// address hides every working one behind it. So `finish` runs inside the loop:
+/// whatever it needs to consider the endpoint good (its own frames, the Server
+/// identity, the owner generation) is part of the same bounded attempt, and a
+/// failure simply moves to the next candidate.
+///
+/// Every attempt is bounded by `wait`, and the caller sees one aggregated error
+/// only after every candidate has failed.
+pub async fn connect_first_healthy<F, Fut, T>(
+    target: &Resolved,
+    wait: std::time::Duration,
+    mut finish: F,
+) -> Result<T>
+where
+    F: FnMut(CandidateSession) -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    // Bound the sweep as well as each attempt. Callers pick `wait` for one
+    // endpoint; without an aggregate cap a profile with a full alternative list
+    // could hold a caller — an editor waiting on an ACP cancel, say — for many
+    // multiples of it.
+    let overall = tokio::time::Instant::now() + wait * MAX_CANDIDATE_SWEEP_MULTIPLE;
+    let mut last_error = None;
+    for candidate in target.connection_attempts() {
+        if tokio::time::Instant::now() >= overall {
+            break;
+        }
+        // One budget for the whole attempt, not one per stage: the promise is
+        // that a single endpoint cannot hold up the ones behind it.
+        let deadline = (tokio::time::Instant::now() + wait).min(overall);
+        let (connection, sealed) = match open_candidate(&candidate, open_budget_within(wait)).await
+        {
+            Ok(opened) => opened,
+            Err(error) => {
+                last_error = Some(error);
+                continue;
+            }
+        };
+        let session = CandidateSession {
+            connection,
+            target: candidate,
+            sealed,
+        };
+        match tokio::time::timeout_at(deadline, finish(session)).await {
+            Ok(Ok(value)) => return Ok(value),
+            Ok(Err(error)) => last_error = Some(error),
+            Err(_) => {
+                last_error = Some(CoreError::Message(
+                    "the Server accepted the connection but never completed the handshake"
+                        .to_string(),
+                ))
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        CoreError::Message("the saved Server profile has no usable endpoint".to_string())
+    }))
+}
+
+/// Commit what an authenticated session taught us about this profile: which
+/// endpoint actually worked, which others this Server advertises, and whether
+/// the session was sealed.
+///
+/// All three land in one mutation on purpose. They are learned together, and
+/// splitting them would leave the caller holding an owner snapshot that the
+/// first write had already invalidated.
+pub fn learn_resolved_profile_endpoints(
+    target: &Resolved,
+    server_fingerprint: &str,
+    advertised: &[String],
+    sealed: bool,
+) -> Result<Resolved> {
+    learn_resolved_profile_endpoints_at(
+        &connections_path(),
+        target,
+        server_fingerprint,
+        advertised,
+        sealed,
+    )
+}
+
+pub fn learn_resolved_profile_endpoints_at(
+    path: &Path,
+    target: &Resolved,
+    server_fingerprint: &str,
+    advertised: &[String],
+    sealed: bool,
+) -> Result<Resolved> {
+    if server_fingerprint.trim().is_empty() {
+        return Err(CoreError::Message(
+            "the Server did not provide a usable identity; learned endpoints were not saved"
+                .to_string(),
+        ));
+    }
+    let learned = if sealed {
+        normalized_authenticated_endpoints(target.url(), advertised)
+    } else {
+        Vec::new()
+    };
+    // Skip the lease and the rewrite when this session taught the profile
+    // nothing. Every connect goes through here, so an unconditional mutation
+    // would make each one contend on the file lock for no reason. The
+    // comparison is against the exact list that would be written, so a session
+    // that only reorders is not silently skipped.
+    if let Some(owner) = target.owner.as_ref() {
+        let would_write = merged_profile_endpoints(
+            &owner.profile.url,
+            &owner.profile.endpoints,
+            &learned,
+            &target.url,
+        );
+        if owner.profile.url == target.url
+            && (owner.profile.secure || !sealed)
+            && owner.profile.endpoints == would_write
+            && owner.profile.fingerprint.as_deref() == Some(server_fingerprint)
+        {
+            return Ok(target.clone());
+        }
+    }
+    mutate_at(path, |conns| {
+        let owner = target.owner.as_ref().ok_or_else(|| {
+            CoreError::Message(
+                "the transient connection has no saved profile owner; learned endpoints were not saved"
+                    .to_string(),
+            )
+        })?;
+        let require_current = owner.require_current;
+        let owner_name = owner.name.clone();
+        let profile = resolved_profile_owner(conns, target, "its authenticated endpoints")?;
+        if profile.fingerprint.as_deref() != Some(server_fingerprint) {
+            return Err(CoreError::Message(
+                "the Server identity does not match the saved profile; learned endpoints were not saved"
+                    .to_string(),
+            ));
+        }
+
+        let alternatives =
+            merged_profile_endpoints(&profile.url, &profile.endpoints, &learned, &target.url);
+        // Remember which address a person chose before roaming moved us.
+        if profile.url != target.url && profile.configured_url.is_none() {
+            profile.configured_url = Some(profile.url.clone());
+        }
+        profile.url = target.url.clone();
+        profile.endpoints = alternatives;
+        // Latching only on success: a Server that proves it speaks the channel
+        // pins the profile to it, and nothing ever clears the pin implicitly.
+        profile.secure = profile.secure || sealed;
+        let profile = profile.clone();
+        Ok(Resolved {
+            url: target.url.clone(),
+            token: target.token.clone(),
+            source: target.source.clone(),
+            owner: Some(ProfileOwnerSnapshot {
+                name: owner_name,
+                profile,
+                require_current,
+            }),
+            diagnostic_owner: None,
+            token_provenance: target.token_provenance,
+            fresh_default_owner: false,
+        })
+    })
 }
 
 /// Apply trust-on-first-use only to the exact saved profile generation captured
@@ -1457,7 +2012,10 @@ where
             Ok((
                 decision,
                 Resolved {
-                    url: profile.url.clone(),
+                    // Preserve the transport that actually authenticated. It
+                    // may be a learned alternative that the caller must
+                    // promote after this credential commit.
+                    url: target.url.clone(),
                     token,
                     source: target.source.clone(),
                     owner: Some(ProfileOwnerSnapshot {
@@ -1567,6 +2125,15 @@ where
             let decision = tofu_pin_decision(profile.fingerprint.as_deref(), fingerprint);
             profile.token = Some(token.to_string());
             profile.fingerprint = Some(fingerprint.to_string());
+            // An explicit re-pair replaces the credential the latch and the
+            // learned addresses were earned with, so they go too. Without this a
+            // Server rebuilt without the encrypted channel leaves the profile
+            // demanding one, and `pair` cannot recover it.
+            profile.secure = false;
+            profile.endpoints.clear();
+            if let Some(configured) = profile.configured_url.take() {
+                profile.url = configured;
+            }
             let profile = profile.clone();
             let committed = Resolved {
                 url: profile.url.clone(),
@@ -1635,6 +2202,9 @@ pub fn reselect_profile_endpoint(profile: &mut Profile, new_url: String) -> bool
     let had_token = profile.token.take().is_some();
     let had_fingerprint = profile.fingerprint.take().is_some();
     profile.url = new_url;
+    profile.endpoints.clear();
+    profile.configured_url = None;
+    profile.secure = false;
     had_token || had_fingerprint
 }
 
@@ -1714,6 +2284,9 @@ mod tests {
             "home".to_string(),
             Profile {
                 url: "ws://192.168.1.20:8787".to_string(),
+                endpoints: vec!["ws://100.64.0.8:8787".to_string()],
+                configured_url: None,
+                secure: true,
                 token: Some("tok-home".to_string()),
                 label: Some("Home".to_string()),
                 fingerprint: Some("AA:BB".to_string()),
@@ -1999,6 +2572,718 @@ mod tests {
         }
     }
 
+    #[test]
+    fn durable_profile_attempts_primary_then_deduplicated_learned_endpoints() {
+        let mut home = profile("ws://192.168.1.20:8787");
+        home.token = Some("home-token".to_string());
+        home.fingerprint = Some("server-a".to_string());
+        home.endpoints = vec![
+            "ws://192.168.1.20:8787".to_string(),
+            "ws://100.64.0.8:8787".to_string(),
+            "ws://100.64.0.8:8787".to_string(),
+            "ws://127.0.0.1:8787".to_string(),
+            "ws://attacker.example:8787".to_string(),
+            "ws://100.64.0.9:9999".to_string(),
+        ];
+        let conns = conns_with(Some("home"), &[("home", home)]);
+        let target = resolve(&conns, &Target::Current, None, None, no_discovery)
+            .expect("resolve durable profile");
+
+        let attempts: Vec<_> = target
+            .connection_attempts()
+            .into_iter()
+            .map(|candidate| candidate.url_owned())
+            .collect();
+
+        assert_eq!(
+            attempts,
+            vec![
+                "ws://192.168.1.20:8787".to_string(),
+                "ws://100.64.0.8:8787".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn authenticated_candidate_is_promoted_only_for_the_pinned_profile() {
+        let path = tmp_path();
+        let mut home = profile("ws://192.168.1.20:8787");
+        home.token = Some("home-token".to_string());
+        home.fingerprint = Some("server-a".to_string());
+        home.endpoints = vec!["ws://100.64.0.8:8787".to_string()];
+        save_at(&path, &conns_with(Some("home"), &[("home", home)])).expect("seed paired profile");
+
+        let stored = load_at(&path).expect("load paired profile");
+        let target = resolve(&stored, &Target::Current, None, None, no_discovery)
+            .expect("resolve paired profile")
+            .connection_attempts()
+            .into_iter()
+            .nth(1)
+            .expect("learned candidate");
+        let committed = learn_resolved_profile_endpoints_at(
+            &path,
+            &target,
+            "server-a",
+            &[
+                "ws://192.168.1.20:8787".to_string(),
+                "ws://100.64.0.8:8787".to_string(),
+                "ws://127.0.0.1:8787".to_string(),
+                "http://invalid:8787".to_string(),
+            ],
+            true,
+        )
+        .expect("promote authenticated candidate");
+
+        assert_eq!(committed.url(), "ws://100.64.0.8:8787");
+        let saved = load_at(&path).expect("load promoted profile");
+        assert_eq!(saved.profiles["home"].url, "ws://100.64.0.8:8787");
+        assert_eq!(
+            saved.profiles["home"].endpoints,
+            vec!["ws://192.168.1.20:8787".to_string()]
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Seed a paired profile whose alternative list is already at the cap, so
+    /// the retention order — not spare capacity — decides what survives.
+    fn paired_profile_at_endpoint_cap(primary: &str, saved_alternatives: &[String]) -> Profile {
+        let mut home = profile(primary);
+        home.token = Some("home-token".to_string());
+        home.fingerprint = Some("server-a".to_string());
+        home.endpoints = saved_alternatives.to_vec();
+        home
+    }
+
+    /// Resolve a paired profile and return its candidates in attempt order.
+    fn paired_candidates(secure_pinned: bool) -> Vec<Resolved> {
+        let mut home = profile("ws://192.168.1.20:8787");
+        home.token = Some("home-token".to_string());
+        home.fingerprint = Some("server-a".to_string());
+        home.endpoints = vec!["ws://100.64.0.8:8787".to_string()];
+        home.secure = secure_pinned;
+        let conns = conns_with(Some("home"), &[("home", home)]);
+        resolve(&conns, &Target::Current, None, None, no_discovery)
+            .expect("resolve paired profile")
+            .connection_attempts()
+    }
+
+    /// The whole downgrade policy in one place: an address Fleety taught itself
+    /// must prove the Server cryptographically, while the address the user
+    /// typed keeps working against a Server that has not been updated — until
+    /// this Server proves once that it can do better.
+    #[test]
+    fn only_the_user_configured_endpoint_may_fall_back_to_cleartext() {
+        let candidates = paired_candidates(false);
+        assert_eq!(
+            candidates[0].channel_policy(),
+            ChannelPolicy::SecurePreferred,
+            "the endpoint the user configured must still reach an un-updated Server"
+        );
+        assert_eq!(
+            candidates[1].channel_policy(),
+            ChannelPolicy::SecureRequired,
+            "an endpoint Fleety learned by itself never gets the cleartext fallback"
+        );
+    }
+
+    /// Roaming exists to reach the same Server at another address. A credential
+    /// that cannot key a handshake cannot prove an address is that Server, so it
+    /// must never be carried to one the user did not choose.
+    #[test]
+    fn a_credential_that_cannot_prove_an_endpoint_never_leaves_the_configured_one() {
+        let mut home = profile("ws://192.168.1.20:8787");
+        home.token = Some("home-token".to_string());
+        home.fingerprint = Some("server-a".to_string());
+        home.endpoints = vec!["ws://100.64.0.8:8787".to_string()];
+        let conns = conns_with(Some("home"), &[("home", home)]);
+
+        // A caller-supplied token is not this profile's own credential.
+        let explicit = resolve(
+            &conns,
+            &Target::Current,
+            None,
+            Some("caller-supplied-token".to_string()),
+            no_discovery,
+        )
+        .expect("resolve with an explicit token");
+        assert_eq!(
+            explicit.connection_attempts().len(),
+            1,
+            "an explicit FLEETY_TOKEN must not be offered to learned endpoints"
+        );
+
+        // A profile pinned but never paired has nothing to key a handshake with.
+        let mut unpaired = profile("ws://192.168.1.20:8787");
+        unpaired.fingerprint = Some("server-a".to_string());
+        unpaired.endpoints = vec!["ws://100.64.0.8:8787".to_string()];
+        let conns = conns_with(Some("home"), &[("home", unpaired)]);
+        let tokenless = resolve(&conns, &Target::Current, None, None, no_discovery)
+            .expect("resolve a token-less profile");
+        assert_eq!(
+            tokenless.connection_attempts().len(),
+            1,
+            "a profile with no token of its own must not roam"
+        );
+    }
+
+    /// The latch is bound to the credential it was earned with. Re-pointing a
+    /// profile drops that credential, so keeping the latch would leave the
+    /// profile unable to connect to whatever it is re-paired against.
+    #[test]
+    fn reselecting_an_endpoint_also_drops_the_secure_latch() {
+        let mut profile = profile("ws://old:8787");
+        profile.token = Some("token".to_string());
+        profile.fingerprint = Some("pin".to_string());
+        profile.secure = true;
+
+        assert!(reselect_profile_endpoint(
+            &mut profile,
+            "ws://new:8787".to_string()
+        ));
+        assert!(
+            !profile.secure,
+            "a profile re-pointed at another Server must not demand a channel that Server may not speak"
+        );
+    }
+
+    /// A cleartext session can only ever be as trustworthy as the fingerprint it
+    /// presented — and that fingerprint is public. Letting such a session seed
+    /// the endpoint list would turn one accepted downgrade into a permanent
+    /// takeover, because the attacker's addresses would then be tried forever.
+    /// The latch is one line and both directions of getting it wrong are silent,
+    /// so each case here moves the primary — otherwise the commit takes its
+    /// The latch is one line and both directions of getting it wrong are silent,
+    /// so each case here commits a candidate that is not the current primary —
+    /// otherwise the commit takes its "nothing changed" early return and the
+    /// line under test never runs.
+    #[test]
+    fn the_secure_latch_is_set_only_by_a_sealed_session_and_never_cleared() {
+        let path = tmp_path();
+        let roaming_candidate = |secure: bool| {
+            let mut home = profile("ws://192.168.1.20:8787");
+            home.token = Some("home-token".to_string());
+            home.fingerprint = Some("server-a".to_string());
+            home.endpoints = vec!["ws://100.64.0.8:8787".to_string()];
+            home.secure = secure;
+            save_at(&path, &conns_with(Some("home"), &[("home", home)])).expect("seed profile");
+            let stored = load_at(&path).expect("load profile");
+            resolve(&stored, &Target::Current, None, None, no_discovery)
+                .expect("resolve profile")
+                .connection_attempts()
+                .into_iter()
+                .nth(1)
+                .expect("learned candidate")
+        };
+
+        let unsealed = roaming_candidate(false);
+        learn_resolved_profile_endpoints_at(&path, &unsealed, "server-a", &[], false)
+            .expect("commit an unsealed session");
+        let saved = load_at(&path).expect("reload");
+        assert_eq!(
+            saved.profiles["home"].url, "ws://100.64.0.8:8787",
+            "the commit must have taken the write path"
+        );
+        assert!(
+            !saved.profiles["home"].secure,
+            "an unsealed session must never set the latch"
+        );
+
+        let sealed = roaming_candidate(false);
+        learn_resolved_profile_endpoints_at(&path, &sealed, "server-a", &[], true)
+            .expect("commit a sealed session");
+        assert!(
+            load_at(&path).expect("reload").profiles["home"].secure,
+            "a sealed session must set the latch"
+        );
+
+        let latched = roaming_candidate(true);
+        learn_resolved_profile_endpoints_at(&path, &latched, "server-a", &[], false)
+            .expect("commit an unsealed session on a latched profile");
+        assert!(
+            load_at(&path).expect("reload").profiles["home"].secure,
+            "nothing clears the latch implicitly"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Pairing sends a credential no handshake protects, so the whole chain has
+    /// to hold: the address it targets, and the address the profile is left on
+    /// afterwards. Leaving the profile on a roamed address would let a
+    /// Server-taught endpoint inherit the cleartext fallback reserved for one a
+    /// person chose.
+    #[test]
+    fn pairing_targets_and_returns_to_the_address_the_user_configured() {
+        let path = tmp_path();
+        let mut home = profile("ws://100.64.0.8:8787");
+        home.token = Some("old-token".to_string());
+        home.fingerprint = Some("server-a".to_string());
+        home.endpoints = vec!["ws://192.168.1.20:8787".to_string()];
+        home.configured_url = Some("ws://home.lan:8787".to_string());
+        home.secure = true;
+        save_at(&path, &conns_with(Some("home"), &[("home", home)])).expect("seed roamed profile");
+
+        let stored = load_at(&path).expect("load roamed profile");
+        let target = resolve(&stored, &Target::Current, None, None, no_discovery)
+            .expect("resolve roamed profile");
+        assert_eq!(
+            target.configured_url(),
+            "ws://home.lan:8787",
+            "pairing must target the address a person chose, not the roamed one"
+        );
+
+        store_resolved_profile_pairing_at(&path, &target, "new-token", "server-b")
+            .expect("commit pairing");
+
+        let saved = load_at(&path).expect("reload after pairing");
+        let home = &saved.profiles["home"];
+        assert_eq!(
+            home.url, "ws://home.lan:8787",
+            "the profile must return to the address the pairing happened at"
+        );
+        assert_eq!(home.configured_url, None);
+        assert!(home.endpoints.is_empty());
+        assert!(
+            !home.secure,
+            "the latch belonged to the credential this pairing replaced"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn an_unsealed_session_cannot_teach_a_profile_new_endpoints() {
+        let path = tmp_path();
+        let mut home = profile("ws://192.168.1.20:8787");
+        home.token = Some("home-token".to_string());
+        home.fingerprint = Some("server-a".to_string());
+        save_at(&path, &conns_with(Some("home"), &[("home", home)])).expect("seed paired profile");
+
+        let stored = load_at(&path).expect("load paired profile");
+        let target = resolve(&stored, &Target::Current, None, None, no_discovery)
+            .expect("resolve paired profile");
+        learn_resolved_profile_endpoints_at(
+            &path,
+            &target,
+            "server-a",
+            &["ws://203.0.113.9:8787".to_string()],
+            false,
+        )
+        .expect("an unsealed session still completes");
+
+        let saved = load_at(&path).expect("reload");
+        assert!(
+            saved.profiles["home"].endpoints.is_empty(),
+            "an unsealed session must not add addresses: {:?}",
+            saved.profiles["home"].endpoints
+        );
+        assert!(!saved.profiles["home"].secure);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Roaming rewrites the primary, so `url` stops meaning "what the user
+    /// chose". Pairing sends a credential with no handshake behind it, so it
+    /// must keep going to the chosen address.
+    #[test]
+    fn promotion_remembers_the_address_the_user_configured() {
+        let path = tmp_path();
+        let mut home = profile("ws://192.168.1.20:8787");
+        home.token = Some("home-token".to_string());
+        home.fingerprint = Some("server-a".to_string());
+        home.endpoints = vec!["ws://100.64.0.8:8787".to_string()];
+        save_at(&path, &conns_with(Some("home"), &[("home", home)])).expect("seed paired profile");
+
+        let stored = load_at(&path).expect("load paired profile");
+        let candidate = resolve(&stored, &Target::Current, None, None, no_discovery)
+            .expect("resolve paired profile")
+            .connection_attempts()
+            .into_iter()
+            .nth(1)
+            .expect("learned candidate");
+        let committed =
+            learn_resolved_profile_endpoints_at(&path, &candidate, "server-a", &[], true)
+                .expect("promote the candidate");
+
+        assert_eq!(committed.url(), "ws://100.64.0.8:8787");
+        assert_eq!(
+            committed.configured_url(),
+            "ws://192.168.1.20:8787",
+            "pairing must still target the address a person chose"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_profile_that_has_seen_a_secure_server_never_downgrades_again() {
+        for candidate in paired_candidates(true) {
+            assert_eq!(
+                candidate.channel_policy(),
+                ChannelPolicy::SecureRequired,
+                "once pinned, jamming the handshake must not win a downgrade"
+            );
+        }
+    }
+
+    /// The latch has to be decided before asking whether a key can be derived.
+    /// Otherwise every target that *cannot* key the handshake — a read-only
+    /// probe, a caller-supplied token, a profile whose token was cleared — falls
+    /// back to cleartext and sends whatever credential it does hold, which is
+    /// precisely what the latch exists to prevent.
+    #[test]
+    fn a_latched_profile_refuses_cleartext_even_when_it_cannot_key_the_handshake() {
+        let mut home = profile("ws://192.168.1.20:8787");
+        home.token = Some("home-token".to_string());
+        home.fingerprint = Some("server-a".to_string());
+        home.secure = true;
+        let conns = conns_with(Some("home"), &[("home", home)]);
+
+        // A read-only diagnostic target keeps its snapshot as a diagnostic owner.
+        let probe = resolve(&conns, &Target::Current, None, None, no_discovery)
+            .expect("resolve for a read-only probe")
+            .into_read_only();
+        assert_eq!(
+            probe.channel_policy(),
+            ChannelPolicy::SecureRequired,
+            "diagnostics must not be the one surface that connects in the clear"
+        );
+
+        // A caller-supplied token cannot key this profile's channel.
+        let explicit = resolve(
+            &conns,
+            &Target::Current,
+            None,
+            Some("caller-supplied-token".to_string()),
+            no_discovery,
+        )
+        .expect("resolve with an explicit token");
+        assert_eq!(explicit.channel_policy(), ChannelPolicy::SecureRequired);
+
+        // A profile whose token was cleared still has the latch.
+        let mut cleared = profile("ws://192.168.1.20:8787");
+        cleared.fingerprint = Some("server-a".to_string());
+        cleared.secure = true;
+        let conns = conns_with(Some("home"), &[("home", cleared)]);
+        let unpaired = resolve(&conns, &Target::Current, None, None, no_discovery)
+            .expect("resolve a cleared profile");
+        assert_eq!(unpaired.channel_policy(), ChannelPolicy::SecureRequired);
+    }
+
+    /// Every attempt must be the string the profile stores, not a URL-normalised
+    /// rewrite: the owner-generation checks compare these strings, so a rewrite
+    /// authenticates and is then refused by our own commit path — and a hostname
+    /// past the head of the list was being dropped outright.
+    #[test]
+    fn every_saved_endpoint_is_attempted_exactly_as_stored() {
+        let mut home = profile("ws://100.64.0.8:8787");
+        home.token = Some("home-token".to_string());
+        home.fingerprint = Some("server-a".to_string());
+        home.endpoints = vec![
+            "ws://192.168.1.20:8787".to_string(),
+            // A Server may not teach a hostname, so these are ignored here.
+            "ws://elsewhere.lan:8787".to_string(),
+            "wss://home.lan:8787".to_string(),
+        ];
+        home.configured_url = Some("ws://home.lan:8787/".to_string());
+        let conns = conns_with(Some("home"), &[("home", home)]);
+
+        let attempts: Vec<_> = resolve(&conns, &Target::Current, None, None, no_discovery)
+            .expect("resolve paired profile")
+            .connection_attempts()
+            .into_iter()
+            .map(|candidate| candidate.url_owned())
+            .collect();
+
+        assert_eq!(
+            attempts,
+            vec![
+                "ws://100.64.0.8:8787".to_string(),
+                // The address a person vouched for comes before the ones a
+                // Server nominated, and keeps its trailing slash however many
+                // roams ago it was configured.
+                "ws://home.lan:8787/".to_string(),
+                "ws://192.168.1.20:8787".to_string(),
+            ],
+            "Server-taught entries stay IP-literal; the configured address is attempted as stored"
+        );
+    }
+
+    /// Spawn a peer that accepts the socket, reads the handshake offer, and
+    /// drops the link — an older Server, and also what an impostor does.
+    async fn handshake_dropping_peer() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    if let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await {
+                        use futures::StreamExt;
+                        let _ = ws.next().await;
+                    }
+                });
+            }
+        });
+        format!("ws://{addr}")
+    }
+
+    /// Returning the right policy is only half of it — this proves the code that
+    /// opens a candidate actually acts on it. Removing the `SecureRequired`
+    /// check makes the first half of this test pass a token to a peer that
+    /// proved nothing.
+    #[tokio::test]
+    async fn open_candidate_refuses_the_cleartext_fallback_only_where_the_policy_allows_it() {
+        let url = handshake_dropping_peer().await;
+        let mut home = profile(&url);
+        home.token = Some("home-token".to_string());
+        home.fingerprint = Some("server-a".to_string());
+        home.secure = true;
+        let conns = conns_with(Some("home"), &[("home", home)]);
+        let latched = resolve(&conns, &Target::Current, None, None, no_discovery)
+            .expect("resolve latched profile");
+        assert_eq!(latched.channel_policy(), ChannelPolicy::SecureRequired);
+        assert!(
+            open_candidate(&latched, std::time::Duration::from_secs(2))
+                .await
+                .is_err(),
+            "a required channel must not fall back to cleartext"
+        );
+
+        // The same peer, on a profile that has never seen the channel work: the
+        // configured endpoint is still allowed the old path.
+        let mut home = profile(&url);
+        home.token = Some("home-token".to_string());
+        home.fingerprint = Some("server-a".to_string());
+        let conns = conns_with(Some("home"), &[("home", home)]);
+        let preferred = resolve(&conns, &Target::Current, None, None, no_discovery)
+            .expect("resolve unlatched profile");
+        assert_eq!(preferred.channel_policy(), ChannelPolicy::SecurePreferred);
+        let (_, sealed) = open_candidate(&preferred, std::time::Duration::from_secs(2))
+            .await
+            .expect("the configured endpoint may still connect in the clear");
+        assert!(!sealed, "that fallback session is not sealed");
+    }
+
+    /// The open and the caller's handshake share one deadline, so the open must
+    /// leave the handshake something to spend. A peer that accepts the socket
+    /// and never completes the WebSocket upgrade is the clean case: with the
+    /// budget split it costs half the attempt, without it the whole one, and the
+    /// caller's handshake never gets to run at all.
+    #[tokio::test]
+    async fn opening_a_candidate_leaves_the_caller_half_of_its_budget() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let stalled = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        let target = Resolved::unowned(format!("ws://{addr}"), None, Source::OverrideUrl);
+        let wait = std::time::Duration::from_millis(800);
+
+        let started = tokio::time::Instant::now();
+        let outcome =
+            connect_first_healthy(
+                &target,
+                wait,
+                |_session| async move { Ok::<(), CoreError>(()) },
+            )
+            .await;
+        let elapsed = started.elapsed();
+        stalled.abort();
+
+        assert!(outcome.is_err(), "a stalled upgrade cannot open");
+        assert!(
+            elapsed < wait,
+            "the open must not spend the budget the handshake needs; took {elapsed:?} of {wait:?}"
+        );
+    }
+
+    #[test]
+    fn a_target_with_no_paired_credential_has_nothing_to_prove() {
+        let conns = conns_with(None, &[]);
+        let raw = resolve(
+            &conns,
+            &Target::Url("ws://198.51.100.7:8787".to_string()),
+            None,
+            None,
+            no_discovery,
+        )
+        .expect("resolve raw url");
+        assert_eq!(raw.channel_policy(), ChannelPolicy::Cleartext);
+
+        // Paired URL but never pinned to a Server identity: there is no
+        // identity to bind a key to, so there is no channel to open.
+        let mut home = profile("ws://192.168.1.20:8787");
+        home.token = Some("home-token".to_string());
+        let conns = conns_with(Some("home"), &[("home", home)]);
+        let unpinned = resolve(&conns, &Target::Current, None, None, no_discovery)
+            .expect("resolve unpinned profile");
+        assert_eq!(unpinned.channel_policy(), ChannelPolicy::Cleartext);
+    }
+
+    /// The pin is a latch: a sealed session sets it, an unsealed one never
+    /// clears it, and it rides the same mutation that commits the endpoints so
+    /// no caller is left holding a snapshot the write already invalidated.
+    #[test]
+    fn a_sealed_session_pins_the_profile_and_an_unsealed_one_cannot_unpin_it() {
+        let path = tmp_path();
+        let mut home = profile("ws://192.168.1.20:8787");
+        home.token = Some("home-token".to_string());
+        home.fingerprint = Some("server-a".to_string());
+        save_at(&path, &conns_with(Some("home"), &[("home", home)])).expect("seed paired profile");
+
+        let stored = load_at(&path).expect("load paired profile");
+        let target = resolve(&stored, &Target::Current, None, None, no_discovery)
+            .expect("resolve paired profile");
+        assert!(!target.owner.as_ref().expect("owner").profile.secure);
+
+        let committed = learn_resolved_profile_endpoints_at(&path, &target, "server-a", &[], true)
+            .expect("commit a sealed session");
+        assert!(
+            load_at(&path).expect("reload").profiles["home"].secure,
+            "a sealed session pins the profile"
+        );
+        assert!(
+            committed
+                .owner
+                .as_ref()
+                .expect("refreshed owner")
+                .profile
+                .secure,
+            "the caller gets back a snapshot that already reflects the pin"
+        );
+
+        // A later session that could not seal must not undo the pin.
+        learn_resolved_profile_endpoints_at(&path, &committed, "server-a", &[], false)
+            .expect("commit an unsealed session");
+        assert!(
+            load_at(&path).expect("reload").profiles["home"].secure,
+            "nothing clears the pin implicitly"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn authenticated_session_endpoints_outrank_stale_entries_at_the_cap() {
+        let path = tmp_path();
+        let stale: Vec<_> = (1..=15)
+            .map(|n| format!("ws://198.51.100.{n}:8787"))
+            .collect();
+        let home = paired_profile_at_endpoint_cap("ws://192.168.1.20:8787", &stale);
+        save_at(&path, &conns_with(Some("home"), &[("home", home)])).expect("seed paired profile");
+
+        let stored = load_at(&path).expect("load paired profile");
+        let target = resolve(&stored, &Target::Current, None, None, no_discovery)
+            .expect("resolve paired profile");
+        // This session re-advertises the connected interface plus one interface
+        // that appeared after the saved list filled up.
+        learn_resolved_profile_endpoints_at(
+            &path,
+            &target,
+            "server-a",
+            &[
+                "ws://192.168.1.20:8787".to_string(),
+                "ws://10.9.9.9:8787".to_string(),
+            ],
+            true,
+        )
+        .expect("learn endpoints from the authenticated session");
+
+        let saved = load_at(&path).expect("load profile after learning");
+        let endpoints = &saved.profiles["home"].endpoints;
+        assert_eq!(saved.profiles["home"].url, "ws://192.168.1.20:8787");
+        assert_eq!(
+            endpoints.first().map(String::as_str),
+            Some("ws://10.9.9.9:8787"),
+            "an interface reported by this authenticated session must displace a stale entry"
+        );
+        assert_eq!(endpoints.len(), 15, "the alternative cap still holds");
+        assert!(
+            !endpoints.contains(&"ws://198.51.100.15:8787".to_string()),
+            "the oldest stale entry is the one evicted"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn promotion_keeps_the_previous_primary_even_when_alternatives_are_full() {
+        let path = tmp_path();
+        let mut saved_alternatives = vec!["ws://100.64.0.8:8787".to_string()];
+        saved_alternatives.extend((1..=14).map(|n| format!("ws://198.51.100.{n}:8787")));
+        let home = paired_profile_at_endpoint_cap("ws://192.168.1.20:8787", &saved_alternatives);
+        save_at(&path, &conns_with(Some("home"), &[("home", home)])).expect("seed paired profile");
+
+        let stored = load_at(&path).expect("load paired profile");
+        let candidate = resolve(&stored, &Target::Current, None, None, no_discovery)
+            .expect("resolve paired profile")
+            .connection_attempts()
+            .into_iter()
+            .nth(1)
+            .expect("learned candidate");
+        // The LAN interface is gone; the Server now reports a full set of
+        // interfaces that does not include the previous primary.
+        let advertised: Vec<_> = (1..=15)
+            .map(|n| format!("ws://203.0.113.{n}:8787"))
+            .collect();
+        learn_resolved_profile_endpoints_at(&path, &candidate, "server-a", &advertised, true)
+            .expect("promote the authenticated candidate");
+
+        let saved = load_at(&path).expect("load profile after promotion");
+        let endpoints = &saved.profiles["home"].endpoints;
+        assert_eq!(saved.profiles["home"].url, "ws://100.64.0.8:8787");
+        assert_eq!(
+            endpoints.first().map(String::as_str),
+            Some("ws://192.168.1.20:8787"),
+            "the endpoint we roamed away from stays reachable as a fallback"
+        );
+        assert!(
+            endpoints.contains(&"ws://203.0.113.1:8787".to_string()),
+            "interfaces reported by this authenticated session must be retained"
+        );
+        assert!(
+            !endpoints.contains(&"ws://198.51.100.14:8787".to_string()),
+            "stale entries yield to this session's endpoints"
+        );
+        assert_eq!(endpoints.len(), 15, "the alternative cap still holds");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mismatched_identity_cannot_promote_or_mutate_a_learned_endpoint() {
+        let path = tmp_path();
+        let mut home = profile("ws://192.168.1.20:8787");
+        home.token = Some("home-token".to_string());
+        home.fingerprint = Some("server-a".to_string());
+        home.endpoints = vec!["ws://100.64.0.8:8787".to_string()];
+        save_at(&path, &conns_with(Some("home"), &[("home", home)])).expect("seed paired profile");
+        let before = std::fs::read(&path).expect("read paired profile");
+
+        let stored = load_at(&path).expect("load paired profile");
+        let candidate = resolve(&stored, &Target::Current, None, None, no_discovery)
+            .expect("resolve paired profile")
+            .connection_attempts()
+            .into_iter()
+            .nth(1)
+            .expect("learned candidate");
+        let error = learn_resolved_profile_endpoints_at(
+            &path,
+            &candidate,
+            "server-b",
+            &["ws://100.64.0.9:8787".to_string()],
+            false,
+        )
+        .expect_err("mismatched identity must be rejected");
+
+        assert!(error.to_string().contains("identity does not match"));
+        assert_eq!(
+            std::fs::read(&path).expect("read profile after rejection"),
+            before
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
     /// A discovery stub that must never run — it panics if the resolver queries it.
     fn no_discovery() -> Option<ResolutionCandidate> {
         panic!("discovery must not be queried on this path");
@@ -2200,7 +3485,7 @@ mod tests {
                 no_discovery,
             )
             .expect_err("named URL must use the shared endpoint validator");
-            assert!(named.report().message.contains("server url"));
+            assert!(named.report().message.contains("profile URL"));
 
             let raw = resolve(
                 &conns,
@@ -2210,7 +3495,7 @@ mod tests {
                 no_discovery,
             )
             .expect_err("raw URL must use the shared endpoint validator");
-            assert!(raw.report().message.contains("server url"));
+            assert!(raw.report().message.contains("profile URL"));
 
             let env = resolve(
                 &conns,
@@ -2220,7 +3505,7 @@ mod tests {
                 no_discovery,
             )
             .expect_err("env URL must use the shared endpoint validator");
-            assert!(env.report().message.contains("server url"));
+            assert!(env.report().message.contains("profile URL"));
         }
     }
 

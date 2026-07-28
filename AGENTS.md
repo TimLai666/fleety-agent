@@ -90,6 +90,63 @@ no Fleety crate). This file holds things that aren't derivable from the code.
 
 ## Follow-ups
 
+### [2026-07-28] — Reconnect journal: a crash between the drift receipt and the reap bricks startup
+
+- **Where:** `crates/fleety-daemon/src/main.rs` — `reject_frozen_authenticated_reconnect`
+  writes the receipt and then reaps the journal as two steps; on restart
+  `recover_reconnect_for_instance_at` builds its own differently-worded failure
+  and `preserve_reconnect_receipt_at` rejects it as conflicting.
+- **What:** a crash between those two steps leaves a failure receipt and an
+  unproven accepted journal for the same nonce. Every subsequent start then
+  fails `ControlGuard::claim` and exits non-zero — deterministically, with no
+  way out but deleting files by hand. The existing test passes only because it
+  seeds a receipt carrying the identical message the retry then constructs, so
+  the cross-path mismatch is never exercised. `design.md` already states the
+  intended rule ("cleanup retry treats that receipt as authoritative and never
+  recreates a terminal-only journal"); it is not implemented on this path.
+- **Suggestion:** treat any existing terminal receipt for that nonce as
+  authoritative during recovery — reap the journal and return — instead of
+  constructing a second failure to publish.
+- **Status:** pending. Pre-dates 5.65 (the machinery is 5.60–5.63); found by an
+  isolated durability audit during 5.65 review, together with a torn-append
+  rollback that can truncate the journal to zero when `metadata()` fails, a
+  Windows rollback that cannot work because the handle is append-only, an
+  unbounded quarantine retry held under the `connections.toml` lease, and a
+  settle-failure loop that stops the daemon serving at all. Worth taking as one
+  follow-up change rather than piecemeal.
+
+### [2026-07-28] — An older binary silently drops a profile's secure-channel state
+
+- **Where:** `crates/fleety-tools/src/connection.rs` (`Profile`), `connections.toml`
+- **What:** `endpoints`, `configured_url`, and `secure` are all
+  `#[serde(default, skip_serializing_if = …)]` and `Connections` carries no
+  schema version. A pre-5.65 `fleety` or `fleetyd` reads the file, ignores those
+  fields, and drops them on the next write — any write, including `connection
+  use` or a TOFU pin. The profile then forgets that its Server proved it can
+  open the encrypted channel and accepts the cleartext path again, with no
+  warning. No attacker is needed: a rollback, a stale binary on `PATH`, or a CLI
+  and daemon on different versions is enough.
+- **Suggestion:** version `Connections` so a newer binary can tell that
+  something downgraded the file, and decide explicitly whether to refuse the
+  write or re-derive the latch. Note that a version field alone does not stop
+  the loss — an old binary drops that too — so the value is detection, not
+  prevention.
+- **Status:** pending
+
+### [2026-07-28] — Reconnect budget is tight for cross-network roaming
+
+- **Where:** `crates/fleety-daemon/src/main.rs` (`RECONNECT_SWEEP_BUDGET`,
+  `RECONNECT_HANDSHAKE_WAIT`, `RECONNECT_ACK_WAIT`)
+- **What:** an owner-requested reconnect must settle inside the caller's 5 s
+  wait, so the whole candidate sweep gets 4.5 s: 3 s for the configured endpoint
+  and the remainder split across alternatives. Roaming's main scenario is
+  leaving a LAN for an overlay, where RTT is far higher than the LAN the numbers
+  were tuned on, so a legitimate alternative can time out. The ordinary
+  (non-reconnect) path uses `CONNECT_ENDPOINT_WAIT` (15 s) and is unaffected.
+- **Suggestion:** widen the sweep and the caller's wait together, or let the
+  caller carry its own budget in the request so the two cannot drift.
+- **Status:** pending
+
 ### [2026-07-27] — `server_smoke` command tests fail on a spawn deadline, and say the wrong thing
 
 - **Where:** `crates/fleety-server/tests/server_smoke.rs`

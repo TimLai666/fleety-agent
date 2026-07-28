@@ -349,21 +349,55 @@ mDNS disabled, no TTY, or nothing found, it falls back to the explicit
 `fleety` CLI alongside `fleety-server`, so a server host can drive its own
 server this way out of the box.
 
-**Server identity + explicit endpoint recovery.** Each server mints a persistent identity
+**Server identity + authenticated endpoint recovery.** Each server mints a persistent identity
 fingerprint on first start (stored at `<agent home>/server-id`, stable across
 restarts and address changes) and advertises it in the mDNS TXT record (`fp`)
 and in `Welcome`. A device pins it when pairing and back-fills it on the next
 authenticated connection when the saved profile still has a URL. A legacy
 token-only, URL-less profile has neither an endpoint nor a pin to prove which
 LAN advertiser owns the token, so the token is withheld and that profile must be
-paired again instead of trusting an mDNS response. If a saved URL stops answering,
-Fleety keeps the profile unchanged and directs the user to explicitly select the
-intended endpoint and re-pair. Changing a URL through `connection set-url` or
-Settings clears the old token and fingerprint before the next connection.
+paired again instead of trusting an mDNS response. During an authenticated
+session, the Server reports compatible IP endpoints from its active interfaces.
+The paired profile saves those endpoints under its pinned identity, tries the
+last successful endpoint first, and promotes a successful alternative without
+using mDNS. This also covers a user-managed VPN or overlay address such as
+Tailscale when that interface was active during an earlier authenticated
+session; Fleety contains no Tailscale-specific integration. An address that was
+never reported still needs explicit selection and pairing. Changing a URL
+through `connection set-url` or Settings clears the old token, fingerprint, and
+learned endpoints before the next connection.
 The TXT fingerprint may help order or label discovery results, but it is public,
 unsigned metadata and never authorizes sending a stored token or changing a
-credentialed profile. Transparent address healing requires TLS or public-key
-identity proof.
+credentialed profile.
+
+`FLEETY_MDNS_HOST_IP` bounds more than the mDNS record: on a wildcard bind
+(`0.0.0.0`) it is also the only address an authenticated `Welcome` will
+advertise, so an operator who pins it keeps every other interface — VPN and
+container bridges included — out of what clients learn. An unparsable value
+advertises nothing rather than falling back to enumerating interfaces. When the
+Server binds one explicit address instead of the wildcard, that address is
+already the only one advertised and the pin changes nothing.
+
+**Encrypted control channel.** A paired profile opens its connection with a Noise
+`NNpsk0` handshake whose pre-shared key is derived from the per-device token and
+bound to the pinned Server identity. The token is never transmitted; completing
+the handshake is itself the proof that the peer holds it, which is what a public
+fingerprint compared after the fact could never establish. Every later frame —
+`Welcome`, the endpoint list, configuration values, provider keys, OAuth
+credentials, tool traffic — is encrypted and integrity-protected, so a host on
+the path can neither read a frame nor insert one. An endpoint Fleety learned by
+itself must always complete the handshake. The endpoint the user configured may
+still connect in the clear while its profile has never seen this Server complete
+one; the first success records support on the profile and the cleartext path is
+refused from then on, so jamming the handshake cannot win a downgrade. Pairing
+and same-host loopback trust have no pre-shared token and are unchanged.
+
+The channel needs a WebSocket. The SSE+POST fallback authenticates its downstream
+with the very bearer this handshake exists to withhold, so it cannot carry a
+sealed session: `FLEETY_FORCE_SSE=1`, or a middlebox that blocks the upgrade,
+leaves a paired profile on the cleartext path — and once that profile has
+recorded secure-channel support it will refuse that path and report the endpoint
+as unreachable. Keep the WebSocket upgrade available for paired profiles.
 
 | Var | Default | Meaning |
 |---|---|---|
@@ -417,6 +451,16 @@ profile receives one before it can become a durable connection owner; transient
 raw/environment commands do not rewrite unrelated legacy records. Deleting and
 recreating an otherwise identical profile gets a new generation so an in-flight
 pairing or identity reply cannot write into the replacement.
+Paired profiles may also carry a bounded list of Server-reported IP endpoints.
+The CLI and daemon try the last successful URL first, then those alternatives in
+stable order. A candidate is saved only after an authenticated connection to the
+pinned Server, and it must preserve the original scheme, port, path, and query.
+The successful candidate becomes primary while the previous primary remains an
+alternative. Each candidate gets one bounded attempt covering the connect,
+handshake, `Hello`, authenticated `Welcome`, and identity check together, so an
+endpoint that opens a socket and then stalls cannot hide the working ones behind
+it; a rejection seen before the Server proves itself fails only that candidate
+and never clears the saved token.
 When discovery is needed, clients may collect the full probe window for display
 and ordering. Every automatic mDNS result remains unowned and cannot become an
 operational session, receive a token or pairing code, persist a `Welcome` token,

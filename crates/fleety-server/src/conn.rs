@@ -471,8 +471,8 @@ pub async fn handle_conn(
 /// fallback both call this; only `inbound`/`writer` differ.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_connection(
-    mut inbound: Box<dyn ClientInbound>,
-    mut writer: Box<dyn FrameWriter>,
+    inbound: Box<dyn ClientInbound>,
+    writer: Box<dyn FrameWriter>,
     storage: Arc<Storage>,
     provider: Arc<dyn ModelProvider>,
     workspace: Arc<PathBuf>,
@@ -484,6 +484,12 @@ pub(crate) async fn run_connection(
     device_tools: DeviceTools,
     peer_is_loopback: bool,
 ) -> Result<()> {
+    // Before anything is said: if the client offers the secure channel, answer
+    // it here so every frame below — Hello and its token included — travels
+    // sealed. A client that does not offer one keeps the cleartext path.
+    let (mut inbound, mut writer, sealed_session) =
+        negotiate_secure_channel(inbound, writer, &auth).await?;
+
     // The first frame must be Hello; enforce auth if the server requires it.
     let (device_id, minted_token, loopback_trusted, daemon_capable, connection_tools) =
         match inbound.next_client().await? {
@@ -630,6 +636,7 @@ pub(crate) async fn run_connection(
         &device_id,
         loopback_trusted,
         &connection_tools,
+        sealed_session,
     )
     .await;
 
@@ -667,6 +674,7 @@ async fn serve(
     device_id: &str,
     loopback_trusted: bool,
     connection_tools: &[agent_core::ToolSpec],
+    sealed_session: bool,
 ) -> Result<()> {
     let session_id = uuid::Uuid::new_v4().to_string();
     let default_conversation = uuid::Uuid::new_v4().to_string();
@@ -683,6 +691,14 @@ async fn serve(
             server_fingerprint: {
                 let fp = crate::server_fingerprint();
                 (!fp.is_empty()).then(|| fp.to_string())
+            },
+            // Only a sealed session may act on these, so an unsealed one has
+            // nothing to gain from them — and this Server's interface list is
+            // not something to hand an unauthenticated peer.
+            server_endpoints: if sealed_session {
+                crate::authenticated_server_endpoints()
+            } else {
+                Vec::new()
             },
             loopback_trusted,
             token: minted_token,
@@ -737,6 +753,16 @@ async fn serve(
 
     while let Some(msg) = inbound.next_client().await? {
         match msg {
+            // Channel-setup frames belong to the handshake, which has already
+            // run by the time the service loop sees anything. On a secure
+            // channel these are stripped by the inbound wrapper, so reaching
+            // here means the client is either re-offering a handshake or trying
+            // to seal on a cleartext link. Refuse rather than reinterpret.
+            ClientMsg::SecureHandshake { .. } | ClientMsg::SecureFrame { .. } => {
+                return Err(CoreError::Provider(
+                    "client sent a secure-channel frame outside the handshake".to_string(),
+                ))
+            }
             ClientMsg::UserMessage {
                 conversation_id,
                 text,
@@ -1821,10 +1847,10 @@ fn credential_gate(
         return Some(fleety_protocol::WireError {
             kind: "invalid".to_string(),
             message: "this server stores Codex credentials per provider — update fleety and \
-                      sign in per provider with `fleety auth login <provider>`"
+                      sign in per provider with `fleety provider login <provider>`"
                 .to_string(),
             remediation: Some(
-                "update the fleety CLI, then run `fleety auth login <provider>`".to_string(),
+                "update the fleety CLI, then run `fleety provider login <provider>`".to_string(),
             ),
         });
     }
@@ -1882,7 +1908,7 @@ fn credential_put(
                     kind: "invalid".to_string(),
                     message: format!("malformed {kind} payload: {e}"),
                     remediation: Some(
-                        "re-run `fleety auth login` on an up-to-date CLI".to_string(),
+                        "re-run `fleety provider login` on an up-to-date CLI".to_string(),
                     ),
                 }),
             }
@@ -1990,12 +2016,12 @@ async fn provider_model_list(provider_name: &str, auth_required: bool) -> Server
         Err(error) => {
             let report = error.report();
             let detail = report.message.to_ascii_lowercase();
-            if detail.contains("not signed in") || detail.contains("auth login") {
+            if detail.contains("not signed in") || detail.contains("provider login") {
                 model_list_error(
                     provider_name,
                     "not_authenticated",
                     &format!("provider '{provider_name}' is not signed in"),
-                    &format!("run `fleety auth login {provider_name}`, then retry"),
+                    &format!("run `fleety provider login {provider_name}`, then retry"),
                 )
             } else {
                 tracing::warn!(provider = %provider_name, error = %report.message, "provider model discovery failed");
@@ -3638,7 +3664,7 @@ fn deliver_pending_schedule_notifications(storage: &Arc<Storage>, out: &Out, dev
         let conversation = format!("schedule-{}", pending.id);
         let text = if pending.status == "error" {
             format!(
-                "⚠ Schedule {} FAILED: {}\nResume with: fleety resume {}",
+                "⚠ Schedule {} FAILED: {}\nResume with: fleety conversations resume {}",
                 pending.id, pending.summary, conversation
             )
         } else {
@@ -4070,6 +4096,162 @@ impl FrameWriter for WsFrameWriter {
     async fn send_text(&mut self, text: String) -> bool {
         self.tx.send(WsMessage::Text(text)).await.is_ok()
     }
+}
+
+/// Holds one already-read frame so the caller can look at the first frame and
+/// still hand the stream on untouched.
+pub(crate) struct PushbackInbound {
+    inner: Box<dyn ClientInbound>,
+    pending: Option<ClientMsg>,
+}
+
+#[async_trait::async_trait]
+impl ClientInbound for PushbackInbound {
+    async fn next_client(&mut self) -> Result<Option<ClientMsg>> {
+        match self.pending.take() {
+            Some(frame) => Ok(Some(frame)),
+            None => self.inner.next_client().await,
+        }
+    }
+}
+
+/// Inbound half of an established secure channel: opens each sealed frame and
+/// hands on the control frame inside it.
+struct SecureInbound {
+    inner: Box<dyn ClientInbound>,
+    session: SharedSecureSession,
+}
+
+#[async_trait::async_trait]
+impl ClientInbound for SecureInbound {
+    async fn next_client(&mut self) -> Result<Option<ClientMsg>> {
+        let Some(frame) = self.inner.next_client().await? else {
+            return Ok(None);
+        };
+        // Once the channel is up, an unsealed control frame is a protocol
+        // violation. Accepting one would hand an active relay the downgrade it
+        // was denied at the handshake.
+        let ClientMsg::SecureFrame { payload } = frame else {
+            return Err(CoreError::Provider(
+                "client sent an unsealed control frame on a secure channel".to_string(),
+            ));
+        };
+        let opened = {
+            let mut session = self.session.lock().map_err(|_| {
+                CoreError::Provider("the secure channel state was lost".to_string())
+            })?;
+            session.open(&payload)?
+        };
+        serde_json::from_str(&opened).map(Some).map_err(|e| {
+            CoreError::Provider(format!(
+                "malformed client frame: {e}; expected a ClientMsg JSON object"
+            ))
+        })
+    }
+}
+
+/// Outbound half of an established secure channel.
+struct SecureFrameWriter {
+    inner: Box<dyn FrameWriter>,
+    session: SharedSecureSession,
+}
+
+#[async_trait::async_trait]
+impl FrameWriter for SecureFrameWriter {
+    async fn send_text(&mut self, text: String) -> bool {
+        let sealed = {
+            let Ok(mut session) = self.session.lock() else {
+                return false;
+            };
+            match session.seal(&text) {
+                Ok(payload) => payload,
+                Err(_) => return false,
+            }
+        };
+        match serde_json::to_string(&ServerMsg::SecureFrame { payload: sealed }) {
+            Ok(frame) => self.inner.send_text(frame).await,
+            Err(_) => false,
+        }
+    }
+}
+
+type SharedSecureSession = Arc<std::sync::Mutex<fleety_tools::secure::SecureSession>>;
+
+/// Answer a secure-channel opening if that is what the client led with.
+///
+/// Returns the (possibly wrapped) halves. A client that does not offer a
+/// handshake keeps the pre-existing cleartext path, which is what lets an
+/// already-paired device reach a Server that is not yet updated; a client that
+/// *does* offer one and cannot be answered is refused outright rather than
+/// silently served in the clear.
+async fn negotiate_secure_channel(
+    inbound: Box<dyn ClientInbound>,
+    mut writer: Box<dyn FrameWriter>,
+    auth: &AuthStore,
+) -> Result<(Box<dyn ClientInbound>, Box<dyn FrameWriter>, bool)> {
+    let mut inbound = PushbackInbound {
+        inner: inbound,
+        pending: None,
+    };
+    let first = inbound.next_client().await?;
+    let Some(ClientMsg::SecureHandshake {
+        version,
+        key_id,
+        msg,
+    }) = first
+    else {
+        inbound.pending = first;
+        return Ok((Box::new(inbound), writer, false));
+    };
+
+    let fingerprint = crate::server_fingerprint();
+    let answer =
+        if version == fleety_tools::secure::SECURE_CHANNEL_VERSION && !fingerprint.is_empty() {
+            auth.token_for_key_id(&key_id, fingerprint)
+                .and_then(|token| {
+                    fleety_tools::secure::Responder::accept(version, &token, fingerprint, &msg).ok()
+                })
+        } else {
+            None
+        };
+    let Some((responder, reply)) = answer else {
+        // One reason for every failure: which device tokens this Server holds,
+        // and whether the handshake failed on the key or on the message, are
+        // not things an unauthenticated peer gets to learn.
+        send_error_frame(
+            writer.as_mut(),
+            "secure_unavailable",
+            "this Server cannot open a secure channel for that device",
+            "pair this device again with `fleety init` or `fleety pair <code>`",
+        )
+        .await;
+        return Err(CoreError::Provider(
+            "secure channel opening refused".to_string(),
+        ));
+    };
+
+    let accept = serde_json::to_string(&ServerMsg::SecureAccept {
+        version,
+        msg: reply,
+    })
+    .map_err(|e| CoreError::Provider(format!("could not frame the secure acceptance: {e}")))?;
+    if !writer.send_text(accept).await {
+        return Err(CoreError::Provider(
+            "client went away during the secure handshake".to_string(),
+        ));
+    }
+    let session: SharedSecureSession = Arc::new(std::sync::Mutex::new(responder.finish()?));
+    Ok((
+        Box::new(SecureInbound {
+            inner: Box::new(inbound),
+            session: session.clone(),
+        }),
+        Box::new(SecureFrameWriter {
+            inner: writer,
+            session,
+        }),
+        true,
+    ))
 }
 
 /// Send a `ServerMsg::Error` through a `FrameWriter` (used before the `Out`
@@ -5111,7 +5293,9 @@ mod tests {
         // Failure is prominently marked and points the user at the conversation.
         assert!(assistant[0].1.contains("FAILED"));
         assert!(assistant[0].1.contains("it broke"));
-        assert!(assistant[0].1.contains("fleety resume schedule-s1"));
+        assert!(assistant[0]
+            .1
+            .contains("fleety conversations resume schedule-s1"));
 
         // A second connect from the same device does not redeliver the outcome.
         deliver_pending_schedule_notifications(&storage, &out, "phone");
@@ -6243,6 +6427,239 @@ mod tests {
             local_tools_json: None,
             hostname: None,
         }
+    }
+
+    const PAIRED_TOKEN: &str = "paired-device-token-must-not-leak";
+
+    /// A Server that knows exactly one device token, so the secure-channel
+    /// tests can key a handshake the way a paired client does.
+    fn paired_auth() -> Arc<AuthStore> {
+        let path = std::env::temp_dir()
+            .join(format!("fleety-auth-{}", uuid::Uuid::new_v4()))
+            .join("auth.json");
+        Arc::new(AuthStore::load(path, Some(PAIRED_TOKEN.to_string()), true))
+    }
+
+    /// Serve one raw-WebSocket connection with the given auth store, returning
+    /// the address to connect to.
+    async fn spawn_paired_server(auth: Arc<AuthStore>) -> std::net::SocketAddr {
+        let home = std::env::temp_dir().join(format!("fleety-secure-{}", uuid::Uuid::new_v4()));
+        let workspace = home.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let storage = Arc::new(Storage::new(home));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let _ = handle_conn(
+                    stream,
+                    storage,
+                    Arc::new(EchoProvider),
+                    Arc::new(workspace),
+                    Policy::FullAccess,
+                    bridge::new_hub(),
+                    bridge::new_pending(),
+                    bridge::new_handles(),
+                    auth,
+                    bridge::new_device_tools(),
+                )
+                .await;
+            }
+        });
+        addr
+    }
+
+    /// The full paired path: the client proves itself with the token it already
+    /// holds, and from there nothing readable — the token least of all — is on
+    /// the wire, yet the ordinary session proceeds untouched underneath.
+    #[tokio::test]
+    async fn a_paired_client_opens_a_secure_channel_and_the_session_runs_sealed() {
+        let fingerprint = crate::test_server_fingerprint().to_string();
+        let addr = spawn_paired_server(paired_auth()).await;
+
+        let (client, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .expect("connect");
+        let (mut tx, mut rx) = client.split();
+
+        let (initiator, opening) =
+            fleety_tools::secure::Initiator::start(PAIRED_TOKEN, &fingerprint).expect("start");
+        send_client(
+            &mut tx,
+            &ClientMsg::SecureHandshake {
+                version: fleety_tools::secure::SECURE_CHANNEL_VERSION,
+                key_id: fleety_tools::secure::key_id(PAIRED_TOKEN, &fingerprint).expect("key id"),
+                msg: opening,
+            },
+        )
+        .await;
+
+        let Some(ServerMsg::SecureAccept { version, msg }) = recv_server(&mut rx).await else {
+            panic!("the Server must answer a handshake it can key");
+        };
+        let mut session = initiator
+            .finish(version, &msg)
+            .expect("the Server proved itself");
+
+        // Hello now travels sealed, so the token it carries never appears.
+        let hello = serde_json::to_string(&ClientMsg::Hello {
+            device_id: "dev".into(),
+            protocol: PROTOCOL_VERSION,
+            token: Some(PAIRED_TOKEN.to_string()),
+            pairing_code: None,
+            local_tools_json: None,
+            hostname: None,
+        })
+        .expect("serialize");
+        let payload = session.seal(&hello).expect("seal");
+        assert!(
+            !payload.contains(PAIRED_TOKEN),
+            "the sealed Hello must not carry the token in the clear"
+        );
+        send_client(&mut tx, &ClientMsg::SecureFrame { payload }).await;
+
+        let Some(ServerMsg::SecureFrame { payload }) = recv_server(&mut rx).await else {
+            panic!("the Server must answer inside the channel, not beside it");
+        };
+        let opened = session.open(&payload).expect("open the Server's frame");
+        assert!(
+            opened.contains("\"type\":\"welcome\""),
+            "the sealed frame carries the ordinary Welcome: {opened}"
+        );
+    }
+
+    /// The endpoint list is only ever acted on by a sealed session, so sending
+    /// it on an unsealed one is disclosure with nothing gained: it hands an
+    /// unauthenticated peer this host's interface map.
+    #[tokio::test]
+    async fn an_unsealed_session_is_not_told_this_servers_other_addresses() {
+        let _ = crate::test_server_fingerprint();
+        // Without a listen address there is nothing to disclose and the
+        // assertion below would hold vacuously.
+        let advertised = crate::test_server_listen_addr();
+        assert!(
+            !advertised.is_empty(),
+            "this host has no non-loopback interface, so the disclosure this test \
+             guards cannot occur here"
+        );
+        let addr = spawn_paired_server(open_auth()).await;
+
+        let (client, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .expect("connect");
+        let (mut tx, mut rx) = client.split();
+        send_client(&mut tx, &hello("dev")).await;
+
+        match recv_server(&mut rx).await {
+            Some(ServerMsg::Welcome {
+                server_endpoints, ..
+            }) => assert!(
+                server_endpoints.is_empty(),
+                "an unsealed session must not receive this Server's address list: {server_endpoints:?}"
+            ),
+            other => panic!("expected a Welcome, got {other:?}"),
+        }
+    }
+
+    /// A device this Server has no credential for gets one uninformative
+    /// refusal and no session — it must not learn which tokens exist here, and
+    /// it must not be quietly served in the clear instead.
+    #[tokio::test]
+    async fn an_unkeyable_handshake_is_refused_without_a_session_or_a_reason() {
+        let fingerprint = crate::test_server_fingerprint().to_string();
+        let addr = spawn_paired_server(paired_auth()).await;
+
+        let (client, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .expect("connect");
+        let (mut tx, mut rx) = client.split();
+
+        let stranger = "a-token-this-server-never-issued";
+        let (_, opening) =
+            fleety_tools::secure::Initiator::start(stranger, &fingerprint).expect("start");
+        send_client(
+            &mut tx,
+            &ClientMsg::SecureHandshake {
+                version: fleety_tools::secure::SECURE_CHANNEL_VERSION,
+                key_id: fleety_tools::secure::key_id(stranger, &fingerprint).expect("key id"),
+                msg: opening,
+            },
+        )
+        .await;
+
+        match recv_server(&mut rx).await {
+            Some(ServerMsg::Error { error }) => {
+                assert_eq!(error.kind, "secure_unavailable");
+                assert!(
+                    !error.message.contains(PAIRED_TOKEN),
+                    "the refusal must not disclose what this Server holds"
+                );
+            }
+            other => panic!("expected one uninformative refusal, got {other:?}"),
+        }
+        assert!(
+            recv_server(&mut rx).await.is_none(),
+            "a refused handshake must not go on to serve a session"
+        );
+    }
+
+    /// Having opened the channel, the client may not step back out of it.
+    #[tokio::test]
+    async fn a_cleartext_frame_after_the_handshake_ends_the_connection() {
+        let fingerprint = crate::test_server_fingerprint().to_string();
+        let addr = spawn_paired_server(paired_auth()).await;
+
+        let (client, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .expect("connect");
+        let (mut tx, mut rx) = client.split();
+
+        let (initiator, opening) =
+            fleety_tools::secure::Initiator::start(PAIRED_TOKEN, &fingerprint).expect("start");
+        send_client(
+            &mut tx,
+            &ClientMsg::SecureHandshake {
+                version: fleety_tools::secure::SECURE_CHANNEL_VERSION,
+                key_id: fleety_tools::secure::key_id(PAIRED_TOKEN, &fingerprint).expect("key id"),
+                msg: opening,
+            },
+        )
+        .await;
+        let Some(ServerMsg::SecureAccept { version, msg }) = recv_server(&mut rx).await else {
+            panic!("the Server must answer a handshake it can key");
+        };
+        let _ = initiator
+            .finish(version, &msg)
+            .expect("channel established");
+
+        // An unsealed Hello is what a relay stripping the encryption would send.
+        send_client(&mut tx, &hello("dev")).await;
+
+        assert!(
+            recv_server(&mut rx).await.is_none(),
+            "the Server must not fall back to serving cleartext once sealed"
+        );
+    }
+
+    /// The compatibility path the release policy depends on: a client that does
+    /// not offer a handshake is served exactly as before, so an already-paired
+    /// device can still reach a Server it has not updated yet.
+    #[tokio::test]
+    async fn a_client_that_offers_no_handshake_is_still_served() {
+        let addr = spawn_paired_server(open_auth()).await;
+
+        let (client, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .expect("connect");
+        let (mut tx, mut rx) = client.split();
+        send_client(&mut tx, &hello("dev")).await;
+
+        assert!(
+            matches!(recv_server(&mut rx).await, Some(ServerMsg::Welcome { .. })),
+            "the cleartext path must keep working for clients that cannot seal"
+        );
     }
 
     #[test]

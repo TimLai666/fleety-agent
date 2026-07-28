@@ -24,10 +24,7 @@ pub fn runtimes_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("FLEETY_RUNTIMES_DIR") {
         return PathBuf::from(dir);
     }
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".fleety").join("runtimes")
+    crate::device::home_dir().join(".fleety").join("runtimes")
 }
 
 fn node_version() -> String {

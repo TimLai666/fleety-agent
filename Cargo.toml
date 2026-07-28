@@ -6,9 +6,9 @@ members = ["crates/*"]
 version = "0.1.21"
 edition = "2021"
 # 1.85 is the edition-2024 floor, required by the vendored `fleety-textarea`
-# (see AGENTS.md, "Vendored Rust source"). CI builds on `stable`, so nothing
-# verifies this number — treat it as a promise to source builders, and check it
-# by hand when raising it.
+# (see AGENTS.md, "Vendored Rust source") and by `snow`. CI builds on `stable`,
+# so nothing verifies this number — treat it as a promise to source builders,
+# and check it by hand when raising it.
 rust-version = "1.85"
 license = "Apache-2.0"
 repository = "https://github.com/TimLai666/fleety-agent"
@@ -48,6 +48,11 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 chrono-tz = { version = "0.10", default-features = false }
 iana-time-zone = "0.1"
 mdns-sd = "0.13"
+if-addrs = "0.13"
+# Noise Protocol Framework. Paired profiles authenticate and encrypt their
+# control channel with Noise_NNpsk0, keyed by the per-device token, so a saved
+# endpoint proves the Server's identity before any credential is exchanged.
+snow = "0.10"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 fs4 = { version = "=1.1.0", default-features = false, features = ["sync"] }
 # These exact pins were taken to hold Clap at the old Rust 1.80 baseline. That

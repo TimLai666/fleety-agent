@@ -143,6 +143,27 @@ pub struct ConfigChange {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMsg {
+    /// Open an authenticated, encrypted channel before anything else is said.
+    ///
+    /// A paired profile keys this from the per-device token it already holds, so
+    /// completing it proves the peer is the Server this profile was pinned to —
+    /// the point being that the token itself never travels. `key_id` is a public,
+    /// non-reversible handle that tells the Server *which* device token to answer
+    /// with; `msg` is the opening Noise message. Both are bound into the
+    /// handshake, so a relay cannot rewrite either without breaking it.
+    ///
+    /// Additive: a Server that predates the secure channel does not understand
+    /// this frame, which the client treats as "cannot offer a secure channel"
+    /// rather than as a reason to reveal anything.
+    SecureHandshake {
+        version: u32,
+        key_id: String,
+        msg: String,
+    },
+    /// One control frame carried inside an established secure channel. `payload`
+    /// is the sealed form of an ordinary [`ClientMsg`]. Once the channel is up,
+    /// a cleartext control frame is a protocol violation, never a fallback.
+    SecureFrame { payload: String },
     /// First frame: identify the origin device. `token` authenticates an
     /// enrolled device; `pairing_code` enrolls a new one (the server mints and
     /// returns a token in `Welcome`). `local_tools_json` is the JSON-encoded
@@ -336,6 +357,13 @@ pub enum ClientMsg {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMsg {
+    /// Answer to `SecureHandshake`, completing the channel. Producing a `msg`
+    /// the client accepts is the Server's proof that it holds this profile's
+    /// device token; a peer that merely took over the address cannot.
+    SecureAccept { version: u32, msg: String },
+    /// One control frame carried inside an established secure channel. See
+    /// [`ClientMsg::SecureFrame`].
+    SecureFrame { payload: String },
     /// Reply to `Hello`: the session and (initial) conversation. `token` is set
     /// only right after a successful pairing — the client should save it and
     /// authenticate with it on future connects.
@@ -363,6 +391,12 @@ pub enum ServerMsg {
         /// server after an address change. Additive; absent on older servers.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         server_fingerprint: Option<String>,
+        /// Reachable WebSocket endpoints derived from the Server's current
+        /// non-loopback interfaces. Clients accept these only inside an
+        /// authenticated durable-profile session. Additive; empty for older
+        /// servers.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        server_endpoints: Vec<String>,
         /// True when the server accepted this connection on same-host loopback
         /// trust (no token needed). The CLI uses it to skip pairing prompts for
         /// a local server. Additive; `false` on older servers.
@@ -529,6 +563,64 @@ mod tests {
     use super::*;
 
     #[test]
+    fn secure_channel_frames_round_trip_and_stay_distinguishable_from_control_frames() {
+        let opening = ClientMsg::SecureHandshake {
+            version: 1,
+            key_id: "6f1c3a52d0444a519b6e1f2d3c4b5a60".into(),
+            msg: "bm9pc2UtbXNn".into(),
+        };
+        let json = serde_json::to_string(&opening).expect("serialize");
+        assert!(json.contains("\"type\":\"secure_handshake\""));
+        assert_eq!(
+            serde_json::from_str::<ClientMsg>(&json).expect("parse"),
+            opening
+        );
+
+        let sealed = ServerMsg::SecureFrame {
+            payload: "c2VhbGVk".into(),
+        };
+        let json = serde_json::to_string(&sealed).expect("serialize");
+        assert!(json.contains("\"type\":\"secure_frame\""));
+        assert_eq!(
+            serde_json::from_str::<ServerMsg>(&json).expect("parse"),
+            sealed
+        );
+
+        let accept = ServerMsg::SecureAccept {
+            version: 1,
+            msg: "cmVwbHk=".into(),
+        };
+        let json = serde_json::to_string(&accept).expect("serialize");
+        assert!(json.contains("\"type\":\"secure_accept\""));
+        assert_eq!(
+            serde_json::from_str::<ServerMsg>(&json).expect("parse"),
+            accept
+        );
+    }
+
+    /// A Server that predates the secure channel cannot parse the opening frame.
+    /// The client must read that as "no secure channel here", which is what keeps
+    /// it from revealing a credential to a peer it has not authenticated.
+    #[test]
+    fn a_server_without_the_secure_channel_cannot_parse_its_frames() {
+        let opening = serde_json::to_string(&ClientMsg::SecureHandshake {
+            version: 1,
+            key_id: "abc".into(),
+            msg: "bXNn".into(),
+        })
+        .expect("serialize");
+
+        // Stand in for an older build by parsing into the frame set that existed
+        // before these variants: an unknown `type` has no arm to land in.
+        #[derive(Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum LegacyClientMsg {
+            Hello {},
+        }
+        assert!(serde_json::from_str::<LegacyClientMsg>(&opening).is_err());
+    }
+
+    #[test]
     fn hello_hostname_is_optional_and_additive() {
         // With a hostname → round-trips.
         let h = ClientMsg::Hello {
@@ -571,6 +663,10 @@ mod tests {
             audio_input: true,
             config_protocol: CONFIG_PROTOCOL_VERSION,
             server_fingerprint: Some("srv-fp-1".into()),
+            server_endpoints: vec![
+                "ws://192.168.1.20:8787".into(),
+                "ws://100.64.0.8:8787".into(),
+            ],
             loopback_trusted: false,
             token: None,
         };
@@ -579,6 +675,9 @@ mod tests {
         assert!(json.contains("\"audio_input\":true"));
         assert!(json.contains("\"config_protocol\":5"));
         assert!(json.contains("\"server_fingerprint\":\"srv-fp-1\""));
+        assert!(json.contains(
+            "\"server_endpoints\":[\"ws://192.168.1.20:8787\",\"ws://100.64.0.8:8787\"]"
+        ));
         // An old server's frame (no server_version / audio_input / config_protocol)
         // still parses → defaults ("" / false / 0 → legacy ConfigExec + local STT).
         let old = r#"{"type":"welcome","session_id":"s","conversation_id":"c","protocol":0}"#;
@@ -587,11 +686,13 @@ mod tests {
                 server_version,
                 audio_input,
                 config_protocol,
+                server_endpoints,
                 ..
             } => {
                 assert_eq!(server_version, "");
                 assert!(!audio_input);
                 assert_eq!(config_protocol, 0);
+                assert!(server_endpoints.is_empty());
             }
             _ => panic!("not welcome"),
         }

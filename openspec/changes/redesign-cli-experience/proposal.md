@@ -13,6 +13,7 @@ Fleety 的功能已涵蓋聊天、連線、Provider、模型、OAuth、遠端設
 - Profile 切換遇到 staged 變更時提供 Apply／Discard／Cancel，不再自動丟棄；連線成功後才重新載入 Server 與 Daemon snapshot。
 - 將 mDNS 限縮為 discovery／selection surface：沒有明確 saved endpoint 時只列出候選，不得自動建立 operational session；已設定明確 endpoint 的 current profile仍自動連線。credentialed endpoint 改變需明確 reselect／re-pair，reconnect request則持久保存到Daemon消費並exactly-once回覆。
 - 將 raw `--server`／`--url`、`FLEETY_AGENT_URL` 與 ACP endpoint 限縮為真正 transient target：只使用明示 `FLEETY_TOKEN`，不得按 URL 借用或改寫任何 saved profile credential；stored token 只能由明確 named／current profile 取得。
+- 已配對 profile 從認證完成的 Server 自動學習可達 endpoint，並在 LAN、使用者自行提供的 overlay 或其他網路路徑間自動重連；Fleety 不整合或管理特定 overlay。
 - 所有 structured configuration mutation在owner dispatch前共用認證gate，Provider command與TUI保留並顯示不含secret的key presence。
 - Provider、模型目錄與 OAuth 狀態整合成同一條旅程，畫面使用「connected Server」與 Provider 名稱，不再以 `providers.toml` 表達操作目的地。
 - 新增 `doctor` 與 shell completion，讓連線、版本、Daemon、Server、OAuth／Provider 狀態可被主動診斷，也讓命令可發現。
@@ -43,5 +44,5 @@ Fleety 的功能已涵蓋聊天、連線、Provider、模型、OAuth、遠端設
   - Modified: `crates/fleety-cli/src/main.rs`, `crates/fleety-cli/src/config.rs`, `crates/fleety-cli/src/config_panel.rs`, `crates/fleety-cli/src/provider_service.rs`, `crates/fleety-cli/src/provider_tui.rs`, `crates/fleety-cli/src/tui.rs`, `crates/fleety-cli/src/server.rs`, `crates/fleety-cli/src/auth.rs`, `crates/fleety-cli/tests/cli_smoke.rs`, `crates/fleety-daemon/src/main.rs`, `crates/fleety-daemon/tests/fleetyd_smoke.rs`, `crates/fleety-protocol/src/lib.rs`, `crates/fleety-server/src/conn.rs`, `crates/fleety-server/src/main.rs`, `crates/fleety-server/tests/server_smoke.rs`, `crates/fleety-tools/src/config.rs`, `crates/fleety-tools/src/connection.rs`, `crates/fleety-tools/src/provider_service.rs`, four generated `spectra-archive` instructions, `README.md`, `docs/design-cli-config.md`, `docs/env.md`, `docs/STATUS.md`
   - New: `crates/fleety-cli/src/commands.rs`, `crates/fleety-cli/src/workspace_tui.rs`
   - Removed: none
-- Dependencies: 預計導入集中式 Rust CLI parser 與 completion 支援；最終選型與二進位大小影響記錄於 design。
+- Dependencies: 導入集中式 Rust CLI parser 與 completion 支援（clap／clap_complete）；已配對 profile 的加密控制通道導入 `snow`（Noise）與 `hkdf`，Server 介面列舉導入 `if-addrs`。`snow` 的 MSRV 與 vendored `fleety-textarea` 相同（1.85），未新增原生建置相依。最終選型與二進位大小影響記錄於 design。
 - Compatibility: 現有腳本命令在本次變更中維持可執行；canonical 名稱變更先透過 alias 與 stderr 棄用提示過渡。

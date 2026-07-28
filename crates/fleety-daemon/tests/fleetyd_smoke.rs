@@ -47,32 +47,229 @@ fn welcome(token: Option<&str>) -> ServerMsg {
         audio_input: false,
         config_protocol: 0,
         server_fingerprint: Some("fingerprint-smoke".into()),
+        server_endpoints: Vec::new(),
         loopback_trusted: false,
         token: token.map(String::from),
     }
 }
 
+type FakeWs = tokio_tungstenite::tungstenite::WebSocket<std::net::TcpStream>;
+
+/// The device token and Server identity a fake Server is enrolled with.
+///
+/// `Some(..)` completes the paired handshake — only if the daemon derives the
+/// same key, which is what the roaming tests are asserting. `None` refuses it
+/// the way a Server holding no credential for this device does, and the daemon
+/// comes back in the clear wherever its profile still permits that.
+type FakeSecure = Option<(String, String)>;
+
+/// One fake-Server connection, after the handshake phase.
+struct FakeLink {
+    ws: FakeWs,
+    session: Option<fleety_tools::secure::SecureSession>,
+    /// The first control frame, when the client did not open with a handshake.
+    pending: Option<ClientMsg>,
+}
+
+impl FakeLink {
+    /// The next control frame, unsealed, so assertions read the same whether or
+    /// not the channel is encrypted.
+    fn read(&mut self) -> Option<ClientMsg> {
+        if let Some(pending) = self.pending.take() {
+            return Some(pending);
+        }
+        loop {
+            let frame = self.ws.read().ok()?;
+            if frame.is_close() {
+                return None;
+            }
+            let Ok(text) = frame.to_text() else {
+                continue;
+            };
+            if text.is_empty() {
+                continue;
+            }
+            let message = serde_json::from_str::<ClientMsg>(text).ok()?;
+            return match message {
+                ClientMsg::SecureFrame { payload } => {
+                    let session = self.session.as_mut()?;
+                    let opened = session.open(&payload).ok()?;
+                    serde_json::from_str::<ClientMsg>(&opened).ok()
+                }
+                other => Some(other),
+            };
+        }
+    }
+
+    fn send(&mut self, msg: &ServerMsg) {
+        let json = serde_json::to_string(msg).expect("server msg");
+        let frame = match self.session.as_mut() {
+            Some(session) => {
+                let payload = session.seal(&json).expect("seal");
+                serde_json::to_string(&ServerMsg::SecureFrame { payload }).expect("sealed frame")
+            }
+            None => json,
+        };
+        let _ = self.ws.send(Message::Text(frame));
+    }
+
+    /// Hold the link open until the client closes it, reporting that it did.
+    fn read_until_closed(&mut self) -> bool {
+        loop {
+            match self.ws.read() {
+                Ok(Message::Close(_)) | Err(_) => break true,
+                Ok(_) => continue,
+            }
+        }
+    }
+
+    /// Bound reads so a probe can assert that *nothing* arrived.
+    fn set_read_timeout(&mut self, timeout: Duration) {
+        let _ = self.ws.get_ref().set_read_timeout(Some(timeout));
+    }
+
+    fn close(mut self) {
+        let _ = self.ws.close(None);
+    }
+}
+
+fn send_plain(ws: &mut FakeWs, msg: &ServerMsg) {
+    let json = serde_json::to_string(msg).expect("server msg");
+    let _ = ws.send(Message::Text(json));
+}
+
+/// Accept one client, answering or refusing the paired secure handshake.
+///
+/// A refusal is followed by waiting for the client to reconnect, which is what
+/// it does when its profile still allows the cleartext path — so callers do not
+/// have to know whether a handshake happened at all.
+fn accept_link(listener: &std::net::TcpListener, secure: &FakeSecure) -> Option<FakeLink> {
+    loop {
+        let (stream, _) = listener.accept().ok()?;
+        if let Some(link) = link_from_stream(stream, secure) {
+            return Some(link);
+        }
+        // The handshake was refused: wait for the cleartext reconnect.
+    }
+}
+
+/// The per-stream half of [`accept_link`], for fakes that accept their own
+/// connections. `None` means the handshake was refused and the client will be
+/// back on a new stream.
+fn link_from_stream(stream: std::net::TcpStream, secure: &FakeSecure) -> Option<FakeLink> {
+    let mut ws = accept(stream).ok()?;
+    let first = loop {
+        let frame = ws.read().ok()?;
+        if frame.is_close() {
+            return None;
+        }
+        let Ok(text) = frame.to_text() else {
+            continue;
+        };
+        if text.is_empty() {
+            continue;
+        }
+        break serde_json::from_str::<ClientMsg>(text).ok()?;
+    };
+    match first {
+        ClientMsg::SecureHandshake { version, msg, .. } => match secure {
+            Some((token, fingerprint)) => {
+                let (responder, reply) =
+                    fleety_tools::secure::Responder::accept(version, token, fingerprint, &msg)
+                        .expect("the fake Server holds this device's token");
+                send_plain(
+                    &mut ws,
+                    &ServerMsg::SecureAccept {
+                        version,
+                        msg: reply,
+                    },
+                );
+                Some(FakeLink {
+                    ws,
+                    session: Some(responder.finish().expect("fake secure channel")),
+                    pending: None,
+                })
+            }
+            None => {
+                // An older Server cannot parse the frame at all, so it just
+                // drops the link; the client then reconnects in the clear. A
+                // Server that understands the frame and refuses is saying it
+                // holds no credential for this device, which is now fatal and is
+                // covered by its own server-side test.
+                let _ = ws.close(None);
+                None
+            }
+        },
+        other => Some(FakeLink {
+            ws,
+            session: None,
+            pending: Some(other),
+        }),
+    }
+}
+
 fn start_ws_server(steps: Vec<Vec<ServerMsg>>) -> (String, mpsc::Receiver<Vec<ClientMsg>>) {
+    start_ws_server_with(steps, None)
+}
+
+fn start_ws_server_with(
+    steps: Vec<Vec<ServerMsg>>,
+    secure: FakeSecure,
+) -> (String, mpsc::Receiver<Vec<ClientMsg>>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ws server");
     let addr = listener.local_addr().expect("local addr");
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let (stream, _) = listener.accept().expect("accept ws");
-        let mut ws = accept(stream).expect("accept websocket");
         let mut received = Vec::new();
-        for responses in steps {
-            let frame = ws.read().expect("client frame");
-            let text = frame.to_text().expect("text frame");
-            received.push(serde_json::from_str::<ClientMsg>(text).expect("client msg"));
-            for response in responses {
-                ws.send(Message::Text(
-                    serde_json::to_string(&response).expect("server msg"),
-                ))
-                .expect("send response");
+        if let Some(mut link) = accept_link(&listener, &secure) {
+            for responses in steps {
+                let Some(message) = link.read() else {
+                    break;
+                };
+                received.push(message);
+                for response in responses {
+                    link.send(&response);
+                }
             }
+            link.close();
         }
-        let _ = ws.close(None);
         tx.send(received).expect("send received frames");
+    });
+    (format!("ws://{addr}"), rx)
+}
+
+fn start_non_loopback_ws_server(
+    steps: Vec<Vec<ServerMsg>>,
+    secure: FakeSecure,
+) -> (String, mpsc::Receiver<Vec<ClientMsg>>) {
+    let ip = if_addrs::get_if_addrs()
+        .expect("enumerate test interfaces")
+        .into_iter()
+        .find_map(|interface| match interface.ip() {
+            std::net::IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => Some(ip),
+            _ => None,
+        })
+        .expect("a non-loopback IPv4 interface is required for endpoint roaming smoke tests");
+    let listener = std::net::TcpListener::bind((ip, 0)).expect("bind non-loopback ws server");
+    let addr = listener.local_addr().expect("non-loopback local addr");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut received = Vec::new();
+        if let Some(mut link) = accept_link(&listener, &secure) {
+            for responses in steps {
+                let Some(message) = link.read() else {
+                    break;
+                };
+                received.push(message);
+                for response in responses {
+                    link.send(&response);
+                }
+            }
+            thread::sleep(Duration::from_millis(300));
+            link.close();
+        }
+        tx.send(received)
+            .expect("send non-loopback received frames");
     });
     (format!("ws://{addr}"), rx)
 }
@@ -83,11 +280,8 @@ fn start_duplicate_welcome_server() -> (String, mpsc::Receiver<ClientMsg>) {
     let addr = listener.local_addr().expect("duplicate Welcome address");
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let (stream, _) = listener.accept().expect("accept duplicate Welcome ws");
-        let mut ws = accept(stream).expect("accept duplicate Welcome websocket");
-        let frame = ws.read().expect("duplicate Welcome client frame");
-        let hello = serde_json::from_str::<ClientMsg>(frame.to_text().expect("Hello text"))
-            .expect("Hello message");
+        let mut link = accept_link(&listener, &None).expect("accept duplicate Welcome ws");
+        let hello = link.read().expect("duplicate Welcome client frame");
         tx.send(hello).expect("publish duplicate Welcome Hello");
         for token in [None, Some("second-token")] {
             let message = ServerMsg::Welcome {
@@ -98,16 +292,14 @@ fn start_duplicate_welcome_server() -> (String, mpsc::Receiver<ClientMsg>) {
                 audio_input: false,
                 config_protocol: 0,
                 server_fingerprint: Some("fingerprint-duplicate".into()),
+                server_endpoints: Vec::new(),
                 loopback_trusted: false,
                 token: token.map(str::to_string),
             };
-            ws.send(Message::Text(
-                serde_json::to_string(&message).expect("serialize duplicate Welcome"),
-            ))
-            .expect("send duplicate Welcome");
+            link.send(&message);
         }
         thread::sleep(Duration::from_millis(300));
-        let _ = ws.close(None);
+        link.close();
     });
     (format!("ws://{addr}"), rx)
 }
@@ -118,33 +310,17 @@ fn start_delayed_welcome_presence_probe() -> (String, mpsc::Receiver<Option<Clie
     let addr = listener.local_addr().expect("pre-Welcome presence address");
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let (stream, _) = listener.accept().expect("accept pre-Welcome presence ws");
-        stream
-            .set_read_timeout(Some(Duration::from_millis(400)))
-            .expect("set pre-Welcome read timeout");
-        let mut ws = accept(stream).expect("accept pre-Welcome presence websocket");
-        let hello = ws.read().expect("presence probe Hello");
-        assert!(matches!(
-            serde_json::from_str::<ClientMsg>(hello.to_text().expect("Hello text")),
-            Ok(ClientMsg::Hello { .. })
-        ));
-        let pre_welcome = ws.read().ok().and_then(|frame| {
-            frame
-                .to_text()
-                .ok()
-                .and_then(|text| serde_json::from_str::<ClientMsg>(text).ok())
-        });
+        let mut link = accept_link(&listener, &None).expect("accept pre-Welcome presence ws");
+        link.set_read_timeout(Duration::from_millis(400));
+        assert!(matches!(link.read(), Some(ClientMsg::Hello { .. })));
+        let pre_welcome = link.read();
         tx.send(pre_welcome)
             .expect("publish pre-Welcome presence capture");
-        ws.send(Message::Text(
-            serde_json::to_string(&named_welcome(
-                "presence-authenticated",
-                Some("fingerprint-presence"),
-            ))
-            .expect("serialize presence Welcome"),
-        ))
-        .expect("send presence Welcome");
-        let _ = ws.close(None);
+        link.send(&named_welcome(
+            "presence-authenticated",
+            Some("fingerprint-presence"),
+        ));
+        link.close();
     });
     (format!("ws://{addr}"), rx)
 }
@@ -274,33 +450,22 @@ fn start_held_ws_server(
     let (hello_tx, hello_rx) = mpsc::channel();
     let (closed_tx, closed_rx) = mpsc::channel();
     thread::spawn(move || {
-        let (stream, _) = listener.accept().expect("accept held websocket");
-        let mut ws = accept(stream).expect("upgrade held websocket");
-        let frame = ws.read().expect("held server hello");
-        let hello = serde_json::from_str::<ClientMsg>(frame.to_text().expect("hello text"))
-            .expect("parse held hello");
+        let mut link = accept_link(&listener, &None).expect("accept held websocket");
+        let hello = link.read().expect("held server hello");
         hello_tx.send(hello).expect("publish held hello");
-        ws.send(Message::Text(
-            serde_json::to_string(&ServerMsg::Welcome {
-                session_id: format!("session-{name}"),
-                conversation_id: format!("conversation-{name}"),
-                protocol: PROTOCOL_VERSION,
-                server_version: String::new(),
-                audio_input: false,
-                config_protocol: 0,
-                server_fingerprint: Some(format!("fingerprint-{name}")),
-                loopback_trusted: false,
-                token: None,
-            })
-            .expect("serialize held welcome"),
-        ))
-        .expect("send held welcome");
-        let closed = loop {
-            match ws.read() {
-                Ok(Message::Close(_)) | Err(_) => break true,
-                Ok(_) => continue,
-            }
-        };
+        link.send(&ServerMsg::Welcome {
+            session_id: format!("session-{name}"),
+            conversation_id: format!("conversation-{name}"),
+            protocol: PROTOCOL_VERSION,
+            server_version: String::new(),
+            audio_input: false,
+            config_protocol: 0,
+            server_fingerprint: Some(format!("fingerprint-{name}")),
+            server_endpoints: Vec::new(),
+            loopback_trusted: false,
+            token: None,
+        });
+        let closed = link.read_until_closed();
         let _ = closed_tx.send(closed);
     });
     (format!("ws://{addr}"), hello_rx, closed_rx)
@@ -357,32 +522,24 @@ fn start_rotating_token_ws_server(
             };
             let hello_tx = hello_tx.clone();
             thread::spawn(move || {
-                let mut ws = accept(stream).expect("upgrade rotating-token websocket");
-                let frame = ws.read().expect("rotating-token hello");
-                let hello = serde_json::from_str::<ClientMsg>(frame.to_text().expect("hello text"))
-                    .expect("parse rotating-token hello");
+                let Some(mut link) = link_from_stream(stream, &None) else {
+                    return;
+                };
+                let hello = link.read().expect("rotating-token hello");
                 hello_tx.send(hello).expect("publish rotating-token hello");
-                ws.send(Message::Text(
-                    serde_json::to_string(&ServerMsg::Welcome {
-                        session_id: format!("session-{name}"),
-                        conversation_id: format!("conversation-{name}"),
-                        protocol: PROTOCOL_VERSION,
-                        server_version: String::new(),
-                        audio_input: false,
-                        config_protocol: 0,
-                        server_fingerprint: Some(format!("fingerprint-{name}")),
-                        loopback_trusted: false,
-                        token: Some(minted_token.to_string()),
-                    })
-                    .expect("serialize rotating-token welcome"),
-                ))
-                .expect("send rotating-token welcome");
-                loop {
-                    match ws.read() {
-                        Ok(Message::Close(_)) | Err(_) => return,
-                        Ok(_) => {}
-                    }
-                }
+                link.send(&ServerMsg::Welcome {
+                    session_id: format!("session-{name}"),
+                    conversation_id: format!("conversation-{name}"),
+                    protocol: PROTOCOL_VERSION,
+                    server_version: String::new(),
+                    audio_input: false,
+                    config_protocol: 0,
+                    server_fingerprint: Some(format!("fingerprint-{name}")),
+                    server_endpoints: Vec::new(),
+                    loopback_trusted: false,
+                    token: Some(minted_token.to_string()),
+                });
+                link.read_until_closed();
             });
         }
     });
@@ -443,25 +600,14 @@ fn start_gated_ws_server(
     let (reply_tx, reply_rx) = mpsc::channel();
     let (closed_tx, closed_rx) = mpsc::channel();
     thread::spawn(move || {
-        let (stream, _) = listener.accept().expect("accept gated websocket");
-        let mut ws = accept(stream).expect("upgrade gated websocket");
-        let frame = ws.read().expect("gated server hello");
-        let hello = serde_json::from_str::<ClientMsg>(frame.to_text().expect("hello text"))
-            .expect("parse gated hello");
+        let mut link = accept_link(&listener, &None).expect("accept gated websocket");
+        let hello = link.read().expect("gated server hello");
         hello_tx.send(hello).expect("publish gated hello");
         let Ok(reply) = reply_rx.recv() else {
             return;
         };
-        ws.send(Message::Text(
-            serde_json::to_string(&reply).expect("serialize gated reply"),
-        ))
-        .expect("send gated reply");
-        let closed = loop {
-            match ws.read() {
-                Ok(Message::Close(_)) | Err(_) => break true,
-                Ok(_) => continue,
-            }
-        };
+        link.send(&reply);
+        let closed = link.read_until_closed();
         let _ = closed_tx.send(closed);
     });
     (format!("ws://{addr}"), hello_rx, reply_tx, closed_rx)
@@ -476,6 +622,7 @@ fn named_welcome(name: &str, fingerprint: Option<&str>) -> ServerMsg {
         audio_input: false,
         config_protocol: 0,
         server_fingerprint: fingerprint.map(String::from),
+        server_endpoints: Vec::new(),
         loopback_trusted: false,
         token: None,
     }
@@ -1136,6 +1283,80 @@ fn saved_current_profile_skips_live_mdns_and_connects_with_its_token() {
         "saved current endpoint must bypass discovery and the rogue advertiser"
     );
     let _ = mdns.shutdown();
+}
+
+#[test]
+fn daemon_falls_back_to_a_learned_endpoint_and_promotes_it() {
+    let home = TempDir::new("learned-endpoint-roaming");
+    let root = TempDir::new("learned-endpoint-roaming-root");
+    // The learned endpoint holds this device's token, so it can complete the
+    // handshake. That is the precondition for being tried at all: an endpoint
+    // fleetyd taught itself never receives the credential without proving it.
+    let (reachable_url, rx) = start_non_loopback_ws_server(
+        vec![vec![welcome(None)]],
+        Some(("roaming-token".to_string(), "fingerprint-smoke".to_string())),
+    );
+    let port = reachable_url
+        .rsplit_once(':')
+        .map(|(_, port)| port)
+        .expect("reachable endpoint port");
+    let old_url = format!("ws://127.0.0.1:{port}");
+    let conns_path = home.0.join(".fleety").join("connections.toml");
+    let mut conns = fleety_tools::connection::Connections {
+        device_id: "daemon-roaming".into(),
+        current: Some("home".into()),
+        ..Default::default()
+    };
+    conns.profiles.insert(
+        "home".into(),
+        fleety_tools::connection::Profile {
+            url: old_url.clone(),
+            endpoints: vec![reachable_url.clone()],
+            token: Some("roaming-token".into()),
+            fingerprint: Some("fingerprint-smoke".into()),
+            ..Default::default()
+        },
+    );
+    fleety_tools::connection::save_at(&conns_path, &conns).expect("seed roaming profile");
+
+    let child = Command::new(env!("CARGO_BIN_EXE_fleetyd"))
+        .env("HOME", &home.0)
+        .env("USERPROFILE", &home.0)
+        .env("FLEETY_CONNECTIONS", &conns_path)
+        .env("FLEETY_DEVICE_ROOT", &root.0)
+        .env("FLEETY_DEVICE_ID", "daemon-roaming")
+        .env("FLEETY_MDNS_DISABLED", "1")
+        .env_remove("FLEETY_AGENT_URL")
+        .env_remove("FLEETY_TOKEN")
+        .env_remove("FLEETY_PAIRING_CODE")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("run fleetyd with a learned endpoint");
+    let _child = ChildGuard(child);
+
+    let received = rx
+        .recv_timeout(Duration::from_secs(15))
+        .expect("learned endpoint Hello");
+    assert!(matches!(
+        received.first(),
+        Some(ClientMsg::Hello { token, .. }) if token.as_deref() == Some("roaming-token")
+    ));
+    thread::sleep(Duration::from_secs(1));
+    let saved =
+        fleety_tools::connection::load_at(&conns_path).expect("load promoted daemon profile");
+    assert_eq!(saved.profiles["home"].url, reachable_url, "{saved:?}");
+    assert!(
+        saved.profiles["home"].endpoints.contains(&old_url),
+        "{saved:?}"
+    );
+    // The fake Server only answers a handshake keyed by this exact token and
+    // identity, so the pin landing here is proof the session really was sealed
+    // — not merely that fleetyd reached the endpoint.
+    assert!(
+        saved.profiles["home"].secure,
+        "roaming onto a learned endpoint must run inside the encrypted channel: {saved:?}"
+    );
 }
 
 #[test]
@@ -1979,6 +2200,326 @@ fn daemon_reconnect_settles_authentication_rejection_as_failure() {
     );
 }
 
+/// A candidate that fails before proving itself must not settle the reconnect
+/// that a later candidate can still satisfy, and must not be able to unpair the
+/// device on the way out.
+///
+/// The two endpoints deliberately share a port on different interfaces: a
+/// learned candidate may only change the host, so a different port would be
+/// filtered out before it was ever tried.
+#[test]
+fn a_failed_candidate_does_not_settle_a_reconnect_a_later_endpoint_can_satisfy() {
+    let seq = COMMAND_SEQ.fetch_add(1, Ordering::Relaxed);
+    let home = TempDir::new(&format!("candidate-advance-{seq}"));
+    let root = TempDir::new(&format!("candidate-advance-root-{seq}"));
+
+    // The real Server, on a non-loopback interface, holding this device's token.
+    let (live_url, live_rx) = start_non_loopback_ws_server(
+        vec![vec![named_welcome(
+            "advance-live",
+            Some("fingerprint-advance"),
+        )]],
+        Some((
+            "advance-token".to_string(),
+            "fingerprint-advance".to_string(),
+        )),
+    );
+    let port: u16 = live_url
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse().ok())
+        .expect("live endpoint port");
+
+    // The configured endpoint: same port on loopback, answering every attempt
+    // with an authentication rejection it cannot back up.
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port)).expect("bind rejecting server");
+    thread::spawn(move || {
+        while let Some(mut link) = accept_link(&listener, &None) {
+            if link.read().is_none() {
+                continue;
+            }
+            link.send(&ServerMsg::Error {
+                error: WireError {
+                    kind: "unauthenticated".into(),
+                    message: "token rejected".into(),
+                    remediation: None,
+                },
+            });
+            link.close();
+        }
+    });
+    let dead_url = format!("ws://127.0.0.1:{port}");
+
+    let conns_path = home.0.join(".fleety").join("connections.toml");
+    std::fs::create_dir_all(conns_path.parent().expect("connections parent"))
+        .expect("create fleety dir");
+    let mut conns = fleety_tools::connection::Connections {
+        device_id: "candidate-advance".into(),
+        current: Some("home".into()),
+        ..Default::default()
+    };
+    conns.profiles.insert(
+        "home".into(),
+        fleety_tools::connection::Profile {
+            url: dead_url,
+            endpoints: vec![live_url],
+            token: Some("advance-token".into()),
+            fingerprint: Some("fingerprint-advance".into()),
+            ..Default::default()
+        },
+    );
+    fleety_tools::connection::save_at(&conns_path, &conns).expect("seed advancing profile");
+
+    let child = Command::new(env!("CARGO_BIN_EXE_fleetyd"))
+        .env("HOME", &home.0)
+        .env("USERPROFILE", &home.0)
+        .env("FLEETY_CONNECTIONS", &conns_path)
+        .env("FLEETY_DEVICE_ROOT", &root.0)
+        .env("FLEETY_DEVICE_ID", "candidate-advance")
+        .env("FLEETY_MDNS_DISABLED", "1")
+        .env_remove("FLEETY_AGENT_URL")
+        .env_remove("FLEETY_TOKEN")
+        .env_remove("FLEETY_PAIRING_CODE")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("run fleetyd across candidates");
+    let mut child = ChildGuard(child);
+
+    let reached = live_rx.recv_timeout(Duration::from_secs(20));
+    let _ = child.0.kill();
+    assert!(
+        reached.is_ok(),
+        "the rejecting primary must not stop the daemon from reaching the working endpoint"
+    );
+
+    let saved = fleety_tools::connection::load_at(&conns_path).expect("reload profile");
+    assert_eq!(
+        saved.profiles["home"].token.as_deref(),
+        Some("advance-token"),
+        "an endpoint that never proved itself must not be able to unpair the device"
+    );
+}
+
+/// An owner-requested reconnect must settle on the endpoint that works, not on
+/// the first one that fails. The reconnect decision is first-writer-wins, so a
+/// failed candidate that leaves its decision behind makes a healthy endpoint
+/// unable to report success — and a candidate that already committed its
+/// credential must not have that rolled back either.
+#[test]
+fn an_owner_reconnect_settles_success_on_the_endpoint_that_answers() {
+    let seq = COMMAND_SEQ.fetch_add(1, Ordering::Relaxed);
+    let home = TempDir::new(&format!("reconnect-advance-{seq}"));
+    let root = TempDir::new(&format!("reconnect-advance-root-{seq}"));
+    let (url_a, hello_a, _closed_a) = start_held_ws_server("advance-a");
+
+    // Profile B: the configured endpoint refuses, a learned one is the Server.
+    let (live_url, live_rx) = start_non_loopback_ws_server(
+        vec![vec![named_welcome(
+            "advance-b",
+            Some("fingerprint-advance"),
+        )]],
+        Some((
+            "advance-token".to_string(),
+            "fingerprint-advance".to_string(),
+        )),
+    );
+    let port: u16 = live_url
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse().ok())
+        .expect("live endpoint port");
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port)).expect("bind rejecting server");
+    thread::spawn(move || {
+        while let Some(mut link) = accept_link(&listener, &None) {
+            if link.read().is_none() {
+                continue;
+            }
+            link.send(&ServerMsg::Error {
+                error: WireError {
+                    kind: "unauthenticated".into(),
+                    message: "token rejected".into(),
+                    remediation: None,
+                },
+            });
+            link.close();
+        }
+    });
+
+    let conns_path = home.0.join(".fleety").join("connections.toml");
+    std::fs::create_dir_all(conns_path.parent().expect("connections parent"))
+        .expect("create fleety dir");
+    let mut conns = fleety_tools::connection::Connections {
+        device_id: "daemon-smoke".into(),
+        current: Some("A".into()),
+        ..Default::default()
+    };
+    conns.profiles.insert(
+        "A".into(),
+        fleety_tools::connection::Profile {
+            url: url_a,
+            token: Some("token-a".into()),
+            ..Default::default()
+        },
+    );
+    conns.profiles.insert(
+        "B".into(),
+        fleety_tools::connection::Profile {
+            url: format!("ws://127.0.0.1:{port}"),
+            endpoints: vec![live_url],
+            token: Some("advance-token".into()),
+            fingerprint: Some("fingerprint-advance".into()),
+            ..Default::default()
+        },
+    );
+    fleety_tools::connection::save_at(&conns_path, &conns).expect("seed advancing profiles");
+
+    let child = Command::new(env!("CARGO_BIN_EXE_fleetyd"))
+        .env("HOME", &home.0)
+        .env("USERPROFILE", &home.0)
+        .env("FLEETY_CONNECTIONS", &conns_path)
+        .env("FLEETY_DEVICE_ID", "daemon-smoke")
+        .env("FLEETY_DEVICE_ROOT", &root.0)
+        .env("FLEETY_MDNS_DISABLED", "1")
+        .env_remove("FLEETY_AGENT_URL")
+        .env_remove("FLEETY_TOKEN")
+        .env_remove("FLEETY_PAIRING_CODE")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("run fleetyd");
+    let mut child = ChildGuard(child);
+    hello_a
+        .recv_timeout(Duration::from_secs(15))
+        .expect("profile A hello");
+    let ready_path = home.0.join(".fleety").join("fleetyd.control-ready.json");
+    wait_until(|| ready_path.exists());
+    fleety_tools::connection::mutate_at(&conns_path, |live| {
+        live.current = Some("B".into());
+        Ok(())
+    })
+    .expect("switch to profile B");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_fleetyd"))
+        .args(["reconnect", "--profile", "B"])
+        .env("HOME", &home.0)
+        .env("USERPROFILE", &home.0)
+        .env("FLEETY_CONNECTIONS", &conns_path)
+        .output()
+        .expect("invoke reconnect");
+
+    let reached = live_rx.recv_timeout(Duration::from_secs(5));
+    let _ = child.0.kill();
+    assert!(
+        reached.is_ok(),
+        "the rejecting configured endpoint must not stop the reconnect reaching the working one"
+    );
+    assert!(
+        output.status.success(),
+        "the reconnect must settle as success on the endpoint that answered: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// F-2's gap: the advance test used an endpoint that *refuses* immediately. A
+/// configured endpoint that accepts the socket and then says nothing is the
+/// harder case — it is what leaving a network looks like — and it is the one a
+/// per-candidate deadline computed after the connect fails to bound.
+#[test]
+fn an_owner_reconnect_reaches_a_learned_endpoint_when_the_configured_one_stalls() {
+    let seq = COMMAND_SEQ.fetch_add(1, Ordering::Relaxed);
+    let home = TempDir::new(&format!("reconnect-stall-{seq}"));
+    let root = TempDir::new(&format!("reconnect-stall-root-{seq}"));
+    let (url_a, hello_a, _closed_a) = start_held_ws_server("stall-a");
+
+    let (live_url, live_rx) = start_non_loopback_ws_server(
+        vec![vec![named_welcome("stall-b", Some("fingerprint-stall"))]],
+        Some(("stall-token".to_string(), "fingerprint-stall".to_string())),
+    );
+    let port: u16 = live_url
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse().ok())
+        .expect("live endpoint port");
+    // Accepts the upgrade and then never sends a frame or closes.
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port)).expect("bind stalling server");
+    thread::spawn(move || {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept() {
+            if let Ok(ws) = accept(stream) {
+                held.push(ws);
+            }
+        }
+    });
+
+    let conns_path = home.0.join(".fleety").join("connections.toml");
+    std::fs::create_dir_all(conns_path.parent().expect("connections parent"))
+        .expect("create fleety dir");
+    let mut conns = fleety_tools::connection::Connections {
+        device_id: "daemon-smoke".into(),
+        current: Some("A".into()),
+        ..Default::default()
+    };
+    conns.profiles.insert(
+        "A".into(),
+        fleety_tools::connection::Profile {
+            url: url_a,
+            token: Some("token-a".into()),
+            ..Default::default()
+        },
+    );
+    conns.profiles.insert(
+        "B".into(),
+        fleety_tools::connection::Profile {
+            url: format!("ws://127.0.0.1:{port}"),
+            endpoints: vec![live_url],
+            token: Some("stall-token".into()),
+            fingerprint: Some("fingerprint-stall".into()),
+            ..Default::default()
+        },
+    );
+    fleety_tools::connection::save_at(&conns_path, &conns).expect("seed stalling profiles");
+
+    let child = Command::new(env!("CARGO_BIN_EXE_fleetyd"))
+        .env("HOME", &home.0)
+        .env("USERPROFILE", &home.0)
+        .env("FLEETY_CONNECTIONS", &conns_path)
+        .env("FLEETY_DEVICE_ID", "daemon-smoke")
+        .env("FLEETY_DEVICE_ROOT", &root.0)
+        .env("FLEETY_MDNS_DISABLED", "1")
+        .env_remove("FLEETY_AGENT_URL")
+        .env_remove("FLEETY_TOKEN")
+        .env_remove("FLEETY_PAIRING_CODE")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("run fleetyd");
+    let mut child = ChildGuard(child);
+    hello_a
+        .recv_timeout(Duration::from_secs(15))
+        .expect("profile A hello");
+    let ready_path = home.0.join(".fleety").join("fleetyd.control-ready.json");
+    wait_until(|| ready_path.exists());
+    fleety_tools::connection::mutate_at(&conns_path, |live| {
+        live.current = Some("B".into());
+        Ok(())
+    })
+    .expect("switch to profile B");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_fleetyd"))
+        .args(["reconnect", "--profile", "B"])
+        .env("HOME", &home.0)
+        .env("USERPROFILE", &home.0)
+        .env("FLEETY_CONNECTIONS", &conns_path)
+        .output()
+        .expect("invoke reconnect");
+
+    let reached = live_rx.recv_timeout(Duration::from_secs(5));
+    let _ = child.0.kill();
+    assert!(
+        reached.is_ok(),
+        "a stalling configured endpoint must not consume the whole sweep: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn daemon_reconnect_handshake_deadline_settles_failure_without_welcome() {
     let output = run_gated_reconnect(None, Some("fingerprint-gated-b"), None);
@@ -2141,6 +2682,7 @@ fn durable_profile_rejects_control_when_welcome_omits_identity() {
             audio_input: false,
             config_protocol: 0,
             server_fingerprint: None,
+            server_endpoints: Vec::new(),
             loopback_trusted: false,
             token: None,
         },
@@ -2206,6 +2748,7 @@ fn durable_profile_rejects_control_when_welcome_identity_is_whitespace() {
             audio_input: false,
             config_protocol: 0,
             server_fingerprint: Some(" \t ".into()),
+            server_endpoints: Vec::new(),
             loopback_trusted: false,
             token: None,
         },
@@ -2334,6 +2877,7 @@ fn durable_profile_rejects_an_empty_minted_token() {
             audio_input: false,
             config_protocol: 0,
             server_fingerprint: Some("fingerprint-a".into()),
+            server_endpoints: Vec::new(),
             loopback_trusted: false,
             token: Some(String::new()),
         },

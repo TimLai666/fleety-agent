@@ -2,12 +2,18 @@
 
 ### Requirement: mDNS is a sticky, fingerprint-guarded fallback in the resolver
 
-Within the shared connection resolver, a saved current profile with an explicit URL SHALL connect automatically and SHALL rank above every discovery path. When no saved current URL can be resolved, mDNS SHALL collect candidates for display and explicit selection only; the resolver SHALL NOT return an mDNS candidate as an operational target. Matching, mismatched, and absent TXT fingerprints SHALL NOT authorize sending a stored or caller-explicit token, sending a pairing code, persisting a `Welcome` token, accepting control frames, or assigning saved profile provenance. A user SHALL explicitly select an endpoint and complete pairing before that endpoint can become an operational profile. A credentialed URL-less current profile SHALL require explicit endpoint selection and re-pair instead of falling through to mDNS.
+Within the shared connection resolver, a saved current profile with an explicit URL SHALL connect automatically and SHALL rank above every discovery path. Authenticated endpoints previously learned from that same profile's `Welcome` SHALL be part of the saved profile rather than mDNS discovery. When no saved current URL or learned endpoint can be resolved, mDNS SHALL collect candidates for display and explicit selection only; the resolver SHALL NOT return an mDNS candidate as an operational target. Matching, mismatched, and absent TXT fingerprints SHALL NOT authorize sending a stored or caller-explicit token, sending a pairing code, persisting a `Welcome` token, accepting control frames, or assigning saved profile provenance. A user SHALL explicitly select an endpoint and complete pairing before that endpoint can become an operational profile. A credentialed profile without any saved endpoint SHALL require explicit endpoint selection and re-pair instead of falling through to mDNS.
 
 #### Scenario: an enrolled device does not drift to mDNS
 
 - **WHEN** a device has a current profile with a saved URL and an mDNS advertiser appears on the LAN
 - **THEN** the resolver SHALL stay on the current profile's URL and SHALL NOT query mDNS
+
+#### Scenario: learned endpoints remain profile-owned
+
+- **GIVEN** profile `home` learned `ws://100.64.0.8:8787` from an authenticated `Welcome`
+- **WHEN** its primary LAN endpoint is unreachable
+- **THEN** the resolver SHALL try the learned endpoint as part of `home` without querying mDNS or treating another advertiser as trusted
 
 ##### Example: current profile wins over a live mDNS advertiser
 

@@ -70,7 +70,7 @@ git diff -- .agents/skills/spectra-archive/SKILL.md .claude/skills/spectra-archi
 
 這個 change 尚未完成：
 
-- Spectra 進度：77/79
+- Spectra 進度：77/80
 - 已完成 5.58：automatic mDNS 只負責探索／顯示；已儲存明確 endpoint 的 current profile 仍會自動連線
 - 已完成 5.59：fleetyd 必須先取得 reconnect-control owner 與適用的 service PID owner，失敗時在 poller、dependency、network 前非零退出
 - 已完成 5.60：每個 reconnect caller 只接收自己 nonce 的 settlement；舊 terminal result 先持久化成 nonce receipt，後續操作再提交新 nonce
@@ -83,6 +83,9 @@ git diff -- .agents/skills/spectra-archive/SKILL.md .claude/skills/spectra-archi
 - 5.63 最新獨立複審：No findings；64 個 daemon unit tests、35 個 fleetyd smoke tests、228 個 fleety-tools unit tests、完整 workspace tests、Clippy、fmt、diff check 與 Spectra gates 全數通過
 - 已完成 5.64：raw URL、ACP 與 daemon transport override 不再借用 saved credential；只有 resolver 凍結的 named/current profile generation 可寫回 token、TOFU pin 或 auth cleanup，pair/init 的 publication ambiguity 可依同 generation 安全重試，doctor 保持唯讀
 - 5.64 最新三個隔離複審：No findings；315 個 CLI unit tests、107 個 CLI smoke tests、69 個 daemon unit tests、41 個 fleetyd smoke tests、237 個 fleety-tools unit tests、329 個 Server unit tests、完整 workspace tests、Clippy、release build、fmt、diff check 與 Spectra gates 全數通過
+- 5.65 實作完成、待最終複審：已加入以既有 device token 為 PSK 的 Noise `NNpsk0` 加密握手（`snow`），token 不再上線路，`Welcome`、endpoint 清單與所有後續 frame 都在加密且防竄改的 channel 內；learned endpoint 一律必須通過握手，使用者設定的 endpoint 在 profile 尚未見過安全 Server 前可回退明文，見過後由 `Profile.secure` 永久釘住
+- 5.65 已接線的介面：CLI 一次性指令、Chat 初次與重連、ACP turn／cancel、Settings／auth、Provider editor、`doctor` 唯讀探測、fleetyd reconnect，全部共用 `connect_first_healthy`／`open_candidate`；每個 candidate 在單一 deadline 內完成 connect／handshake／`Hello`／`Welcome`／identity
+- 5.65 已完成兩輪隔離複審並修正全部 Critical／High／Medium；第三輪複審為交付前的最後一關
 - 尚待處理：5.3、5.55
 - Windows 交叉編譯仍受本機缺少 MSVC C headers 阻擋於 `ring`；不得誤報成 Windows build 已通過
 - Clean review streak：3
@@ -174,8 +177,8 @@ mDNS TXT fingerprint 不是可信的身份證明。現有流程可能在驗證 S
 - 新的 LAN 候選必須明確選取、提供 pairing code，且收到新 token 後才能存成 current
 - 已儲存明確 endpoint 的 current profile 必須照常自動連線並跳過 mDNS
 - Credentialed sticky healing 不得只根據 TXT 自動更換 URL
-- Credentialed endpoint 改變必須要求使用者明確 reselect 或 re-pair
-- 若未來要支援透明 healing，必須有 TLS 或 public-key identity proof
+- mDNS 新候選造成的 credentialed endpoint 改變仍必須要求使用者明確 reselect 或 re-pair
+- 已驗證 session 內由同一 Server 回報的備援端點可存入該 pinned profile；後續只在 `Welcome` identity 符合既有 pin 時升為 primary
 - 不能把 mDNS 宣告值當成已驗證 identity
 
 # 最新 reviewer 的 Medium 問題

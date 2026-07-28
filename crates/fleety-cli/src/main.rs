@@ -291,13 +291,39 @@ fn usage(msg: &str) -> std::process::ExitCode {
     std::process::ExitCode::from(2)
 }
 
+/// End quietly when the reader of our stdout goes away.
+///
+/// Rust masks `SIGPIPE`, so a closed pipe surfaces as an `EPIPE` write error and
+/// the print macros panic on it — `fleety config list | head` exits 101 with a
+/// backtrace, which is neither what the user did wrong nor something this
+/// crate's never-crash rule allows. Resetting the signal disposition would need
+/// `unsafe`, which this crate forbids, so the panic is intercepted instead: a
+/// broken pipe is a normal end to a pipeline, not a failure to report.
+fn quiet_on_broken_pipe() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = info
+            .payload()
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| info.payload().downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        // Match the untranslated prefix the std macros produce, not the OS
+        // error text, which glibc localises.
+        if payload.contains("failed printing to") || payload.contains("Broken pipe") {
+            std::process::exit(0);
+        }
+        previous(info);
+    }));
+}
+
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
+    quiet_on_broken_pipe();
     // Parse side-effect-free top-level queries before logging, config seeding,
     // or legacy migration. `--help` and `--version` must never touch user data.
     let (args, output) = take_output_options(std::env::args().collect());
     let _ = OUTPUT_OPTIONS.set(output);
-    let _show_warnings = output.warnings;
     if output.no_color {
         std::env::set_var("NO_COLOR", "1");
     }
@@ -705,6 +731,10 @@ async fn main() -> std::process::ExitCode {
                 // works with any ACP-capable editor.
                 if invalid {
                     usage("usage: fleety acp install [editor] [--server <url>]")
+                } else if let Some(message) =
+                    acp::unsupported_editor(target.as_deref(), server.as_deref())
+                {
+                    usage(&message)
                 } else {
                     done(acp::install(target, server))
                 }
@@ -955,7 +985,19 @@ fn generate_completion(shell: &str) -> std::process::ExitCode {
         _ => return usage("usage: fleety completion <bash|zsh|fish|powershell|elvish>"),
     };
     let mut command = commands::command();
-    clap_complete::generate(shell, &mut command, "fleety", &mut std::io::stdout());
+    // Generate into memory first: `clap_complete` panics on a write failure, so
+    // handing it stdout means `fleety completion zsh | head` crashes on the
+    // closed pipe with a message that names a "generated file" the user never
+    // asked for.
+    let mut script = Vec::new();
+    clap_complete::generate(shell, &mut command, "fleety", &mut script);
+    use std::io::Write as _;
+    if let Err(error) = std::io::stdout().write_all(&script) {
+        if error.kind() != std::io::ErrorKind::BrokenPipe {
+            eprintln!("error: could not write the completion script: {error}");
+            return std::process::ExitCode::FAILURE;
+        }
+    }
     std::process::ExitCode::SUCCESS
 }
 
@@ -1035,35 +1077,6 @@ fn is_auth_rejection(kind: &str) -> bool {
     kind == "unauthenticated"
 }
 
-struct ChatWelcome {
-    server_identity: Option<String>,
-    server_version: String,
-    config_protocol: u32,
-}
-
-async fn receive_chat_welcome(rx: &mut Rx) -> Result<ChatWelcome> {
-    match recv(rx).await? {
-        Some(ServerMsg::Welcome {
-            server_fingerprint,
-            server_version,
-            config_protocol,
-            ..
-        }) => Ok(ChatWelcome {
-            server_identity: server_fingerprint,
-            server_version,
-            config_protocol,
-        }),
-        Some(ServerMsg::Error { error }) => Err(CoreError::Message(format!(
-            "the Server rejected Chat: {}",
-            error.message
-        ))),
-        other => Err(CoreError::Message(format!(
-            "expected Chat Welcome, got {}",
-            server_msg_kind_option(other.as_ref())
-        ))),
-    }
-}
-
 fn chat_model_context(
     entries: &[fleety_protocol::ConfigEntry],
     providers_json: &str,
@@ -1120,8 +1133,16 @@ async fn run_tui(session: workspace::WorkspaceSession) -> Result<workspace::Sess
 
     let mut chat_transport = None;
     workspace.reduce(workspace::Action::Connect);
-    let (mut tx, mut rx, target) = match open(&RemoteOwner::Server).await {
-        Ok(connection) => connection,
+    // Chat is not considered connected until an endpoint has completed the
+    // whole handshake, so reaching a Server and being *rejected* by one are the
+    // same outcome here: no session, and the user is sent to pick a profile.
+    let OpenedSession {
+        mut tx,
+        mut rx,
+        mut target,
+        welcome,
+    } = match open(&RemoteOwner::Server).await {
+        Ok(session) => session,
         Err(error) => {
             let message = error.report().message;
             workspace.reduce(workspace::Action::Offline(message.clone()));
@@ -1144,37 +1165,6 @@ async fn run_tui(session: workspace::WorkspaceSession) -> Result<workspace::Sess
             )));
         }
     };
-    let token = target.token_owned();
-    send(&mut tx, &hello(token.clone(), None)).await?;
-
-    // Chat is not considered connected until the authenticated Welcome has
-    // supplied the transport identity used by the persistent header.
-    let welcome = match receive_chat_welcome(&mut rx).await {
-        Ok(welcome) => welcome,
-        Err(error) => {
-            let _ = tx.close().await;
-            let message = error.report().message;
-            workspace.reduce(workspace::Action::Offline(message.clone()));
-            workspace.reduce(workspace::Action::PushNotice(
-                workspace::Notice::error("Chat handshake failed")
-                    .details(message)
-                    .remediation("Verify or select the Server profile in Settings"),
-            ));
-            workspace.reduce(workspace::Action::Navigate(workspace::Route::Settings(
-                workspace::SettingsPage::Connection,
-            )));
-            return Ok(workspace::SessionResult::Continue(Box::new(
-                workspace::WorkspaceSession {
-                    workspace,
-                    chat: app,
-                    chat_transport,
-                    input,
-                    daemon_device_id,
-                },
-            )));
-        }
-    };
-    verify_and_pin_welcome_identity(welcome.server_identity.as_deref(), &target)?;
     maybe_converge_cli(&welcome.server_version).await;
     let server_identity = welcome.server_identity.clone();
     let (provider, model) =
@@ -1334,7 +1324,7 @@ async fn run_tui(session: workspace::WorkspaceSession) -> Result<workspace::Sess
                                         }
                                     }
                                     workspace::Effect::ConnectCurrentProfile => {
-                                        if let Some((new_tx, new_rx)) = reconnect(
+                                        if let Some((new_tx, new_rx, new_target)) = reconnect(
                                             &target,
                                             server_identity.as_deref(),
                                             &mut app,
@@ -1347,6 +1337,7 @@ async fn run_tui(session: workspace::WorkspaceSession) -> Result<workspace::Sess
                                         {
                                             tx = new_tx;
                                             rx = new_rx;
+                                            target = new_target;
                                         }
                                     }
                                     workspace::Effect::RetryNotice(id) => {
@@ -1598,7 +1589,7 @@ async fn run_tui(session: workspace::WorkspaceSession) -> Result<workspace::Sess
                     // The link dropped: try to reconnect with capped backoff and
                     // resume the conversation, instead of exiting outright. On a
                     // give-up, reconnect() has already set the status + should_quit.
-                    if let Some((new_tx, new_rx)) =
+                    if let Some((new_tx, new_rx, new_target)) =
                         reconnect(
                             &target,
                             server_identity.as_deref(),
@@ -1612,6 +1603,7 @@ async fn run_tui(session: workspace::WorkspaceSession) -> Result<workspace::Sess
                     {
                         tx = new_tx;
                         rx = new_rx;
+                        target = new_target;
                     }
                 }
                 }
@@ -1647,16 +1639,37 @@ impl From<CoreError> for ChatReconnectError {
     }
 }
 
+/// One reconnect attempt, across every endpoint this profile knows.
+///
+/// Returns the endpoint that answered as well as the transport, because a
+/// reconnect may legitimately land somewhere other than where the session
+/// started — the header and the next attempt must both follow it there.
+///
+/// The identity check runs after the handshake has been committed, which is
+/// deliberate: committing requires matching the profile's own pin, so the only
+/// way to reach a mismatch here is that the user re-paired the profile mid
+/// session. Learning that new Server's endpoints is right; continuing this
+/// chat session against it is not.
 async fn reconnect_chat_once(
     target: &connection::Resolved,
     expected_identity: Option<&str>,
     conversation_id: Option<String>,
     after_seq: u64,
-) -> std::result::Result<(Tx, Rx, workspace::ChatTransportContext), ChatReconnectError> {
-    let connection = transport::connect(target.url(), target.token()).await?;
-    let (mut tx, mut rx) = connection.split();
-    send(&mut tx, &hello(target.token_owned(), None)).await?;
-    let welcome = receive_chat_welcome(&mut rx).await?;
+) -> std::result::Result<
+    (
+        Tx,
+        Rx,
+        workspace::ChatTransportContext,
+        connection::Resolved,
+    ),
+    ChatReconnectError,
+> {
+    let OpenedSession {
+        mut tx,
+        mut rx,
+        target,
+        welcome,
+    } = open_resolved(target, &RemoteOwner::Server, CLIENT_HANDSHAKE_WAIT).await?;
     if welcome.server_identity.as_deref() != expected_identity {
         let _ = tx.close().await;
         return Err(ChatReconnectError::IdentityChanged);
@@ -1674,14 +1687,14 @@ async fn reconnect_chat_once(
         .await?;
     }
     let context = workspace::ChatTransportContext {
-        profile: workspace_profile_label(target),
+        profile: workspace_profile_label(&target),
         endpoint: target.url_owned(),
         server_identity: welcome.server_identity,
         server_version: (!welcome.server_version.is_empty()).then_some(welcome.server_version),
         provider,
         model,
     };
-    Ok((tx, rx, context))
+    Ok((tx, rx, context, target))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1791,7 +1804,7 @@ async fn reconnect(
     chat_transport: &mut Option<workspace::ChatTransportContext>,
     terminal: &mut fleety_inline::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     input: &mut workspace::WorkspaceInput,
-) -> Option<(Tx, Rx)> {
+) -> Option<(Tx, Rx, connection::Resolved)> {
     prepare_for_chat_reconnect(app, chat_transport);
 
     const MAX_ATTEMPTS: u32 = 8;
@@ -1848,10 +1861,10 @@ async fn reconnect(
         };
 
         match attempt_result {
-            Ok((tx, rx, context)) => {
+            Ok((tx, rx, context, target)) => {
                 app.status = "reconnected".to_string();
                 workspace::activate_chat_transport(workspace, chat_transport, context);
-                return Some((tx, rx));
+                return Some((tx, rx, target));
             }
             Err(ChatReconnectError::IdentityChanged) => {
                 app.status = "reconnect refused: Server identity changed".into();
@@ -2123,30 +2136,138 @@ fn resolve_target_read_only() -> Result<connection::Resolved> {
 /// goes through here so they share one resolution and one token decision.
 /// A failed saved endpoint is never healed from unsigned mDNS TXT metadata.
 /// The user must explicitly select and re-pair the intended Server.
-async fn open(owner: &RemoteOwner) -> Result<(Tx, Rx, connection::Resolved)> {
-    let target = resolve_target()?;
-    record_remote_context(&target, owner, None);
-    match transport::connect(target.url(), target.token()).await {
-        Ok(ws) => {
-            let (tx, rx) = ws.split();
-            Ok((tx, rx, target))
-        }
-        Err(e) => match target.source() {
-            connection::Source::Profile(name) | connection::Source::OverrideProfile(name) => Err(
-                CoreError::Message(profile_recovery_error(name, &e.report().message)),
-            ),
-            _ => Err(e),
-        },
-    }
+/// What an authenticated `Welcome` told this session. Kept small and owned so
+/// every caller reads the same handshake rather than repeating it.
+#[derive(Clone)]
+struct SessionWelcome {
+    conversation_id: String,
+    server_version: String,
+    config_protocol: u32,
+    server_identity: Option<String>,
+    audio_input: bool,
 }
 
-fn profile_recovery_error(profile: &str, cause: &str) -> String {
-    format!(
-        "could not reach saved Server profile '{}': {}. {}",
-        terminal_safe_field(profile),
-        transport::redact_urls_in_text(cause),
-        connection::explicit_repair_guidance()
-    )
+/// An open, authenticated session on whichever endpoint answered.
+struct OpenedSession {
+    tx: Tx,
+    rx: Rx,
+    /// The endpoint that completed the handshake, carrying the profile snapshot
+    /// as this session left it. Callers must use this and not the target they
+    /// resolved from: a saved alternative may have answered instead, and it may
+    /// have just been promoted.
+    target: connection::Resolved,
+    welcome: SessionWelcome,
+}
+
+/// Per-candidate budget covering the *whole* handshake — transport, secure
+/// channel, `Hello`, authenticated `Welcome`, identity check. Bounding the
+/// whole thing is the point: an endpoint that connects and then stalls, or
+/// answers as the wrong Server, must not hide the working endpoints behind it.
+const CLIENT_HANDSHAKE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+async fn open(owner: &RemoteOwner) -> Result<OpenedSession> {
+    let target = resolve_target()?;
+    record_remote_context(&target, owner, None);
+    open_resolved(&target, owner, CLIENT_HANDSHAKE_WAIT).await
+}
+
+/// Open the first endpoint of `target` that completes the entire handshake.
+///
+/// This is the one place a Fleety client establishes a session, so every
+/// surface — one-shot commands, Chat, ACP, Settings, Provider — inherits the
+/// same channel policy, the same per-candidate deadline, and the same rule that
+/// nothing is committed until the Server has proven which Server it is.
+async fn open_resolved(
+    target: &connection::Resolved,
+    owner: &RemoteOwner,
+    wait: std::time::Duration,
+) -> Result<OpenedSession> {
+    let owner = owner.clone();
+    let opened = connection::connect_first_healthy(target, wait, move |session| {
+        let owner = owner.clone();
+        async move {
+            let connection::CandidateSession {
+                connection,
+                target,
+                sealed,
+            } = session;
+            let (mut tx, mut rx) = connection.split();
+            send(&mut tx, &hello(target.token_owned(), None)).await?;
+            match recv(&mut rx).await? {
+                Some(ServerMsg::Welcome {
+                    conversation_id,
+                    server_version,
+                    config_protocol,
+                    server_fingerprint,
+                    server_endpoints,
+                    audio_input,
+                    ..
+                }) => {
+                    let committed = verify_and_learn_welcome_identity(
+                        server_fingerprint.as_deref(),
+                        &server_endpoints,
+                        &target,
+                        sealed,
+                    )?;
+                    record_remote_context(&committed, &owner, server_fingerprint.as_deref());
+                    Ok(OpenedSession {
+                        tx,
+                        rx,
+                        target: committed,
+                        welcome: SessionWelcome {
+                            conversation_id,
+                            server_version,
+                            config_protocol,
+                            server_identity: server_fingerprint,
+                            audio_input,
+                        },
+                    })
+                }
+                other => {
+                    let _ = tx.close().await;
+                    Err(CoreError::Message(hello_failure_message_for_target(
+                        other.as_ref(),
+                        &target,
+                    )))
+                }
+            }
+        }
+    })
+    .await;
+
+    let has_credential = target.profile_owner_fingerprint().is_some();
+    opened.map_err(|error| match target.source() {
+        connection::Source::Profile(name) | connection::Source::OverrideProfile(name) => {
+            CoreError::Message(profile_recovery_error_for(
+                name,
+                &error.report().message,
+                has_credential,
+            ))
+        }
+        _ => error,
+    })
+}
+
+/// Why a saved profile could not be reached.
+///
+/// The recovery sentence is only appended when it is true of this profile: it
+/// talks about a stored token and a pinned identity, and on a profile that has
+/// neither it both misleads and buries the actual cause.
+fn profile_recovery_error_for(profile: &str, cause: &str, has_credential: bool) -> String {
+    let cause = transport::redact_urls_in_text(cause);
+    let profile = terminal_safe_field(profile);
+    if has_credential {
+        format!(
+            "could not reach saved Server profile '{profile}': {cause}. {}",
+            connection::explicit_repair_guidance()
+        )
+    } else {
+        format!(
+            "could not reach saved Server profile '{profile}': {cause}. Check the address with \
+             `fleety connection show {profile}`, or set the intended one with `fleety init \
+             <ws-url> --name {profile}`"
+        )
+    }
 }
 
 /// The collecting scan + entry type live in `fleety_tools::connection` (shared
@@ -2246,7 +2367,8 @@ fn close_inline_terminal(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Selection {
     Pick(usize),
-    Cancel,
+    /// Enter on its own: take the first entry, which the prompt advertises.
+    Default,
     Invalid,
 }
 
@@ -2254,7 +2376,7 @@ enum Selection {
 fn parse_selection(input: &str, n: usize) -> Selection {
     let t = input.trim();
     if t.is_empty() {
-        return Selection::Cancel;
+        return Selection::Default;
     }
     match t.parse::<usize>() {
         Ok(i) if (1..=n).contains(&i) => Selection::Pick(i - 1),
@@ -2315,7 +2437,9 @@ pub(crate) async fn probe_local_server(
     url: &str,
     timeout: std::time::Duration,
 ) -> Option<DiscoveredServer> {
-    let ws = tokio::time::timeout(timeout, transport::connect(url, None))
+    // Speculative: this address was never configured by anyone, so a failure to
+    // reach it is the expected case and must not be reported as one.
+    let ws = tokio::time::timeout(timeout, transport::connect_quietly(url, None))
         .await
         .ok()?
         .ok()?;
@@ -2338,11 +2462,24 @@ pub(crate) async fn probe_local_server(
     }
 }
 
-/// Read one line from stdin (the picker / pairing prompts); EOF reads as empty.
-fn read_prompt_line() -> String {
+/// Pairing is a decision about which machine to trust. With no one there to
+/// make it, the guided picker stops instead of choosing on the user's behalf.
+const PROMPT_INPUT_ENDED: &str =
+    "no answer to the server prompt (input ended) — nothing was selected or paired; run \
+     `fleety init` on a terminal, or name the server directly with \
+     `fleety init ws://host:8787 --name <name> --pairing-code <code>`";
+
+/// Read one line from stdin (the picker / pairing prompts).
+///
+/// `None` means the input stream ended. That is not the same as pressing Enter:
+/// EOF used to read as an empty line, so `fleety init < /dev/null` took the
+/// default and paired with whichever server happened to be first, unattended.
+fn read_prompt_line() -> Option<String> {
     let mut line = String::new();
-    let _ = std::io::stdin().read_line(&mut line);
-    line
+    match std::io::stdin().read_line(&mut line) {
+        Ok(0) | Err(_) => None,
+        Ok(_) => Some(line),
+    }
 }
 
 fn guided_pairing_code(
@@ -2357,7 +2494,7 @@ fn guided_pairing_code(
     if code.is_empty() {
         return Err(CoreError::Message(
             "pairing code is required before a LAN-discovered server can be saved or used; \
-             mint one with `fleety pair-code` on an already-paired device — no connection \
+             mint one with `fleety pair-code` on an already-paired device, or use the code the Server printed in its log at first run — no connection \
              was made and connections.toml was not changed"
                 .to_string(),
         ));
@@ -2432,9 +2569,12 @@ async fn init_interactive(name_override: Option<String>) -> Result<()> {
     let picked = loop {
         // Default (empty input) picks #1 — the local server when present.
         eprint!("Pick a server [1-{}] (Enter for 1): ", found.len());
-        match parse_selection(&read_prompt_line(), found.len()) {
+        let Some(answer) = read_prompt_line() else {
+            return Err(CoreError::Message(PROMPT_INPUT_ENDED.to_string()));
+        };
+        match parse_selection(&answer, found.len()) {
             Selection::Pick(i) => break i,
-            Selection::Cancel => break 0,
+            Selection::Default => break 0,
             Selection::Invalid => {
                 eprintln!("Please enter a number from 1 to {}.", found.len());
                 continue;
@@ -2461,7 +2601,7 @@ async fn init_interactive(name_override: Option<String>) -> Result<()> {
             "Pairing code required — mint one with `fleety pair-code` on an \
              already-paired device: "
         );
-        guided_pairing_code(false, false, &read_prompt_line())?
+        guided_pairing_code(false, false, &read_prompt_line().unwrap_or_default())?
     };
     let selection = if is_local {
         InitSelection::GuidedLocal
@@ -2594,17 +2734,22 @@ async fn pair(code: String) -> Result<()> {
     // with the old saved token: a still-valid token would make the Server skip
     // redeeming the code, and a rebuilt Server must be able to replace its old
     // identity under the resolver-frozen owner generation.
-    let (mut tx, mut rx) = transport::connect(target.url(), None).await?.split();
-    let url = target.url_owned();
+    // Roaming may have moved `url` to an address Fleety chose on its own. A
+    // pairing code is a credential with no handshake behind it, so it goes to
+    // the endpoint a person configured.
+    let pairing_endpoint = target.configured_url().to_string();
+    let (mut tx, mut rx) = transport::connect(&pairing_endpoint, None).await?.split();
+    let url = pairing_endpoint.clone();
     print_remote_context(&target, &RemoteOwner::Server, None);
     send(&mut tx, &hello(None, Some(code))).await?;
     let result = match recv(&mut rx).await? {
         Some(ServerMsg::Welcome {
             token: Some(tok),
             server_fingerprint: Some(server_fingerprint),
+            server_endpoints,
             ..
         }) if !tok.trim().is_empty() && !server_fingerprint.trim().is_empty() => {
-            let (recovery, notify_daemon) =
+            let (initial_error, notify_daemon, committed) =
                 match connection::store_resolved_profile_pairing_recoverable(
                     &target,
                     &tok,
@@ -2612,21 +2757,37 @@ async fn pair(code: String) -> Result<()> {
                 )? {
                     connection::CredentialCommit::Durable {
                         profile_is_current,
+                        committed,
                         ..
-                    } => (None, profile_is_current),
+                    } => (None, profile_is_current, committed),
                     connection::CredentialCommit::PublishedNotDurable {
                         committed,
                         error,
                         profile_is_current,
                         ..
-                    } => (
-                        Some(ProfilePublicationRecovery {
-                            initial_error: error,
-                            committed,
-                        }),
-                        profile_is_current,
-                    ),
+                    } => (Some(error), profile_is_current, committed),
                 };
+            // Pairing runs on the explicit endpoint the user typed, before any
+            // device token exists to key a channel with, so it is never sealed.
+            let committed = match connection::learn_resolved_profile_endpoints(
+                &committed,
+                &server_fingerprint,
+                &server_endpoints,
+                false,
+            ) {
+                Ok(refreshed) => refreshed,
+                Err(error) => {
+                    tracing::warn!(
+                        report = ?error.report(),
+                        "could not record what pairing learned about the profile"
+                    );
+                    committed
+                }
+            };
+            let recovery = initial_error.map(|initial_error| ProfilePublicationRecovery {
+                initial_error,
+                committed,
+            });
             finish_profile_publication(
                 &profile_name,
                 "pairing",
@@ -2733,9 +2894,11 @@ fn origin() -> OriginContext {
         cwd: std::env::current_dir()
             .ok()
             .map(|p| p.display().to_string()),
-        home: std::env::var("HOME")
-            .ok()
-            .or_else(|| std::env::var("USERPROFILE").ok()),
+        home: fleety_tools::device::home_is_known().then(|| {
+            fleety_tools::device::home_dir()
+                .to_string_lossy()
+                .into_owned()
+        }),
     }
 }
 
@@ -2826,6 +2989,20 @@ async fn init_selected(
                 .and_then(|profile| profile.fingerprint.clone())
         })
         .flatten();
+    // `init` runs before there is a resolved owner, so it opens the endpoint
+    // directly. A profile that has already seen this Server speak the encrypted
+    // channel must not have its saved token replayed in the clear here: the
+    // guidance for a refused endpoint points at `fleety init`, so this is
+    // exactly the path an attacker who took over the address would steer the
+    // user onto. Re-pairing with a code stays available and needs no token.
+    let latched =
+        prior_profile.as_ref().is_some_and(|profile| profile.secure) && !pairing_attempted;
+    if latched {
+        return Err(CoreError::Message(format!(
+            "server profile '{}' has an encrypted channel with its Server, so its saved token is not sent over a plain connection. Re-pair with `fleety init <ws-url> --name <profile> --pairing-code <code>`",
+            terminal_safe_field(&name)
+        )));
+    }
     let proposed_target = connection::Resolved::unowned(
         url.clone(),
         token.clone(),
@@ -2885,7 +3062,18 @@ async fn init_selected(
                 }
                 let profile = live.profiles.entry(name.clone()).or_default();
                 profile.url = url.clone();
+                // Enrollment happens before any encrypted channel exists, and
+                // only a sealed session may teach a profile addresses. The first
+                // sealed connection learns them.
+                profile.endpoints.clear();
+                // This URL *is* the configured address now, so any memory of an
+                // earlier one is stale — and `pair` uses it to decide where a
+                // one-time code may be sent.
+                profile.configured_url = None;
                 if credentialed_endpoint_change || pairing_attempted {
+                    // A deliberate re-pair replaces the credential the latch and
+                    // the learned endpoints were earned with, so they go too.
+                    profile.secure = false;
                     profile.token = minted_token.clone();
                     profile.fingerprint = server_fingerprint.clone();
                 } else if let Some(minted) = minted_token.as_ref() {
@@ -3016,26 +3204,18 @@ fn guess_mime(path: &Path, kind: &str) -> String {
 }
 
 async fn ask(text: String, attachments: Vec<WireAttachment>) -> Result<()> {
-    let (mut tx, mut rx, target) = open(&RemoteOwner::Server).await?;
-
-    send(&mut tx, &hello(target.token_owned(), None)).await?;
-    match recv(&mut rx).await? {
-        Some(ServerMsg::Welcome {
-            server_version,
-            server_fingerprint,
-            ..
-        }) => {
-            verify_and_pin_welcome_identity(server_fingerprint.as_deref(), &target)?;
-            maybe_converge_cli(&server_version).await;
-            eprint_remote_context(&target, &RemoteOwner::Server, server_fingerprint.as_deref());
-        }
-        other => {
-            return Err(CoreError::Message(hello_failure_message_for_target(
-                other.as_ref(),
-                &target,
-            )))
-        }
-    }
+    let OpenedSession {
+        mut tx,
+        mut rx,
+        target,
+        welcome,
+    } = open(&RemoteOwner::Server).await?;
+    maybe_converge_cli(&welcome.server_version).await;
+    eprint_remote_context(
+        &target,
+        &RemoteOwner::Server,
+        welcome.server_identity.as_deref(),
+    );
 
     send(
         &mut tx,
@@ -3058,7 +3238,7 @@ async fn ask(text: String, attachments: Vec<WireAttachment>) -> Result<()> {
                 // stderr, so piping the reply stays clean — without this line
                 // the id `fleety resume` needs is never shown anywhere.
                 let conversation_id = terminal_safe_text(&conversation_id);
-                eprintln!("(conversation {conversation_id} — continue with: fleety resume {conversation_id})");
+                eprintln!("(conversation {conversation_id} — continue with: fleety conversations resume {conversation_id})");
                 break;
             }
             None => {
@@ -3083,6 +3263,15 @@ async fn ask(text: String, attachments: Vec<WireAttachment>) -> Result<()> {
                     ),
                 };
                 send(&mut tx, &ClientMsg::ToolError { call_id, error }).await?;
+            }
+            // Channel-setup frames are consumed by the transport during the
+            // handshake and unwrapped by it afterwards, so one arriving here is
+            // a peer trying to renegotiate mid-session. Refuse the turn rather
+            // than carry on with a channel whose state is in question.
+            Some(ServerMsg::SecureAccept { .. }) | Some(ServerMsg::SecureFrame { .. }) => {
+                return Err(CoreError::Provider(
+                    "the Server sent a secure-channel frame outside the handshake".to_string(),
+                ))
             }
             // Credential / pairing-code replies belong to their own commands'
             // request/reply exchanges; in the ask loop they are stray noise.
@@ -3162,29 +3351,19 @@ fn capture_voice_text() -> Option<String> {
 }
 
 async fn voice_chat() -> Result<()> {
-    let (mut tx, mut rx, target) = open(&RemoteOwner::Server).await?;
-
-    send(&mut tx, &hello(target.token_owned(), None)).await?;
-    let (conversation, audio_input) = match recv(&mut rx).await? {
-        Some(ServerMsg::Welcome {
-            server_version,
-            conversation_id,
-            audio_input,
-            server_fingerprint,
-            ..
-        }) => {
-            verify_and_pin_welcome_identity(server_fingerprint.as_deref(), &target)?;
-            maybe_converge_cli(&server_version).await;
-            print_remote_context(&target, &RemoteOwner::Server, server_fingerprint.as_deref());
-            (conversation_id, audio_input)
-        }
-        other => {
-            return Err(CoreError::Message(hello_failure_message_for_target(
-                other.as_ref(),
-                &target,
-            )))
-        }
-    };
+    let OpenedSession {
+        mut tx,
+        mut rx,
+        target,
+        welcome,
+    } = open(&RemoteOwner::Server).await?;
+    maybe_converge_cli(&welcome.server_version).await;
+    print_remote_context(
+        &target,
+        &RemoteOwner::Server,
+        welcome.server_identity.as_deref(),
+    );
+    let (conversation, audio_input) = (welcome.conversation_id.clone(), welcome.audio_input);
     // Decide once: send audio to an audio-capable model, else transcribe locally.
     let voice_mode = voice::voice_mode(audio_input, voice::voice_audio_setting());
 
@@ -3315,26 +3494,19 @@ async fn voice_chat() -> Result<()> {
 
 /// Reconnect to a conversation and print events replayed after `after_seq`.
 async fn resume(conversation_id: String, after_seq: u64) -> Result<()> {
-    let (mut tx, mut rx, target) = open(&RemoteOwner::Server).await?;
-
-    send(&mut tx, &hello(target.token_owned(), None)).await?;
-    match recv(&mut rx).await? {
-        Some(ServerMsg::Welcome {
-            server_version,
-            server_fingerprint,
-            ..
-        }) => {
-            verify_and_pin_welcome_identity(server_fingerprint.as_deref(), &target)?;
-            maybe_converge_cli(&server_version).await;
-            print_remote_context(&target, &RemoteOwner::Server, server_fingerprint.as_deref());
-        }
-        other => {
-            return Err(CoreError::Message(hello_failure_message_for_target(
-                other.as_ref(),
-                &target,
-            )))
-        }
-    }
+    let label = conversation_id.clone();
+    let OpenedSession {
+        mut tx,
+        mut rx,
+        target,
+        welcome,
+    } = open(&RemoteOwner::Server).await?;
+    maybe_converge_cli(&welcome.server_version).await;
+    print_remote_context(
+        &target,
+        &RemoteOwner::Server,
+        welcome.server_identity.as_deref(),
+    );
 
     send(
         &mut tx,
@@ -3344,15 +3516,19 @@ async fn resume(conversation_id: String, after_seq: u64) -> Result<()> {
         },
     )
     .await?;
+    let mut replayed = 0usize;
     loop {
         match recv(&mut rx).await? {
             Some(ServerMsg::Replay {
                 seq, role, content, ..
-            }) => println!(
-                "[{seq}] {}: {}",
-                terminal_safe_field(&role),
-                terminal_safe_field(&content)
-            ),
+            }) => {
+                replayed += 1;
+                println!(
+                    "[{seq}] {}: {}",
+                    terminal_safe_field(&role),
+                    terminal_safe_field(&content)
+                );
+            }
             Some(ServerMsg::Done { .. }) => break,
             Some(ServerMsg::Welcome { .. }) => {
                 return Err(CoreError::Message(
@@ -3370,7 +3546,31 @@ async fn resume(conversation_id: String, after_seq: u64) -> Result<()> {
         }
     }
     let _ = tx.close().await;
+    // A resume that replays nothing used to exit 0 in silence, which reads the
+    // same as success — the user cannot tell an unknown id from an empty
+    // conversation from already being caught up.
+    if replayed == 0 {
+        println!("{}", empty_resume_notice(&label, after_seq));
+    }
     Ok(())
+}
+
+/// What to print when a resume replayed no messages. The Server does not say
+/// which of the possible reasons applies, so name them rather than implying
+/// everything worked.
+fn empty_resume_notice(conversation_id: &str, after_seq: u64) -> String {
+    let id = terminal_safe_field(conversation_id);
+    if after_seq == 0 {
+        format!(
+            "no messages in conversation '{id}' — it is empty, or the id is not one this Server \
+             knows (list ids with `fleety conversations`)"
+        )
+    } else {
+        format!(
+            "no messages after seq {after_seq} in conversation '{id}' — you are already up to \
+             date, or the id is not one this Server knows (list ids with `fleety conversations`)"
+        )
+    }
 }
 
 /// Open a connection, send Hello, await Welcome, return the streams. Common
@@ -3664,25 +3864,19 @@ fn record_remote_device_filter(device_id: &str) {
 async fn connect_hello_for_owner(
     owner: RemoteOwner,
 ) -> Result<(Tx, Rx, u32, connection::Resolved)> {
-    let (mut tx, mut rx, target) = open(&owner).await?;
-    send(&mut tx, &hello(target.token_owned(), None)).await?;
-    match recv(&mut rx).await? {
-        Some(ServerMsg::Welcome {
-            server_version,
-            server_fingerprint,
-            config_protocol,
-            ..
-        }) => {
-            verify_and_pin_welcome_identity(server_fingerprint.as_deref(), &target)?;
-            maybe_converge_cli(&server_version).await;
-            print_remote_context(&target, &owner, server_fingerprint.as_deref());
-            Ok((tx, rx, config_protocol, target))
-        }
-        other => Err(CoreError::Message(hello_failure_message_for_target(
-            other.as_ref(),
-            &target,
-        ))),
-    }
+    let session = open(&owner).await?;
+    maybe_converge_cli(&session.welcome.server_version).await;
+    print_remote_context(
+        &session.target,
+        &owner,
+        session.welcome.server_identity.as_deref(),
+    );
+    Ok((
+        session.tx,
+        session.rx,
+        session.welcome.config_protocol,
+        session.target,
+    ))
 }
 
 async fn connect_hello() -> Result<(Tx, Rx)> {
@@ -3783,6 +3977,47 @@ fn verify_and_pin_welcome_identity(
     }
 }
 
+/// `sealed` records whether this session ran inside the encrypted channel; it
+/// is committed with the endpoints so the profile refuses a downgrade later.
+fn verify_and_learn_welcome_identity(
+    fingerprint: Option<&str>,
+    server_endpoints: &[String],
+    target: &connection::Resolved,
+    sealed: bool,
+) -> Result<connection::Resolved> {
+    let committed = verify_and_pin_welcome_identity(fingerprint, target)?;
+    if !committed.has_profile_owner() {
+        return Ok(committed);
+    }
+    let fingerprint = fingerprint
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            CoreError::Message(
+                "the selected saved profile requires a non-empty Server identity; learned endpoints were not saved"
+                    .to_string(),
+            )
+        })?;
+    match connection::learn_resolved_profile_endpoints(
+        &committed,
+        fingerprint,
+        server_endpoints,
+        sealed,
+    ) {
+        Ok(refreshed) => Ok(refreshed),
+        // Identity is already verified above; this commit only records what the
+        // session taught us. Losing it costs a promotion, not correctness, and
+        // failing here would drop a proven session and walk on to endpoints that
+        // have proven nothing.
+        Err(error) => {
+            tracing::warn!(
+                report = ?error.report(),
+                "could not record what this session learned about the profile"
+            );
+            Ok(committed)
+        }
+    }
+}
+
 /// `connect_hello` for the `auth` command: also returns the server's advertised
 /// config protocol (the credential-support gate) and the resolved target, so
 /// auth can refuse an old server up front and name the server it acts on.
@@ -3817,35 +4052,62 @@ async fn connect_hello_for_auth_target_inner(
     target: &connection::Resolved,
     verify_identity: bool,
 ) -> Result<(Tx, Rx, u32, Option<String>, String, connection::Resolved)> {
-    let ws = transport::connect(target.url(), target.token()).await?;
-    let (mut tx, mut rx) = ws.split();
-    send(&mut tx, &hello(target.token_owned(), None)).await?;
-    match recv(&mut rx).await? {
-        Some(ServerMsg::Welcome {
-            server_version,
-            config_protocol,
-            server_fingerprint,
-            ..
-        }) => {
-            let committed_target = if verify_identity {
-                verify_and_pin_welcome_identity(server_fingerprint.as_deref(), target)?
-            } else {
-                target.clone()
-            };
-            Ok((
-                tx,
-                rx,
+    connect_hello_for_auth_target_inner_with(target, verify_identity, CLIENT_HANDSHAKE_WAIT).await
+}
+
+async fn connect_hello_for_auth_target_inner_with(
+    target: &connection::Resolved,
+    verify_identity: bool,
+    wait: std::time::Duration,
+) -> Result<(Tx, Rx, u32, Option<String>, String, connection::Resolved)> {
+    connection::connect_first_healthy(target, wait, move |session| async move {
+        let connection::CandidateSession {
+            connection,
+            target,
+            sealed,
+        } = session;
+        let (mut tx, mut rx) = connection.split();
+        send(&mut tx, &hello(target.token_owned(), None)).await?;
+        match recv(&mut rx).await? {
+            Some(ServerMsg::Welcome {
+                server_version,
                 config_protocol,
                 server_fingerprint,
-                server_version,
-                committed_target,
-            ))
+                server_endpoints,
+                ..
+            }) => {
+                // Settings' own profile-switch path reconnects without touching
+                // credential storage, so it opts out of the commit but still
+                // gets the endpoint that actually answered.
+                let committed_target = if verify_identity {
+                    verify_and_learn_welcome_identity(
+                        server_fingerprint.as_deref(),
+                        &server_endpoints,
+                        &target,
+                        sealed,
+                    )?
+                } else {
+                    target.clone()
+                };
+                Ok((
+                    tx,
+                    rx,
+                    config_protocol,
+                    server_fingerprint,
+                    server_version,
+                    committed_target,
+                ))
+            }
+            other => {
+                let _ = tx.close().await;
+                Err(CoreError::Message(hello_failure_message_for_target(
+                    other.as_ref(),
+                    &target,
+                )))
+            }
         }
-        other => Err(CoreError::Message(hello_failure_message_for_target(
-            other.as_ref(),
-            target,
-        ))),
-    }
+    })
+    .await
 }
 
 pub(crate) async fn connect_hello_for_auth_target(
@@ -3886,9 +4148,19 @@ async fn connect_hello_for_profile_switch_target_with_timeout(
     connections_path: &std::path::Path,
     timeout: std::time::Duration,
 ) -> Result<(Tx, Rx, u32, Option<String>, connection::Resolved)> {
-    let (mut tx, rx, config_protocol, fingerprint, server_version, _) =
-        tokio::time::timeout(timeout, connect_hello_for_auth_target_inner(target, false))
-            .await
+    // Keep the endpoint that actually answered: a switch may legitimately land on
+    // a saved alternative, and Settings must record and display that one rather
+    // than the address it started from.
+    // The caller's budget bounds the whole sweep, so each candidate gets a share
+    // of it. Handing every candidate the full budget meant a profile with a
+    // saved alternative could never reach it — the case roaming exists for.
+    let per_candidate = (timeout / 3).max(std::time::Duration::from_secs(1));
+    let (mut tx, rx, config_protocol, fingerprint, server_version, connected) =
+        tokio::time::timeout(
+            timeout,
+            connect_hello_for_auth_target_inner_with(target, false, per_candidate),
+        )
+        .await
             .map_err(|_| {
                 CoreError::Message(
                     "timed out waiting for the selected Server to authenticate the Settings connection; the profile was saved but fleetyd was not notified"
@@ -3916,9 +4188,10 @@ async fn connect_hello_for_profile_switch_target_with_timeout(
                 terminal_safe_field(seen)
             )));
         }
-        connection::store_resolved_profile_credentials_at(connections_path, target, None, seen)?.1
+        connection::store_resolved_profile_credentials_at(connections_path, &connected, None, seen)?
+            .1
     } else {
-        target.clone()
+        connected
     };
     maybe_converge_cli(&server_version).await;
     Ok((tx, rx, config_protocol, fingerprint, committed_target))
@@ -4090,12 +4363,36 @@ async fn config_remote_request(
             ))
         }
     };
-    let (mut tx, mut rx, config_protocol, _) = connect_hello_for_owner(owner).await.map_err(|e| {
-        CoreError::Message(format!(
-            "could not reach the configuration owner: {} — no local file fallback was used; check the server/daemon connection or select the correct --target",
-            e.report().message
-        ))
-    })?;
+    let owner_label = owner.label();
+    // Failing to *select* an owner and failing to *reach* one are different
+    // problems with different next steps. Wrapping "you have not chosen a
+    // Server yet" inside "could not reach the Server" contradicts itself, and
+    // its `fleety connection use <name>` names a list that is empty. The
+    // resolution error already ends in the step that fixes it.
+    if let Err(unresolved) = resolve_target_read_only() {
+        return Err(CoreError::Message(format!(
+            "{} — nothing was written locally",
+            unresolved.report().message
+        )));
+    }
+    // Provider and model settings have exactly one owner by design, so offering
+    // `--owner` there is advice the parser would reject.
+    let owner_choice_applies =
+        !matches!(args.first().map(String::as_str), Some("provider" | "model"));
+    let (mut tx, mut rx, config_protocol, _) =
+        connect_hello_for_owner(owner).await.map_err(|e| {
+            let next = if owner_choice_applies {
+                "reach that owner, or name a different one with `--owner`"
+            } else {
+                "reach that Server, or select a different one with `fleety connection use <name>`"
+            };
+            CoreError::Message(format!(
+                "could not reach {}, which owns this setting: {} — nothing was written locally; \
+                 {next}",
+                owner_label,
+                e.report().message
+            ))
+        })?;
     if matches!(target, ConfigTarget::Server)
         && matches!(args.first().map(String::as_str), Some("provider" | "model"))
     {
@@ -4686,13 +4983,16 @@ async fn doctor() -> std::process::ExitCode {
                 "Profile",
                 DoctorLevel::Fail,
                 error.report().message,
-                Some("fleety connection list"),
+                // `connection list` shows an empty table when there is no
+                // profile to resolve — a dead end. `init` is the path that ends
+                // with a saved, paired one.
+                Some("fleety init"),
             ));
             checks.push(DoctorCheck::new(
                 "Server",
                 DoctorLevel::Fail,
                 "not checked because profile resolution failed",
-                Some("fleety connection list"),
+                Some(BLOCKED_BY_PROFILE),
             ));
         }
     }
@@ -4704,7 +5004,7 @@ async fn doctor() -> std::process::ExitCode {
             "Daemon connection",
             DoctorLevel::Warn,
             "not checked because the Server is unavailable",
-            Some("fleety daemon start"),
+            Some(BLOCKED_BY_SERVER),
         ));
     }
 
@@ -4783,54 +5083,83 @@ fn mark_server_failed(checks: &mut Vec<DoctorCheck>, detail: String) {
     }
 }
 
+/// What to tell the user when a check never ran because an earlier one failed.
+/// Repeating the skipped check's own command sends them straight back into the
+/// same failure, so a blocked check points at its blocker instead.
+const BLOCKED_BY_SERVER: &str = "clear the Server check above first, then re-run `fleety doctor`";
+const BLOCKED_BY_PROFILE: &str = "clear the Profile check above first, then re-run `fleety doctor`";
+
 fn add_unchecked_remote_checks(checks: &mut Vec<DoctorCheck>) {
-    for (name, remediation) in [
-        ("Config protocol", "fleety update"),
-        ("Providers", "fleety provider list"),
-        ("OAuth", "fleety provider status"),
-        ("Active model", "fleety model list"),
-    ] {
+    for name in ["Config protocol", "Providers", "OAuth", "Active model"] {
         if !checks.iter().any(|check| check.name == name) {
             checks.push(DoctorCheck::new(
                 name,
                 DoctorLevel::Warn,
                 "not checked because the Server is unavailable",
-                Some(remediation),
+                Some(BLOCKED_BY_SERVER),
             ));
         }
     }
 }
 
+/// Probe the Server for `fleety doctor`.
+///
+/// Diagnostics try every saved endpoint, because reporting "unavailable" while
+/// a saved alternative is answering is exactly the wrong answer. It stays
+/// strictly read-only: identity is checked against the existing pin without
+/// writing one, and nothing here promotes an endpoint, saves a credential, or
+/// records secure-channel support — so running doctor can never change what a
+/// later connection will do.
 async fn doctor_remote(target: &connection::Resolved, checks: &mut Vec<DoctorCheck>) -> Result<()> {
-    let ws = transport::connect(target.url(), target.token()).await?;
-    let (mut tx, mut rx) = ws.split();
-    send(&mut tx, &hello(target.token_owned(), None)).await?;
-    let (server_version, config_protocol, server_fingerprint) = match recv(&mut rx).await? {
-        Some(ServerMsg::Welcome {
-            server_version,
-            config_protocol,
-            server_fingerprint,
-            ..
-        }) => (server_version, config_protocol, server_fingerprint),
-        other => {
-            return Err(CoreError::Message(hello_failure_message_for_target(
-                other.as_ref(),
-                target,
-            )))
-        }
-    };
-    verify_welcome_identity_read_only(server_fingerprint.as_deref(), target)?;
-    record_remote_context(target, &RemoteOwner::Server, server_fingerprint.as_deref());
+    let (mut tx, mut rx, probed, server_version, config_protocol, server_fingerprint) =
+        connection::connect_first_healthy(target, CLIENT_HANDSHAKE_WAIT, |session| async move {
+            let connection::CandidateSession {
+                connection, target, ..
+            } = session;
+            let (mut tx, mut rx) = connection.split();
+            send(&mut tx, &hello(target.token_owned(), None)).await?;
+            match recv(&mut rx).await? {
+                Some(ServerMsg::Welcome {
+                    server_version,
+                    config_protocol,
+                    server_fingerprint,
+                    ..
+                }) => {
+                    verify_welcome_identity_read_only(server_fingerprint.as_deref(), &target)?;
+                    Ok((
+                        tx,
+                        rx,
+                        target,
+                        server_version,
+                        config_protocol,
+                        server_fingerprint,
+                    ))
+                }
+                other => {
+                    let _ = tx.close().await;
+                    Err(CoreError::Message(hello_failure_message_for_target(
+                        other.as_ref(),
+                        &target,
+                    )))
+                }
+            }
+        })
+        .await?;
+    record_remote_context(&probed, &RemoteOwner::Server, server_fingerprint.as_deref());
     let identity = server_fingerprint.as_deref().unwrap_or("not advertised");
     let version = if server_version.is_empty() {
         "not advertised"
     } else {
         &server_version
     };
+    // Name the endpoint that answered: when a profile has saved alternatives,
+    // "connected" alone hides the fact that the configured address is dead and
+    // something else is carrying the session.
+    let endpoint = terminal_safe_endpoint(probed.url());
     checks.push(DoctorCheck::new(
         "Server",
         DoctorLevel::Pass,
-        format!("connected; version {version}; identity {identity}"),
+        format!("connected at {endpoint}; version {version}; identity {identity}"),
         None::<String>,
     ));
     checks.push(DoctorCheck::new(
@@ -5329,7 +5658,7 @@ pub(crate) async fn recv(rx: &mut Rx) -> Result<Option<ServerMsg>> {
 #[cfg(test)]
 mod coverage_tests {
     use super::{
-        expand_long_option_equals, format_relative, format_uptime, profile_recovery_error,
+        expand_long_option_equals, format_relative, format_uptime, profile_recovery_error_for,
         truncate_preview,
     };
 
@@ -5389,9 +5718,10 @@ mod coverage_tests {
 
     #[test]
     fn profile_recovery_error_redacts_cause_and_directs_explicit_repair() {
-        let notice = profile_recovery_error(
+        let notice = profile_recovery_error_for(
             "prod\u{1b}]52;c;STEAL\u{7}\r\nforged",
             "connect wss://user:pass@new.test/x?token=SECRET#tail failed",
+            true,
         );
         for forbidden in ["pass", "SECRET", "#tail", "\u{1b}", "\u{7}", "\r", "\n"] {
             assert!(
@@ -5455,6 +5785,69 @@ mod tests {
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::sync::Mutex;
     use tokio_tungstenite::tungstenite::Message;
+
+    #[test]
+    fn the_picker_default_is_the_first_entry_and_eof_is_not_an_answer() {
+        // Enter takes the advertised default…
+        assert_eq!(parse_selection("", 3), Selection::Default);
+        assert_eq!(parse_selection("2", 3), Selection::Pick(1));
+        assert_eq!(parse_selection("4", 3), Selection::Invalid);
+        // …but a closed stdin is not an answer, and the guided flow says so
+        // instead of pairing with whatever happened to be listed first.
+        assert!(PROMPT_INPUT_ENDED.contains("nothing was selected or paired"));
+        assert!(PROMPT_INPUT_ENDED.contains("--pairing-code"));
+    }
+
+    #[test]
+    fn an_empty_resume_says_why_instead_of_exiting_silently() {
+        let fresh = empty_resume_notice("conv-7", 0);
+        assert!(fresh.contains("conv-7"), "{fresh}");
+        assert!(fresh.contains("empty"), "{fresh}");
+        assert!(fresh.contains("fleety conversations"), "{fresh}");
+
+        // Resuming past a sequence number is the "already caught up" case, and
+        // must not be described as an empty conversation.
+        let caught_up = empty_resume_notice("conv-7", 42);
+        assert!(caught_up.contains("42"), "{caught_up}");
+        assert!(caught_up.contains("up to date"), "{caught_up}");
+        assert_ne!(fresh, caught_up);
+
+        // The id is user-supplied and lands on a terminal.
+        let hostile = empty_resume_notice("conv\u{1b}[2J", 0);
+        assert!(!hostile.contains('\u{1b}'), "{hostile:?}");
+    }
+
+    #[test]
+    fn a_check_that_never_ran_points_at_its_blocker_not_at_itself() {
+        // `Fix: fleety provider list` under "not checked because the Server is
+        // unavailable" sends the reader straight back into the same failure.
+        let mut checks = Vec::new();
+        add_unchecked_remote_checks(&mut checks);
+        assert_eq!(checks.len(), 4, "{checks:?}");
+        for check in &checks {
+            assert!(check.detail.starts_with("not checked because"), "{check:?}");
+            let fix = check.remediation.as_deref().unwrap_or_default();
+            assert_eq!(
+                fix, BLOCKED_BY_SERVER,
+                "{} sends the user in a loop",
+                check.name
+            );
+        }
+
+        // A check that did run keeps its own remediation.
+        let mut ran = vec![DoctorCheck::new(
+            "Providers",
+            DoctorLevel::Pass,
+            "3 providers",
+            None::<String>,
+        )];
+        add_unchecked_remote_checks(&mut ran);
+        assert_eq!(
+            ran.iter().filter(|c| c.name == "Providers").count(),
+            1,
+            "a completed check was overwritten: {ran:?}"
+        );
+    }
 
     #[test]
     fn reconnect_keeps_local_input_and_can_navigate_to_settings() {
@@ -5614,6 +6007,7 @@ mod tests {
                         audio_input: false,
                         config_protocol: 0,
                         server_fingerprint: Some(identity),
+                        server_endpoints: Vec::new(),
                         loopback_trusted: false,
                         token: None,
                     })
@@ -5660,7 +6054,7 @@ mod tests {
         app.last_conversation_id = Some("conversation-a".into());
         app.last_seq = 42;
 
-        let (mut tx, _rx, context) = reconnect_chat_once(
+        let (mut tx, _rx, context, _target) = reconnect_chat_once(
             &target,
             Some("server-b"),
             app.last_conversation_id.clone(),
@@ -5761,8 +6155,8 @@ mod tests {
         // 1-based picks within bounds; empty input cancels; anything else re-prompts.
         assert_eq!(parse_selection("1", 3), Selection::Pick(0));
         assert_eq!(parse_selection(" 3 ", 3), Selection::Pick(2));
-        assert_eq!(parse_selection("", 3), Selection::Cancel);
-        assert_eq!(parse_selection("  \n", 3), Selection::Cancel);
+        assert_eq!(parse_selection("", 3), Selection::Default);
+        assert_eq!(parse_selection("  \n", 3), Selection::Default);
         assert_eq!(parse_selection("0", 3), Selection::Invalid);
         assert_eq!(parse_selection("4", 3), Selection::Invalid);
         assert_eq!(parse_selection("abc", 3), Selection::Invalid);
@@ -6422,6 +6816,7 @@ mod tests {
             audio_input: false,
             config_protocol: 0,
             server_fingerprint: Some("fingerprint".to_string()),
+            server_endpoints: Vec::new(),
             loopback_trusted: false,
             token: Some("bearer-must-not-leak".to_string()),
         };

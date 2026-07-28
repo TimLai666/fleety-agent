@@ -149,7 +149,7 @@ echo
 echo "Prefer loopback-only? Persist it first:  $BIN config set FLEETY_ADDR 127.0.0.1:8787"
 echo
 echo "Drive it from this host with the CLI (no pairing — the local server is trusted"
-echo "on loopback):  fleety init   (picks the local server), then  fleety tui"
+echo "on loopback):  fleety init   (picks the local server), then  fleety chat"
 echo
 echo "Update later with:  $BIN update   (self-update + sidecar refresh; restarts when idle)"
 case ":$PATH:" in

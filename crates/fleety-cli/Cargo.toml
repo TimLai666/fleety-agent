@@ -52,3 +52,4 @@ unicode-segmentation = "=1.13.3"
 
 [dev-dependencies]
 uuid = { workspace = true }
+if-addrs = { workspace = true }
