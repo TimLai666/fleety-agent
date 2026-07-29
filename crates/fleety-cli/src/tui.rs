@@ -1072,19 +1072,38 @@ mod tests {
     #[test]
     fn a_handed_over_code_block_carries_its_styling() {
         let mut app = App::new("ready");
-        app.push("fleety", "intro\n```rust\nlet x = 1;\n```");
+        app.push(
+            "fleety",
+            "intro\n```rust\nfn main() { println!(\"hi\"); }\n```",
+        );
         let out = app.take_emissions().join("");
         assert!(
-            without_escapes(&out).contains("let x = 1;"),
+            without_escapes(&out).contains("fn main()"),
             "code kept: {out:?}"
         );
         // Syntect colours the code, and that styling has to travel with the
         // text as escape sequences — the terminal owns these rows now, so there
-        // is no ratatui buffer left to carry a Style.
-        assert!(
-            out.contains("\u{1b}[38;2;"),
-            "syntax colours travel with the text: {out:?}"
-        );
+        // is no ratatui buffer left to carry a Style. The exact SGR form follows
+        // terminal capability and may be ANSI-16, ANSI-256, or truecolor.
+        let code = out
+            .split_once("rust\u{1b}[0m\n")
+            .map(|(_, code)| code)
+            .unwrap_or_default()
+            .split("\u{1b}[0m\u{1b}[2m```")
+            .next()
+            .unwrap_or_default();
+        let styled = code
+            .split("\u{1b}[")
+            .skip(1)
+            .any(|sgr| !sgr.starts_with("0m"));
+        if fleety_markdown::get_color_level() == fleety_markdown::ColorLevel::None {
+            assert!(
+                !styled,
+                "NO_COLOR must suppress syntax colours in scrollback: {out:?}"
+            );
+        } else {
+            assert!(styled, "syntax colours travel with the text: {out:?}");
+        }
     }
 
     #[test]

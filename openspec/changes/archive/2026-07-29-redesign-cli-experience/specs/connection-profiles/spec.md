@@ -212,7 +212,7 @@ After authentication, `Welcome` SHALL advertise a bounded list of syntactically 
 
 ### Requirement: Endpoint roaming never widens what a credential reaches
 
-A profile SHALL distinguish addresses by provenance. An address the user configured SHALL be recorded separately and SHALL remain attemptable exactly as stored, whatever its host form. An address a Server advertised SHALL be accepted only as an IP literal that preserves the connected endpoint's scheme, port, path, and query, and SHALL be attempted exactly as stored so an authenticated session is never refused by the client's own ownership checks. Only a session that completed the encrypted handshake SHALL add endpoints to a profile: a fingerprint is public, so a cleartext session that presents the pinned one SHALL be able to promote the endpoint it is already on but SHALL NOT teach the profile new addresses. Pairing SHALL send its pairing code only to the endpoint the user configured, never to one roaming promoted. A deliberate re-pair SHALL clear the learned endpoints and the secure-channel record along with the credential they were earned with, so a profile can always be recovered onto a Server that speaks a different protocol version.
+A profile SHALL distinguish addresses by provenance. An address the user configured SHALL be recorded separately and SHALL remain attemptable exactly as stored, whatever its host form. An address a Server advertised SHALL be accepted only as an IP literal that preserves the connected endpoint's scheme, port, path, and query, and SHALL be attempted exactly as stored so an authenticated session is never refused by the client's own ownership checks. Only a session that completed the encrypted handshake SHALL add endpoints to a profile: a fingerprint is public, so a cleartext session that presents the pinned one SHALL be able to promote the endpoint it is already on but SHALL NOT teach the profile new addresses. Pairing SHALL send its pairing code only to the endpoint the user configured, never to one roaming promoted. A deliberate re-pair SHALL clear the learned endpoints and the secure-channel record along with the credential they were earned with, so a profile can always be recovered onto a Server that speaks a different protocol version. A current binary SHALL bind the presence of the learned endpoint list, configured address, and secure-channel latch into the profile's opaque lifecycle generation. If an older writer preserves that generation but removes or changes the bound state, the current binary SHALL reject the profile before transport or credential use and SHALL require every installed Fleety binary to be updated before explicit re-pairing.
 
 #### Scenario: a cleartext session cannot seed addresses
 
@@ -226,15 +226,83 @@ A profile SHALL distinguish addresses by provenance. An address the user configu
 - **WHEN** the user runs `fleety pair <code>`
 - **THEN** the pairing code SHALL be sent to the endpoint the user originally configured, and the profile SHALL return to that endpoint so a Server-advertised address never inherits the standing of one the user chose
 
+#### Scenario: explicit named pairing overrides a transient environment endpoint
+
+- **GIVEN** `FLEETY_AGENT_URL=ws://transient:8787` and saved profile `office`
+- **WHEN** the user runs `fleety --profile office pair CODE`
+- **THEN** Fleety SHALL redeem `CODE` against `office` without sending its old token and SHALL NOT contact the environment endpoint
+- **AND WHEN** the user runs `fleety pair CODE` without a named override
+- **THEN** Fleety SHALL reject the ambiguous transient environment target before transport
+
+#### Scenario: legacy devices migrate before explicit pairing
+
+- **GIVEN** an existing device has only legacy `config.json` with a URL and token
+- **WHEN** the user runs `fleety pair CODE`
+- **THEN** Fleety SHALL migrate the legacy record into the current named profile before resolving the pairing owner
+- **AND** the pairing transport SHALL carry `CODE` but SHALL NOT carry the migrated old token
+
 #### Scenario: a Server that cannot key the channel is refused, not downgraded
 
 - **GIVEN** an endpoint answers the handshake by stating it holds no credential for this device
 - **WHEN** the client receives that answer
 - **THEN** it SHALL fail with re-pair guidance and SHALL NOT retry that endpoint in the clear
 
+#### Scenario: an older writer cannot silently erase the secure latch
+
+- **GIVEN** a current binary persisted profile `home` with a versioned generation bound to a secure-channel latch and learned endpoints
+- **WHEN** an older binary rewrites the profile while preserving the opaque generation but omitting `secure`, `configured_url`, or `endpoints`
+- **THEN** every current Fleety surface SHALL reject `home` before opening a transport or using its credential and SHALL direct the user to update every binary and explicitly re-pair
+
 ### Requirement: A paired profile proves the Server before revealing a credential
 
 A paired profile SHALL open its control channel with a mutually authenticated, encrypted handshake keyed by the per-device token it already holds and bound to the Server identity it is pinned to. The device token SHALL NOT be transmitted, and every subsequent control frame SHALL be encrypted and integrity-protected, including `Welcome`, the advertised endpoint list, configuration values, and credential frames. The negotiated channel version and key handle SHALL be bound into the handshake so a modified advertisement aborts it rather than negotiating a weaker path. Each candidate endpoint SHALL be given one bounded attempt covering transport connect, handshake, `Hello`, authenticated `Welcome`, and identity validation together; a candidate that fails any step SHALL be abandoned in favour of the next without mutating any saved credential, identity pin, endpoint list, or primary URL. An endpoint the profile learned rather than the user configured SHALL NOT fall back to the cleartext path. The endpoint the user configured MAY fall back while its profile has never observed this Server complete the handshake; once observed, the profile SHALL record that support and SHALL refuse the cleartext path thereafter. Pairing, same-host loopback trust, and targets with no saved credential have no pre-shared secret to key a handshake with and remain on the existing path.
+
+Before opening each candidate transport, including every advance after a stalled
+or failed candidate, Fleety SHALL revalidate the frozen durable profile owner
+against the current connection store. This applies equally when the owner is
+write-capable and when `doctor` has reduced it to read-only diagnostic authority.
+A concurrent pairing, owner mutation, or generation mismatch SHALL abort the
+remaining sweep before another endpoint receives the stale token or identity pin.
+Doctor SHALL allow the shared aggregate sweep deadline to cover every candidate
+it promises to diagnose. Settings SHALL keep its shorter whole-operation
+deadline and SHALL divide that budget across the shared sweep bound rather than
+allowing an early candidate to consume it all.
+
+#### Scenario: repeated init proves an existing paired Server first
+
+- **GIVEN** profile `office` stores a token and pinned identity for `ws://office:8787`
+- **WHEN** the user runs `fleety init ws://office:8787 --name office` without a pairing code
+- **THEN** `init` SHALL resolve `office` as the durable credential owner and attempt the secure handshake before `Hello`
+- **AND** the saved token SHALL appear only inside the encrypted control channel
+- **AND** a successful secure session SHALL latch secure-channel support on `office`
+
+#### Scenario: repeated init uses one authoritative owner snapshot
+
+- **GIVEN** another Fleety process clears, rotates, or creates profile `office`'s credential while `init` is completing a legacy-generation preflight
+- **WHEN** `init` reloads the profile before transport
+- **THEN** its target, secure policy, identity pin, `Hello`, and commit preconditions SHALL all derive only from that final frozen snapshot
+- **AND** no token or security state from the earlier snapshot SHALL reach a transport or overwrite the newer owner
+
+#### Scenario: a tokenless secure latch remains fail closed
+
+- **GIVEN** profile `office` retains its secure latch and pinned identity after authentication rejection cleared its token
+- **WHEN** the user repeats same-URL `init` without a pairing code
+- **THEN** `init` SHALL retain `office` as the durable owner and fail before transport because it cannot key the required secure channel
+- **AND** it SHALL NOT open a cleartext session, accept a replacement credential, or mutate the profile
+
+#### Scenario: protected connection state cannot move to another URL without pairing
+
+- **GIVEN** profile `office` retains any token, identity pin, secure latch, learned endpoint, or separately configured endpoint
+- **WHEN** the user runs `init` for `office` at a different URL without a pairing code
+- **THEN** Fleety SHALL reject before transport and direct explicit-URL `init --pairing-code`
+- **AND** the old profile SHALL remain byte-identical
+
+#### Scenario: owner drift between candidates aborts the sweep
+
+- **GIVEN** a durable profile has primary endpoint `A`, learned endpoint `B`, and a frozen token／pin owner snapshot
+- **WHEN** `A` fails after another process changes that saved profile
+- **THEN** Fleety SHALL fail owner revalidation before opening a transport to `B`
+- **AND** `B` SHALL receive neither a connection nor any stale credential
 
 #### Scenario: a saved endpoint that cannot prove itself receives nothing
 
@@ -260,11 +328,40 @@ A paired profile SHALL open its control channel with a mutually authenticated, e
 - **WHEN** the per-candidate deadline elapses
 - **THEN** Fleety SHALL abandon that candidate and attempt the remaining endpoints before reporting one aggregated failure
 
+#### Scenario: bounded Settings and Doctor still reach a later endpoint
+
+- **GIVEN** a saved primary accepts a connection but stalls and a later saved endpoint can authenticate
+- **WHEN** Doctor or Settings starts its bounded candidate sweep
+- **THEN** the stalled primary SHALL NOT consume the entire caller deadline
+- **AND** the later endpoint SHALL be attempted within that surface's documented aggregate bound
+
+#### Scenario: a proven but silent Server cannot hang diagnostics
+
+- **GIVEN** `fleety doctor` receives an authenticated `Welcome` whose config protocol supports Provider and Daemon snapshots
+- **WHEN** the Server does not answer either snapshot request
+- **THEN** each request SHALL stop at its diagnostic reply deadline
+- **AND** Doctor SHALL preserve the successful Server check, report the unavailable snapshot checks with remediation, and return
+- **AND** after any timeout Doctor SHALL close the request stream and mark later owner checks blocked, because a late uncorrelated reply cannot be safely attributed
+
+#### Scenario: an SSE upstream stall cannot hide a later candidate
+
+- **GIVEN** a candidate opens its SSE downstream but its `Hello` POST never returns
+- **WHEN** fleetyd reaches the deadline created before that candidate transport attempt
+- **THEN** it SHALL abandon the candidate and continue its ordinary or owner-requested sweep
+- **AND** the same deadline SHALL also bound the candidate's authenticated `Welcome`
+
 #### Scenario: diagnostics report which endpoint answered without changing anything
 
 - **GIVEN** a profile whose configured endpoint is unreachable and whose learned endpoint is serving
 - **WHEN** `fleety doctor` runs
 - **THEN** it SHALL report the Server as reachable and name the redacted endpoint that answered, and SHALL NOT promote it, persist a credential, pin an identity, or record secure-channel support
+
+#### Scenario: diagnostics stop when their frozen profile changes
+
+- **GIVEN** `fleety doctor` holds a read-only snapshot for primary endpoint `A` and alternative `B`
+- **WHEN** `A` fails after another process replaces the saved profile
+- **THEN** Doctor SHALL fail owner revalidation before opening a transport to `B`
+- **AND** it SHALL neither send the old credential nor gain profile mutation authority
 
 ### Requirement: Persisted profile switching reconnects the active Daemon
 
@@ -274,6 +371,12 @@ After any operation changes the persisted current profile selection, endpoint, o
 
 - **WHEN** the user changes current profile from `A` to `B`
 - **THEN** CLI Server state, Server snapshot, Daemon snapshot, and the running `fleetyd` session SHALL all resolve to `B` before the workflow reports a fully refreshed state
+
+#### Scenario: a later current switch aborts the stale Settings reconnect
+
+- **GIVEN** Settings persisted current profile `B` and froze `B` from that current-owner state
+- **WHEN** another process changes current to `C` before Settings opens the `B` transport
+- **THEN** Settings SHALL fail owner revalidation before transport, load no `B` snapshots, and report the selection conflict
 
 #### Scenario: timed-out request is not overwritten
 
@@ -369,7 +472,7 @@ The profile URL, token, and fingerprint used for reconnect SHALL be read togethe
 
 ### Requirement: Connection profiles are the single persistent source of the connection target
 
-The connection target (which server + its token) SHALL live in one file, `~/.fleety/connections.toml`, holding a device-wide `device_id`, a `current` profile name, and named `profiles` each carrying `url`, an optional list of alternate `endpoints` learned from that Server, an optional `configured_url` recording the address the user chose when roaming has moved `url`, a `secure` flag recording that this Server has proven it can open the encrypted control channel, an optional `token`, an optional `label`, an optional server `fingerprint`, and an internal lifecycle `generation`. A newly created or explicitly selected durable profile SHALL receive a non-empty generation before it grants mutation authority; raw URL and environment targets SHALL NOT trigger generation writes. Deleting and recreating a profile SHALL mint a different generation even when all user-visible fields are identical. The file SHALL be written atomically (temp + rename) with `0600` permissions. Loading a missing file SHALL yield an empty set (not an error); loading a present-but-unparseable file SHALL return an explicit error rather than being silently treated as empty. `FLEETY_AGENT_URL` SHALL NOT be a registry setting — `config set FLEETY_AGENT_URL` returns an unknown-key error and the value is never seeded from `config.toml`.
+The connection target (which server + its token) SHALL live in one file, `~/.fleety/connections.toml`, holding a device-wide `device_id`, a `current` profile name, and named `profiles` each carrying `url`, an optional list of alternate `endpoints` learned from that Server, an optional `configured_url` recording the address the user chose when roaming has moved `url`, a `secure` flag recording that this Server has proven it can open the encrypted control channel, an optional `token`, an optional `label`, an optional server `fingerprint`, and an internal lifecycle `generation`. The generation SHALL remain opaque to callers and SHALL use a versioned envelope that binds its lifecycle nonce to the presence state of `endpoints`, `configured_url`, and `secure`. A newly created or explicitly selected durable profile SHALL receive a non-empty generation before it grants mutation authority; raw URL and environment targets SHALL NOT trigger generation writes. A legacy plain generation SHALL remain readable until the selected durable profile passes through that authorized migration path. A versioned generation whose bound state does not match the serialized profile SHALL be treated as evidence of an incompatible older writer and SHALL fail closed. Deleting and recreating a profile SHALL mint a different lifecycle nonce even when all user-visible fields are identical. The file SHALL be written atomically (temp + rename) with `0600` permissions. Loading a missing file SHALL yield an empty set (not an error); loading a present-but-unparseable file SHALL return an explicit error rather than being silently treated as empty. `FLEETY_AGENT_URL` SHALL NOT be a registry setting — `config set FLEETY_AGENT_URL` returns an unknown-key error and the value is never seeded from `config.toml`.
 
 #### Scenario: profiles round-trip with restricted permissions
 
@@ -387,6 +490,25 @@ The connection target (which server + its token) SHALL live in one file, `~/.fle
 - **WHEN** a raw URL or `FLEETY_AGENT_URL` target is resolved
 - **THEN** the legacy profile SHALL remain byte-identical and SHALL grant no owner capability
 
+#### Scenario: selected durable profile records forward-compatible state
+
+- **GIVEN** profile `home` has a legacy plain generation and is selected as the durable operational target
+- **WHEN** Fleety acquires the profile mutation lease before connecting
+- **THEN** it SHALL preserve the lifecycle nonce, write a versioned generation that matches the profile's roaming and secure-channel fields, and only then grant owner capability
+
+#### Scenario: incompatible profile state fails every current surface
+
+- **GIVEN** profile `home` has a versioned generation whose bound state does not match its serialized roaming or secure-channel fields
+- **WHEN** a CLI command, TUI route, ACP turn, `fleety doctor`, or `fleetyd` resolves or mutates `home`
+- **THEN** the operation SHALL fail before network I/O or credential use with guidance to update every Fleety binary and explicitly re-pair
+
+#### Scenario: a lost configured address names an executable recovery
+
+- **GIVEN** a versioned generation records `configured_url` but an older writer removed that field
+- **WHEN** a current surface rejects the mismatched profile
+- **THEN** its remediation SHALL direct the user to `fleety init <ws-url> --name <profile> --pairing-code <code>`
+- **AND** it SHALL NOT recommend bare `pair`, because that command safely refuses to guess the learned primary
+
 #### Scenario: empty environment URL is unset
 
 - **GIVEN** `FLEETY_AGENT_URL` is present but empty and a legacy current profile has a usable URL
@@ -400,12 +522,19 @@ The connection target (which server + its token) SHALL live in one file, `~/.fle
 
 ### Requirement: The fleety server command group manages named server profiles
 
-The CLI SHALL provide a `fleety server` command group to manage profiles: `add <name> <url>` (with optional `--label`, `--pair <code>`, `--use`), `use <name>`, `list`, `show [<name>]`, `current`, `rename <old> <new>`, `remove <name>`, and `set-url <name> <url>`. `connection` SHALL be the canonical spelling and `server` SHALL remain its compatible alias. `use` SHALL change only the `current` field. `list` SHALL mark the current profile and, when an env override is in effect, print a prominent notice at the top. Removing the current profile SHALL always require explicitly switching to another profile first; `--force` SHALL remain parse-compatible but SHALL NOT choose a replacement from profile ordering. `fleety init <url>` SHALL enroll and select the named profile only after authentication succeeds. `fleety pair <code>` SHALL be an explicit recovery action that sends no old saved token and atomically replaces the exact resolver-frozen profile generation with the newly minted token and Server fingerprint.
+The CLI SHALL provide a `fleety server` command group to manage profiles: `add <name> <url>` (with optional `--label`, `--pair <code>`, `--use`), `use <name>`, `list`, `show [<name>]`, `current`, `rename <old> <new>`, `remove <name>`, and `set-url <name> <url>`. `connection` SHALL be the canonical spelling and `server` SHALL remain its compatible alias. `use` SHALL change only the user-visible `current` field, plus the selected legacy profile's internal generation binding when migration is required; every other user-visible profile field SHALL remain unchanged. `list` SHALL mark the current profile and, when an env override is in effect, print a prominent notice at the top. Removing the current profile SHALL always require explicitly switching to another profile first; `--force` SHALL remain parse-compatible but SHALL NOT choose a replacement from profile ordering. `fleety init <url>` SHALL enroll and select the named profile only after authentication succeeds. `fleety pair <code>` SHALL be an explicit recovery action that sends no old saved token and atomically replaces the exact resolver-frozen profile generation with the newly minted token and Server fingerprint.
 
 #### Scenario: add then use selects the connection
 
 - **WHEN** the user runs `fleety connection add home ws://h:8787 --use`
 - **THEN** `fleety connection current` SHALL print `home` and later commands SHALL connect to `ws://h:8787`
+
+#### Scenario: selecting a legacy profile binds its security state atomically
+
+- **GIVEN** profile `home` has a legacy plain generation and is not current
+- **WHEN** the user runs `fleety connection use home`
+- **THEN** the same connection-store mutation lease SHALL bind `home`'s current roaming and secure-channel presence state before setting it current
+- **AND** no later resolve SHALL be responsible for that first binding
 
 #### Scenario: first remote init redeems its code directly
 

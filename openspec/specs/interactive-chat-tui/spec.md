@@ -591,3 +591,271 @@ code:
   - AGENTS.md
   - crates/fleety-textarea/src/editor_tests/editing.rs
 -->
+
+---
+### Requirement: Chat participates in the shared workspace context
+
+Chat SHALL render within the terminal workspace and SHALL use the shared selected profile, connection state, provider/model, notices, and navigation. Chat reconnect and conversation resume SHALL update shared context rather than maintaining a separate hidden connection identity.
+
+#### Scenario: profile context matches the active chat transport
+
+- **WHEN** the workspace reconnects Chat after a profile switch
+- **THEN** the header profile, Server identity, model, and Chat transport SHALL all come from the new connection before message submission is enabled
+
+##### Example: stale A transport cannot submit as B
+
+- **GIVEN** the header selected profile is `B` but the retained transport context still identifies profile `A`
+- **WHEN** the user presses Enter
+- **THEN** the draft remains unchanged and no UserMessage is sent until a `B` Welcome and model snapshot atomically replace the context
+
+
+<!-- @trace
+source: redesign-cli-experience
+updated: 2026-07-29
+code:
+  - crates/fleety-tools/src/secure.rs
+  - crates/fleety-markdown/src/style.rs
+  - crates/fleety-cli/src/commands.rs
+  - crates/fleety-textarea/README.md
+  - scripts/check-spectra-archive-instructions.sh
+  - crates/fleety-cli/src/tui.rs
+  - docs/HANDOFF.md
+  - crates/fleety-textarea/src/editor_tests/keys.rs
+  - .agents/skills/spectra-archive/SKILL.md
+  - crates/fleety-textarea/src/editor_tests/mod.rs
+  - crates/fleety-daemon/src/main.rs
+  - crates/fleety-markdown/src/latex/mod.rs
+  - crates/fleety-tools/src/config.rs
+  - scripts/install-server.sh
+  - crates/fleety-markdown/src/latex/math_box.rs
+  - docs/STATUS.md
+  - crates/fleety-markdown/src/open_code_highlighter.rs
+  - crates/fleety-markdown/src/hyperlinks.rs
+  - .opencode/skills/spectra-archive/SKILL.md
+  - crates/fleety-inline/src/common.rs
+  - crates/fleety-server/Cargo.toml
+  - crates/fleety-textarea/LICENSE
+  - crates/fleety-markdown-core/Cargo.toml
+  - crates/fleety-inline/src/terminal.rs
+  - crates/fleety-textarea/src/editor_tests/planning.rs
+  - crates/fleety-cli/src/provider_tui.rs
+  - crates/fleety-textarea/Cargo.toml
+  - crates/fleety-markdown/src/parse.rs
+  - crates/fleety-cli/src/workspace.rs
+  - crates/agent-core/src/codex_responses.rs
+  - crates/fleety-cli/src/markdown.rs
+  - crates/fleety-server/src/main.rs
+  - crates/fleety-tools/src/oauth.rs
+  - Cargo.toml
+  - crates/fleety-tools/src/connection.rs
+  - crates/fleety-inline/src/scrollback.rs
+  - crates/fleety-textarea/src/editor_tests/viewport.rs
+  - AGENTS.md
+  - crates/fleety-cli/src/main.rs
+  - crates/fleety-markdown/src/syntax.rs
+  - crates/fleety-cli/src/acp.rs
+  - crates/fleety-textarea/src/editor_keys.rs
+  - crates/fleety-tools/src/provider_service.rs
+  - crates/fleety-tools/src/providers_config.rs
+  - crates/fleety-markdown/assets/tokyo-night.tmTheme
+  - crates/fleety-inline/src/segment.rs
+  - crates/fleety-markdown/src/latex/commands.rs
+  - crates/fleety-tools/src/lib.rs
+  - crates/fleety-tools/src/deps/runtime.rs
+  - crates/fleety-server/src/http.rs
+  - crates/fleety-markdown-core/LICENSE
+  - crates/fleety-server/src/mdns.rs
+  - .opencode/commands/spectra-archive.md
+  - crates/fleety-cli/src/server.rs
+  - crates/fleety-markdown/src/output.rs
+  - crates/fleety-inline/src/lib.rs
+  - crates/fleety-textarea/src/textarea.rs
+  - crates/fleety-textarea/src/editor.rs
+  - crates/fleety-markdown/src/streaming.rs
+  - crates/fleety-markdown/src/render.rs
+  - crates/fleety-inline/LICENSE
+  - crates/fleety-markdown/src/latex/tests.rs
+  - crates/fleety-markdown/src/buffers.rs
+  - crates/fleety-tools/src/device.rs
+  - crates/fleety-markdown/src/colors.rs
+  - docs/env.md
+  - crates/fleety-markdown/src/mermaid.rs
+  - crates/fleety-tools/src/transport.rs
+  - crates/fleety-markdown/src/checkpoint.rs
+  - crates/fleety-markdown/src/source_map.rs
+  - crates/fleety-markdown/Cargo.toml
+  - docs/roadmap.md
+  - crates/fleety-cli/src/provider_service.rs
+  - crates/fleety-inline/src/resize.rs
+  - crates/fleety-textarea/src/wrapping.rs
+  - crates/fleety-server/src/auth.rs
+  - crates/fleety-cli/Cargo.toml
+  - crates/fleety-markdown/src/latex/symbols.rs
+  - crates/fleety-markdown/src/latex/cursor.rs
+  - crates/fleety-markdown/src/lib.rs
+  - crates/fleety-server/src/conn.rs
+  - crates/fleety-textarea/src/render/mod.rs
+  - crates/fleety-tools/src/service.rs
+  - crates/fleety-textarea/src/lib.rs
+  - docs/tools.md
+  - crates/fleety-tools/Cargo.toml
+  - docs/acp.md
+  - crates/fleety-cli/src/config.rs
+  - crates/fleety-textarea/src/render/line_utils.rs
+  - crates/fleety-markdown/src/latex_delimiters.rs
+  - README.md
+  - crates/fleety-markdown/src/latex/environments.rs
+  - crates/fleety-daemon/Cargo.toml
+  - crates/fleety-inline/Cargo.toml
+  - crates/fleety-markdown/src/url_scan.rs
+  - crates/fleety-cli/src/auth.rs
+  - crates/fleety-tools/src/chrome.rs
+  - docs/design-cli-config.md
+  - crates/fleety-cli/src/input.rs
+  - .github/workflows/ci.yml
+  - crates/fleety-protocol/src/lib.rs
+  - crates/fleety-server/src/providers.rs
+  - crates/fleety-markdown/README.md
+  - crates/fleety-markdown/LICENSE
+  - crates/fleety-textarea/src/editor_tests/editing.rs
+  - crates/fleety-inline/src/tests.rs
+  - crates/fleety-inline/README.md
+  - crates/fleety-cli/src/config_panel.rs
+  - crates/fleety-markdown-core/src/lib.rs
+  - crates/fleety-daemon/src/winsvc.rs
+tests:
+  - crates/fleety-cli/src/test_terminal.rs
+  - crates/fleety-daemon/tests/fleetyd_smoke.rs
+  - crates/fleety-cli/tests/cli_smoke.rs
+-->
+
+---
+### Requirement: Chat input survives route changes and recoverable connection loss
+
+Unsent text and attachments SHALL survive navigation to Conversations, Settings, contextual help, and recoverable reconnect states. They SHALL be discarded only after explicit confirmation or forced process termination.
+
+#### Scenario: inspect settings without losing a draft
+
+- **GIVEN** Chat contains unsent multi-line text and an attachment
+- **WHEN** the user opens Settings and returns to Chat
+- **THEN** the text, cursor position, and attachment SHALL be unchanged
+
+<!-- @trace
+source: redesign-cli-experience
+updated: 2026-07-29
+code:
+  - crates/fleety-tools/src/secure.rs
+  - crates/fleety-markdown/src/style.rs
+  - crates/fleety-cli/src/commands.rs
+  - crates/fleety-textarea/README.md
+  - scripts/check-spectra-archive-instructions.sh
+  - crates/fleety-cli/src/tui.rs
+  - docs/HANDOFF.md
+  - crates/fleety-textarea/src/editor_tests/keys.rs
+  - .agents/skills/spectra-archive/SKILL.md
+  - crates/fleety-textarea/src/editor_tests/mod.rs
+  - crates/fleety-daemon/src/main.rs
+  - crates/fleety-markdown/src/latex/mod.rs
+  - crates/fleety-tools/src/config.rs
+  - scripts/install-server.sh
+  - crates/fleety-markdown/src/latex/math_box.rs
+  - docs/STATUS.md
+  - crates/fleety-markdown/src/open_code_highlighter.rs
+  - crates/fleety-markdown/src/hyperlinks.rs
+  - .opencode/skills/spectra-archive/SKILL.md
+  - crates/fleety-inline/src/common.rs
+  - crates/fleety-server/Cargo.toml
+  - crates/fleety-textarea/LICENSE
+  - crates/fleety-markdown-core/Cargo.toml
+  - crates/fleety-inline/src/terminal.rs
+  - crates/fleety-textarea/src/editor_tests/planning.rs
+  - crates/fleety-cli/src/provider_tui.rs
+  - crates/fleety-textarea/Cargo.toml
+  - crates/fleety-markdown/src/parse.rs
+  - crates/fleety-cli/src/workspace.rs
+  - crates/agent-core/src/codex_responses.rs
+  - crates/fleety-cli/src/markdown.rs
+  - crates/fleety-server/src/main.rs
+  - crates/fleety-tools/src/oauth.rs
+  - Cargo.toml
+  - crates/fleety-tools/src/connection.rs
+  - crates/fleety-inline/src/scrollback.rs
+  - crates/fleety-textarea/src/editor_tests/viewport.rs
+  - AGENTS.md
+  - crates/fleety-cli/src/main.rs
+  - crates/fleety-markdown/src/syntax.rs
+  - crates/fleety-cli/src/acp.rs
+  - crates/fleety-textarea/src/editor_keys.rs
+  - crates/fleety-tools/src/provider_service.rs
+  - crates/fleety-tools/src/providers_config.rs
+  - crates/fleety-markdown/assets/tokyo-night.tmTheme
+  - crates/fleety-inline/src/segment.rs
+  - crates/fleety-markdown/src/latex/commands.rs
+  - crates/fleety-tools/src/lib.rs
+  - crates/fleety-tools/src/deps/runtime.rs
+  - crates/fleety-server/src/http.rs
+  - crates/fleety-markdown-core/LICENSE
+  - crates/fleety-server/src/mdns.rs
+  - .opencode/commands/spectra-archive.md
+  - crates/fleety-cli/src/server.rs
+  - crates/fleety-markdown/src/output.rs
+  - crates/fleety-inline/src/lib.rs
+  - crates/fleety-textarea/src/textarea.rs
+  - crates/fleety-textarea/src/editor.rs
+  - crates/fleety-markdown/src/streaming.rs
+  - crates/fleety-markdown/src/render.rs
+  - crates/fleety-inline/LICENSE
+  - crates/fleety-markdown/src/latex/tests.rs
+  - crates/fleety-markdown/src/buffers.rs
+  - crates/fleety-tools/src/device.rs
+  - crates/fleety-markdown/src/colors.rs
+  - docs/env.md
+  - crates/fleety-markdown/src/mermaid.rs
+  - crates/fleety-tools/src/transport.rs
+  - crates/fleety-markdown/src/checkpoint.rs
+  - crates/fleety-markdown/src/source_map.rs
+  - crates/fleety-markdown/Cargo.toml
+  - docs/roadmap.md
+  - crates/fleety-cli/src/provider_service.rs
+  - crates/fleety-inline/src/resize.rs
+  - crates/fleety-textarea/src/wrapping.rs
+  - crates/fleety-server/src/auth.rs
+  - crates/fleety-cli/Cargo.toml
+  - crates/fleety-markdown/src/latex/symbols.rs
+  - crates/fleety-markdown/src/latex/cursor.rs
+  - crates/fleety-markdown/src/lib.rs
+  - crates/fleety-server/src/conn.rs
+  - crates/fleety-textarea/src/render/mod.rs
+  - crates/fleety-tools/src/service.rs
+  - crates/fleety-textarea/src/lib.rs
+  - docs/tools.md
+  - crates/fleety-tools/Cargo.toml
+  - docs/acp.md
+  - crates/fleety-cli/src/config.rs
+  - crates/fleety-textarea/src/render/line_utils.rs
+  - crates/fleety-markdown/src/latex_delimiters.rs
+  - README.md
+  - crates/fleety-markdown/src/latex/environments.rs
+  - crates/fleety-daemon/Cargo.toml
+  - crates/fleety-inline/Cargo.toml
+  - crates/fleety-markdown/src/url_scan.rs
+  - crates/fleety-cli/src/auth.rs
+  - crates/fleety-tools/src/chrome.rs
+  - docs/design-cli-config.md
+  - crates/fleety-cli/src/input.rs
+  - .github/workflows/ci.yml
+  - crates/fleety-protocol/src/lib.rs
+  - crates/fleety-server/src/providers.rs
+  - crates/fleety-markdown/README.md
+  - crates/fleety-markdown/LICENSE
+  - crates/fleety-textarea/src/editor_tests/editing.rs
+  - crates/fleety-inline/src/tests.rs
+  - crates/fleety-inline/README.md
+  - crates/fleety-cli/src/config_panel.rs
+  - crates/fleety-markdown-core/src/lib.rs
+  - crates/fleety-daemon/src/winsvc.rs
+tests:
+  - crates/fleety-cli/src/test_terminal.rs
+  - crates/fleety-daemon/tests/fleetyd_smoke.rs
+  - crates/fleety-cli/tests/cli_smoke.rs
+-->

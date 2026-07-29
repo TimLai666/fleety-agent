@@ -590,7 +590,18 @@ impl Panel {
                 }
                 if let Some(name) = self.profile_names().get(self.sel).cloned() {
                     if let Some(p) = self.conns.profiles.get_mut(&name) {
-                        let cleared = connection::reselect_profile_endpoint(p, value);
+                        if let Err(error) = connection::validate_named_profile_generation(&name, p)
+                        {
+                            self.status = format!("error: {}", error.report().message);
+                            return false;
+                        }
+                        let cleared = match connection::reselect_profile_endpoint(p, value) {
+                            Ok(cleared) => cleared,
+                            Err(error) => {
+                                self.status = format!("error: {}", error.report().message);
+                                return false;
+                            }
+                        };
                         self.status = if cleared {
                             format!(
                                 "set url for '{name}' and cleared its old credential (s to save, then re-pair)"
@@ -1329,14 +1340,23 @@ fn has_local_profile(conns: &Connections, local_url: &str) -> bool {
     conns.profiles.values().any(|p| p.url == local_url)
 }
 
-/// Resolve exactly the profile the user saved in the Connection region. This
-/// deliberately ignores environment overrides, mDNS, and later changes to the
-/// global current profile so the reconnect transaction cannot drift to a
-/// different server while awaiting network I/O.
-fn resolve_saved_profile(conns: &Connections, name: &str) -> Result<connection::Resolved> {
+/// Persist a selected profile as current and freeze the target from that same
+/// current-owner state. A later switch must then fail owner revalidation before
+/// this Settings session opens the stale Server transport.
+fn freeze_selected_profile_as_current(
+    connections: &mut Connections,
+    name: &str,
+) -> Result<connection::Resolved> {
+    let selected = connections.profiles.get_mut(name).ok_or_else(|| {
+        CoreError::Message(format!(
+            "no server profile named '{name}' — see `fleety connection list`"
+        ))
+    })?;
+    connection::upgrade_legacy_profile_generation_binding(selected)?;
+    connections.current = Some(name.to_string());
     connection::resolve(
-        conns,
-        &connection::Target::Named(name.to_string()),
+        connections,
+        &connection::Target::Current,
         None,
         None,
         || None,
@@ -1495,8 +1515,7 @@ async fn commit_profile_switch_at(
         // Resolve from the owner-current profile while the mutation lease is
         // held. Concurrent token/fingerprint rotation is legitimate and this
         // switch must reconnect with that live snapshot, not panel.conns.
-        let target = resolve_saved_profile(live, &profile)?;
-        live.current = Some(profile.clone());
+        let target = freeze_selected_profile_as_current(live, &profile)?;
         Ok((live.clone(), target))
     });
     let (persisted, target) = match persisted {
@@ -1596,7 +1615,9 @@ fn save_connection_url_edits_at(
                 // never held — the discovered loopback Server. Saving it is how
                 // the user accepts it, so add it rather than skipping silently.
                 if !live.profiles.contains_key(name) {
-                    live.profiles.insert(name.clone(), edited.clone());
+                    let mut edited = edited.clone();
+                    connection::rebind_profile_generation_after_authorized_mutation(&mut edited)?;
+                    live.profiles.insert(name.clone(), edited);
                 }
                 continue;
             };
@@ -1614,7 +1635,8 @@ fn save_connection_url_edits_at(
                     "server profile '{name}' changed in another Fleety process; reopen Settings"
                 )));
             }
-            connection::reselect_profile_endpoint(current, edited.url.clone());
+            connection::validate_named_profile_generation(name, current)?;
+            connection::reselect_profile_endpoint(current, edited.url.clone())?;
             if is_live_current {
                 reconnect_profile = Some(name.clone());
             }
@@ -1801,6 +1823,7 @@ async fn run_settings(
             .entry("local".to_string())
             .or_insert_with(|| connection::Profile {
                 url,
+                generation: String::new(),
                 ..Default::default()
             });
     }
@@ -2293,6 +2316,48 @@ mod tests {
     use futures::{SinkExt, StreamExt};
     use tokio::sync::oneshot;
     use tokio_tungstenite::tungstenite::Message;
+
+    #[test]
+    fn switched_profile_target_is_bound_to_the_new_current_owner() {
+        let path = std::env::temp_dir().join(format!(
+            "fleety-profile-switch-owner-drift-{}-{}.toml",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let mut conns = Connections {
+            current: Some("A".into()),
+            ..Default::default()
+        };
+        for name in ["A", "B", "C"] {
+            conns.profiles.insert(
+                name.into(),
+                connection::Profile {
+                    url: format!("ws://{name}:8787"),
+                    generation: format!("{name}-generation"),
+                    ..Default::default()
+                },
+            );
+        }
+
+        let target =
+            freeze_selected_profile_as_current(&mut conns, "B").expect("freeze selected B");
+        assert_eq!(conns.current.as_deref(), Some("B"));
+        connection::save_at(&path, &conns).expect("persist B selection");
+        connection::mutate_at(&path, |live| {
+            live.current = Some("C".into());
+            Ok(())
+        })
+        .expect("concurrently switch to C");
+
+        let error = connection::validate_resolved_profile_before_transport_at(&path, &target)
+            .expect_err("the stale B transport must fail before opening");
+        assert!(
+            error.report().message.contains("is no longer current"),
+            "{}",
+            error.report().message
+        );
+        std::fs::remove_file(path).expect("remove profile switch fixture");
+    }
 
     /// Accept a client, refusing the paired secure handshake if it opens with
     /// one and waiting for the cleartext reconnect.
@@ -3615,7 +3680,14 @@ mod tests {
         on_key(&mut panel, KeyCode::Char('u'));
         assert_eq!(panel.profile_switch_pending.as_deref(), Some("a"));
 
-        let target = resolve_saved_profile(&conns, "a").expect("resolve profile A");
+        let target = connection::resolve(
+            &conns,
+            &connection::Target::Named("a".into()),
+            None,
+            None,
+            || None,
+        )
+        .expect("resolve profile A");
         assert_eq!(target.url(), new_url);
         assert_eq!(target.token(), Some("token-a"));
         assert_eq!(
@@ -4609,7 +4681,8 @@ mod tests {
         connection::reselect_profile_endpoint(
             pending.profiles.get_mut("B").expect("pending B"),
             "ws://b-new.test:8787".into(),
-        );
+        )
+        .expect("stage B URL");
         let mut live = baseline.clone();
         live.current = Some("B".into());
         connection::save_at(&path, &live).expect("seed concurrent current B");

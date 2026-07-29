@@ -171,40 +171,193 @@ tests:
 ---
 ### Requirement: Guided first-run init discovers, picks, and pairs
 
-When `fleety init` runs without a URL on a TTY (and mDNS is not disabled), the CLI SHALL scan the LAN with the collecting discovery, present the found servers as a numbered list (display name, URL, and a marker on entries whose URL already exists in a saved profile), and let the user pick one by number. Empty input or end-of-input SHALL cancel; an out-of-range or non-numeric choice SHALL re-prompt. The picked server SHALL be saved through the existing profile upsert (profile name defaulting to the display name, `--name` overriding; an existing profile of that name keeps its token) and made current. The CLI SHALL then prompt for a pairing code, naming where codes come from (the server's first-run console line, or `pair_create` on an already-paired device): a non-empty code runs the existing pairing flow and reports the profile as paired and current; empty input skips pairing and prints how to pair later. A pairing failure SHALL leave the saved profile in place. When the scan finds nothing, or stdout is not a TTY, or mDNS is disabled, `fleety init` SHALL print the existing usage guidance instead of entering the interactive flow; `fleety init <ws-url>` SHALL behave exactly as before.
+When `fleety init` runs without a URL on a TTY and mDNS is enabled, the CLI SHALL scan the LAN with collecting discovery, present every found Server as a numbered list, and let the user pick one by number. Discovery alone SHALL NOT create an operational session. Empty input SHALL pick the first entry; an out-of-range or non-numeric choice SHALL re-prompt. The profile name SHALL default to the display name unless `--name` overrides it. Only the selected endpoint SHALL be contacted for enrollment. A same-host loopback pick SHALL skip pairing. A LAN pick SHALL reuse a non-empty credential only when the selected profile name and URL exactly match the saved profile; every other LAN pick SHALL require a non-empty pairing code and a `Welcome` carrying a newly minted token before the URL, token, fingerprint, or current selection is persisted. Empty pairing input SHALL fail before connecting and leave `connections.toml` byte-identical. A picked URL that differs from a credentialed profile with the same name SHALL NOT receive the old token. When discovery finds nothing, or stdout is not a TTY, or mDNS is disabled, `fleety init` SHALL print explicit-URL usage guidance. `fleety init <ws-url>` SHALL apply the endpoint-change credential boundary without entering the picker. When it includes `--pairing-code`, it SHALL send neither an existing saved token nor pin and SHALL replace both only after receiving newly minted complete credentials against the unchanged saved generation.
 
 #### Scenario: pick and pair in one flow
 
-- **WHEN** `fleety init` runs on a TTY, the scan lists one server, the user picks it and enters a valid pairing code
-- **THEN** the profile is saved and current, the device is paired, and the CLI reports both
+- **WHEN** `fleety init` runs on a TTY, the scan lists one Server, and the user picks it and enters a valid pairing code
+- **THEN** the profile SHALL be saved as current with the newly minted token and observed fingerprint
 
-#### Scenario: skipping the code leaves an unpaired current profile
+#### Scenario: unselected advertisers remain discovery-only
 
-- **WHEN** the user picks a server and presses Enter at the pairing-code prompt
-- **THEN** the profile is saved and current, and the CLI prints how to pair later with `fleety pair`
+- **WHEN** guided init displays multiple mDNS candidates and the user selects one
+- **THEN** every unselected candidate SHALL receive no `Hello`, token, pairing code, profile mutation, or control authority
 
-#### Scenario: re-running init on a saved server keeps its token
+#### Scenario: a new LAN pick cannot skip pairing
 
-- **WHEN** the picked server's profile name already exists with a stored token
-- **THEN** the upsert updates its URL, keeps the token, and marks it current
+- **GIVEN** the selected profile name has no stored credential
+- **WHEN** the user picks the Server and leaves the pairing-code prompt empty
+- **THEN** the CLI SHALL fail before sending `Hello` and SHALL NOT save or select the profile
+
+#### Scenario: pairing acknowledgement must mint a credential
+
+- **GIVEN** a new LAN candidate was explicitly selected and a pairing code was supplied
+- **WHEN** the candidate replies with `Welcome` but no newly minted token
+- **THEN** enrollment SHALL fail and `connections.toml` SHALL remain byte-identical
+
+#### Scenario: same-host loopback remains frictionless
+
+- **WHEN** guided init selects the locally probed loopback Server
+- **THEN** it SHALL enroll without a pairing code because the transport peer is same-host trusted
+
+##### Example: local default selection
+
+- **GIVEN** a Server answers at `ws://127.0.0.1:8787`
+- **WHEN** guided init selects that locally probed entry
+- **THEN** the CLI SHALL send no pairing code, save the verified `local` endpoint, and make it current
+
+#### Scenario: re-running init on the same saved endpoint keeps its token
+
+- **WHEN** the picked Server's profile name and URL equal a saved credentialed profile
+- **THEN** the profile SHALL keep its token and become current
+
+##### Example: same office endpoint
+
+- **GIVEN** profile `office` stores URL `ws://office:8787` and token `office-token`
+- **WHEN** init selects `ws://office:8787` as `office`
+- **THEN** the Hello SHALL carry `office-token` and the saved credential SHALL remain associated with that URL
+
+#### Scenario: re-running init on a changed saved endpoint requires re-pair
+
+- **GIVEN** profile `office` stores URL `ws://old:8787` and token `old-token`
+- **WHEN** guided or explicit init selects `ws://new:8787` as `office`
+- **THEN** the CLI SHALL send neither `old-token` nor a profile mutation until a supplied pairing code mints a new token
 
 #### Scenario: nothing found falls back to usage
 
-- **WHEN** the scan window ends with no server discovered
-- **THEN** the CLI says no server was found and prints the existing usage guidance with the explicit-URL form
+- **WHEN** the scan window ends with no Server discovered
+- **THEN** the CLI SHALL say no Server was found and print explicit-URL usage guidance
 
-#### Scenario: explicit URL is unchanged
+##### Example: empty LAN scan
+
+- **GIVEN** no local or LAN Server answers during the bounded scan
+- **WHEN** guided init completes discovery
+- **THEN** it SHALL make no profile mutation and SHALL print `fleety init <ws-url> --name <name> --pairing-code <code>`
+
+#### Scenario: explicit URL skips the picker
 
 - **WHEN** `fleety init ws://host:8787` runs
-- **THEN** the behavior and messages are identical to before the guided flow existed
+- **THEN** the CLI SHALL validate and connect to that explicit URL without running guided discovery
+
 
 <!-- @trace
-source: init-discovery-picker
-updated: 2026-07-11
+source: redesign-cli-experience
+updated: 2026-07-29
 code:
-  - docs/env.md
-  - README.md
+  - crates/fleety-tools/src/secure.rs
+  - crates/fleety-markdown/src/style.rs
+  - crates/fleety-cli/src/commands.rs
+  - crates/fleety-textarea/README.md
+  - scripts/check-spectra-archive-instructions.sh
+  - crates/fleety-cli/src/tui.rs
+  - docs/HANDOFF.md
+  - crates/fleety-textarea/src/editor_tests/keys.rs
+  - .agents/skills/spectra-archive/SKILL.md
+  - crates/fleety-textarea/src/editor_tests/mod.rs
+  - crates/fleety-daemon/src/main.rs
+  - crates/fleety-markdown/src/latex/mod.rs
+  - crates/fleety-tools/src/config.rs
+  - scripts/install-server.sh
+  - crates/fleety-markdown/src/latex/math_box.rs
+  - docs/STATUS.md
+  - crates/fleety-markdown/src/open_code_highlighter.rs
+  - crates/fleety-markdown/src/hyperlinks.rs
+  - .opencode/skills/spectra-archive/SKILL.md
+  - crates/fleety-inline/src/common.rs
+  - crates/fleety-server/Cargo.toml
+  - crates/fleety-textarea/LICENSE
+  - crates/fleety-markdown-core/Cargo.toml
+  - crates/fleety-inline/src/terminal.rs
+  - crates/fleety-textarea/src/editor_tests/planning.rs
+  - crates/fleety-cli/src/provider_tui.rs
+  - crates/fleety-textarea/Cargo.toml
+  - crates/fleety-markdown/src/parse.rs
+  - crates/fleety-cli/src/workspace.rs
+  - crates/agent-core/src/codex_responses.rs
+  - crates/fleety-cli/src/markdown.rs
+  - crates/fleety-server/src/main.rs
+  - crates/fleety-tools/src/oauth.rs
+  - Cargo.toml
+  - crates/fleety-tools/src/connection.rs
+  - crates/fleety-inline/src/scrollback.rs
+  - crates/fleety-textarea/src/editor_tests/viewport.rs
+  - AGENTS.md
   - crates/fleety-cli/src/main.rs
+  - crates/fleety-markdown/src/syntax.rs
+  - crates/fleety-cli/src/acp.rs
+  - crates/fleety-textarea/src/editor_keys.rs
+  - crates/fleety-tools/src/provider_service.rs
+  - crates/fleety-tools/src/providers_config.rs
+  - crates/fleety-markdown/assets/tokyo-night.tmTheme
+  - crates/fleety-inline/src/segment.rs
+  - crates/fleety-markdown/src/latex/commands.rs
+  - crates/fleety-tools/src/lib.rs
+  - crates/fleety-tools/src/deps/runtime.rs
+  - crates/fleety-server/src/http.rs
+  - crates/fleety-markdown-core/LICENSE
+  - crates/fleety-server/src/mdns.rs
+  - .opencode/commands/spectra-archive.md
+  - crates/fleety-cli/src/server.rs
+  - crates/fleety-markdown/src/output.rs
+  - crates/fleety-inline/src/lib.rs
+  - crates/fleety-textarea/src/textarea.rs
+  - crates/fleety-textarea/src/editor.rs
+  - crates/fleety-markdown/src/streaming.rs
+  - crates/fleety-markdown/src/render.rs
+  - crates/fleety-inline/LICENSE
+  - crates/fleety-markdown/src/latex/tests.rs
+  - crates/fleety-markdown/src/buffers.rs
+  - crates/fleety-tools/src/device.rs
+  - crates/fleety-markdown/src/colors.rs
+  - docs/env.md
+  - crates/fleety-markdown/src/mermaid.rs
+  - crates/fleety-tools/src/transport.rs
+  - crates/fleety-markdown/src/checkpoint.rs
+  - crates/fleety-markdown/src/source_map.rs
+  - crates/fleety-markdown/Cargo.toml
+  - docs/roadmap.md
+  - crates/fleety-cli/src/provider_service.rs
+  - crates/fleety-inline/src/resize.rs
+  - crates/fleety-textarea/src/wrapping.rs
+  - crates/fleety-server/src/auth.rs
+  - crates/fleety-cli/Cargo.toml
+  - crates/fleety-markdown/src/latex/symbols.rs
+  - crates/fleety-markdown/src/latex/cursor.rs
+  - crates/fleety-markdown/src/lib.rs
+  - crates/fleety-server/src/conn.rs
+  - crates/fleety-textarea/src/render/mod.rs
+  - crates/fleety-tools/src/service.rs
+  - crates/fleety-textarea/src/lib.rs
+  - docs/tools.md
+  - crates/fleety-tools/Cargo.toml
+  - docs/acp.md
+  - crates/fleety-cli/src/config.rs
+  - crates/fleety-textarea/src/render/line_utils.rs
+  - crates/fleety-markdown/src/latex_delimiters.rs
+  - README.md
+  - crates/fleety-markdown/src/latex/environments.rs
+  - crates/fleety-daemon/Cargo.toml
+  - crates/fleety-inline/Cargo.toml
+  - crates/fleety-markdown/src/url_scan.rs
+  - crates/fleety-cli/src/auth.rs
+  - crates/fleety-tools/src/chrome.rs
+  - docs/design-cli-config.md
+  - crates/fleety-cli/src/input.rs
+  - .github/workflows/ci.yml
+  - crates/fleety-protocol/src/lib.rs
+  - crates/fleety-server/src/providers.rs
+  - crates/fleety-markdown/README.md
+  - crates/fleety-markdown/LICENSE
+  - crates/fleety-textarea/src/editor_tests/editing.rs
+  - crates/fleety-inline/src/tests.rs
+  - crates/fleety-inline/README.md
+  - crates/fleety-cli/src/config_panel.rs
+  - crates/fleety-markdown-core/src/lib.rs
+  - crates/fleety-daemon/src/winsvc.rs
+tests:
+  - crates/fleety-cli/src/test_terminal.rs
+  - crates/fleety-daemon/tests/fleetyd_smoke.rs
+  - crates/fleety-cli/tests/cli_smoke.rs
 -->
 
 ---

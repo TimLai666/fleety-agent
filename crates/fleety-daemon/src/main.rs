@@ -40,9 +40,6 @@ const RECONNECT_HANDSHAKE_WAIT: std::time::Duration = std::time::Duration::from_
 /// each a share — deliberately tight, because someone is waiting. The ordinary
 /// (non-reconnect) path uses [`CONNECT_ENDPOINT_WAIT`] instead.
 const RECONNECT_SWEEP_BUDGET: std::time::Duration = std::time::Duration::from_millis(4_500);
-/// How long any session may take to reach an authenticated `Welcome`. Separate
-/// from the reconnect budget, which is deliberately tighter.
-const WELCOME_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
 /// Budget for opening one endpoint outside an owner-requested reconnect. The
 /// reconnect budget is deliberately tighter because a caller is waiting on it;
 /// an ordinary connect can afford a slow link, a TLS handshake, and Noise.
@@ -599,6 +596,58 @@ fn load_reconnect_journal_at(path: &std::path::Path) -> Result<Option<ReconnectJ
     Ok(state)
 }
 
+fn rollback_reconnect_journal_at(path: &std::path::Path, original_len: u64) -> std::io::Result<()> {
+    let file = std::fs::OpenOptions::new().write(true).open(path)?;
+    file.set_len(original_len)?;
+    file.sync_all()
+}
+
+fn append_reconnect_bytes_at_with<M, O, W, S, R>(
+    path: &std::path::Path,
+    bytes: &[u8],
+    mut metadata_len: M,
+    mut open_append: O,
+    mut write_all: W,
+    mut sync_all: S,
+    mut rollback: R,
+) -> Result<()>
+where
+    M: FnMut(&std::path::Path) -> std::io::Result<u64>,
+    O: FnMut(&std::path::Path) -> std::io::Result<std::fs::File>,
+    W: FnMut(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
+    S: FnMut(&std::fs::File) -> std::io::Result<()>,
+    R: FnMut(&std::path::Path, u64) -> std::io::Result<()>,
+{
+    let original_len = metadata_len(path).map_err(|error| {
+        agent_core::CoreError::Message(format!(
+            "cannot inspect fleetyd reconnect journal before append {}: {error}",
+            path.display()
+        ))
+    })?;
+    let mut file = open_append(path).map_err(|error| {
+        agent_core::CoreError::Message(format!(
+            "cannot open fleetyd reconnect journal {}: {error}",
+            path.display()
+        ))
+    })?;
+    let result = write_all(&mut file, bytes).and_then(|()| sync_all(&file));
+    if let Err(error) = result {
+        drop(file);
+        if let Err(rollback_error) = rollback(path, original_len) {
+            return Err(agent_core::CoreError::Message(format!(
+                "cannot make fleetyd reconnect journal event durable {}: {error}; \
+                 rollback to {original_len} bytes also failed: {rollback_error}",
+                path.display()
+            )));
+        }
+        return Err(agent_core::CoreError::Message(format!(
+            "cannot make fleetyd reconnect journal event durable {}: {error}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 fn append_reconnect_event_at(path: &std::path::Path, event: &ReconnectJournalEvent) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| {
@@ -608,55 +657,62 @@ fn append_reconnect_event_at(path: &std::path::Path, event: &ReconnectJournalEve
             ))
         })?;
     }
-    if let Ok(existing) = std::fs::read(path) {
-        if existing.last().is_some_and(|byte| *byte != b'\n') {
-            let complete_len = existing
-                .iter()
-                .rposition(|byte| *byte == b'\n')
-                .map_or(0, |index| index + 1);
-            let file = std::fs::OpenOptions::new()
-                .write(true)
-                .open(path)
-                .map_err(|error| {
-                    agent_core::CoreError::Message(format!(
-                        "cannot repair fleetyd reconnect journal {}: {error}",
-                        path.display()
-                    ))
-                })?;
-            file.set_len(complete_len as u64)
-                .and_then(|()| file.sync_all())
-                .map_err(|error| {
-                    agent_core::CoreError::Message(format!(
-                        "cannot make fleetyd reconnect journal repair durable {}: {error}",
-                        path.display()
-                    ))
-                })?;
+    match std::fs::read(path) {
+        Ok(existing) => {
+            if existing.last().is_some_and(|byte| *byte != b'\n') {
+                let complete_len = existing
+                    .iter()
+                    .rposition(|byte| *byte == b'\n')
+                    .map_or(0, |index| index + 1);
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(path)
+                    .map_err(|error| {
+                        agent_core::CoreError::Message(format!(
+                            "cannot repair fleetyd reconnect journal {}: {error}",
+                            path.display()
+                        ))
+                    })?;
+                file.set_len(complete_len as u64)
+                    .and_then(|()| file.sync_all())
+                    .map_err(|error| {
+                        agent_core::CoreError::Message(format!(
+                            "cannot make fleetyd reconnect journal repair durable {}: {error}",
+                            path.display()
+                        ))
+                    })?;
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(agent_core::CoreError::Message(format!(
+                "cannot inspect fleetyd reconnect journal before repair {}: {error}",
+                path.display()
+            )));
         }
     }
     let mut bytes = reconnect_event_value(event).to_string().into_bytes();
     bytes.push(b'\n');
     let created = !path.exists();
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|error| {
-            agent_core::CoreError::Message(format!(
-                "cannot open fleetyd reconnect journal {}: {error}",
-                path.display()
-            ))
-        })?;
     use std::io::Write;
-    let original_len = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
-    let result = file.write_all(&bytes).and_then(|()| file.sync_all());
-    if let Err(error) = result {
-        let _ = file.set_len(original_len);
-        let _ = file.sync_all();
-        return Err(agent_core::CoreError::Message(format!(
-            "cannot make fleetyd reconnect journal event durable {}: {error}",
-            path.display()
-        )));
-    }
+    append_reconnect_bytes_at_with(
+        path,
+        &bytes,
+        |path| match std::fs::metadata(path) {
+            Ok(metadata) => Ok(metadata.len()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+            Err(error) => Err(error),
+        },
+        |path| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+        },
+        |file, bytes| file.write_all(bytes),
+        |file| file.sync_all(),
+        rollback_reconnect_journal_at,
+    )?;
     #[cfg(unix)]
     if created {
         let parent = path.parent().ok_or_else(|| {
@@ -1273,6 +1329,19 @@ fn recover_reconnect_for_instance_at(path: &std::path::Path, instance: &str) -> 
     let Some(state) = load_reconnect_journal_at(path)? else {
         return Ok(());
     };
+    let receipt = reconnect_receipt_path_at(path, &state.request.nonce)?;
+    if let Some(ack) = load_reconnect_receipt_at(&receipt)? {
+        if ack.nonce != state.request.nonce {
+            return Err(reconnect_journal_error(format!(
+                "reconnect receipt {} belongs to nonce {} instead of {}",
+                receipt.display(),
+                ack.nonce,
+                state.request.nonce
+            )));
+        }
+        reap_reconnect_journal_at(path)?;
+        return Ok(());
+    }
     if let ReconnectPhase::Settled(ack) = &state.phase {
         if !ack.accepted || reconnect_success_proof_matches(path, ack)? {
             return Ok(());
@@ -1283,7 +1352,6 @@ fn recover_reconnect_for_instance_at(path: &std::path::Path, instance: &str) -> 
             message: "fleetyd restarted before reconnect success committed its durable proof"
                 .to_string(),
         };
-        let receipt = reconnect_receipt_path_at(path, &failure.nonce)?;
         preserve_reconnect_receipt_at(&receipt, &failure)?;
         reap_reconnect_journal_at(path)?;
         return Ok(());
@@ -2147,6 +2215,7 @@ fn persist_authenticated_target_credentials(
         if let Some(token) = minted_token {
             profile.token = Some(token.to_string());
         }
+        connection::rebind_profile_generation_after_authorized_mutation(profile)?;
         let _ = name;
         Ok(true)
     })
@@ -2942,6 +3011,16 @@ async fn run(
                 let mut served = false;
                 let mut requested_reconnect = None;
                 for (tried_index, candidate) in attempts.into_iter().enumerate() {
+                    // A previous candidate can consume enough time for another
+                    // binary or pairing flow to replace this profile. Refuse
+                    // the remaining frozen candidates before opening another
+                    // transport with stale credential authority.
+                    if let Err(error) =
+                        connection::validate_resolved_profile_before_transport(&target)
+                    {
+                        last_error = Some(error);
+                        break;
+                    }
                     // One deadline per candidate, fixed before the connect
                     // starts and shared with the session below. Recomputing it
                     // after opening gave a slow candidate two shares, which on a
@@ -2954,10 +3033,12 @@ async fn run(
                     } else {
                         alternate_share
                     };
-                    let candidate_deadline = reconnect_deadline
-                        .map(|deadline| (tokio::time::Instant::now() + share).min(deadline));
+                    let candidate_deadline = match reconnect_deadline {
+                        Some(deadline) => (tokio::time::Instant::now() + share).min(deadline),
+                        None => tokio::time::Instant::now() + CONNECT_ENDPOINT_WAIT,
+                    };
                     let opened = if let Some(deadline) = reconnect_deadline {
-                        let slice = candidate_deadline.unwrap_or(deadline);
+                        let slice = candidate_deadline;
                         tokio::select! {
                             result = tokio::time::timeout_at(
                                 slice.min(deadline),
@@ -3213,7 +3294,7 @@ async fn serve(
     shutdown: Option<tokio::sync::watch::Receiver<bool>>,
     control: Option<&ControlGuard>,
     pending_reconnect: &mut Option<PendingReconnect>,
-    reconnect_deadline: Option<tokio::time::Instant>,
+    candidate_deadline: tokio::time::Instant,
     // `sealed`: this connection runs inside the encrypted channel, committed
     // with the endpoints so the profile refuses a downgrade next time.
     sealed: bool,
@@ -3284,41 +3365,32 @@ async fn serve(
             return Outcome::Disconnected;
         }
     };
-    let hello_result = if let Some(deadline) = reconnect_deadline {
-        tokio::select! {
-            result = tokio::time::timeout_at(deadline, conn.send_text(hello)) => {
-                match result {
-                    Ok(result) => result,
-                    Err(_) => {
-                        decide_pending_reconnect(
-                            pending_reconnect,
-                            false,
-                            "fleetyd could not send Hello before the reconnect deadline"
-                                .to_string(),
-                        );
-                        conn.close().await;
-                        return Outcome::Disconnected;
-                    }
+    let hello_result = tokio::select! {
+        result = tokio::time::timeout_at(candidate_deadline, conn.send_text(hello)) => {
+            match result {
+                Ok(result) => result,
+                Err(_) => {
+                    decide_pending_reconnect(
+                        pending_reconnect,
+                        false,
+                        "fleetyd could not send Hello before the candidate deadline".to_string(),
+                    );
+                    conn.close().await;
+                    return Outcome::Disconnected;
                 }
             }
-            _ = wait_stop(shutdown.clone()) => {
+        }
+        _ = wait_stop(shutdown.clone()) => {
+            if pending_reconnect.is_some() {
                 decide_pending_reconnect(
                     pending_reconnect,
                     false,
                     "fleetyd stopped before the reconnect completed".to_string(),
                 );
                 settle_pending_reconnect_before_exit(pending_reconnect).await;
-                conn.close().await;
-                return Outcome::Shutdown;
             }
-        }
-    } else {
-        tokio::select! {
-            result = conn.send_text(hello) => result,
-            _ = wait_stop(shutdown.clone()) => {
-                conn.close().await;
-                return Outcome::Shutdown;
-            }
+            conn.close().await;
+            return Outcome::Shutdown;
         }
     };
     if let Err(e) = hello_result {
@@ -3345,12 +3417,7 @@ async fn serve(
     // Always bounded. An owner-requested reconnect keeps its own tighter budget;
     // every other session still needs a limit, or one silent endpoint hides
     // every working endpoint behind it.
-    let mut welcome_deadline = Some(
-        pending_reconnect
-            .as_ref()
-            .and(reconnect_deadline)
-            .unwrap_or_else(|| tokio::time::Instant::now() + WELCOME_WAIT),
-    );
+    let mut welcome_deadline = Some(candidate_deadline);
     let mut authenticated_welcome = false;
     loop {
         if pending_reconnect
@@ -3758,6 +3825,7 @@ mod tests {
                 "FLEETY_DEVICE_ID",
                 "FLEETY_TOKEN",
                 "FLEETY_MDNS_DISABLED",
+                "FLEETY_FORCE_SSE",
                 "FLEETY_CONNECTIONS",
                 "FLEETY_CONFIG",
                 "COMPUTERNAME",
@@ -3779,6 +3847,7 @@ mod tests {
                 "FLEETY_DEVICE_ID",
                 "FLEETY_TOKEN",
                 "FLEETY_MDNS_DISABLED",
+                "FLEETY_FORCE_SSE",
                 "FLEETY_CONNECTIONS",
                 "FLEETY_CONFIG",
                 "COMPUTERNAME",
@@ -3801,6 +3870,21 @@ mod tests {
             }
             let _ = std::fs::remove_dir_all(&self.temp_home);
         }
+    }
+
+    fn seed_claimed_reconnect_journal() -> (PathBuf, Vec<u8>) {
+        let journal = reconnect_journal_path();
+        let request = ReconnectRequest {
+            instance: "daemon-a".to_string(),
+            nonce: "nonce-a".to_string(),
+            expected_profile: "B".to_string(),
+        };
+        submit_reconnect_at(&journal, &request).expect("submit");
+        claim_reconnect_at(&journal, "daemon-a")
+            .expect("claim")
+            .expect("request");
+        let durable = std::fs::read(&journal).expect("read durable journal");
+        (journal, durable)
     }
 
     #[test]
@@ -4548,6 +4632,238 @@ mod tests {
         assert!(matches!(state.phase, ReconnectPhase::Claimed));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn reconnect_journal_read_failure_never_appends_after_a_torn_record() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("reconnect-torn-tail-read-failure");
+        let journal = reconnect_journal_path();
+        let request = ReconnectRequest {
+            instance: "daemon-a".to_string(),
+            nonce: "nonce-a".to_string(),
+            expected_profile: "B".to_string(),
+        };
+        submit_reconnect_at(&journal, &request).expect("submit");
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&journal)
+            .expect("open journal")
+            .write_all(br#"{"event":"settled","nonce":"nonce-a""#)
+            .expect("write torn tail");
+        let before = std::fs::read(&journal).expect("read journal before permission change");
+        let original_permissions = std::fs::metadata(&journal)
+            .expect("journal metadata")
+            .permissions();
+        std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o200))
+            .expect("make journal write-only");
+
+        let result = append_reconnect_event_at(
+            &journal,
+            &ReconnectJournalEvent::Claimed {
+                nonce: "nonce-a".to_string(),
+            },
+        );
+
+        std::fs::set_permissions(&journal, original_permissions)
+            .expect("restore journal permissions");
+        let error = result.expect_err("an unreadable torn tail must stop before append");
+        assert!(
+            error
+                .report()
+                .message
+                .contains("cannot inspect fleetyd reconnect journal before repair"),
+            "{}",
+            error.report().message
+        );
+        assert_eq!(
+            std::fs::read(&journal).expect("read preserved journal"),
+            before,
+            "a read failure must preserve the torn bytes and every durable event"
+        );
+    }
+
+    #[test]
+    fn reconnect_append_metadata_failure_never_writes_or_truncates_durable_events() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("reconnect-append-metadata-failure");
+        let (journal, durable) = seed_claimed_reconnect_journal();
+        let opened = std::cell::Cell::new(false);
+        let wrote = std::cell::Cell::new(false);
+
+        let error = append_reconnect_bytes_at_with(
+            &journal,
+            b"partial",
+            |_| Err(std::io::Error::other("injected metadata failure")),
+            |path| {
+                opened.set(true);
+                std::fs::OpenOptions::new().append(true).open(path)
+            },
+            |file, bytes| {
+                wrote.set(true);
+                use std::io::Write;
+                file.write_all(bytes)?;
+                Err(std::io::Error::other("injected write failure"))
+            },
+            |_| Ok(()),
+            rollback_reconnect_journal_at,
+        )
+        .expect_err("metadata failure must stop before append");
+
+        assert!(error.report().message.contains("metadata"));
+        assert!(
+            !opened.get(),
+            "metadata failure must prevent opening a writer"
+        );
+        assert!(!wrote.get(), "metadata failure must prevent any write");
+        assert_eq!(
+            std::fs::read(&journal).expect("read preserved journal"),
+            durable,
+            "metadata failure preserves every durable event"
+        );
+    }
+
+    #[test]
+    fn reconnect_append_write_failure_rolls_back_to_every_durable_event() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("reconnect-append-write-failure");
+        let (journal, durable) = seed_claimed_reconnect_journal();
+        let synced = std::cell::Cell::new(false);
+
+        let error = append_reconnect_bytes_at_with(
+            &journal,
+            b"partial",
+            |path| std::fs::metadata(path).map(|metadata| metadata.len()),
+            |path| std::fs::OpenOptions::new().append(true).open(path),
+            |file, bytes| {
+                use std::io::Write;
+                file.write_all(bytes)?;
+                Err(std::io::Error::other("injected write failure"))
+            },
+            |_| {
+                synced.set(true);
+                Ok(())
+            },
+            rollback_reconnect_journal_at,
+        )
+        .expect_err("write failure must roll back");
+
+        assert!(error.report().message.contains("write failure"));
+        assert!(!synced.get(), "failed write is never synced as success");
+        assert_eq!(
+            std::fs::read(&journal).expect("read rolled-back journal"),
+            durable
+        );
+    }
+
+    #[test]
+    fn reconnect_append_sync_failure_rolls_back_to_every_durable_event() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("reconnect-append-sync-failure");
+        let (journal, durable) = seed_claimed_reconnect_journal();
+
+        let error = append_reconnect_bytes_at_with(
+            &journal,
+            b"complete but not durable\n",
+            |path| std::fs::metadata(path).map(|metadata| metadata.len()),
+            |path| std::fs::OpenOptions::new().append(true).open(path),
+            |file, bytes| {
+                use std::io::Write;
+                file.write_all(bytes)
+            },
+            |_| Err(std::io::Error::other("injected sync failure")),
+            rollback_reconnect_journal_at,
+        )
+        .expect_err("sync failure must roll back");
+
+        assert!(error.report().message.contains("sync failure"));
+        assert_eq!(
+            std::fs::read(&journal).expect("read rolled-back journal"),
+            durable
+        );
+    }
+
+    #[test]
+    fn reconnect_append_rollback_open_failure_never_shortens_durable_events() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("reconnect-append-rollback-open-failure");
+        let (journal, durable) = seed_claimed_reconnect_journal();
+
+        let error = append_reconnect_bytes_at_with(
+            &journal,
+            b"partial",
+            |path| std::fs::metadata(path).map(|metadata| metadata.len()),
+            |path| std::fs::OpenOptions::new().append(true).open(path),
+            |file, bytes| {
+                use std::io::Write;
+                file.write_all(bytes)?;
+                Err(std::io::Error::other("injected write failure"))
+            },
+            |_| Ok(()),
+            |_, _| Err(std::io::Error::other("injected rollback open failure")),
+        )
+        .expect_err("rollback-open failure remains an error");
+
+        let after = std::fs::read(&journal).expect("read journal after failed rollback");
+        assert!(error.report().message.contains("rollback open failure"));
+        assert!(after.starts_with(&durable));
+        assert!(after.len() >= durable.len());
+    }
+
+    #[test]
+    fn reconnect_append_rollback_truncate_failure_never_shortens_durable_events() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("reconnect-append-rollback-truncate-failure");
+        let (journal, durable) = seed_claimed_reconnect_journal();
+
+        let error = append_reconnect_bytes_at_with(
+            &journal,
+            b"partial",
+            |path| std::fs::metadata(path).map(|metadata| metadata.len()),
+            |path| std::fs::OpenOptions::new().append(true).open(path),
+            |file, bytes| {
+                use std::io::Write;
+                file.write_all(bytes)?;
+                Err(std::io::Error::other("injected write failure"))
+            },
+            |_| Ok(()),
+            |path, _| {
+                let _rollback = std::fs::OpenOptions::new().write(true).open(path)?;
+                Err(std::io::Error::other("injected rollback truncate failure"))
+            },
+        )
+        .expect_err("rollback-truncate failure remains an error");
+
+        let after = std::fs::read(&journal).expect("read journal after failed rollback");
+        assert!(error.report().message.contains("rollback truncate failure"));
+        assert!(after.starts_with(&durable));
+        assert!(after.len() >= durable.len());
+    }
+
+    #[test]
+    fn reconnect_rollback_uses_a_separate_write_capable_handle() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("reconnect-rollback-write-handle");
+        let (journal, durable) = seed_claimed_reconnect_journal();
+        let mut append = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&journal)
+            .expect("open append-only handle");
+        use std::io::Write;
+        append.write_all(b"partial").expect("append partial tail");
+        drop(append);
+
+        rollback_reconnect_journal_at(&journal, durable.len() as u64)
+            .expect("rollback with a separate writable handle");
+
+        assert_eq!(
+            std::fs::read(&journal).expect("read rolled-back journal"),
+            durable
+        );
+    }
+
     #[test]
     fn reconnect_lease_drop_never_deletes_a_successor_lock() {
         let _lock = ENV_LOCK.lock().expect("env lock");
@@ -5053,6 +5369,84 @@ mod tests {
 
         assert_eq!(attempts, 2);
         assert!(pending.is_none());
+    }
+
+    #[test]
+    fn candidate_deadline_bounds_a_stalled_sse_hello_post() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("stalled-sse-hello-post");
+        std::env::set_var("FLEETY_FORCE_SSE", "1");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build test runtime");
+        runtime.block_on(async {
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind stalled SSE server");
+            let address = listener.local_addr().expect("stalled SSE address");
+            tokio::spawn(async move {
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    tokio::spawn(async move {
+                        let mut request = vec![0_u8; 4096];
+                        let Ok(read) =
+                            tokio::io::AsyncReadExt::read(&mut stream, &mut request).await
+                        else {
+                            return;
+                        };
+                        let request = String::from_utf8_lossy(&request[..read]);
+                        if request.starts_with("GET /sse?") {
+                            let response = b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                                         transfer-encoding: chunked\r\nconnection: keep-alive\r\n\r\n\
+                                         9\r\n: ready\n\n\r\n";
+                            let _ =
+                                tokio::io::AsyncWriteExt::write_all(&mut stream, response).await;
+                            std::future::pending::<()>().await;
+                        } else if request.starts_with("POST /send?") {
+                            std::future::pending::<()>().await;
+                        }
+                    });
+                }
+            });
+
+            let url = format!("ws://{address}");
+            let target = Resolved::unowned(url.clone(), None, Source::OverrideUrl);
+            let connection = fleety_tools::transport::connect(&url, None)
+                .await
+                .expect("open SSE downstream");
+            let mut pending = None;
+            let mut authenticated = false;
+
+            let result = tokio::time::timeout(
+                std::time::Duration::from_millis(300),
+                serve(
+                    &target,
+                    None,
+                    connection,
+                    None,
+                    None,
+                    &mut pending,
+                    tokio::time::Instant::now() + std::time::Duration::from_millis(50),
+                    false,
+                    &mut authenticated,
+                ),
+            )
+            .await;
+
+            assert!(
+                result.is_ok(),
+                "one candidate deadline must also bound a stalled SSE Hello POST"
+            );
+            assert!(matches!(
+                result.expect("bounded serve"),
+                Outcome::Disconnected
+            ));
+            assert!(!authenticated);
+        });
     }
 
     #[test]
@@ -5585,6 +5979,53 @@ mod tests {
             .expect("observe failure receipt")
             .expect("failure result");
         assert!(!observed.accepted);
+    }
+
+    #[test]
+    fn restart_reaps_a_journal_when_its_terminal_receipt_already_exists() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("reconnect-receipt-authoritative-on-restart");
+        let journal = reconnect_journal_path();
+        let request = ReconnectRequest {
+            instance: "daemon-old".to_string(),
+            nonce: "nonce-a".to_string(),
+            expected_profile: "B".to_string(),
+        };
+        submit_reconnect_at(&journal, &request).expect("submit");
+        claim_reconnect_at(&journal, "daemon-old")
+            .expect("claim")
+            .expect("request");
+        append_reconnect_event_at(
+            &journal,
+            &ReconnectJournalEvent::Settled {
+                ack: ReconnectAck {
+                    nonce: "nonce-a".to_string(),
+                    accepted: true,
+                    message: "frozen success".to_string(),
+                },
+            },
+        )
+        .expect("settle frozen success");
+        let receipt = reconnect_receipt_path_at(&journal, "nonce-a").expect("receipt path");
+        let failure = ReconnectAck {
+            nonce: "nonce-a".to_string(),
+            accepted: false,
+            message: "profile owner changed before reconnect success".to_string(),
+        };
+        preserve_reconnect_receipt_at(&receipt, &failure).expect("publish terminal receipt");
+
+        let control = ControlGuard::claim()
+            .expect("the terminal receipt must let restart finish journal cleanup");
+
+        assert!(!journal.exists(), "restart reaps the obsolete journal");
+        assert_eq!(
+            load_reconnect_receipt_at(&receipt)
+                .expect("load terminal receipt")
+                .expect("terminal receipt"),
+            failure,
+            "restart preserves the first durable terminal result"
+        );
+        drop(control);
     }
 
     #[test]

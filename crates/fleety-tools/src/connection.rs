@@ -62,7 +62,7 @@ pub fn validate_ws_url(url: &str) -> Result<()> {
 /// server fingerprint pinned at enrollment, and opaque lifecycle generation.
 /// A credentialed, URL-less profile requires explicit endpoint selection and
 /// re-pairing; unsigned mDNS metadata cannot restore its credential binding.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Profile {
     #[serde(default)]
     pub url: String,
@@ -93,18 +93,140 @@ pub struct Profile {
     pub generation: String,
 }
 
-impl Default for Profile {
-    fn default() -> Self {
-        Self {
-            url: String::new(),
-            endpoints: Vec::new(),
-            configured_url: None,
-            secure: false,
-            token: None,
-            label: None,
-            fingerprint: None,
-            generation: uuid::Uuid::new_v4().to_string(),
+const PROFILE_GENERATION_PREFIX: &str = "fleety-profile-v1:";
+const PROFILE_GENERATION_NAMESPACE: &str = "fleety-profile-v";
+
+fn profile_presence_mask(profile: &Profile) -> u8 {
+    u8::from(!profile.endpoints.is_empty())
+        | (u8::from(profile.configured_url.is_some()) << 1)
+        | (u8::from(profile.secure) << 2)
+}
+
+fn parse_versioned_profile_generation(generation: &str) -> Result<Option<(u8, &str)>> {
+    let Some(encoded) = generation.strip_prefix(PROFILE_GENERATION_PREFIX) else {
+        if generation.starts_with(PROFILE_GENERATION_NAMESPACE) {
+            return Err(profile_generation_error(
+                "the profile generation uses an unsupported version",
+            ));
         }
+        return Ok(None);
+    };
+    let (mask, nonce) = encoded
+        .split_once(':')
+        .ok_or_else(|| profile_generation_error("the profile generation envelope is incomplete"))?;
+    let mask = mask
+        .parse::<u8>()
+        .ok()
+        .filter(|mask| *mask <= 0b111)
+        .ok_or_else(|| profile_generation_error("the profile generation mask is invalid"))?;
+    if nonce.trim().is_empty() {
+        return Err(profile_generation_error(
+            "the profile generation nonce is empty",
+        ));
+    }
+    Ok(Some((mask, nonce)))
+}
+
+fn profile_generation_error(reason: &str) -> CoreError {
+    CoreError::Message(format!(
+        "{reason}; a saved connection profile may have been rewritten by an older Fleety \
+         binary — update every Fleety binary that shares this configuration, then re-pair \
+         the affected profile"
+    ))
+}
+
+fn validate_profile_generation(profile: &Profile) -> Result<()> {
+    let Some((expected, _)) = parse_versioned_profile_generation(&profile.generation)? else {
+        return Ok(());
+    };
+    let actual = profile_presence_mask(profile);
+    if actual != expected {
+        return Err(profile_generation_error(
+            "the profile generation no longer matches its roaming security state",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_profile_generation_envelopes(connections: &Connections) -> Result<()> {
+    for (name, profile) in &connections.profiles {
+        parse_versioned_profile_generation(&profile.generation).map_err(|error| {
+            let name = serde_json::to_string(name).unwrap_or_else(|_| "\"<invalid>\"".to_string());
+            CoreError::Message(format!(
+                "saved connection profile {name} has an unreadable generation envelope: {}",
+                error.report().message,
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+pub fn validate_named_profile_generation(name: &str, profile: &Profile) -> Result<()> {
+    validate_profile_generation(profile).map_err(|error| {
+        let name = serde_json::to_string(name).unwrap_or_else(|_| "\"<invalid>\"".to_string());
+        let recovery = if parse_versioned_profile_generation(&profile.generation)
+            .ok()
+            .flatten()
+            .is_some_and(|(expected, _)| expected & 0b010 != 0 && profile.configured_url.is_none())
+        {
+            "`fleety init <ws-url> --name <profile> --pairing-code <code>`"
+        } else {
+            "`fleety --profile <name> pair <code>`"
+        };
+        CoreError::Message(format!(
+            "saved connection profile {name} is incompatible: {}. After updating every \
+             binary, recover it with {recovery}; the old token will not be sent",
+            error.report().message,
+        ))
+    })
+}
+
+pub fn profile_generation_requires_explicit_repair(profile: &Profile) -> Result<bool> {
+    let Some((expected, _)) = parse_versioned_profile_generation(&profile.generation)? else {
+        return Ok(false);
+    };
+    Ok(expected != profile_presence_mask(profile))
+}
+
+fn bind_new_profile_generation(profile: &mut Profile) {
+    let nonce = if profile.generation.trim().is_empty() {
+        uuid::Uuid::new_v4().to_string()
+    } else {
+        profile.generation.clone()
+    };
+    profile.generation = format!(
+        "{PROFILE_GENERATION_PREFIX}{}:{nonce}",
+        profile_presence_mask(profile),
+    );
+}
+
+pub fn upgrade_legacy_profile_generation_binding(profile: &mut Profile) -> Result<bool> {
+    if parse_versioned_profile_generation(&profile.generation)?.is_some() {
+        validate_profile_generation(profile)?;
+        return Ok(false);
+    }
+    bind_new_profile_generation(profile);
+    Ok(true)
+}
+
+fn refresh_profile_generation_binding(profile: &mut Profile) -> Result<()> {
+    if let Some((_, nonce)) = parse_versioned_profile_generation(&profile.generation)? {
+        profile.generation = format!(
+            "{PROFILE_GENERATION_PREFIX}{}:{nonce}",
+            profile_presence_mask(profile)
+        );
+    }
+    Ok(())
+}
+
+/// Rebind the envelope after an explicitly authorized mutation changes one of
+/// its protected fields. Legacy generations keep their opaque nonce.
+pub fn rebind_profile_generation_after_authorized_mutation(profile: &mut Profile) -> Result<()> {
+    if parse_versioned_profile_generation(&profile.generation)?.is_some() {
+        refresh_profile_generation_binding(profile)
+    } else {
+        bind_new_profile_generation(profile);
+        Ok(())
     }
 }
 
@@ -156,6 +278,10 @@ pub fn fleety_dir() -> PathBuf {
 /// (a fresh device); a present-but-unparseable file is an **error** — we never
 /// silently treat a corrupt file as empty and drift off the configured server.
 pub fn load_at(path: &Path) -> Result<Connections> {
+    load_at_unvalidated(path)
+}
+
+fn load_at_unvalidated(path: &Path) -> Result<Connections> {
     match std::fs::read_to_string(path) {
         Ok(text) => toml::from_str(&text).map_err(|e| {
             CoreError::Message(format!(
@@ -195,6 +321,24 @@ enum SaveStatus {
 }
 
 fn save_at_with_sync_status<S, P>(
+    path: &Path,
+    conns: &Connections,
+    sync_staged: S,
+    sync_published: P,
+) -> Result<SaveStatus>
+where
+    S: FnOnce(&std::fs::File) -> std::io::Result<()>,
+    P: FnOnce(&Path, Option<&Path>) -> std::io::Result<()>,
+{
+    // A known-v1 mismatch belongs to that profile and remains detectable after
+    // reserialization. It must not block an authorized mutation of a different
+    // healthy profile. Unknown or malformed envelopes still block every write
+    // because this binary cannot safely preserve a format it does not know.
+    validate_profile_generation_envelopes(conns)?;
+    save_at_with_sync_status_unchecked(path, conns, sync_staged, sync_published)
+}
+
+fn save_at_with_sync_status_unchecked<S, P>(
     path: &Path,
     conns: &Connections,
     sync_staged: S,
@@ -267,11 +411,9 @@ where
 /// Unix permissions remain `0600` because the file may hold bearer tokens.
 pub fn save_at(path: &Path, conns: &Connections) -> Result<()> {
     crate::device::ensure_writable_path(path, "connections.toml")?;
-    let mut conns = conns.clone();
-    ensure_profile_generations(&mut conns);
     save_at_with_sync(
         path,
-        &conns,
+        conns,
         std::fs::File::sync_all,
         sync_published_connections,
     )
@@ -384,17 +526,6 @@ fn acquire_mutation_lease(path: &Path) -> Result<MutationLease> {
     }
 }
 
-fn ensure_profile_generations(connections: &mut Connections) -> bool {
-    let mut changed = false;
-    for profile in connections.profiles.values_mut() {
-        if profile.generation.trim().is_empty() {
-            profile.generation = uuid::Uuid::new_v4().to_string();
-            changed = true;
-        }
-    }
-    changed
-}
-
 /// Cross-process-safe read-modify-write for the shared connection profile
 /// store. Callers must update only the fields they own and validate any
 /// expected URL/current preconditions inside `mutation`.
@@ -420,7 +551,6 @@ where
     let _lease = acquire_mutation_lease(path)?;
     let mut connections = load_at(path)?;
     let result = mutation(&mut connections)?;
-    ensure_profile_generations(&mut connections);
     let status =
         save_at_with_sync_status(path, &connections, std::fs::File::sync_all, sync_published)?;
     Ok((result, status))
@@ -455,11 +585,10 @@ pub fn ensure_resolvable_profile_generation_at(
     let Some(existing_name) = existing_name else {
         return Ok(false);
     };
-    if existing
-        .profiles
-        .get(existing_name)
-        .is_none_or(|profile| !profile.generation.trim().is_empty())
-    {
+    if existing.profiles.get(existing_name).is_none_or(|profile| {
+        parse_versioned_profile_generation(&profile.generation)
+            .is_ok_and(|generation| generation.is_some())
+    }) {
         return Ok(false);
     }
 
@@ -476,10 +605,10 @@ pub fn ensure_resolvable_profile_generation_at(
     let Some(profile) = connections.profiles.get_mut(&name) else {
         return Ok(false);
     };
-    if !profile.generation.trim().is_empty() {
+    if parse_versioned_profile_generation(&profile.generation)?.is_some() {
         return Ok(false);
     }
-    profile.generation = uuid::Uuid::new_v4().to_string();
+    upgrade_legacy_profile_generation_binding(profile)?;
     save_at_with_sync(
         path,
         &connections,
@@ -611,19 +740,18 @@ pub fn migrate_from_config_json_at(dir: &Path) -> Result<Migration> {
     // Only mint a `default` profile when there is something to point at. A
     // A url-less record keeps `url` empty so recovery never guesses localhost.
     if agent_url.is_some() || token.is_some() {
-        conns.profiles.insert(
-            "default".to_string(),
-            Profile {
-                url: agent_url.unwrap_or_default(),
-                endpoints: Vec::new(),
-                configured_url: None,
-                secure: false,
-                token,
-                label: None,
-                fingerprint: None,
-                generation: uuid::Uuid::new_v4().to_string(),
-            },
-        );
+        let mut profile = Profile {
+            url: agent_url.unwrap_or_default(),
+            endpoints: Vec::new(),
+            configured_url: None,
+            secure: false,
+            token,
+            label: None,
+            fingerprint: None,
+            generation: uuid::Uuid::new_v4().to_string(),
+        };
+        rebind_profile_generation_after_authorized_mutation(&mut profile)?;
+        conns.profiles.insert("default".to_string(), profile);
         conns.current = Some("default".to_string());
     }
 
@@ -955,6 +1083,7 @@ pub fn resolve(
                     "no server profile named '{name}' — see `fleety connection list`"
                 ))
             })?;
+            validate_named_profile_generation(name, p)?;
             if p.url.is_empty() {
                 return Err(CoreError::Message(format!(
                     "server profile '{name}' has no url; set one with \
@@ -1003,6 +1132,7 @@ pub fn resolve(
     // — an enrolled device does not drift to a LAN advertiser.
     if let Some(name) = conns.current.as_ref() {
         if let Some(p) = conns.profiles.get(name) {
+            validate_named_profile_generation(name, p)?;
             if !p.url.is_empty() {
                 validate_ws_url(&p.url)?;
                 let (token, token_provenance) = match env_token.clone() {
@@ -1082,6 +1212,137 @@ pub fn resolve(
         diagnostic_owner: None,
         token_provenance,
         fresh_default_owner: conns.current.is_none() && conns.profiles.is_empty(),
+    })
+}
+
+/// A profile target resolved only for an explicit pairing-code redemption.
+///
+/// This intentionally exposes neither the saved token nor the saved identity
+/// pin. The complete profile snapshot remains private and exists only so the
+/// post-Welcome commit can reject owner drift under the mutation lease.
+#[derive(Debug, Clone)]
+pub struct ExplicitPairingTarget {
+    url: String,
+    source: Source,
+    owner: ProfileOwnerSnapshot,
+    expected_current: Option<String>,
+    require_current_unchanged: bool,
+}
+
+impl ExplicitPairingTarget {
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    pub fn source(&self) -> &Source {
+        &self.source
+    }
+}
+
+pub fn resolve_profile_for_explicit_pairing(target: &Target) -> Result<ExplicitPairingTarget> {
+    resolve_profile_for_explicit_pairing_at(&connections_path(), target)
+}
+
+pub fn resolve_profile_for_explicit_pairing_at(
+    path: &Path,
+    target: &Target,
+) -> Result<ExplicitPairingTarget> {
+    let connections = load_at_unvalidated(path)?;
+    let (name, require_current, source) =
+        match target {
+            Target::Named(name) => (name.clone(), false, Source::OverrideProfile(name.clone())),
+            Target::Current => {
+                let name = connections.current.clone().ok_or_else(|| {
+                    CoreError::Message(
+                        "pairing needs a current named server profile; run `fleety init <ws-url> \
+                     --name <name> --pairing-code <code>`"
+                            .to_string(),
+                    )
+                })?;
+                (name.clone(), true, Source::Profile(name))
+            }
+            Target::Url(_) => return Err(CoreError::Message(
+                "pairing needs a named server profile; use `fleety --profile <name> pair <code>`"
+                    .to_string(),
+            )),
+        };
+    validate_profile_generation_envelopes(&connections)?;
+    let profile = connections.profiles.get(&name).ok_or_else(|| {
+        CoreError::Message(format!(
+            "no server profile named '{name}' — see `fleety connection list`"
+        ))
+    })?;
+    // Known v1 mismatches are the exact state this explicit recovery path is
+    // allowed to replace. Unknown or malformed envelopes still fail closed.
+    let generation = parse_versioned_profile_generation(&profile.generation)?;
+    if generation
+        .is_some_and(|(expected, _)| expected & 0b010 != 0 && profile.configured_url.is_none())
+    {
+        return Err(CoreError::Message(format!(
+            "server profile '{name}' lost the user-configured endpoint that its generation \
+             recorded; `fleety pair` will not send a one-time code to the learned primary \
+             address. Recover with `fleety init <ws-url> --name <profile> --pairing-code <code>`"
+        )));
+    }
+    let url = profile
+        .configured_url
+        .as_deref()
+        .unwrap_or(&profile.url)
+        .to_string();
+    if url.is_empty() {
+        return Err(CoreError::Message(format!(
+            "server profile '{name}' has no configured endpoint to re-pair"
+        )));
+    }
+    validate_ws_url(&url)?;
+    Ok(ExplicitPairingTarget {
+        url,
+        source,
+        owner: ProfileOwnerSnapshot {
+            name,
+            profile: profile.clone(),
+            require_current,
+        },
+        expected_current: connections.current.clone(),
+        require_current_unchanged: false,
+    })
+}
+
+pub fn resolve_profile_for_explicit_reenrollment(
+    name: &str,
+    url: &str,
+) -> Result<ExplicitPairingTarget> {
+    resolve_profile_for_explicit_reenrollment_at(&connections_path(), name, url)
+}
+
+fn resolve_profile_for_explicit_reenrollment_at(
+    path: &Path,
+    name: &str,
+    url: &str,
+) -> Result<ExplicitPairingTarget> {
+    validate_ws_url(url)?;
+    let connections = load_at_unvalidated(path)?;
+    validate_profile_generation_envelopes(&connections)?;
+    let profile = connections.profiles.get(name).ok_or_else(|| {
+        CoreError::Message(format!(
+            "no server profile named '{name}' — see `fleety connection list`"
+        ))
+    })?;
+    if !profile_generation_requires_explicit_repair(profile)? {
+        return Err(CoreError::Message(format!(
+            "server profile '{name}' does not need incompatible-writer recovery"
+        )));
+    }
+    Ok(ExplicitPairingTarget {
+        url: url.to_string(),
+        source: Source::OverrideProfile(name.to_string()),
+        owner: ProfileOwnerSnapshot {
+            name: name.to_string(),
+            profile: profile.clone(),
+            require_current: false,
+        },
+        expected_current: connections.current.clone(),
+        require_current_unchanged: true,
     })
 }
 
@@ -1287,6 +1548,7 @@ fn resolved_profile_owner<'a>(
             owner.name
         ))
     })?;
+    validate_named_profile_generation(&owner.name, profile)?;
     if profile != &owner.profile {
         return Err(CoreError::Message(format!(
             "server profile '{}' changed during connection; {action} was not applied",
@@ -1308,6 +1570,15 @@ pub fn validate_resolved_profile_owner<'a>(
             "the transient connection has no saved profile owner; {action} was not applied"
         ))
     })?;
+    validate_resolved_profile_snapshot(conns, target, owner, action)
+}
+
+fn validate_resolved_profile_snapshot<'a>(
+    conns: &'a Connections,
+    target: &Resolved,
+    owner: &ProfileOwnerSnapshot,
+    action: &str,
+) -> Result<&'a Profile> {
     let source_name = match &target.source {
         Source::Profile(name) | Source::OverrideProfile(name) => name,
         _ => {
@@ -1336,6 +1607,7 @@ pub fn validate_resolved_profile_owner<'a>(
             owner.name
         ))
     })?;
+    validate_named_profile_generation(&owner.name, profile)?;
     if profile != &owner.profile {
         return Err(CoreError::Message(format!(
             "server profile '{}' changed during connection; {action} was not applied",
@@ -1343,6 +1615,26 @@ pub fn validate_resolved_profile_owner<'a>(
         )));
     }
     Ok(profile)
+}
+
+/// Revalidate a cached durable target immediately before opening another
+/// transport. Raw and environment targets have no owner and remain unchanged.
+pub fn validate_resolved_profile_before_transport(target: &Resolved) -> Result<()> {
+    validate_resolved_profile_before_transport_at(&connections_path(), target)
+}
+
+pub fn validate_resolved_profile_before_transport_at(path: &Path, target: &Resolved) -> Result<()> {
+    let Some(owner) = target.owner.as_ref().or(target.diagnostic_owner.as_ref()) else {
+        return Ok(());
+    };
+    let connections = load_at(path)?;
+    validate_resolved_profile_snapshot(
+        &connections,
+        target,
+        owner,
+        "a new connection with its saved credential",
+    )?;
+    Ok(())
 }
 
 /// Whether a candidate endpoint is allowed to talk in the clear.
@@ -1467,6 +1759,14 @@ fn merged_profile_endpoints(
 /// one attempt. Large enough to try the endpoints that matter, small enough that
 /// a caller is never left waiting for the full alternative list.
 const MAX_CANDIDATE_SWEEP_MULTIPLE: u32 = 3;
+
+/// Divide a caller's whole-sweep budget across the candidates the shared
+/// connector can attempt before its aggregate cap.
+pub fn candidate_wait_within_sweep_budget(
+    sweep_budget: std::time::Duration,
+) -> std::time::Duration {
+    (sweep_budget / MAX_CANDIDATE_SWEEP_MULTIPLE).max(std::time::Duration::from_millis(1))
+}
 
 /// How many alternative endpoints a profile keeps beside its primary `url`.
 const MAX_PROFILE_ALTERNATIVE_ENDPOINTS: usize = 15;
@@ -1666,6 +1966,19 @@ pub struct CandidateSession {
 pub async fn connect_first_healthy<F, Fut, T>(
     target: &Resolved,
     wait: std::time::Duration,
+    finish: F,
+) -> Result<T>
+where
+    F: FnMut(CandidateSession) -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    connect_first_healthy_at(&connections_path(), target, wait, finish).await
+}
+
+pub async fn connect_first_healthy_at<F, Fut, T>(
+    path: &Path,
+    target: &Resolved,
+    wait: std::time::Duration,
     mut finish: F,
 ) -> Result<T>
 where
@@ -1682,6 +1995,11 @@ where
         if tokio::time::Instant::now() >= overall {
             break;
         }
+        // The target is a frozen credential-owner snapshot, but another
+        // process can replace that owner while an earlier candidate stalls.
+        // Revalidate before every transport, not merely before entering the
+        // sweep, so a later endpoint never receives stale token/pin state.
+        validate_resolved_profile_before_transport_at(path, target)?;
         // One budget for the whole attempt, not one per stage: the promise is
         // that a single endpoint cannot hold up the ones behind it.
         let deadline = (tokio::time::Instant::now() + wait).min(overall);
@@ -1802,6 +2120,7 @@ pub fn learn_resolved_profile_endpoints_at(
         // Latching only on success: a Server that proves it speaks the channel
         // pins the profile to it, and nothing ever clears the pin implicitly.
         profile.secure = profile.secure || sealed;
+        rebind_profile_generation_after_authorized_mutation(profile)?;
         let profile = profile.clone();
         Ok(Resolved {
             url: target.url.clone(),
@@ -2057,6 +2376,171 @@ pub fn store_resolved_profile_pairing(
     store_resolved_profile_pairing_at(&connections_path(), target, token, fingerprint)
 }
 
+pub fn store_explicit_profile_pairing(
+    target: &ExplicitPairingTarget,
+    token: &str,
+    fingerprint: &str,
+) -> Result<PinDecision> {
+    store_explicit_profile_pairing_at(&connections_path(), target, token, fingerprint)
+}
+
+pub fn store_explicit_profile_pairing_at(
+    path: &Path,
+    target: &ExplicitPairingTarget,
+    token: &str,
+    fingerprint: &str,
+) -> Result<PinDecision> {
+    match store_explicit_profile_pairing_recoverable_at(path, target, token, fingerprint)? {
+        CredentialCommit::Durable { decision, .. } => Ok(decision),
+        CredentialCommit::PublishedNotDurable { error, .. } => Err(error),
+    }
+}
+
+pub fn store_explicit_profile_pairing_recoverable(
+    target: &ExplicitPairingTarget,
+    token: &str,
+    fingerprint: &str,
+) -> Result<CredentialCommit> {
+    store_explicit_profile_pairing_recoverable_at(&connections_path(), target, token, fingerprint)
+}
+
+pub fn store_explicit_profile_pairing_recoverable_at(
+    path: &Path,
+    target: &ExplicitPairingTarget,
+    token: &str,
+    fingerprint: &str,
+) -> Result<CredentialCommit> {
+    store_explicit_profile_pairing_recoverable_at_with(
+        path,
+        target,
+        None,
+        false,
+        token,
+        fingerprint,
+    )
+}
+
+pub fn store_explicit_profile_reenrollment_recoverable(
+    target: &ExplicitPairingTarget,
+    url: &str,
+    token: &str,
+    fingerprint: &str,
+) -> Result<CredentialCommit> {
+    store_explicit_profile_pairing_recoverable_at_with(
+        &connections_path(),
+        target,
+        Some(url),
+        true,
+        token,
+        fingerprint,
+    )
+}
+
+fn store_explicit_profile_pairing_recoverable_at_with(
+    path: &Path,
+    target: &ExplicitPairingTarget,
+    replacement_url: Option<&str>,
+    make_current: bool,
+    token: &str,
+    fingerprint: &str,
+) -> Result<CredentialCommit> {
+    if token.trim().is_empty() || fingerprint.trim().is_empty() {
+        return Err(CoreError::Message(
+            "the Server returned incomplete pairing credentials; no credential was saved"
+                .to_string(),
+        ));
+    }
+    if let Some(url) = replacement_url {
+        validate_ws_url(url)?;
+    }
+    let _lease = acquire_mutation_lease(path)?;
+    let mut connections = load_at_unvalidated(path)?;
+    validate_profile_generation_envelopes(&connections)?;
+    if target.owner.require_current
+        && connections.current.as_deref() != Some(target.owner.name.as_str())
+    {
+        return Err(CoreError::Message(format!(
+            "server profile '{}' is no longer current; pairing credentials were not applied",
+            target.owner.name
+        )));
+    }
+    if target.require_current_unchanged && connections.current != target.expected_current {
+        return Err(CoreError::Message(
+            "the current server profile changed during re-enrollment; pairing credentials and \
+             profile selection were not applied"
+                .to_string(),
+        ));
+    }
+    let profile = connections
+        .profiles
+        .get_mut(&target.owner.name)
+        .ok_or_else(|| {
+            CoreError::Message(format!(
+                "server profile '{}' disappeared during pairing; pairing credentials were not applied",
+                target.owner.name
+            ))
+        })?;
+    if profile != &target.owner.profile {
+        return Err(CoreError::Message(format!(
+            "server profile '{}' changed during pairing; pairing credentials were not applied",
+            target.owner.name
+        )));
+    }
+    let decision = tofu_pin_decision(profile.fingerprint.as_deref(), fingerprint);
+    profile.token = Some(token.to_string());
+    profile.fingerprint = Some(fingerprint.to_string());
+    profile.secure = false;
+    profile.endpoints.clear();
+    if let Some(url) = replacement_url {
+        profile.url = url.to_string();
+        profile.configured_url = None;
+    } else if let Some(configured) = profile.configured_url.take() {
+        profile.url = configured;
+    }
+    rebind_profile_generation_after_authorized_mutation(profile)?;
+    let profile = profile.clone();
+    if make_current {
+        connections.current = Some(target.owner.name.clone());
+    }
+    let profile_is_current = connections.current.as_deref() == Some(target.owner.name.as_str());
+    let committed = Resolved {
+        url: profile.url.clone(),
+        token: profile.token.clone(),
+        source: target.source.clone(),
+        owner: Some(ProfileOwnerSnapshot {
+            name: target.owner.name.clone(),
+            profile,
+            require_current: target.owner.require_current,
+        }),
+        diagnostic_owner: None,
+        token_provenance: TokenProvenance::SavedProfile,
+        fresh_default_owner: false,
+    };
+    // A stale binary rewrites the whole file, so several known-v1 profiles can
+    // be mismatched together. This explicit repair may replace its frozen
+    // target while leaving other mismatches detectable for their own repair.
+    // Unknown or malformed envelopes were rejected above.
+    let status = save_at_with_sync_status_unchecked(
+        path,
+        &connections,
+        std::fs::File::sync_all,
+        sync_published_connections,
+    )?;
+    Ok(match status {
+        SaveStatus::Durable => CredentialCommit::Durable {
+            decision,
+            committed,
+            profile_is_current,
+        },
+        SaveStatus::PublishedNotDurable(error) => CredentialCommit::PublishedNotDurable {
+            decision,
+            committed,
+            profile_is_current,
+            error,
+        },
+    })
+}
+
 pub fn store_resolved_profile_pairing_at(
     path: &Path,
     target: &Resolved,
@@ -2134,6 +2618,7 @@ where
             if let Some(configured) = profile.configured_url.take() {
                 profile.url = configured;
             }
+            rebind_profile_generation_after_authorized_mutation(profile)?;
             let profile = profile.clone();
             let committed = Resolved {
                 url: profile.url.clone(),
@@ -2195,9 +2680,10 @@ pub fn explicit_repair_guidance() -> String {
 
 /// Changing a saved endpoint breaks its credential binding. Return whether
 /// credentials were cleared so callers can tell the user to re-pair.
-pub fn reselect_profile_endpoint(profile: &mut Profile, new_url: String) -> bool {
+pub fn reselect_profile_endpoint(profile: &mut Profile, new_url: String) -> Result<bool> {
+    validate_profile_generation(profile)?;
     if profile.url == new_url {
-        return false;
+        return Ok(false);
     }
     let had_token = profile.token.take().is_some();
     let had_fingerprint = profile.fingerprint.take().is_some();
@@ -2205,7 +2691,8 @@ pub fn reselect_profile_endpoint(profile: &mut Profile, new_url: String) -> bool
     profile.endpoints.clear();
     profile.configured_url = None;
     profile.secure = false;
-    had_token || had_fingerprint
+    rebind_profile_generation_after_authorized_mutation(profile)?;
+    Ok(had_token || had_fingerprint)
 }
 
 #[cfg(test)]
@@ -2301,6 +2788,410 @@ mod tests {
         assert_eq!(home.token.as_deref(), Some("tok-home"));
         assert_eq!(home.label.as_deref(), Some("Home"));
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn versioned_generation_detects_each_old_serializer_field_drop() {
+        let original = "device_id = \"dev-1\"\ncurrent = \"home\"\n\n\
+                        [profiles.home]\n\
+                        url = \"ws://192.168.1.20:8787\"\n\
+                        endpoints = [\"ws://100.64.0.8:8787\"]\n\
+                        configured_url = \"ws://home.example:8787\"\n\
+                        secure = true\n\
+                        token = \"saved-secret\"\n\
+                        generation = \"fleety-profile-v1:7:00000000-0000-4000-8000-000000000001\"\n";
+
+        for field in ["endpoints", "configured_url", "secure"] {
+            let p = tmp_path();
+            let downgraded = original
+                .lines()
+                .filter(|line| !line.trim_start().starts_with(&format!("{field} =")))
+                .collect::<Vec<_>>()
+                .join("\n");
+            std::fs::write(&p, downgraded).expect("simulate an old serializer rewrite");
+
+            let connections = load_at(&p).expect("the store remains inspectable for repair");
+            let error = resolve(&connections, &Target::Current, None, None, || None)
+                .expect_err("field loss must fail closed before resolution");
+
+            assert!(error
+                .report()
+                .message
+                .contains("update every Fleety binary"));
+            assert!(error.report().message.contains("re-pair"));
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
+    fn lost_configured_url_guidance_names_the_only_safe_recovery_command() {
+        let profile = Profile {
+            url: "ws://100.64.0.8:8787".to_string(),
+            endpoints: vec!["ws://192.168.1.20:8787".to_string()],
+            configured_url: None,
+            secure: true,
+            token: Some("old-token".to_string()),
+            fingerprint: Some("old-pin".to_string()),
+            generation: "fleety-profile-v1:7:home-generation".to_string(),
+            ..Profile::default()
+        };
+
+        let error = validate_named_profile_generation("home", &profile)
+            .expect_err("a missing configured URL must fail closed");
+        let message = error.report().message;
+        assert!(
+            message.contains("fleety init <ws-url> --name <profile> --pairing-code <code>"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("fleety --profile <name> pair <code>"),
+            "the rejected bare-pair path must not be recommended: {message}"
+        );
+    }
+
+    #[test]
+    fn an_incompatible_unrelated_profile_does_not_block_a_healthy_named_profile() {
+        let path = tmp_path();
+        std::fs::write(
+            &path,
+            "device_id = \"dev-1\"\ncurrent = \"broken\"\n\n\
+             [profiles.broken]\nurl = \"ws://broken:8787\"\nsecure = true\n\
+             generation = \"fleety-profile-v1:7:broken-generation\"\n\n\
+             [profiles.healthy]\nurl = \"ws://healthy:8787\"\n\
+             generation = \"healthy-legacy-generation\"\n",
+        )
+        .expect("seed one incompatible and one healthy profile");
+
+        let connections = load_at(&path).expect("unrelated profiles remain inspectable");
+        let resolved = resolve(
+            &connections,
+            &Target::Named("healthy".to_string()),
+            None,
+            None,
+            || None,
+        )
+        .expect("the named healthy profile remains usable");
+
+        assert_eq!(resolved.url(), "ws://healthy:8787");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn an_incompatible_unrelated_profile_does_not_block_a_healthy_profile_mutation() {
+        let path = tmp_path();
+        std::fs::write(
+            &path,
+            "device_id = \"dev-1\"\ncurrent = \"healthy\"\n\n\
+             [profiles.broken]\nurl = \"ws://broken:8787\"\nsecure = true\n\
+             generation = \"fleety-profile-v1:7:broken-generation\"\n\n\
+             [profiles.healthy]\nurl = \"ws://healthy:8787\"\ntoken = \"healthy-token\"\n\
+             fingerprint = \"healthy-pin\"\ngeneration = \"fleety-profile-v1:0:healthy-generation\"\n",
+        )
+        .expect("seed one incompatible and one healthy profile");
+
+        mutate_at(&path, |connections| {
+            let healthy = connections.profiles.get_mut("healthy").expect("healthy");
+            validate_named_profile_generation("healthy", healthy)?;
+            reselect_profile_endpoint(healthy, "ws://healthy-new:8787".to_string())
+        })
+        .expect("mutate only the healthy target");
+
+        let connections = load_at(&path).expect("load preserved store");
+        assert_eq!(connections.profiles["healthy"].url, "ws://healthy-new:8787");
+        validate_named_profile_generation("healthy", &connections.profiles["healthy"])
+            .expect("healthy mutation rebinds its state");
+        validate_named_profile_generation("broken", &connections.profiles["broken"])
+            .expect_err("unrelated mismatch remains detectable");
+        assert_eq!(
+            connections.profiles["broken"].generation,
+            "fleety-profile-v1:7:broken-generation"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn in_memory_versioned_generation_mismatch_fails_before_saved_token_resolution() {
+        let mut conns = conns_with(
+            Some("home"),
+            &[(
+                "home",
+                Profile {
+                    url: "ws://192.168.1.20:8787".to_string(),
+                    endpoints: Vec::new(),
+                    configured_url: Some("ws://home.example:8787".to_string()),
+                    secure: true,
+                    token: Some("saved-secret".to_string()),
+                    generation: "fleety-profile-v1:7:00000000-0000-4000-8000-000000000001"
+                        .to_string(),
+                    ..Default::default()
+                },
+            )],
+        );
+        conns
+            .profiles
+            .get_mut("home")
+            .expect("home")
+            .endpoints
+            .clear();
+        let discovered = std::cell::Cell::new(false);
+
+        let error = resolve(&conns, &Target::Current, None, None, || {
+            discovered.set(true);
+            None
+        })
+        .expect_err("generation mismatch must stop before resolution");
+
+        assert!(error
+            .report()
+            .message
+            .contains("update every Fleety binary"));
+        assert!(
+            !discovered.get(),
+            "fail closed before discovery or network work"
+        );
+    }
+
+    #[test]
+    fn cached_profile_is_revalidated_before_a_new_transport() {
+        let path = tmp_path();
+        let original = "device_id = \"dev-1\"\ncurrent = \"home\"\n\n\
+                        [profiles.home]\nurl = \"ws://home:8787\"\n\
+                        endpoints = [\"ws://100.64.0.8:8787\"]\n\
+                        configured_url = \"ws://home:8787\"\nsecure = true\n\
+                        token = \"saved-token\"\nfingerprint = \"saved-pin\"\n\
+                        generation = \"fleety-profile-v1:7:home-generation\"\n";
+        std::fs::write(&path, original).expect("seed compatible profile");
+        let target = resolve(
+            &load_at(&path).expect("load compatible profile"),
+            &Target::Current,
+            None,
+            None,
+            || None,
+        )
+        .expect("freeze durable target");
+        let downgraded = original
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("secure ="))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, downgraded).expect("simulate stale writer between sessions");
+
+        let error = validate_resolved_profile_before_transport_at(&path, &target)
+            .expect_err("cached target must fail before another transport");
+
+        assert!(error.report().message.contains("profile \"home\""));
+        assert!(
+            error.report().message.contains("older Fleety binary"),
+            "{}",
+            error.report().message
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_new_profile_is_version_bound_on_its_first_persistence() {
+        let path = tmp_path();
+        let default_profile = Profile::default();
+        assert!(default_profile.generation.is_empty(), "{default_profile:?}");
+        let mut conns = conns_with(
+            Some("home"),
+            &[(
+                "home",
+                Profile {
+                    url: "ws://home:8787".to_string(),
+                    generation: String::new(),
+                    ..Default::default()
+                },
+            )],
+        );
+        conns.profiles.get_mut("home").expect("home").secure = true;
+        rebind_profile_generation_after_authorized_mutation(
+            conns.profiles.get_mut("home").expect("home"),
+        )
+        .expect("bind new profile before persistence");
+
+        save_at(&path, &conns).expect("persist new profile");
+
+        let saved = load_at(&path).expect("load version-bound profile");
+        assert!(
+            saved.profiles["home"]
+                .generation
+                .starts_with("fleety-profile-v1:4:"),
+            "{saved:?}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn an_unrelated_save_does_not_upgrade_an_empty_legacy_generation() {
+        let path = tmp_path();
+        let conns = conns_with(
+            Some("healthy"),
+            &[
+                (
+                    "healthy",
+                    Profile {
+                        url: "ws://healthy:8787".to_string(),
+                        generation: "fleety-profile-v1:0:healthy-generation".to_string(),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "legacy",
+                    Profile {
+                        url: "ws://legacy:8787".to_string(),
+                        generation: String::new(),
+                        ..Default::default()
+                    },
+                ),
+            ],
+        );
+
+        save_at(&path, &conns).expect("preserve unrelated legacy state");
+
+        let saved = load_at(&path).expect("load saved connections");
+        assert!(
+            saved.profiles["legacy"].generation.is_empty(),
+            "only selected durable migration may bind the legacy profile"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn explicit_pairing_repair_never_resolves_the_old_credential() {
+        let path = tmp_path();
+        std::fs::write(
+            &path,
+            "device_id = \"dev-1\"\ncurrent = \"home\"\n\n\
+             [profiles.home]\nurl = \"ws://home:8787\"\ntoken = \"old-token\"\n\
+             fingerprint = \"old-pin\"\nconfigured_url = \"ws://home:8787\"\nsecure = true\n\
+             generation = \"fleety-profile-v1:7:legacy-home-generation\"\n",
+        )
+        .expect("simulate an old serializer dropping roaming fields");
+
+        let target = resolve_profile_for_explicit_pairing_at(&path, &Target::Current)
+            .expect("explicit pairing remains a recovery path");
+
+        assert_eq!(target.url(), "ws://home:8787");
+
+        store_explicit_profile_pairing_at(&path, &target, "new-token", "new-pin")
+            .expect("commit replacement credentials under the frozen owner lease");
+        let repaired = load_at(&path).expect("the repaired profile is valid again");
+        let home = &repaired.profiles["home"];
+        assert_eq!(home.token.as_deref(), Some("new-token"));
+        assert_eq!(home.fingerprint.as_deref(), Some("new-pin"));
+        assert!(!home.secure);
+        assert!(home.endpoints.is_empty());
+        assert_eq!(
+            home.generation,
+            "fleety-profile-v1:0:legacy-home-generation"
+        );
+    }
+
+    #[test]
+    fn explicit_pairing_can_repair_one_of_several_profiles_downgraded_together() {
+        let path = tmp_path();
+        std::fs::write(
+            &path,
+            "device_id = \"dev-1\"\ncurrent = \"home\"\n\n\
+             [profiles.home]\nurl = \"ws://home:8787\"\ntoken = \"old-home-token\"\n\
+             fingerprint = \"old-home-pin\"\nconfigured_url = \"ws://home:8787\"\nsecure = true\n\
+             generation = \"fleety-profile-v1:7:home-generation\"\n\n\
+             [profiles.office]\nurl = \"ws://office:8787\"\ntoken = \"old-office-token\"\n\
+             fingerprint = \"old-office-pin\"\nconfigured_url = \"ws://office:8787\"\nsecure = true\n\
+             generation = \"fleety-profile-v1:7:office-generation\"\n",
+        )
+        .expect("simulate one stale writer dropping fields from every profile");
+
+        let target =
+            resolve_profile_for_explicit_pairing_at(&path, &Target::Named("home".to_string()))
+                .expect("one known-v1 mismatch remains explicitly repairable");
+        store_explicit_profile_pairing_at(&path, &target, "new-home-token", "new-home-pin")
+            .expect("repair the selected profile without laundering the other");
+
+        let connections = load_at(&path).expect("the repaired store remains readable");
+        validate_named_profile_generation("home", &connections.profiles["home"])
+            .expect("selected profile is repaired");
+        let office_error =
+            validate_named_profile_generation("office", &connections.profiles["office"])
+                .expect_err("the unrelated mismatch must remain detectable");
+        assert!(office_error.report().message.contains("re-pair"));
+        assert_eq!(
+            connections.profiles["office"].token.as_deref(),
+            Some("old-office-token")
+        );
+        assert_eq!(
+            connections.profiles["office"].generation,
+            "fleety-profile-v1:7:office-generation"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn bare_pair_refuses_a_learned_primary_when_the_configured_endpoint_was_lost() {
+        let path = tmp_path();
+        std::fs::write(
+            &path,
+            "device_id = \"dev-1\"\ncurrent = \"home\"\n\n\
+             [profiles.home]\nurl = \"ws://learned:8787\"\ntoken = \"old-token\"\n\
+             fingerprint = \"old-pin\"\nsecure = true\n\
+             generation = \"fleety-profile-v1:7:home-generation\"\n",
+        )
+        .expect("simulate loss of the separately recorded configured endpoint");
+
+        let error = resolve_profile_for_explicit_pairing_at(&path, &Target::Current)
+            .expect_err("a pairing code must never follow a learned primary");
+
+        assert!(error
+            .report()
+            .message
+            .contains("lost the user-configured endpoint"));
+        assert!(error
+            .report()
+            .message
+            .contains("fleety init <ws-url> --name <profile> --pairing-code <code>"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn explicit_reenrollment_cannot_overwrite_a_concurrent_current_selection() {
+        let path = tmp_path();
+        std::fs::write(
+            &path,
+            "device_id = \"dev-1\"\ncurrent = \"other\"\n\n\
+             [profiles.office]\nurl = \"ws://learned:8787\"\ntoken = \"old-token\"\n\
+             fingerprint = \"old-pin\"\nsecure = true\n\
+             generation = \"fleety-profile-v1:7:office-generation\"\n\n\
+             [profiles.other]\nurl = \"ws://other:8787\"\ngeneration = \"other-generation\"\n\n\
+             [profiles.third]\nurl = \"ws://third:8787\"\ngeneration = \"third-generation\"\n",
+        )
+        .expect("seed a recoverable profile");
+        let target =
+            resolve_profile_for_explicit_reenrollment_at(&path, "office", "ws://explicit:8787")
+                .expect("freeze profile and current owner");
+        mutate_at(&path, |connections| {
+            connections.current = Some("third".to_string());
+            Ok(())
+        })
+        .expect("concurrently switch current");
+        let before = std::fs::read(&path).expect("read concurrent state");
+
+        let error = store_explicit_profile_pairing_recoverable_at_with(
+            &path,
+            &target,
+            Some("ws://explicit:8787"),
+            true,
+            "new-token",
+            "new-pin",
+        )
+        .expect_err("re-enrollment must not overwrite a later selection");
+
+        assert!(error
+            .report()
+            .message
+            .contains("current server profile changed"));
+        assert_eq!(std::fs::read(&path).expect("read rejected state"), before);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -2736,10 +3627,10 @@ mod tests {
         profile.fingerprint = Some("pin".to_string());
         profile.secure = true;
 
-        assert!(reselect_profile_endpoint(
-            &mut profile,
-            "ws://new:8787".to_string()
-        ));
+        assert!(
+            reselect_profile_endpoint(&mut profile, "ws://new:8787".to_string())
+                .expect("reselect a compatible profile")
+        );
         assert!(
             !profile.secure,
             "a profile re-pointed at another Server must not demand a channel that Server may not speak"
@@ -3098,6 +3989,188 @@ mod tests {
             elapsed < wait,
             "the open must not spend the budget the handshake needs; took {elapsed:?} of {wait:?}"
         );
+    }
+
+    async fn counting_cleartext_peer() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let accepts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = accepts.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let _ = tokio_tungstenite::accept_async(stream).await;
+                });
+            }
+        });
+        (format!("ws://{addr}"), accepts)
+    }
+
+    #[tokio::test]
+    async fn candidate_sweep_revalidates_owner_before_every_transport() {
+        let path = tmp_path();
+        let (first_url, first_accepts) = counting_cleartext_peer().await;
+        let second_url = first_url.replacen("127.0.0.1", "localhost", 1);
+        let mut home = profile(&first_url);
+        home.token = Some("home-token".to_string());
+        home.fingerprint = Some("server-a".to_string());
+        home.configured_url = Some(second_url);
+        save_at(&path, &conns_with(Some("home"), &[("home", home)]))
+            .expect("seed durable candidate list");
+        let target = resolve(
+            &load_at(&path).expect("load candidate list"),
+            &Target::Current,
+            None,
+            None,
+            no_discovery,
+        )
+        .expect("freeze owner");
+        assert_eq!(
+            target.connection_attempts().len(),
+            2,
+            "the configured host alias must be a real second candidate"
+        );
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let path_for_attempt = path.clone();
+        let attempts_for_finish = attempts.clone();
+
+        let error = connect_first_healthy_at(
+            &path,
+            &target,
+            std::time::Duration::from_secs(2),
+            move |_session| {
+                let path = path_for_attempt.clone();
+                let attempts = attempts_for_finish.clone();
+                async move {
+                    attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let original = std::fs::read_to_string(&path).expect("read profile");
+                    let downgraded = original
+                        .lines()
+                        .filter(|line| !line.trim_start().starts_with("configured_url ="))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    std::fs::write(&path, downgraded)
+                        .expect("simulate owner replacement between candidates");
+                    Err::<(), CoreError>(CoreError::Message(
+                        "first candidate did not finish".to_string(),
+                    ))
+                }
+            },
+        )
+        .await
+        .expect_err("the second candidate must be refused before transport");
+
+        assert!(
+            error.report().message.contains("changed during connection"),
+            "{}",
+            error.report().message
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only the first candidate reaches the caller handshake"
+        );
+        assert!(
+            first_accepts.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "the first candidate must open before the simulated owner drift"
+        );
+        assert_eq!(
+            first_accepts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the preferred endpoint uses one secure probe and one allowed cleartext fallback; \
+             no third transport may open for the configured alternative"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn read_only_candidate_sweep_revalidates_diagnostic_owner_before_every_transport() {
+        let path = tmp_path();
+        let (first_url, first_accepts) = counting_cleartext_peer().await;
+        let second_url = first_url.replacen("127.0.0.1", "localhost", 1);
+        let mut home = profile(&first_url);
+        home.token = Some("home-token".to_string());
+        home.fingerprint = Some("server-a".to_string());
+        home.configured_url = Some(second_url);
+        save_at(&path, &conns_with(Some("home"), &[("home", home)]))
+            .expect("seed durable diagnostic candidate list");
+        let target = resolve(
+            &load_at(&path).expect("load diagnostic candidate list"),
+            &Target::Current,
+            None,
+            None,
+            no_discovery,
+        )
+        .expect("freeze diagnostic owner")
+        .into_read_only();
+        assert_eq!(
+            target.connection_attempts().len(),
+            2,
+            "doctor must retain both candidates without retaining write authority"
+        );
+        assert!(
+            !target.has_profile_owner(),
+            "a diagnostic target must not regain profile mutation authority"
+        );
+        assert!(
+            validate_resolved_profile_owner(
+                &load_at(&path).expect("reload diagnostic profile"),
+                &target,
+                "a mutation-authorized operation",
+            )
+            .is_err(),
+            "the writable-owner validator must still reject diagnostic authority"
+        );
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let path_for_attempt = path.clone();
+        let attempts_for_finish = attempts.clone();
+
+        let error = connect_first_healthy_at(
+            &path,
+            &target,
+            std::time::Duration::from_secs(2),
+            move |_session| {
+                let path = path_for_attempt.clone();
+                let attempts = attempts_for_finish.clone();
+                async move {
+                    attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let original = std::fs::read_to_string(&path).expect("read profile");
+                    let replaced = original
+                        .lines()
+                        .filter(|line| !line.trim_start().starts_with("configured_url ="))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    std::fs::write(&path, replaced)
+                        .expect("simulate diagnostic owner replacement between candidates");
+                    Err::<(), CoreError>(CoreError::Message(
+                        "first diagnostic candidate did not finish".to_string(),
+                    ))
+                }
+            },
+        )
+        .await
+        .expect_err("doctor must refuse the second candidate before transport");
+
+        assert!(
+            error.report().message.contains("changed during connection"),
+            "{}",
+            error.report().message
+        );
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only the first diagnostic candidate reaches the caller handshake"
+        );
+        assert_eq!(
+            first_accepts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the first diagnostic endpoint uses one secure probe and one allowed cleartext \
+             fallback; the configured alternative must receive no transport"
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -3552,8 +4625,10 @@ mod tests {
         std::fs::write(
             &path,
             "device_id = \"dev-1\"\ncurrent = \"home\"\n\n\
-             [profiles.home]\nurl = \"ws://home:8787\"\ntoken = \"token\"\n\n\
-             [profiles.other]\nurl = \"ws://other:8787\"\ntoken = \"other-token\"\n",
+             [profiles.home]\nurl = \"ws://home:8787\"\ntoken = \"token\"\n\
+             generation = \"legacy-home-generation\"\n\n\
+             [profiles.other]\nurl = \"ws://other:8787\"\ntoken = \"other-token\"\n\
+             generation = \"legacy-other-generation\"\n",
         )
         .expect("seed pre-generation connections");
 
@@ -3563,9 +4638,12 @@ mod tests {
         );
         let upgraded = load_at(&path).expect("load upgraded profile");
         let first = upgraded.profiles["home"].generation.clone();
-        assert!(!first.is_empty());
-        assert!(
-            upgraded.profiles["other"].generation.is_empty(),
+        assert_eq!(
+            first, "fleety-profile-v1:0:legacy-home-generation",
+            "migration must preserve the opaque lifecycle nonce"
+        );
+        assert_eq!(
+            upgraded.profiles["other"].generation, "legacy-other-generation",
             "an unrelated legacy profile must remain untouched"
         );
 
@@ -3820,7 +4898,8 @@ mod tests {
                 ..Default::default()
             };
             assert_eq!(
-                reselect_profile_endpoint(&mut changed, "ws://new:8787".to_string()),
+                reselect_profile_endpoint(&mut changed, "ws://new:8787".to_string())
+                    .expect("reselect a compatible profile"),
                 expected_cleared
             );
             assert_eq!(changed.url, "ws://new:8787");
@@ -3834,12 +4913,31 @@ mod tests {
             fingerprint: Some("pin".to_string()),
             ..Default::default()
         };
-        assert!(!reselect_profile_endpoint(
-            &mut unchanged,
-            "ws://same:8787".to_string()
-        ));
+        assert!(
+            !reselect_profile_endpoint(&mut unchanged, "ws://same:8787".to_string())
+                .expect("keep a compatible profile unchanged")
+        );
         assert_eq!(unchanged.token.as_deref(), Some("token"));
         assert_eq!(unchanged.fingerprint.as_deref(), Some("pin"));
+    }
+
+    #[test]
+    fn ordinary_endpoint_reselection_cannot_launder_a_generation_mismatch() {
+        let mut profile = Profile {
+            url: "ws://roamed:8787".to_string(),
+            secure: true,
+            token: Some("old-token".to_string()),
+            fingerprint: Some("old-pin".to_string()),
+            generation: "fleety-profile-v1:7:home-generation".to_string(),
+            ..Default::default()
+        };
+        let before = profile.clone();
+
+        let error = reselect_profile_endpoint(&mut profile, "ws://new:8787".to_string())
+            .expect_err("ordinary URL mutation must not repair incompatible state");
+
+        assert!(error.report().message.contains("older Fleety binary"));
+        assert_eq!(profile, before, "rejection must precede every mutation");
     }
 
     #[test]

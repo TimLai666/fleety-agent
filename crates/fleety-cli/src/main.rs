@@ -405,17 +405,21 @@ async fn main() -> std::process::ExitCode {
         &fleety_tools::config::load(&fleety_tools::config::config_path()),
         fleety_tools::config::CLI_SCOPES,
     );
-    if let Some(url) = std::env::var("FLEETY_AGENT_URL")
-        .ok()
-        .filter(|url| !url.is_empty())
-    {
-        if let Err(error) = connection::validate_ws_url(&url) {
-            return fail(error);
+    let named_profile_pair = args.get(1).map(String::as_str) == Some("pair")
+        && matches!(OVERRIDE.get(), Some(Target::Named(_)));
+    if !named_profile_pair {
+        if let Some(url) = std::env::var("FLEETY_AGENT_URL")
+            .ok()
+            .filter(|url| !url.is_empty())
+        {
+            if let Err(error) = connection::validate_ws_url(&url) {
+                return fail(error);
+            }
         }
     }
     // `init` defers migration until its explicit URL has passed local syntax
-    // validation. Other already-validated commands retain the one-time legacy
-    // migration before they resolve a connection.
+    // validation. Pairing still needs the one-time migration: otherwise an
+    // existing config.json device appears to have no current named profile.
     if args.get(1).map(String::as_str) != Some("init") {
         if let Err(error) = connection::migrate_from_config_json() {
             return fail(error);
@@ -2164,6 +2168,7 @@ struct OpenedSession {
 /// whole thing is the point: an endpoint that connects and then stalls, or
 /// answers as the wrong Server, must not hide the working endpoints behind it.
 const CLIENT_HANDSHAKE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+const DOCTOR_REPLY_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 async fn open(owner: &RemoteOwner) -> Result<OpenedSession> {
     let target = resolve_target()?;
@@ -2182,6 +2187,7 @@ async fn open_resolved(
     owner: &RemoteOwner,
     wait: std::time::Duration,
 ) -> Result<OpenedSession> {
+    connection::validate_resolved_profile_before_transport(target)?;
     let owner = owner.clone();
     let opened = connection::connect_first_healthy(target, wait, move |session| {
         let owner = owner.clone();
@@ -2718,7 +2724,19 @@ where
 }
 
 async fn pair(code: String) -> Result<()> {
-    let target = resolve_target()?;
+    let over = OVERRIDE.get().cloned().unwrap_or(Target::Current);
+    if !matches!(over, Target::Named(_))
+        && std::env::var("FLEETY_AGENT_URL")
+            .ok()
+            .is_some_and(|url| !url.is_empty())
+    {
+        return Err(CoreError::Message(
+            "pairing cannot use the transient FLEETY_AGENT_URL override; select a named server profile \
+             with `fleety --profile <name> pair <code>`"
+                .to_string(),
+        ));
+    }
+    let target = connection::resolve_profile_for_explicit_pairing(&over)?;
     let profile_name = match target.source() {
         connection::Source::Profile(name) | connection::Source::OverrideProfile(name) => {
             name.clone()
@@ -2737,10 +2755,12 @@ async fn pair(code: String) -> Result<()> {
     // Roaming may have moved `url` to an address Fleety chose on its own. A
     // pairing code is a credential with no handshake behind it, so it goes to
     // the endpoint a person configured.
-    let pairing_endpoint = target.configured_url().to_string();
+    let pairing_endpoint = target.url().to_string();
     let (mut tx, mut rx) = transport::connect(&pairing_endpoint, None).await?.split();
     let url = pairing_endpoint.clone();
-    print_remote_context(&target, &RemoteOwner::Server, None);
+    let display_target =
+        connection::Resolved::unowned(pairing_endpoint, None, target.source().clone());
+    print_remote_context(&display_target, &RemoteOwner::Server, None);
     send(&mut tx, &hello(None, Some(code))).await?;
     let result = match recv(&mut rx).await? {
         Some(ServerMsg::Welcome {
@@ -2750,7 +2770,7 @@ async fn pair(code: String) -> Result<()> {
             ..
         }) if !tok.trim().is_empty() && !server_fingerprint.trim().is_empty() => {
             let (initial_error, notify_daemon, committed) =
-                match connection::store_resolved_profile_pairing_recoverable(
+                match connection::store_explicit_profile_pairing_recoverable(
                     &target,
                     &tok,
                     &server_fingerprint,
@@ -2795,7 +2815,7 @@ async fn pair(code: String) -> Result<()> {
                 notify_daemon,
             )?;
             print_remote_context(
-                &target,
+                &display_target,
                 &RemoteOwner::Server,
                 Some(server_fingerprint.as_str()),
             );
@@ -2948,70 +2968,187 @@ async fn init(url: String, name: String, pairing_code: Option<String>) -> Result
     init_selected(url, name, pairing_code, InitSelection::Explicit).await
 }
 
-async fn init_selected(
-    url: String,
-    name: String,
-    pairing_code: Option<String>,
-    selection: InitSelection,
-) -> Result<()> {
-    // Build the proposed state in memory. Nothing is persisted until this exact
-    // endpoint returns a valid Welcome (and, when supplied, redeems the pairing
-    // code), so a typo or unreachable server cannot poison current selection.
-    let pairing_attempted = pairing_code.is_some();
-    let initial = connection::load()?;
-    validate_guided_pairing(selection, &initial, &name, &url, pairing_code.as_deref())?;
-    let prior_profile = initial.profiles.get(&name).cloned();
-    let initial_current = initial.current.clone();
-    let credentialed_endpoint_change = prior_profile.as_ref().is_some_and(|profile| {
-        profile.url != url
-            && profile
-                .token
-                .as_deref()
-                .is_some_and(|token| !token.is_empty())
+struct StandardInitAttempt {
+    prior_profile: Option<connection::Profile>,
+    initial_current: Option<String>,
+    protected_endpoint_change: bool,
+    old_fingerprint: Option<String>,
+    target: connection::Resolved,
+}
+
+fn profile_has_protected_connection_state(profile: &connection::Profile) -> bool {
+    profile
+        .token
+        .as_deref()
+        .is_some_and(|token| !token.is_empty())
+        || profile
+            .fingerprint
+            .as_deref()
+            .is_some_and(|fingerprint| !fingerprint.trim().is_empty())
+        || profile.secure
+        || !profile.endpoints.is_empty()
+        || profile.configured_url.is_some()
+}
+
+/// Derive every credential-sensitive part of a repeated init from one
+/// authoritative snapshot. Keeping the target key and Hello token in the same
+/// value prevents a generation-upgrade reload from mixing old credentials with
+/// a newer owner.
+fn plan_standard_init_attempt(
+    snapshot: &connection::Connections,
+    name: &str,
+    url: &str,
+    pairing_attempted: bool,
+) -> Result<StandardInitAttempt> {
+    if let Some(profile) = snapshot.profiles.get(name) {
+        connection::validate_named_profile_generation(name, profile)?;
+    }
+    let prior_profile = snapshot.profiles.get(name).cloned();
+    let protected_endpoint_change = prior_profile.as_ref().is_some_and(|profile| {
+        profile.url != url && profile_has_protected_connection_state(profile)
     });
-    if credentialed_endpoint_change && pairing_code.is_none() {
+    if protected_endpoint_change && !pairing_attempted {
         return Err(CoreError::Message(format!(
             "server profile '{}' is paired to a different endpoint; changing it requires an explicit re-pair. Retry with `fleety init <ws-url> --name <profile> --pairing-code <code>`; the old token was not sent and connections.toml was not changed",
-            terminal_safe_field(&name)
+            terminal_safe_field(name)
         )));
     }
-    let token = (!credentialed_endpoint_change && !pairing_attempted)
+    let token = (!protected_endpoint_change && !pairing_attempted)
         .then(|| {
             prior_profile
                 .as_ref()
                 .and_then(|profile| profile.token.clone())
         })
         .flatten();
-    let old_fingerprint = (!credentialed_endpoint_change && !pairing_attempted)
+    let old_fingerprint = (!protected_endpoint_change && !pairing_attempted)
         .then(|| {
             prior_profile
                 .as_ref()
                 .and_then(|profile| profile.fingerprint.clone())
         })
         .flatten();
-    // `init` runs before there is a resolved owner, so it opens the endpoint
-    // directly. A profile that has already seen this Server speak the encrypted
-    // channel must not have its saved token replayed in the clear here: the
-    // guidance for a refused endpoint points at `fleety init`, so this is
-    // exactly the path an attacker who took over the address would steer the
-    // user onto. Re-pairing with a code stays available and needs no token.
-    let latched =
-        prior_profile.as_ref().is_some_and(|profile| profile.secure) && !pairing_attempted;
-    if latched {
+    let durable_same_endpoint = !pairing_attempted
+        && prior_profile
+            .as_ref()
+            .is_some_and(|profile| profile.url == url);
+    let target = if durable_same_endpoint {
+        connection::resolve(
+            snapshot,
+            &Target::Named(name.to_string()),
+            None,
+            None,
+            || None,
+        )?
+    } else {
+        connection::Resolved::unowned(
+            url.to_string(),
+            token.clone(),
+            connection::Source::OverrideProfile(name.to_string()),
+        )
+    };
+    Ok(StandardInitAttempt {
+        prior_profile,
+        initial_current: snapshot.current.clone(),
+        protected_endpoint_change,
+        old_fingerprint,
+        target,
+    })
+}
+
+async fn init_selected(
+    url: String,
+    name: String,
+    pairing_code: Option<String>,
+    selection: InitSelection,
+) -> Result<()> {
+    init_selected_with_hook(url, name, pairing_code, selection, || Ok(())).await
+}
+
+async fn init_selected_with_hook<F>(
+    url: String,
+    name: String,
+    pairing_code: Option<String>,
+    selection: InitSelection,
+    after_preflight: F,
+) -> Result<()>
+where
+    F: FnOnce() -> Result<()>,
+{
+    // Build the proposed state in memory. The only pre-connect write upgrades
+    // this explicitly selected profile's generation safety envelope; the
+    // endpoint, current selection, and credentials remain unchanged until this
+    // exact endpoint returns a valid Welcome.
+    let pairing_attempted = pairing_code.is_some();
+    let initial = connection::load()?;
+    let generation_repair = initial
+        .profiles
+        .get(&name)
+        .map(connection::profile_generation_requires_explicit_repair)
+        .transpose()?
+        .unwrap_or(false);
+    if let Some(profile) = initial.profiles.get(&name) {
+        if generation_repair {
+            if !pairing_attempted {
+                connection::validate_named_profile_generation(&name, profile)?;
+            }
+        } else {
+            connection::validate_named_profile_generation(&name, profile)?;
+        }
+    }
+    validate_guided_pairing(selection, &initial, &name, &url, pairing_code.as_deref())?;
+    let preflight_profile = initial.profiles.get(&name);
+    let preflight_endpoint_change = preflight_profile.is_some_and(|profile| {
+        profile.url != url && profile_has_protected_connection_state(profile)
+    });
+    if preflight_endpoint_change && pairing_code.is_none() {
         return Err(CoreError::Message(format!(
-            "server profile '{}' has an encrypted channel with its Server, so its saved token is not sent over a plain connection. Re-pair with `fleety init <ws-url> --name <profile> --pairing-code <code>`",
+            "server profile '{}' is paired to a different endpoint; changing it requires an explicit re-pair. Retry with `fleety init <ws-url> --name <profile> --pairing-code <code>`; the old token was not sent and connections.toml was not changed",
             terminal_safe_field(&name)
         )));
     }
-    let proposed_target = connection::Resolved::unowned(
-        url.clone(),
-        token.clone(),
-        connection::Source::OverrideProfile(name.clone()),
-    );
+    // Reaching transport makes this an operational use of the selected durable
+    // owner. Only now may the legacy lifecycle nonce be migrated under lease;
+    // local validation refusals above remain byte-for-byte side-effect free.
+    if !generation_repair {
+        connection::ensure_resolvable_profile_generation(&Target::Named(name.clone()), false)?;
+    }
+    after_preflight()?;
+    let initial = connection::load()?;
+    validate_guided_pairing(selection, &initial, &name, &url, pairing_code.as_deref())?;
+    let standard_attempt = (!generation_repair)
+        .then(|| plan_standard_init_attempt(&initial, &name, &url, pairing_attempted))
+        .transpose()?;
+    let prior_profile = standard_attempt
+        .as_ref()
+        .and_then(|attempt| attempt.prior_profile.clone());
+    let initial_current = standard_attempt
+        .as_ref()
+        .and_then(|attempt| attempt.initial_current.clone());
+    let protected_endpoint_change = standard_attempt
+        .as_ref()
+        .is_some_and(|attempt| attempt.protected_endpoint_change);
+    let old_fingerprint = standard_attempt
+        .as_ref()
+        .and_then(|attempt| attempt.old_fingerprint.clone());
+    let explicit_generation_repair = generation_repair
+        .then(|| connection::resolve_profile_for_explicit_reenrollment(&name, &url))
+        .transpose()?;
+    let proposed_target = if let Some(attempt) = standard_attempt {
+        attempt.target
+    } else {
+        connection::Resolved::unowned(
+            url.clone(),
+            None,
+            connection::Source::OverrideProfile(name.clone()),
+        )
+    };
     print_remote_context(&proposed_target, &RemoteOwner::Server, None);
-    let (mut tx, mut rx) = transport::connect(&url, token.as_deref()).await?.split();
+    connection::validate_resolved_profile_before_transport(&proposed_target)?;
+    let (connection, sealed) =
+        connection::open_candidate(&proposed_target, CLIENT_HANDSHAKE_WAIT).await?;
+    let (mut tx, mut rx) = connection.split();
 
-    send(&mut tx, &hello(token, pairing_code)).await?;
+    send(&mut tx, &hello(proposed_target.token_owned(), pairing_code)).await?;
     let recovery = match recv(&mut rx).await? {
         Some(ServerMsg::Welcome {
             session_id,
@@ -3019,7 +3156,7 @@ async fn init_selected(
             server_fingerprint,
             ..
         }) => {
-            if (credentialed_endpoint_change || pairing_attempted)
+            if (protected_endpoint_change || pairing_attempted)
                 && !minted_token
                     .as_deref()
                     .is_some_and(|token| !token.trim().is_empty())
@@ -3048,7 +3185,33 @@ async fn init_selected(
                     )));
                 }
             }
-            let commit = connection::mutate_recoverable(|live| {
+            let recovery = if let Some(repair_target) = explicit_generation_repair.as_ref() {
+                let minted = minted_token.as_deref().ok_or_else(|| {
+                    CoreError::Message(
+                        "the selected Server did not return a replacement token".to_string(),
+                    )
+                })?;
+                let fingerprint = server_fingerprint.as_deref().ok_or_else(|| {
+                    CoreError::Message(
+                        "the selected Server did not return a replacement identity".to_string(),
+                    )
+                })?;
+                match connection::store_explicit_profile_reenrollment_recoverable(
+                    repair_target,
+                    &url,
+                    minted,
+                    fingerprint,
+                )? {
+                    connection::CredentialCommit::Durable { .. } => None,
+                    connection::CredentialCommit::PublishedNotDurable {
+                        committed, error, ..
+                    } => Some(ProfilePublicationRecovery {
+                        initial_error: error,
+                        committed,
+                    }),
+                }
+            } else {
+                let commit = connection::mutate_recoverable(|live| {
                 if live.current != initial_current
                     || live.profiles.get(&name) != prior_profile.as_ref()
                 {
@@ -3070,33 +3233,35 @@ async fn init_selected(
                 // earlier one is stale — and `pair` uses it to decide where a
                 // one-time code may be sent.
                 profile.configured_url = None;
-                if credentialed_endpoint_change || pairing_attempted {
+                if protected_endpoint_change || pairing_attempted {
                     // A deliberate re-pair replaces the credential the latch and
                     // the learned endpoints were earned with, so they go too.
                     profile.secure = false;
                     profile.token = minted_token.clone();
                     profile.fingerprint = server_fingerprint.clone();
-                } else if let Some(minted) = minted_token.as_ref() {
-                    profile.token = Some(minted.clone());
+                } else {
+                    profile.secure = profile.secure || sealed;
+                    if let Some(minted) = minted_token.as_ref() {
+                        profile.token = Some(minted.clone());
+                    }
                 }
-                if !credentialed_endpoint_change && !pairing_attempted && old_fingerprint.is_none() {
+                if !protected_endpoint_change && !pairing_attempted && old_fingerprint.is_none() {
                     profile.fingerprint = server_fingerprint.clone();
                 }
-                if profile.generation.trim().is_empty() {
-                    profile.generation = uuid::Uuid::new_v4().to_string();
-                }
+                connection::rebind_profile_generation_after_authorized_mutation(profile)?;
                 live.current = Some(name.clone());
                 connection::resolve(live, &Target::Current, None, None, || None)
-            })?;
-            let recovery = match commit {
-                connection::MutationCommit::Durable(_) => None,
-                connection::MutationCommit::PublishedNotDurable {
-                    value: committed,
-                    error,
-                } => Some(ProfilePublicationRecovery {
-                    initial_error: error,
-                    committed,
-                }),
+                })?;
+                match commit {
+                    connection::MutationCommit::Durable(_) => None,
+                    connection::MutationCommit::PublishedNotDurable {
+                        value: committed,
+                        error,
+                    } => Some(ProfilePublicationRecovery {
+                        initial_error: error,
+                        committed,
+                    }),
+                }
             };
             let connected = connection::Resolved::unowned(
                 url.clone(),
@@ -4052,67 +4217,80 @@ async fn connect_hello_for_auth_target_inner(
     target: &connection::Resolved,
     verify_identity: bool,
 ) -> Result<(Tx, Rx, u32, Option<String>, String, connection::Resolved)> {
-    connect_hello_for_auth_target_inner_with(target, verify_identity, CLIENT_HANDSHAKE_WAIT).await
+    connect_hello_for_auth_target_inner_with(
+        target,
+        verify_identity,
+        CLIENT_HANDSHAKE_WAIT,
+        &connection::connections_path(),
+    )
+    .await
 }
 
 async fn connect_hello_for_auth_target_inner_with(
     target: &connection::Resolved,
     verify_identity: bool,
     wait: std::time::Duration,
+    connections_path: &std::path::Path,
 ) -> Result<(Tx, Rx, u32, Option<String>, String, connection::Resolved)> {
-    connection::connect_first_healthy(target, wait, move |session| async move {
-        let connection::CandidateSession {
-            connection,
-            target,
-            sealed,
-        } = session;
-        let (mut tx, mut rx) = connection.split();
-        send(&mut tx, &hello(target.token_owned(), None)).await?;
-        match recv(&mut rx).await? {
-            Some(ServerMsg::Welcome {
-                server_version,
-                config_protocol,
-                server_fingerprint,
-                server_endpoints,
-                ..
-            }) => {
-                // Settings' own profile-switch path reconnects without touching
-                // credential storage, so it opts out of the commit but still
-                // gets the endpoint that actually answered.
-                let committed_target = if verify_identity {
-                    verify_and_learn_welcome_identity(
-                        server_fingerprint.as_deref(),
-                        &server_endpoints,
-                        &target,
-                        sealed,
-                    )?
-                } else {
-                    target.clone()
-                };
-                Ok((
-                    tx,
-                    rx,
+    connection::connect_first_healthy_at(
+        connections_path,
+        target,
+        wait,
+        move |session| async move {
+            let connection::CandidateSession {
+                connection,
+                target,
+                sealed,
+            } = session;
+            let (mut tx, mut rx) = connection.split();
+            send(&mut tx, &hello(target.token_owned(), None)).await?;
+            match recv(&mut rx).await? {
+                Some(ServerMsg::Welcome {
+                    server_version,
                     config_protocol,
                     server_fingerprint,
-                    server_version,
-                    committed_target,
-                ))
+                    server_endpoints,
+                    ..
+                }) => {
+                    // Settings' own profile-switch path reconnects without touching
+                    // credential storage, so it opts out of the commit but still
+                    // gets the endpoint that actually answered.
+                    let committed_target = if verify_identity {
+                        verify_and_learn_welcome_identity(
+                            server_fingerprint.as_deref(),
+                            &server_endpoints,
+                            &target,
+                            sealed,
+                        )?
+                    } else {
+                        target.clone()
+                    };
+                    Ok((
+                        tx,
+                        rx,
+                        config_protocol,
+                        server_fingerprint,
+                        server_version,
+                        committed_target,
+                    ))
+                }
+                other => {
+                    let _ = tx.close().await;
+                    Err(CoreError::Message(hello_failure_message_for_target(
+                        other.as_ref(),
+                        &target,
+                    )))
+                }
             }
-            other => {
-                let _ = tx.close().await;
-                Err(CoreError::Message(hello_failure_message_for_target(
-                    other.as_ref(),
-                    &target,
-                )))
-            }
-        }
-    })
+        },
+    )
     .await
 }
 
 pub(crate) async fn connect_hello_for_auth_target(
     target: &connection::Resolved,
 ) -> Result<(Tx, Rx, u32, Option<String>)> {
+    connection::validate_resolved_profile_before_transport(target)?;
     let (tx, rx, config_protocol, fingerprint, server_version, _) =
         connect_hello_for_auth_target_inner(target, true).await?;
     maybe_converge_cli(&server_version).await;
@@ -4122,6 +4300,7 @@ pub(crate) async fn connect_hello_for_auth_target(
 pub(crate) async fn connect_hello_for_auth_target_refreshed(
     target: &connection::Resolved,
 ) -> Result<(Tx, Rx, u32, Option<String>, connection::Resolved)> {
+    connection::validate_resolved_profile_before_transport(target)?;
     let (tx, rx, config_protocol, fingerprint, server_version, committed_target) =
         connect_hello_for_auth_target_inner(target, true).await?;
     maybe_converge_cli(&server_version).await;
@@ -4148,17 +4327,23 @@ async fn connect_hello_for_profile_switch_target_with_timeout(
     connections_path: &std::path::Path,
     timeout: std::time::Duration,
 ) -> Result<(Tx, Rx, u32, Option<String>, connection::Resolved)> {
+    connection::validate_resolved_profile_before_transport_at(connections_path, target)?;
     // Keep the endpoint that actually answered: a switch may legitimately land on
     // a saved alternative, and Settings must record and display that one rather
     // than the address it started from.
     // The caller's budget bounds the whole sweep, so each candidate gets a share
     // of it. Handing every candidate the full budget meant a profile with a
     // saved alternative could never reach it — the case roaming exists for.
-    let per_candidate = (timeout / 3).max(std::time::Duration::from_secs(1));
+    let per_candidate = connection::candidate_wait_within_sweep_budget(timeout);
     let (mut tx, rx, config_protocol, fingerprint, server_version, connected) =
         tokio::time::timeout(
             timeout,
-            connect_hello_for_auth_target_inner_with(target, false, per_candidate),
+            connect_hello_for_auth_target_inner_with(
+                target,
+                false,
+                per_candidate,
+                connections_path,
+            ),
         )
         .await
             .map_err(|_| {
@@ -4964,18 +5149,9 @@ async fn doctor() -> std::process::ExitCode {
                 ),
                 None::<String>,
             ));
-            let remote = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                doctor_remote(&target, &mut checks),
-            )
-            .await;
-            match remote {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => mark_server_failed(&mut checks, error.report().message),
-                Err(_) => mark_server_failed(
-                    &mut checks,
-                    "diagnostic timed out after 5 seconds".to_string(),
-                ),
+            match doctor_remote(&target, &mut checks).await {
+                Ok(()) => {}
+                Err(error) => mark_server_failed(&mut checks, error.report().message),
             }
         }
         Err(error) => {
@@ -5111,39 +5287,62 @@ fn add_unchecked_remote_checks(checks: &mut Vec<DoctorCheck>) {
 /// records secure-channel support — so running doctor can never change what a
 /// later connection will do.
 async fn doctor_remote(target: &connection::Resolved, checks: &mut Vec<DoctorCheck>) -> Result<()> {
+    doctor_remote_at(
+        target,
+        checks,
+        &connection::connections_path(),
+        CLIENT_HANDSHAKE_WAIT,
+        DOCTOR_REPLY_WAIT,
+    )
+    .await
+}
+
+async fn doctor_remote_at(
+    target: &connection::Resolved,
+    checks: &mut Vec<DoctorCheck>,
+    connections_path: &std::path::Path,
+    wait: std::time::Duration,
+    reply_wait: std::time::Duration,
+) -> Result<()> {
+    connection::validate_resolved_profile_before_transport_at(connections_path, target)?;
     let (mut tx, mut rx, probed, server_version, config_protocol, server_fingerprint) =
-        connection::connect_first_healthy(target, CLIENT_HANDSHAKE_WAIT, |session| async move {
-            let connection::CandidateSession {
-                connection, target, ..
-            } = session;
-            let (mut tx, mut rx) = connection.split();
-            send(&mut tx, &hello(target.token_owned(), None)).await?;
-            match recv(&mut rx).await? {
-                Some(ServerMsg::Welcome {
-                    server_version,
-                    config_protocol,
-                    server_fingerprint,
-                    ..
-                }) => {
-                    verify_welcome_identity_read_only(server_fingerprint.as_deref(), &target)?;
-                    Ok((
-                        tx,
-                        rx,
-                        target,
+        connection::connect_first_healthy_at(
+            connections_path,
+            target,
+            wait,
+            |session| async move {
+                let connection::CandidateSession {
+                    connection, target, ..
+                } = session;
+                let (mut tx, mut rx) = connection.split();
+                send(&mut tx, &hello(target.token_owned(), None)).await?;
+                match recv(&mut rx).await? {
+                    Some(ServerMsg::Welcome {
                         server_version,
                         config_protocol,
                         server_fingerprint,
-                    ))
+                        ..
+                    }) => {
+                        verify_welcome_identity_read_only(server_fingerprint.as_deref(), &target)?;
+                        Ok((
+                            tx,
+                            rx,
+                            target,
+                            server_version,
+                            config_protocol,
+                            server_fingerprint,
+                        ))
+                    }
+                    other => {
+                        let _ = tx.close().await;
+                        Err(CoreError::Message(hello_failure_message_for_target(
+                            other.as_ref(),
+                            &target,
+                        )))
+                    }
                 }
-                other => {
-                    let _ = tx.close().await;
-                    Err(CoreError::Message(hello_failure_message_for_target(
-                        other.as_ref(),
-                        &target,
-                    )))
-                }
-            }
-        })
+            },
+        )
         .await?;
     record_remote_context(&probed, &RemoteOwner::Server, server_fingerprint.as_deref());
     let identity = server_fingerprint.as_deref().unwrap_or("not advertised");
@@ -5193,7 +5392,35 @@ async fn doctor_remote(target: &connection::Resolved, checks: &mut Vec<DoctorChe
             Some("fleety update"),
         ));
     } else {
-        inspect_server_configuration(&mut tx, &mut rx, checks, config_protocol).await?;
+        match tokio::time::timeout(
+            reply_wait,
+            inspect_server_configuration(&mut tx, &mut rx, checks, config_protocol),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                checks.push(DoctorCheck::new(
+                    "Providers",
+                    DoctorLevel::Fail,
+                    "timed out waiting for the Server configuration snapshot",
+                    Some("fleety config --owner server list"),
+                ));
+                add_unavailable_provider_checks(checks);
+                checks.push(DoctorCheck::new(
+                    "Daemon connection",
+                    DoctorLevel::Warn,
+                    "not inspected because the previous Server configuration snapshot timed out",
+                    Some("fleety doctor"),
+                ));
+                // Config snapshot replies carry no request identifier. Once one
+                // times out, a late Server reply is indistinguishable from the
+                // next Daemon reply on this stream, so the session is no longer
+                // safe for another diagnostic request.
+                let _ = tx.close().await;
+                return Ok(());
+            }
+        }
     }
 
     if config_protocol == 0 {
@@ -5204,21 +5431,32 @@ async fn doctor_remote(target: &connection::Resolved, checks: &mut Vec<DoctorChe
             Some("fleety daemon start"),
         ));
     } else {
-        send(
-            &mut tx,
-            &ClientMsg::ConfigSnapshot {
-                target: ConfigTarget::Device(device_id()),
-            },
-        )
-        .await?;
-        match recv(&mut rx).await? {
-            Some(ServerMsg::ConfigSnapshotResult { .. }) => checks.push(DoctorCheck::new(
+        let reply = tokio::time::timeout(reply_wait, async {
+            send(
+                &mut tx,
+                &ClientMsg::ConfigSnapshot {
+                    target: ConfigTarget::Device(device_id()),
+                },
+            )
+            .await?;
+            recv(&mut rx).await
+        })
+        .await;
+        match reply {
+            Err(_) => checks.push(DoctorCheck::new(
+                "Daemon connection",
+                DoctorLevel::Warn,
+                "timed out waiting for the Daemon configuration snapshot",
+                Some("fleety daemon restart"),
+            )),
+            Ok(Err(error)) => return Err(error),
+            Ok(Ok(Some(ServerMsg::ConfigSnapshotResult { .. }))) => checks.push(DoctorCheck::new(
                 "Daemon connection",
                 DoctorLevel::Pass,
                 "connected through the selected Server",
                 None::<String>,
             )),
-            Some(ServerMsg::Error { error }) => checks.push(DoctorCheck::new(
+            Ok(Ok(Some(ServerMsg::Error { error }))) => checks.push(DoctorCheck::new(
                 "Daemon connection",
                 DoctorLevel::Warn,
                 error.message,
@@ -5228,9 +5466,9 @@ async fn doctor_remote(target: &connection::Resolved, checks: &mut Vec<DoctorChe
                         .unwrap_or_else(|| "fleety daemon start".to_string()),
                 ),
             )),
-            Some(ServerMsg::ConfigResult {
+            Ok(Ok(Some(ServerMsg::ConfigResult {
                 error: Some(error), ..
-            }) => {
+            }))) => {
                 checks.push(DoctorCheck::new(
                     "Daemon connection",
                     DoctorLevel::Warn,
@@ -5242,7 +5480,7 @@ async fn doctor_remote(target: &connection::Resolved, checks: &mut Vec<DoctorChe
                     ),
                 ));
             }
-            other => checks.push(DoctorCheck::new(
+            Ok(Ok(other)) => checks.push(DoctorCheck::new(
                 "Daemon connection",
                 DoctorLevel::Warn,
                 format!(
@@ -5625,15 +5863,25 @@ async fn open_panel_with_timeout(
     target: &connection::Resolved,
     timeout: std::time::Duration,
 ) -> Result<((Tx, Rx), u32, Option<String>, connection::Resolved)> {
+    connection::validate_resolved_profile_before_transport(target)?;
+    let per_candidate = connection::candidate_wait_within_sweep_budget(timeout);
     let (tx, rx, config_protocol, fingerprint, server_version, committed_target) =
-        tokio::time::timeout(timeout, connect_hello_for_auth_target_inner(target, true))
-            .await
-            .map_err(|_| {
-                CoreError::Message(
-                    "timed out waiting for the Server to authenticate the Settings connection"
-                        .to_string(),
-                )
-            })??;
+        tokio::time::timeout(
+            timeout,
+            connect_hello_for_auth_target_inner_with(
+                target,
+                true,
+                per_candidate,
+                &connection::connections_path(),
+            ),
+        )
+        .await
+        .map_err(|_| {
+            CoreError::Message(
+                "timed out waiting for the Server to authenticate the Settings connection"
+                    .to_string(),
+            )
+        })??;
     maybe_converge_cli(&server_version).await;
     Ok(((tx, rx), config_protocol, fingerprint, committed_target))
 }
@@ -5785,6 +6033,59 @@ mod tests {
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::sync::Mutex;
     use tokio_tungstenite::tungstenite::Message;
+
+    #[test]
+    fn init_plan_uses_only_the_authoritative_profile_snapshot() {
+        let mut cleared = connection::Connections {
+            current: Some("home".into()),
+            ..Default::default()
+        };
+        cleared.profiles.insert(
+            "home".into(),
+            connection::Profile {
+                url: "ws://home:8787".into(),
+                fingerprint: Some("new-pin-without-token".into()),
+                ..Default::default()
+            },
+        );
+        let cleared_plan = plan_standard_init_attempt(&cleared, "home", "ws://home:8787", false)
+            .expect("plan from the cleared authoritative snapshot");
+        assert!(
+            cleared_plan.target.token().is_none(),
+            "a token from an earlier snapshot must not survive credential clearing"
+        );
+
+        let mut rotated = cleared;
+        let home = rotated.profiles.get_mut("home").expect("home");
+        home.token = Some("rotated-token".into());
+        home.fingerprint = Some("rotated-pin".into());
+        home.secure = true;
+        let rotated_plan = plan_standard_init_attempt(&rotated, "home", "ws://home:8787", false)
+            .expect("plan from the rotated authoritative snapshot");
+        assert_eq!(rotated_plan.old_fingerprint.as_deref(), Some("rotated-pin"));
+        assert_eq!(
+            rotated_plan.target.token(),
+            Some("rotated-token"),
+            "the secure owner and Hello must use the same frozen credential"
+        );
+        assert_eq!(
+            rotated_plan.target.channel_policy(),
+            connection::ChannelPolicy::SecureRequired,
+            "a latched same-URL init must proceed through the secure handshake"
+        );
+
+        let home = rotated.profiles.get_mut("home").expect("home");
+        home.token = None;
+        let tokenless_latched =
+            plan_standard_init_attempt(&rotated, "home", "ws://home:8787", false)
+                .expect("retain the tokenless latched owner");
+        assert!(tokenless_latched.target.has_profile_owner());
+        assert_eq!(
+            tokenless_latched.target.channel_policy(),
+            connection::ChannelPolicy::SecureRequired,
+            "clearing a rejected token must not clear or bypass the secure latch"
+        );
+    }
 
     #[test]
     fn the_picker_default_is_the_first_entry_and_eof_is_not_an_answer() {
@@ -5975,6 +6276,429 @@ mod tests {
     }
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    async fn start_init_snapshot_server(
+        secure: Option<(&str, &str)>,
+    ) -> (String, tokio::sync::oneshot::Receiver<ClientMsg>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind init snapshot server");
+        let address = listener.local_addr().expect("init snapshot address");
+        let secure = secure.map(|(token, pin)| (token.to_string(), pin.to_string()));
+        let (observed_tx, observed_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept init client");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("accept init websocket");
+            let first = websocket
+                .next()
+                .await
+                .expect("init first frame")
+                .expect("init frame");
+            let (hello, mut session, pin) = match secure {
+                Some((token, pin)) => {
+                    let ClientMsg::SecureHandshake { version, msg, .. } =
+                        serde_json::from_str(first.to_text().expect("handshake text"))
+                            .expect("parse handshake")
+                    else {
+                        panic!("expected secure handshake");
+                    };
+                    let (responder, reply) =
+                        fleety_tools::secure::Responder::accept(version, &token, &pin, &msg)
+                            .expect("accept init handshake");
+                    websocket
+                        .send(Message::Text(
+                            serde_json::to_string(&ServerMsg::SecureAccept {
+                                version,
+                                msg: reply,
+                            })
+                            .expect("serialize secure accept"),
+                        ))
+                        .await
+                        .expect("send secure accept");
+                    let mut session = responder.finish().expect("finish init handshake");
+                    let sealed = websocket
+                        .next()
+                        .await
+                        .expect("sealed init Hello")
+                        .expect("sealed Hello frame");
+                    let ClientMsg::SecureFrame { payload } =
+                        serde_json::from_str(sealed.to_text().expect("sealed Hello text"))
+                            .expect("parse sealed Hello")
+                    else {
+                        panic!("expected sealed Hello");
+                    };
+                    let opened = session.open(&payload).expect("open init Hello");
+                    (
+                        serde_json::from_str(&opened).expect("parse init Hello"),
+                        Some(session),
+                        pin,
+                    )
+                }
+                None => (
+                    serde_json::from_str(first.to_text().expect("cleartext Hello text"))
+                        .expect("parse cleartext Hello"),
+                    None,
+                    "server-a".to_string(),
+                ),
+            };
+            let welcome = ServerMsg::Welcome {
+                session_id: "snapshot-session".into(),
+                conversation_id: "snapshot-conversation".into(),
+                protocol: PROTOCOL_VERSION,
+                server_version: env!("CARGO_PKG_VERSION").into(),
+                audio_input: false,
+                config_protocol: 0,
+                server_fingerprint: Some(pin),
+                server_endpoints: Vec::new(),
+                loopback_trusted: false,
+                token: None,
+            };
+            match session.as_mut() {
+                Some(session) => {
+                    let json = serde_json::to_string(&welcome).expect("serialize Welcome");
+                    let payload = session.seal(&json).expect("seal Welcome");
+                    websocket
+                        .send(Message::Text(
+                            serde_json::to_string(&ServerMsg::SecureFrame { payload })
+                                .expect("serialize sealed Welcome"),
+                        ))
+                        .await
+                        .expect("send sealed Welcome");
+                }
+                None => websocket
+                    .send(Message::Text(
+                        serde_json::to_string(&welcome).expect("serialize Welcome"),
+                    ))
+                    .await
+                    .expect("send Welcome"),
+            }
+            let _ = observed_tx.send(hello);
+        });
+        (format!("ws://{address}"), observed_rx)
+    }
+
+    #[test]
+    fn init_interleavings_use_only_the_post_migration_owner_snapshot() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let guard = EnvGuard::new("init-authoritative-interleavings");
+        let path = guard.temp_home.join(".fleety").join("connections.toml");
+        std::fs::create_dir_all(path.parent().expect("connections parent"))
+            .expect("create connections directory");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build init interleaving runtime");
+        runtime.block_on(async {
+            let (clear_url, clear_observed) = start_init_snapshot_server(None).await;
+            std::fs::write(
+                &path,
+                format!(
+                    "current = \"home\"\n\n[profiles.home]\nurl = \"{clear_url}\"\n\
+                 token = \"stale-token\"\nfingerprint = \"server-a\"\n\
+                 generation = \"clear-generation\"\n"
+                ),
+            )
+            .expect("seed token-clear interleaving");
+            let clear_result = init_selected_with_hook(
+                clear_url,
+                "home".into(),
+                None,
+                InitSelection::Explicit,
+                || {
+                    connection::mutate(|live| {
+                        live.profiles.get_mut("home").expect("home").token = None;
+                        Ok(())
+                    })
+                },
+            )
+            .await;
+            assert!(
+                clear_result.is_ok()
+                    || clear_result.as_ref().is_err_and(|error| error
+                        .report()
+                        .message
+                        .contains("fleetyd was not notified")),
+                "{clear_result:?}"
+            );
+            assert!(matches!(
+                clear_observed.await.expect("clear Hello"),
+                ClientMsg::Hello { token: None, .. }
+            ));
+            assert!(
+                connection::load().expect("load cleared owner").profiles["home"]
+                    .token
+                    .is_none()
+            );
+
+            let (rotated_url, rotated_observed) =
+                start_init_snapshot_server(Some(("rotated-token", "server-a"))).await;
+            std::fs::write(
+                &path,
+                format!(
+                    "current = \"home\"\n\n[profiles.home]\nurl = \"{rotated_url}\"\n\
+                 token = \"stale-token\"\nfingerprint = \"server-a\"\n\
+                 generation = \"rotate-generation\"\n"
+                ),
+            )
+            .expect("seed token-rotation interleaving");
+            let rotated_result = init_selected_with_hook(
+                rotated_url,
+                "home".into(),
+                None,
+                InitSelection::Explicit,
+                || {
+                    connection::mutate(|live| {
+                        live.profiles.get_mut("home").expect("home").token =
+                            Some("rotated-token".into());
+                        Ok(())
+                    })
+                },
+            )
+            .await;
+            assert!(
+                rotated_result.is_ok()
+                    || rotated_result.as_ref().is_err_and(|error| error
+                        .report()
+                        .message
+                        .contains("fleetyd was not notified")),
+                "{rotated_result:?}"
+            );
+            assert!(matches!(
+                rotated_observed.await.expect("rotated Hello"),
+                ClientMsg::Hello {
+                    token: Some(token),
+                    ..
+                } if token == "rotated-token"
+            ));
+
+            let (paired_url, paired_observed) =
+                start_init_snapshot_server(Some(("new-token", "server-b"))).await;
+            std::fs::write(
+                &path,
+                format!(
+                    "current = \"home\"\n\n[profiles.home]\nurl = \"{paired_url}\"\n\
+                 generation = \"pair-generation\"\n"
+                ),
+            )
+            .expect("seed unpaired-to-paired interleaving");
+            let paired_result = init_selected_with_hook(
+                paired_url,
+                "home".into(),
+                None,
+                InitSelection::Explicit,
+                || {
+                    connection::mutate(|live| {
+                        let profile = live.profiles.get_mut("home").expect("home");
+                        profile.token = Some("new-token".into());
+                        profile.fingerprint = Some("server-b".into());
+                        profile.secure = true;
+                        connection::rebind_profile_generation_after_authorized_mutation(profile)
+                    })
+                },
+            )
+            .await;
+            assert!(
+                paired_result.is_ok()
+                    || paired_result.as_ref().is_err_and(|error| error
+                        .report()
+                        .message
+                        .contains("fleetyd was not notified")),
+                "{paired_result:?}"
+            );
+            assert!(matches!(
+                paired_observed.await.expect("paired Hello"),
+                ClientMsg::Hello {
+                    token: Some(token),
+                    ..
+                } if token == "new-token"
+            ));
+            let paired = connection::load().expect("load paired owner");
+            assert_eq!(
+                paired.profiles["home"].fingerprint.as_deref(),
+                Some("server-b")
+            );
+            assert_eq!(paired.profiles["home"].token.as_deref(), Some("new-token"));
+        });
+    }
+
+    async fn start_roaming_budget_server(identity: &str) -> (String, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind roaming server");
+        let address = listener.local_addr().expect("roaming server address");
+        let identity = identity.to_string();
+        tokio::spawn(async move {
+            for index in 0..3 {
+                let (stream, _) = listener.accept().await.expect("accept roaming client");
+                let identity = identity.clone();
+                tokio::spawn(async move {
+                    let mut websocket = tokio_tungstenite::accept_async(stream)
+                        .await
+                        .expect("accept roaming websocket");
+                    let frame = websocket
+                        .next()
+                        .await
+                        .expect("client frame")
+                        .expect("frame");
+                    if index < 2 {
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        return;
+                    }
+                    let ClientMsg::SecureHandshake { version, msg, .. } =
+                        serde_json::from_str(frame.to_text().expect("handshake text"))
+                            .expect("parse secure handshake")
+                    else {
+                        panic!("expected secure handshake");
+                    };
+                    let (responder, reply) = fleety_tools::secure::Responder::accept(
+                        version,
+                        "saved-token",
+                        &identity,
+                        &msg,
+                    )
+                    .expect("answer secure handshake");
+                    websocket
+                        .send(Message::Text(
+                            serde_json::to_string(&ServerMsg::SecureAccept {
+                                version,
+                                msg: reply,
+                            })
+                            .expect("serialize secure accept"),
+                        ))
+                        .await
+                        .expect("send secure accept");
+                    let mut session = responder.finish().expect("finish secure handshake");
+                    let sealed = websocket
+                        .next()
+                        .await
+                        .expect("sealed hello frame")
+                        .expect("sealed hello");
+                    let ClientMsg::SecureFrame { payload } =
+                        serde_json::from_str(sealed.to_text().expect("sealed hello text"))
+                            .expect("parse sealed hello")
+                    else {
+                        panic!("expected sealed hello");
+                    };
+                    let hello = session.open(&payload).expect("open sealed hello");
+                    assert!(matches!(
+                        serde_json::from_str::<ClientMsg>(&hello).expect("parse hello"),
+                        ClientMsg::Hello { .. }
+                    ));
+                    let welcome = serde_json::to_string(&ServerMsg::Welcome {
+                        session_id: "session-roaming".into(),
+                        conversation_id: "conversation-roaming".into(),
+                        protocol: PROTOCOL_VERSION,
+                        server_version: "2.0.0".into(),
+                        audio_input: false,
+                        config_protocol: 0,
+                        server_fingerprint: Some(identity),
+                        server_endpoints: Vec::new(),
+                        loopback_trusted: false,
+                        token: None,
+                    })
+                    .expect("serialize welcome");
+                    let payload = session.seal(&welcome).expect("seal welcome");
+                    websocket
+                        .send(Message::Text(
+                            serde_json::to_string(&ServerMsg::SecureFrame { payload })
+                                .expect("serialize sealed welcome"),
+                        ))
+                        .await
+                        .expect("send sealed welcome");
+                });
+            }
+        });
+        (
+            format!("ws://localhost:{}", address.port()),
+            format!("ws://{address}"),
+        )
+    }
+
+    async fn start_stalled_snapshot_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stalled snapshot server");
+        let address = listener.local_addr().expect("snapshot server address");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept doctor client");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("accept doctor websocket");
+            let _ = websocket.next().await.expect("hello frame").expect("hello");
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&ServerMsg::Welcome {
+                        session_id: "session-doctor-timeout".into(),
+                        conversation_id: "conversation-doctor-timeout".into(),
+                        protocol: PROTOCOL_VERSION,
+                        server_version: "2.0.0".into(),
+                        audio_input: false,
+                        config_protocol: 5,
+                        server_fingerprint: Some("doctor-timeout-pin".into()),
+                        server_endpoints: Vec::new(),
+                        loopback_trusted: false,
+                        token: None,
+                    })
+                    .expect("serialize welcome"),
+                ))
+                .await
+                .expect("send welcome");
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        });
+        format!("ws://{address}")
+    }
+
+    async fn start_delayed_snapshot_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind delayed snapshot server");
+        let address = listener.local_addr().expect("delayed snapshot address");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept doctor client");
+            let mut websocket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("accept doctor websocket");
+            let _ = websocket.next().await.expect("hello frame").expect("hello");
+            let welcome = ServerMsg::Welcome {
+                session_id: "session-doctor-delayed".into(),
+                conversation_id: "conversation-doctor-delayed".into(),
+                protocol: PROTOCOL_VERSION,
+                server_version: "2.0.0".into(),
+                audio_input: false,
+                config_protocol: 5,
+                server_fingerprint: Some("doctor-delayed-pin".into()),
+                server_endpoints: Vec::new(),
+                loopback_trusted: false,
+                token: None,
+            };
+            websocket
+                .send(Message::Text(
+                    serde_json::to_string(&welcome).expect("serialize welcome"),
+                ))
+                .await
+                .expect("send welcome");
+            let _ = websocket
+                .next()
+                .await
+                .expect("Server snapshot request")
+                .expect("snapshot request");
+            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+            let delayed = ServerMsg::ConfigSnapshotResult {
+                revision: "delayed-server-snapshot".into(),
+                entries: Vec::new(),
+                providers_json: r#"{"providers":[],"roles":{},"key_present":[]}"#.into(),
+            };
+            let _ = websocket
+                .send(Message::Text(
+                    serde_json::to_string(&delayed).expect("serialize delayed snapshot"),
+                ))
+                .await;
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        });
+        format!("ws://{address}")
+    }
 
     async fn start_chat_reconnect_server(
         identity: &str,
@@ -6659,6 +7383,193 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn doctor_reaches_a_saved_alternative_after_a_stalled_primary() {
+        let path = std::env::temp_dir().join(format!(
+            "fleety-doctor-roaming-{}.toml",
+            uuid::Uuid::new_v4()
+        ));
+        let (primary, alternative) = start_roaming_budget_server("saved-pin").await;
+        let mut conns = connection::Connections {
+            current: Some("office".to_string()),
+            ..Default::default()
+        };
+        conns.profiles.insert(
+            "office".to_string(),
+            connection::Profile {
+                url: primary,
+                configured_url: Some(alternative.clone()),
+                token: Some("saved-token".to_string()),
+                fingerprint: Some("saved-pin".to_string()),
+                ..Default::default()
+            },
+        );
+        connection::save_at(&path, &conns).expect("save doctor roaming profile");
+        let target = connection::resolve(
+            &connection::load_at(&path).expect("load doctor roaming profile"),
+            &connection::Target::Current,
+            None,
+            None,
+            || None,
+        )
+        .expect("resolve doctor roaming profile")
+        .into_read_only();
+        let mut checks = Vec::new();
+
+        doctor_remote_at(
+            &target,
+            &mut checks,
+            &path,
+            std::time::Duration::from_millis(300),
+            std::time::Duration::from_millis(300),
+        )
+        .await
+        .expect("doctor must reach the saved alternative");
+
+        let server = checks
+            .iter()
+            .find(|check| check.name == "Server")
+            .expect("Server check");
+        assert_eq!(server.level, DoctorLevel::Pass);
+        assert!(
+            server.detail.contains(&redact_endpoint(&alternative)),
+            "{}",
+            server.detail
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn doctor_bounds_post_welcome_snapshot_waits() {
+        let url = start_stalled_snapshot_server().await;
+        let target = connection::Resolved::unowned(url, None, connection::Source::OverrideUrl)
+            .into_read_only();
+        let path = std::env::temp_dir().join(format!(
+            "fleety-doctor-snapshot-timeout-{}.toml",
+            uuid::Uuid::new_v4()
+        ));
+        let mut checks = Vec::new();
+        let started = std::time::Instant::now();
+
+        doctor_remote_at(
+            &target,
+            &mut checks,
+            &path,
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_millis(30),
+        )
+        .await
+        .expect("snapshot timeouts are diagnostic results");
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "post-Welcome diagnostic requests must remain bounded"
+        );
+        let providers = checks
+            .iter()
+            .find(|check| check.name == "Providers")
+            .expect("Providers timeout check");
+        assert_eq!(providers.level, DoctorLevel::Fail);
+        assert!(
+            providers.detail.contains("timed out"),
+            "{}",
+            providers.detail
+        );
+        let daemon = checks
+            .iter()
+            .find(|check| check.name == "Daemon connection")
+            .expect("Daemon timeout check");
+        assert_eq!(daemon.level, DoctorLevel::Warn);
+        assert!(daemon.detail.contains("timed out"), "{}", daemon.detail);
+    }
+
+    #[tokio::test]
+    async fn doctor_never_misattributes_a_late_server_snapshot_to_the_daemon() {
+        let url = start_delayed_snapshot_server().await;
+        let target = connection::Resolved::unowned(url, None, connection::Source::OverrideUrl)
+            .into_read_only();
+        let path = std::env::temp_dir().join(format!(
+            "fleety-doctor-delayed-snapshot-{}.toml",
+            uuid::Uuid::new_v4()
+        ));
+        let mut checks = Vec::new();
+
+        doctor_remote_at(
+            &target,
+            &mut checks,
+            &path,
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_millis(30),
+        )
+        .await
+        .expect("a late reply becomes a bounded diagnostic result");
+
+        let providers = checks
+            .iter()
+            .find(|check| check.name == "Providers")
+            .expect("Providers timeout check");
+        assert_eq!(providers.level, DoctorLevel::Fail);
+        let daemon = checks
+            .iter()
+            .find(|check| check.name == "Daemon connection")
+            .expect("Daemon blocked check");
+        assert_ne!(
+            daemon.level,
+            DoctorLevel::Pass,
+            "a delayed Server snapshot must never count as a Daemon reply"
+        );
+        assert!(
+            daemon.detail.contains("previous") && daemon.detail.contains("timed out"),
+            "{}",
+            daemon.detail
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_sweep_budget_reaches_a_saved_alternative() {
+        let path = std::env::temp_dir().join(format!(
+            "fleety-settings-roaming-{}.toml",
+            uuid::Uuid::new_v4()
+        ));
+        let (primary, alternative) = start_roaming_budget_server("saved-pin").await;
+        let mut conns = connection::Connections {
+            current: Some("office".to_string()),
+            ..Default::default()
+        };
+        conns.profiles.insert(
+            "office".to_string(),
+            connection::Profile {
+                url: primary,
+                configured_url: Some(alternative.clone()),
+                token: Some("saved-token".to_string()),
+                fingerprint: Some("saved-pin".to_string()),
+                ..Default::default()
+            },
+        );
+        connection::save_at(&path, &conns).expect("save Settings roaming profile");
+        let target = connection::resolve(
+            &connection::load_at(&path).expect("load Settings roaming profile"),
+            &connection::Target::Current,
+            None,
+            None,
+            || None,
+        )
+        .expect("resolve Settings roaming profile");
+        let sweep_budget = std::time::Duration::from_millis(900);
+        let per_candidate = connection::candidate_wait_within_sweep_budget(sweep_budget);
+
+        let (_, _, _, _, _, connected) = tokio::time::timeout(
+            sweep_budget,
+            connect_hello_for_auth_target_inner_with(&target, false, per_candidate, &path),
+        )
+        .await
+        .expect("Settings sweep must stay inside its whole budget")
+        .expect("Settings must reach the saved alternative");
+
+        assert_eq!(connected.url(), alternative);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
     async fn settings_profile_switch_handshake_is_bounded_for_a_silent_server() {
         let listener =
             std::net::TcpListener::bind("127.0.0.1:0").expect("bind silent Settings server");
@@ -6689,7 +7600,11 @@ mod tests {
             Ok(_) => panic!("silent Settings server must time out"),
         };
         assert!(
-            error.report().message.contains("timed out waiting"),
+            error.report().message.contains("timed out waiting")
+                || error
+                    .report()
+                    .message
+                    .contains("never completed the handshake"),
             "{}",
             error.report().message
         );
@@ -6720,7 +7635,11 @@ mod tests {
             Ok(_) => panic!("silent initial Settings server must time out"),
         };
         assert!(
-            error.report().message.contains("timed out waiting"),
+            error.report().message.contains("timed out waiting")
+                || error
+                    .report()
+                    .message
+                    .contains("never completed the handshake"),
             "{}",
             error.report().message
         );

@@ -1534,6 +1534,7 @@ impl<R: tokio::io::AsyncBufRead + Unpin + Send> WsBridge<R> {
             .lock()
             .map_err(|_| CoreError::Message("ACP connection state is unavailable".to_string()))?
             .clone();
+        fleety_tools::connection::validate_resolved_profile_before_transport(&target)?;
         // Advertise the editor-backed tools gated by what the editor supports, so
         // the server offers the agent `editor_*` tools routed back to us.
         let editor_specs = self
@@ -1795,6 +1796,15 @@ impl<R: tokio::io::AsyncBufRead + Unpin + Send> AcpBridge for WsBridge<R> {
             Ok(target) => target.clone(),
             Err(_) => return,
         };
+        if let Err(error) =
+            fleety_tools::connection::validate_resolved_profile_before_transport(&target)
+        {
+            tracing::warn!(
+                error = %crate::terminal_safe_text(&error.report().message),
+                "acp: cancel: saved profile changed; nothing to cancel"
+            );
+            return;
+        }
         let opened = open_acp_session(
             &target,
             None,

@@ -1869,6 +1869,284 @@ fn pair_same_url_replaces_old_token_and_identity_without_sending_them() {
 }
 
 #[test]
+fn named_profile_pairing_overrides_an_environment_url() {
+    let home = TempHome::new("pair-named-over-env");
+    let reply = welcome_with_fingerprint_and_token("office-pin", Some("office-token"));
+    let (url, rx) = start_ws_server(vec![vec![reply]]);
+    let fleety = home.0.join(".fleety");
+    std::fs::create_dir_all(&fleety).expect("fleety dir");
+    std::fs::write(
+        fleety.join("connections.toml"),
+        format!(
+            "current = \"other\"\n\n[profiles.office]\nurl = \"{url}\"\n\n\
+             [profiles.other]\nurl = \"ws://127.0.0.1:9\"\n"
+        ),
+    )
+    .expect("write profiles");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_fleety"))
+        .args(["--profile", "office", "pair", "PAIR-OFFICE"])
+        .env("HOME", &home.0)
+        .env("USERPROFILE", &home.0)
+        .env("FLEETY_DEVICE_ID", "cli-smoke")
+        .env("FLEETY_AGENT_URL", "ws://127.0.0.1:1")
+        .env_remove("FLEETY_TOKEN")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("pair named profile over env");
+    let received = rx
+        .recv_timeout(Duration::from_secs(15))
+        .unwrap_or_else(|error| {
+            panic!(
+                "named profile server received frames ({error:?}); stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(matches!(
+        received.first(),
+        Some(ClientMsg::Hello {
+            token: None,
+            pairing_code: Some(code),
+            ..
+        }) if code == "PAIR-OFFICE"
+    ));
+}
+
+#[test]
+fn named_profile_pairing_ignores_a_malformed_environment_url() {
+    let home = TempHome::new("pair-named-over-malformed-env");
+    let reply = welcome_with_fingerprint_and_token("office-pin", Some("office-token"));
+    let (url, rx) = start_ws_server(vec![vec![reply]]);
+    let fleety = home.0.join(".fleety");
+    std::fs::create_dir_all(&fleety).expect("fleety dir");
+    std::fs::write(
+        fleety.join("connections.toml"),
+        format!("current = \"office\"\n\n[profiles.office]\nurl = \"{url}\"\n"),
+    )
+    .expect("write profile");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_fleety"))
+        .args(["--profile", "office", "pair", "PAIR-OFFICE"])
+        .env("HOME", &home.0)
+        .env("USERPROFILE", &home.0)
+        .env("FLEETY_DEVICE_ID", "cli-smoke")
+        .env("FLEETY_AGENT_URL", "not-a-websocket-url")
+        .env_remove("FLEETY_TOKEN")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("pair named profile over malformed env");
+    let received = rx
+        .recv_timeout(Duration::from_secs(15))
+        .unwrap_or_else(|error| {
+            panic!(
+                "named profile server received frames ({error:?}); stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(matches!(
+        received.first(),
+        Some(ClientMsg::Hello {
+            token: None,
+            pairing_code: Some(code),
+            ..
+        }) if code == "PAIR-OFFICE"
+    ));
+}
+
+#[test]
+fn pair_migrates_a_legacy_config_before_redeeming_the_code() {
+    let home = TempHome::new("pair-migrates-legacy-config");
+    let reply = welcome_with_fingerprint_and_token("new-pin", Some("new-token"));
+    let (url, rx) = start_ws_server(vec![vec![reply]]);
+    let fleety = home.0.join(".fleety");
+    std::fs::create_dir_all(&fleety).expect("fleety dir");
+    std::fs::write(
+        fleety.join("config.json"),
+        serde_json::json!({
+            "agent_url": url,
+            "token": "legacy-token",
+            "device_id": "legacy-device"
+        })
+        .to_string(),
+    )
+    .expect("write legacy config");
+
+    let (output, received) = run_against_profile(&["pair", "PAIR-MIGRATED"], &home, rx);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(matches!(
+        received.first(),
+        Some(ClientMsg::Hello {
+            token: None,
+            pairing_code: Some(code),
+            ..
+        }) if code == "PAIR-MIGRATED"
+    ));
+    assert!(fleety.join("config.json.migrated").exists());
+    let saved = std::fs::read_to_string(fleety.join("connections.toml"))
+        .expect("read migrated connection profile");
+    assert!(saved.contains("new-token"), "{saved}");
+    assert!(!saved.contains("legacy-token"), "{saved}");
+}
+
+#[test]
+fn pair_repairs_an_old_serializer_field_drop_without_sending_the_old_token() {
+    let home = TempHome::new("pair-repairs-versioned-generation-mismatch");
+    let reply = welcome_with_fingerprint_and_token("new-pin", Some("new-token"));
+    let (url, rx) = start_ws_server(vec![vec![reply]]);
+    let fleety = home.0.join(".fleety");
+    std::fs::create_dir_all(&fleety).expect("fleety dir");
+    let connections_path = fleety.join("connections.toml");
+    std::fs::write(
+        &connections_path,
+        format!(
+            "current = \"office\"\n\n[profiles.office]\nurl = \"{url}\"\n\
+             token = \"old-token\"\nfingerprint = \"old-pin\"\n\
+             configured_url = \"{url}\"\nsecure = true\n\
+             generation = \"fleety-profile-v1:7:legacy-office-generation\"\n"
+        ),
+    )
+    .expect("simulate an old serializer dropping roaming fields");
+
+    let (output, received) = run_against_profile(&["pair", "PAIR-REPAIR"], &home, rx);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(matches!(
+        received.first(),
+        Some(ClientMsg::Hello {
+            token: None,
+            pairing_code: Some(code),
+            ..
+        }) if code == "PAIR-REPAIR"
+    ));
+    let saved =
+        fleety_tools::connection::load_at(&connections_path).expect("load repaired profile");
+    let office = &saved.profiles["office"];
+    assert_eq!(office.token.as_deref(), Some("new-token"));
+    assert_eq!(office.fingerprint.as_deref(), Some("new-pin"));
+    assert_eq!(
+        office.generation,
+        "fleety-profile-v1:0:legacy-office-generation"
+    );
+}
+
+#[test]
+fn explicit_init_repairs_a_lost_configured_endpoint_without_sending_the_old_token() {
+    let home = TempHome::new("init-repairs-lost-configured-endpoint");
+    let reply = welcome_with_fingerprint_and_token("new-pin", Some("new-token"));
+    let (url, rx) = start_ws_server(vec![vec![reply]]);
+    let fleety = home.0.join(".fleety");
+    std::fs::create_dir_all(&fleety).expect("fleety dir");
+    let connections_path = fleety.join("connections.toml");
+    std::fs::write(
+        &connections_path,
+        "current = \"other\"\n\n\
+         [profiles.office]\nurl = \"ws://127.0.0.1:9\"\ntoken = \"old-token\"\n\
+         fingerprint = \"old-pin\"\nsecure = true\n\
+         generation = \"fleety-profile-v1:7:office-generation\"\n\n\
+         [profiles.other]\nurl = \"ws://other:8787\"\ngeneration = \"other-generation\"\n",
+    )
+    .expect("simulate loss of the configured endpoint after roaming");
+
+    let args = [
+        "init",
+        url.as_str(),
+        "--name",
+        "office",
+        "--pairing-code",
+        "PAIR-REPAIR",
+    ];
+    let (output, received) = run_against_profile(&args, &home, rx);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(matches!(
+        received.first(),
+        Some(ClientMsg::Hello {
+            token: None,
+            pairing_code: Some(code),
+            ..
+        }) if code == "PAIR-REPAIR"
+    ));
+    let saved =
+        fleety_tools::connection::load_at(&connections_path).expect("load repaired profile");
+    assert_eq!(saved.current.as_deref(), Some("office"));
+    let office = &saved.profiles["office"];
+    assert_eq!(office.url, url);
+    assert_eq!(office.token.as_deref(), Some("new-token"));
+    assert_eq!(office.fingerprint.as_deref(), Some("new-pin"));
+    assert_eq!(office.generation, "fleety-profile-v1:0:office-generation");
+}
+
+#[test]
+fn cli_rejects_a_downgraded_selected_profile_before_transport_use() {
+    let home = TempHome::new("cli-rejects-versioned-generation-mismatch");
+    let fleety = home.0.join(".fleety");
+    std::fs::create_dir_all(&fleety).expect("fleety dir");
+    let connections_path = fleety.join("connections.toml");
+    std::fs::write(
+        &connections_path,
+        "current = \"office\"\n\n[profiles.office]\nurl = \"ws://127.0.0.1:9\"\n\
+         token = \"old-token\"\nsecure = true\n\
+         generation = \"fleety-profile-v1:7:legacy-office-generation\"\n",
+    )
+    .expect("simulate an old serializer dropping roaming fields");
+    let before = std::fs::read(&connections_path).expect("read seed");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_fleety"))
+        .arg("status")
+        .env("HOME", &home.0)
+        .env("USERPROFILE", &home.0)
+        .env("FLEETY_MDNS_DISABLED", "1")
+        .env_remove("FLEETY_AGENT_URL")
+        .env_remove("FLEETY_TOKEN")
+        .output()
+        .expect("run CLI");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("profile \"office\""), "{stderr}");
+    assert!(stderr.contains("update every Fleety binary"), "{stderr}");
+    assert!(
+        stderr.contains("fleety init <ws-url> --name <profile> --pairing-code <code>"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("fleety --profile <name> pair <code>"),
+        "{stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&connections_path).expect("read unchanged file"),
+        before
+    );
+}
+
+#[test]
 fn init_same_url_with_pairing_code_replaces_old_identity_without_sending_token() {
     let home = TempHome::new("init-same-url-rebuilt");
     let reply = welcome_with_fingerprint_and_token("new-pin", Some("new-token"));
@@ -1918,6 +2196,105 @@ fn init_same_url_with_pairing_code_replaces_old_identity_without_sending_token()
 }
 
 #[test]
+fn init_reusing_a_paired_profile_proves_the_server_before_sending_hello() {
+    let home = TempHome::new("init-existing-profile-secure-proof");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind secure init server");
+    let url = format!(
+        "ws://{}",
+        listener.local_addr().expect("secure init address")
+    );
+    let (observed_tx, observed_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let result = (|| -> Result<ClientMsg, String> {
+            let (stream, _) = listener.accept().map_err(|error| error.to_string())?;
+            let mut ws = accept(stream).map_err(|error| error.to_string())?;
+            let first = read_raw(&mut ws).ok_or_else(|| "missing first frame".to_string())?;
+            let ClientMsg::SecureHandshake { version, msg, .. } = first else {
+                return Err(format!(
+                    "saved credential reached the transport before secure proof: {first:?}"
+                ));
+            };
+            let (responder, reply) =
+                fleety_tools::secure::Responder::accept(version, "saved-token", "server-a", &msg)
+                    .map_err(|error| error.report().message)?;
+            send_raw(
+                &mut ws,
+                &ServerMsg::SecureAccept {
+                    version,
+                    msg: reply,
+                },
+            );
+            let mut session = responder.finish().map_err(|error| error.report().message)?;
+            let frame = read_raw(&mut ws).ok_or_else(|| "missing sealed Hello".to_string())?;
+            let ClientMsg::SecureFrame { payload } = frame else {
+                return Err(format!("Hello was not sealed: {frame:?}"));
+            };
+            let opened = session
+                .open(&payload)
+                .map_err(|error| error.report().message)?;
+            let hello =
+                serde_json::from_str::<ClientMsg>(&opened).map_err(|error| error.to_string())?;
+            let response = serde_json::to_string(&welcome_with_fingerprint("server-a"))
+                .map_err(|error| error.to_string())?;
+            let payload = session
+                .seal(&response)
+                .map_err(|error| error.report().message)?;
+            send_raw(&mut ws, &ServerMsg::SecureFrame { payload });
+            let _ = ws.close(None);
+            Ok(hello)
+        })();
+        let _ = observed_tx.send(result);
+    });
+    let fleety = home.0.join(".fleety");
+    std::fs::create_dir_all(&fleety).expect("create Fleety home");
+    let connections = fleety.join("connections.toml");
+    std::fs::write(
+        &connections,
+        format!(
+            "device_id = \"init-secure\"\ncurrent = \"office\"\n\n\
+             [profiles.office]\nurl = \"{url}\"\ntoken = \"saved-token\"\n\
+             fingerprint = \"server-a\"\n\
+             generation = \"fleety-profile-v1:0:init-secure-generation\"\n"
+        ),
+    )
+    .expect("seed paired profile");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_fleety"))
+        .args(["init", &url, "--name", "office"])
+        .env("HOME", &home.0)
+        .env("USERPROFILE", &home.0)
+        .env("FLEETY_DEVICE_ID", "init-secure")
+        .env_remove("FLEETY_AGENT_URL")
+        .env_remove("FLEETY_TOKEN")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run init against secure Server");
+    let observed = observed_rx
+        .recv_timeout(Duration::from_secs(15))
+        .expect("secure Server result");
+
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={} server={observed:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(matches!(
+        observed,
+        Ok(ClientMsg::Hello {
+            token: Some(ref token),
+            pairing_code: None,
+            ..
+        }) if token == "saved-token"
+    ));
+    let saved = fleety_tools::connection::load_at(&connections).expect("load secured profile");
+    assert!(
+        saved.profiles["office"].secure,
+        "successful secure init must latch the encrypted channel"
+    );
+}
+
+#[test]
 fn saved_profile_failure_never_heals_or_mutates_and_directs_explicit_repair() {
     let home = TempHome::new("saved-profile-no-heal");
     let fleety = home.0.join(".fleety");
@@ -1927,7 +2304,7 @@ fn saved_profile_failure_never_heals_or_mutates_and_directs_explicit_repair() {
     std::fs::write(
         &connections_path,
         format!(
-            "current = \"office\"\n\n[profiles.office]\nurl = \"{unreachable}\"\ntoken = \"office-secret\"\nfingerprint = \"public-copyable-hint\"\ngeneration = \"failure-generation\"\n"
+            "current = \"office\"\n\n[profiles.office]\nurl = \"{unreachable}\"\ntoken = \"office-secret\"\nfingerprint = \"public-copyable-hint\"\ngeneration = \"fleety-profile-v1:0:failure-generation\"\n"
         ),
     )
     .expect("write paired profile");
@@ -2394,10 +2771,12 @@ fn a_closed_pipe_ends_quietly_instead_of_panicking() {
 }
 
 #[test]
-fn init_refuses_to_replay_a_latched_profiles_token_without_a_pairing_code() {
+fn init_reuses_a_latched_profile_only_through_its_secure_channel() {
     let home = TempHome::new("init-latched");
-    // The fake Server is never contacted, so a dead port is the point.
-    let url = "ws://127.0.0.1:9";
+    let (url, rx) = start_ws_server_with(
+        vec![vec![welcome_with_fingerprint("server-a")]],
+        Some(("latched-token".into(), "server-a".into())),
+    );
     let connections = home.0.join(".fleety").join("connections.toml");
     std::fs::create_dir_all(connections.parent().expect("parent")).expect("fleety home");
     std::fs::write(
@@ -2405,14 +2784,14 @@ fn init_refuses_to_replay_a_latched_profiles_token_without_a_pairing_code() {
         format!(
             "device_id = \"init-latched\"\ncurrent = \"home\"\n\n\
              [profiles.home]\nurl = \"{url}\"\ntoken = \"latched-token\"\n\
-             fingerprint = \"server-a\"\nsecure = true\ngeneration = \"latched-generation\"\n"
+             fingerprint = \"server-a\"\nsecure = true\n\
+             generation = \"fleety-profile-v1:4:latched-generation\"\n"
         ),
     )
     .expect("seed latched profile");
-    let before = std::fs::read(&connections).expect("read profile before init");
 
     let output = Command::new(env!("CARGO_BIN_EXE_fleety"))
-        .args(["init", url, "--name", "home"])
+        .args(["init", &url, "--name", "home"])
         .env("HOME", &home.0)
         .env("USERPROFILE", &home.0)
         .env("FLEETY_MDNS_DISABLED", "1")
@@ -2423,19 +2802,134 @@ fn init_refuses_to_replay_a_latched_profiles_token_without_a_pairing_code() {
         .expect("run fleety init");
 
     assert!(
-        !output.status.success(),
-        "init must refuse before opening a plain connection: {}",
-        String::from_utf8_lossy(&output.stdout)
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("--pairing-code"),
-        "the refusal must name the way forward: {stderr}"
+    let received = rx
+        .recv_timeout(Duration::from_secs(15))
+        .expect("latched secure Server requests");
+    assert!(matches!(
+        received.as_slice(),
+        [ClientMsg::Hello {
+            token: Some(token),
+            pairing_code: None,
+            ..
+        }] if token == "latched-token"
+    ));
+    let saved = fleety_tools::connection::load_at(&connections).expect("load latched profile");
+    assert_eq!(
+        saved.profiles["home"].token.as_deref(),
+        Some("latched-token")
     );
     assert_eq!(
-        std::fs::read(&connections).expect("read profile after init"),
-        before,
-        "a refused init must not touch the profile"
+        saved.profiles["home"].fingerprint.as_deref(),
+        Some("server-a")
+    );
+    assert!(saved.profiles["home"].secure);
+}
+
+#[test]
+fn init_never_drops_a_tokenless_profiles_secure_latch_or_owner() {
+    let home = TempHome::new("init-tokenless-latched");
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("bind tokenless transport sentinel");
+    listener
+        .set_nonblocking(true)
+        .expect("make transport sentinel nonblocking");
+    let url = format!(
+        "ws://{}",
+        listener.local_addr().expect("transport sentinel address")
+    );
+    let connections = home.0.join(".fleety").join("connections.toml");
+    std::fs::create_dir_all(connections.parent().expect("parent")).expect("fleety home");
+    std::fs::write(
+        &connections,
+        format!(
+            "device_id = \"init-tokenless-latched\"\ncurrent = \"home\"\n\n\
+             [profiles.home]\nurl = \"{url}\"\nfingerprint = \"server-a\"\n\
+             secure = true\ngeneration = \"fleety-profile-v1:4:tokenless-generation\"\n"
+        ),
+    )
+    .expect("seed tokenless latched profile");
+    let before = std::fs::read(&connections).expect("read tokenless profile");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_fleety"))
+        .args(["init", &url, "--name", "home"])
+        .env("HOME", &home.0)
+        .env("USERPROFILE", &home.0)
+        .env("FLEETY_MDNS_DISABLED", "1")
+        .env_remove("FLEETY_AGENT_URL")
+        .env_remove("FLEETY_TOKEN")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run tokenless latched init");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("requires an encrypted channel"), "{stderr}");
+    assert!(stderr.contains("--pairing-code"), "{stderr}");
+    assert!(
+        matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ),
+        "a tokenless latched profile must fail before any transport opens"
+    );
+    assert_eq!(
+        std::fs::read(&connections).expect("read unchanged tokenless profile"),
+        before
+    );
+}
+
+#[test]
+fn init_requires_repair_before_moving_a_tokenless_secure_profile_to_another_url() {
+    let home = TempHome::new("init-tokenless-latched-new-url");
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("bind new-url transport sentinel");
+    listener
+        .set_nonblocking(true)
+        .expect("make new-url sentinel nonblocking");
+    let new_url = format!(
+        "ws://{}",
+        listener.local_addr().expect("new-url sentinel address")
+    );
+    let connections = home.0.join(".fleety").join("connections.toml");
+    std::fs::create_dir_all(connections.parent().expect("parent")).expect("fleety home");
+    std::fs::write(
+        &connections,
+        "device_id = \"init-tokenless-latched-new-url\"\ncurrent = \"home\"\n\n\
+         [profiles.home]\nurl = \"ws://old.example:8787\"\nfingerprint = \"server-a\"\n\
+         secure = true\ngeneration = \"fleety-profile-v1:4:tokenless-new-url-generation\"\n",
+    )
+    .expect("seed tokenless latched profile on the old URL");
+    let before = std::fs::read(&connections).expect("read protected profile");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_fleety"))
+        .args(["init", &new_url, "--name", "home"])
+        .env("HOME", &home.0)
+        .env("USERPROFILE", &home.0)
+        .env("FLEETY_MDNS_DISABLED", "1")
+        .env_remove("FLEETY_AGENT_URL")
+        .env_remove("FLEETY_TOKEN")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run different-URL init");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--pairing-code"), "{stderr}");
+    assert!(
+        matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ),
+        "a protected profile must reject a different URL before transport"
+    );
+    assert_eq!(
+        std::fs::read(&connections).expect("read unchanged protected profile"),
+        before
     );
 }
 
@@ -2464,7 +2958,7 @@ fn durable_profile_rejects_unusable_server_identity_before_control() {
             &connections,
             format!(
                 "device_id = \"identity-test\"\ncurrent = \"A\"\n\n\
-                 [profiles.A]\nurl = \"{url}\"\ntoken = \"token-a\"\nfingerprint = \"fp-a\"\ngeneration = \"identity-generation\"\n"
+                 [profiles.A]\nurl = \"{url}\"\ntoken = \"token-a\"\nfingerprint = \"fp-a\"\ngeneration = \"fleety-profile-v1:0:identity-generation\"\n"
             ),
         )
         .expect("seed pinned profile");

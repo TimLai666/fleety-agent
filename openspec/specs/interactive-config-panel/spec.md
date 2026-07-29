@@ -330,3 +330,407 @@ code:
   - docs/env.md
   - crates/fleety-tools/src/oauth.rs
 -->
+
+---
+### Requirement: Settings use owner-aware navigation and state
+
+The Settings route SHALL provide Connection, CLI, Daemon, Server, and Providers & Models pages. Each page SHALL identify the selected profile and destination owner and SHALL represent Loading, Available, Dirty, Applying, Conflict, Failed, and Unavailable states explicitly. Storage filenames SHALL NOT be used as the primary page title or save destination.
+
+#### Scenario: provider page names the connected Server
+
+- **WHEN** the user opens Providers & Models while profile `office` is connected
+- **THEN** the page SHALL identify `office` and its Server endpoint and SHALL NOT describe the action as editing `providers.toml`
+
+
+<!-- @trace
+source: redesign-cli-experience
+updated: 2026-07-29
+code:
+  - crates/fleety-tools/src/secure.rs
+  - crates/fleety-markdown/src/style.rs
+  - crates/fleety-cli/src/commands.rs
+  - crates/fleety-textarea/README.md
+  - scripts/check-spectra-archive-instructions.sh
+  - crates/fleety-cli/src/tui.rs
+  - docs/HANDOFF.md
+  - crates/fleety-textarea/src/editor_tests/keys.rs
+  - .agents/skills/spectra-archive/SKILL.md
+  - crates/fleety-textarea/src/editor_tests/mod.rs
+  - crates/fleety-daemon/src/main.rs
+  - crates/fleety-markdown/src/latex/mod.rs
+  - crates/fleety-tools/src/config.rs
+  - scripts/install-server.sh
+  - crates/fleety-markdown/src/latex/math_box.rs
+  - docs/STATUS.md
+  - crates/fleety-markdown/src/open_code_highlighter.rs
+  - crates/fleety-markdown/src/hyperlinks.rs
+  - .opencode/skills/spectra-archive/SKILL.md
+  - crates/fleety-inline/src/common.rs
+  - crates/fleety-server/Cargo.toml
+  - crates/fleety-textarea/LICENSE
+  - crates/fleety-markdown-core/Cargo.toml
+  - crates/fleety-inline/src/terminal.rs
+  - crates/fleety-textarea/src/editor_tests/planning.rs
+  - crates/fleety-cli/src/provider_tui.rs
+  - crates/fleety-textarea/Cargo.toml
+  - crates/fleety-markdown/src/parse.rs
+  - crates/fleety-cli/src/workspace.rs
+  - crates/agent-core/src/codex_responses.rs
+  - crates/fleety-cli/src/markdown.rs
+  - crates/fleety-server/src/main.rs
+  - crates/fleety-tools/src/oauth.rs
+  - Cargo.toml
+  - crates/fleety-tools/src/connection.rs
+  - crates/fleety-inline/src/scrollback.rs
+  - crates/fleety-textarea/src/editor_tests/viewport.rs
+  - AGENTS.md
+  - crates/fleety-cli/src/main.rs
+  - crates/fleety-markdown/src/syntax.rs
+  - crates/fleety-cli/src/acp.rs
+  - crates/fleety-textarea/src/editor_keys.rs
+  - crates/fleety-tools/src/provider_service.rs
+  - crates/fleety-tools/src/providers_config.rs
+  - crates/fleety-markdown/assets/tokyo-night.tmTheme
+  - crates/fleety-inline/src/segment.rs
+  - crates/fleety-markdown/src/latex/commands.rs
+  - crates/fleety-tools/src/lib.rs
+  - crates/fleety-tools/src/deps/runtime.rs
+  - crates/fleety-server/src/http.rs
+  - crates/fleety-markdown-core/LICENSE
+  - crates/fleety-server/src/mdns.rs
+  - .opencode/commands/spectra-archive.md
+  - crates/fleety-cli/src/server.rs
+  - crates/fleety-markdown/src/output.rs
+  - crates/fleety-inline/src/lib.rs
+  - crates/fleety-textarea/src/textarea.rs
+  - crates/fleety-textarea/src/editor.rs
+  - crates/fleety-markdown/src/streaming.rs
+  - crates/fleety-markdown/src/render.rs
+  - crates/fleety-inline/LICENSE
+  - crates/fleety-markdown/src/latex/tests.rs
+  - crates/fleety-markdown/src/buffers.rs
+  - crates/fleety-tools/src/device.rs
+  - crates/fleety-markdown/src/colors.rs
+  - docs/env.md
+  - crates/fleety-markdown/src/mermaid.rs
+  - crates/fleety-tools/src/transport.rs
+  - crates/fleety-markdown/src/checkpoint.rs
+  - crates/fleety-markdown/src/source_map.rs
+  - crates/fleety-markdown/Cargo.toml
+  - docs/roadmap.md
+  - crates/fleety-cli/src/provider_service.rs
+  - crates/fleety-inline/src/resize.rs
+  - crates/fleety-textarea/src/wrapping.rs
+  - crates/fleety-server/src/auth.rs
+  - crates/fleety-cli/Cargo.toml
+  - crates/fleety-markdown/src/latex/symbols.rs
+  - crates/fleety-markdown/src/latex/cursor.rs
+  - crates/fleety-markdown/src/lib.rs
+  - crates/fleety-server/src/conn.rs
+  - crates/fleety-textarea/src/render/mod.rs
+  - crates/fleety-tools/src/service.rs
+  - crates/fleety-textarea/src/lib.rs
+  - docs/tools.md
+  - crates/fleety-tools/Cargo.toml
+  - docs/acp.md
+  - crates/fleety-cli/src/config.rs
+  - crates/fleety-textarea/src/render/line_utils.rs
+  - crates/fleety-markdown/src/latex_delimiters.rs
+  - README.md
+  - crates/fleety-markdown/src/latex/environments.rs
+  - crates/fleety-daemon/Cargo.toml
+  - crates/fleety-inline/Cargo.toml
+  - crates/fleety-markdown/src/url_scan.rs
+  - crates/fleety-cli/src/auth.rs
+  - crates/fleety-tools/src/chrome.rs
+  - docs/design-cli-config.md
+  - crates/fleety-cli/src/input.rs
+  - .github/workflows/ci.yml
+  - crates/fleety-protocol/src/lib.rs
+  - crates/fleety-server/src/providers.rs
+  - crates/fleety-markdown/README.md
+  - crates/fleety-markdown/LICENSE
+  - crates/fleety-textarea/src/editor_tests/editing.rs
+  - crates/fleety-inline/src/tests.rs
+  - crates/fleety-inline/README.md
+  - crates/fleety-cli/src/config_panel.rs
+  - crates/fleety-markdown-core/src/lib.rs
+  - crates/fleety-daemon/src/winsvc.rs
+tests:
+  - crates/fleety-cli/src/test_terminal.rs
+  - crates/fleety-daemon/tests/fleetyd_smoke.rs
+  - crates/fleety-cli/tests/cli_smoke.rs
+-->
+
+---
+### Requirement: Settings stage and apply changes per owner
+
+CLI, Daemon, Server, and Provider/Model edits SHALL be staged before persistence. Apply SHALL act on exactly one owner, use that owner's persistence path, and report Saved, Restart required, Conflict, or Failed. Dirty state from separate owners SHALL remain separate and SHALL NOT be presented as one atomic transaction.
+
+#### Scenario: failed remote apply retains the edit
+
+- **WHEN** a Server apply fails or conflicts
+- **THEN** its staged values SHALL remain Dirty or Conflict, the error SHALL remain visible, and no CLI or Daemon file SHALL be modified
+
+##### Example: stale Server revision
+
+- **GIVEN** Server revision `r1` is staged while the owner has advanced to `r2`
+- **WHEN** Apply returns a typed conflict
+- **THEN** the staged `r1` edits and remediation remain visible, and CLI and Daemon bytes remain unchanged
+
+
+<!-- @trace
+source: redesign-cli-experience
+updated: 2026-07-29
+code:
+  - crates/fleety-tools/src/secure.rs
+  - crates/fleety-markdown/src/style.rs
+  - crates/fleety-cli/src/commands.rs
+  - crates/fleety-textarea/README.md
+  - scripts/check-spectra-archive-instructions.sh
+  - crates/fleety-cli/src/tui.rs
+  - docs/HANDOFF.md
+  - crates/fleety-textarea/src/editor_tests/keys.rs
+  - .agents/skills/spectra-archive/SKILL.md
+  - crates/fleety-textarea/src/editor_tests/mod.rs
+  - crates/fleety-daemon/src/main.rs
+  - crates/fleety-markdown/src/latex/mod.rs
+  - crates/fleety-tools/src/config.rs
+  - scripts/install-server.sh
+  - crates/fleety-markdown/src/latex/math_box.rs
+  - docs/STATUS.md
+  - crates/fleety-markdown/src/open_code_highlighter.rs
+  - crates/fleety-markdown/src/hyperlinks.rs
+  - .opencode/skills/spectra-archive/SKILL.md
+  - crates/fleety-inline/src/common.rs
+  - crates/fleety-server/Cargo.toml
+  - crates/fleety-textarea/LICENSE
+  - crates/fleety-markdown-core/Cargo.toml
+  - crates/fleety-inline/src/terminal.rs
+  - crates/fleety-textarea/src/editor_tests/planning.rs
+  - crates/fleety-cli/src/provider_tui.rs
+  - crates/fleety-textarea/Cargo.toml
+  - crates/fleety-markdown/src/parse.rs
+  - crates/fleety-cli/src/workspace.rs
+  - crates/agent-core/src/codex_responses.rs
+  - crates/fleety-cli/src/markdown.rs
+  - crates/fleety-server/src/main.rs
+  - crates/fleety-tools/src/oauth.rs
+  - Cargo.toml
+  - crates/fleety-tools/src/connection.rs
+  - crates/fleety-inline/src/scrollback.rs
+  - crates/fleety-textarea/src/editor_tests/viewport.rs
+  - AGENTS.md
+  - crates/fleety-cli/src/main.rs
+  - crates/fleety-markdown/src/syntax.rs
+  - crates/fleety-cli/src/acp.rs
+  - crates/fleety-textarea/src/editor_keys.rs
+  - crates/fleety-tools/src/provider_service.rs
+  - crates/fleety-tools/src/providers_config.rs
+  - crates/fleety-markdown/assets/tokyo-night.tmTheme
+  - crates/fleety-inline/src/segment.rs
+  - crates/fleety-markdown/src/latex/commands.rs
+  - crates/fleety-tools/src/lib.rs
+  - crates/fleety-tools/src/deps/runtime.rs
+  - crates/fleety-server/src/http.rs
+  - crates/fleety-markdown-core/LICENSE
+  - crates/fleety-server/src/mdns.rs
+  - .opencode/commands/spectra-archive.md
+  - crates/fleety-cli/src/server.rs
+  - crates/fleety-markdown/src/output.rs
+  - crates/fleety-inline/src/lib.rs
+  - crates/fleety-textarea/src/textarea.rs
+  - crates/fleety-textarea/src/editor.rs
+  - crates/fleety-markdown/src/streaming.rs
+  - crates/fleety-markdown/src/render.rs
+  - crates/fleety-inline/LICENSE
+  - crates/fleety-markdown/src/latex/tests.rs
+  - crates/fleety-markdown/src/buffers.rs
+  - crates/fleety-tools/src/device.rs
+  - crates/fleety-markdown/src/colors.rs
+  - docs/env.md
+  - crates/fleety-markdown/src/mermaid.rs
+  - crates/fleety-tools/src/transport.rs
+  - crates/fleety-markdown/src/checkpoint.rs
+  - crates/fleety-markdown/src/source_map.rs
+  - crates/fleety-markdown/Cargo.toml
+  - docs/roadmap.md
+  - crates/fleety-cli/src/provider_service.rs
+  - crates/fleety-inline/src/resize.rs
+  - crates/fleety-textarea/src/wrapping.rs
+  - crates/fleety-server/src/auth.rs
+  - crates/fleety-cli/Cargo.toml
+  - crates/fleety-markdown/src/latex/symbols.rs
+  - crates/fleety-markdown/src/latex/cursor.rs
+  - crates/fleety-markdown/src/lib.rs
+  - crates/fleety-server/src/conn.rs
+  - crates/fleety-textarea/src/render/mod.rs
+  - crates/fleety-tools/src/service.rs
+  - crates/fleety-textarea/src/lib.rs
+  - docs/tools.md
+  - crates/fleety-tools/Cargo.toml
+  - docs/acp.md
+  - crates/fleety-cli/src/config.rs
+  - crates/fleety-textarea/src/render/line_utils.rs
+  - crates/fleety-markdown/src/latex_delimiters.rs
+  - README.md
+  - crates/fleety-markdown/src/latex/environments.rs
+  - crates/fleety-daemon/Cargo.toml
+  - crates/fleety-inline/Cargo.toml
+  - crates/fleety-markdown/src/url_scan.rs
+  - crates/fleety-cli/src/auth.rs
+  - crates/fleety-tools/src/chrome.rs
+  - docs/design-cli-config.md
+  - crates/fleety-cli/src/input.rs
+  - .github/workflows/ci.yml
+  - crates/fleety-protocol/src/lib.rs
+  - crates/fleety-server/src/providers.rs
+  - crates/fleety-markdown/README.md
+  - crates/fleety-markdown/LICENSE
+  - crates/fleety-textarea/src/editor_tests/editing.rs
+  - crates/fleety-inline/src/tests.rs
+  - crates/fleety-inline/README.md
+  - crates/fleety-cli/src/config_panel.rs
+  - crates/fleety-markdown-core/src/lib.rs
+  - crates/fleety-daemon/src/winsvc.rs
+tests:
+  - crates/fleety-cli/src/test_terminal.rs
+  - crates/fleety-daemon/tests/fleetyd_smoke.rs
+  - crates/fleety-cli/tests/cli_smoke.rs
+-->
+
+---
+### Requirement: Profile switching resolves dirty remote state before reconnect
+
+Switching profiles while Server or Daemon state is dirty SHALL require Apply, Discard, or Cancel and SHALL identify the old profile. Apply must succeed before switching; Discard SHALL clear only old-profile staged remote state. After selection, the old transport SHALL close and fresh Server and Daemon snapshots SHALL load from the selected profile.
+
+#### Scenario: cancel keeps profile and edits
+
+- **GIVEN** profile `A` has dirty Server settings
+- **WHEN** the user selects profile `B` and chooses Cancel
+- **THEN** profile `A` SHALL remain selected, its staged changes SHALL remain, and no reconnect SHALL occur
+
+#### Scenario: failed new connection never reuses old snapshots
+
+- **WHEN** the user discards old staged state, selects profile `B`, and `B` cannot connect
+- **THEN** remote pages SHALL become Unavailable and SHALL NOT display or apply profile `A` snapshots
+
+<!-- @trace
+source: redesign-cli-experience
+updated: 2026-07-29
+code:
+  - crates/fleety-tools/src/secure.rs
+  - crates/fleety-markdown/src/style.rs
+  - crates/fleety-cli/src/commands.rs
+  - crates/fleety-textarea/README.md
+  - scripts/check-spectra-archive-instructions.sh
+  - crates/fleety-cli/src/tui.rs
+  - docs/HANDOFF.md
+  - crates/fleety-textarea/src/editor_tests/keys.rs
+  - .agents/skills/spectra-archive/SKILL.md
+  - crates/fleety-textarea/src/editor_tests/mod.rs
+  - crates/fleety-daemon/src/main.rs
+  - crates/fleety-markdown/src/latex/mod.rs
+  - crates/fleety-tools/src/config.rs
+  - scripts/install-server.sh
+  - crates/fleety-markdown/src/latex/math_box.rs
+  - docs/STATUS.md
+  - crates/fleety-markdown/src/open_code_highlighter.rs
+  - crates/fleety-markdown/src/hyperlinks.rs
+  - .opencode/skills/spectra-archive/SKILL.md
+  - crates/fleety-inline/src/common.rs
+  - crates/fleety-server/Cargo.toml
+  - crates/fleety-textarea/LICENSE
+  - crates/fleety-markdown-core/Cargo.toml
+  - crates/fleety-inline/src/terminal.rs
+  - crates/fleety-textarea/src/editor_tests/planning.rs
+  - crates/fleety-cli/src/provider_tui.rs
+  - crates/fleety-textarea/Cargo.toml
+  - crates/fleety-markdown/src/parse.rs
+  - crates/fleety-cli/src/workspace.rs
+  - crates/agent-core/src/codex_responses.rs
+  - crates/fleety-cli/src/markdown.rs
+  - crates/fleety-server/src/main.rs
+  - crates/fleety-tools/src/oauth.rs
+  - Cargo.toml
+  - crates/fleety-tools/src/connection.rs
+  - crates/fleety-inline/src/scrollback.rs
+  - crates/fleety-textarea/src/editor_tests/viewport.rs
+  - AGENTS.md
+  - crates/fleety-cli/src/main.rs
+  - crates/fleety-markdown/src/syntax.rs
+  - crates/fleety-cli/src/acp.rs
+  - crates/fleety-textarea/src/editor_keys.rs
+  - crates/fleety-tools/src/provider_service.rs
+  - crates/fleety-tools/src/providers_config.rs
+  - crates/fleety-markdown/assets/tokyo-night.tmTheme
+  - crates/fleety-inline/src/segment.rs
+  - crates/fleety-markdown/src/latex/commands.rs
+  - crates/fleety-tools/src/lib.rs
+  - crates/fleety-tools/src/deps/runtime.rs
+  - crates/fleety-server/src/http.rs
+  - crates/fleety-markdown-core/LICENSE
+  - crates/fleety-server/src/mdns.rs
+  - .opencode/commands/spectra-archive.md
+  - crates/fleety-cli/src/server.rs
+  - crates/fleety-markdown/src/output.rs
+  - crates/fleety-inline/src/lib.rs
+  - crates/fleety-textarea/src/textarea.rs
+  - crates/fleety-textarea/src/editor.rs
+  - crates/fleety-markdown/src/streaming.rs
+  - crates/fleety-markdown/src/render.rs
+  - crates/fleety-inline/LICENSE
+  - crates/fleety-markdown/src/latex/tests.rs
+  - crates/fleety-markdown/src/buffers.rs
+  - crates/fleety-tools/src/device.rs
+  - crates/fleety-markdown/src/colors.rs
+  - docs/env.md
+  - crates/fleety-markdown/src/mermaid.rs
+  - crates/fleety-tools/src/transport.rs
+  - crates/fleety-markdown/src/checkpoint.rs
+  - crates/fleety-markdown/src/source_map.rs
+  - crates/fleety-markdown/Cargo.toml
+  - docs/roadmap.md
+  - crates/fleety-cli/src/provider_service.rs
+  - crates/fleety-inline/src/resize.rs
+  - crates/fleety-textarea/src/wrapping.rs
+  - crates/fleety-server/src/auth.rs
+  - crates/fleety-cli/Cargo.toml
+  - crates/fleety-markdown/src/latex/symbols.rs
+  - crates/fleety-markdown/src/latex/cursor.rs
+  - crates/fleety-markdown/src/lib.rs
+  - crates/fleety-server/src/conn.rs
+  - crates/fleety-textarea/src/render/mod.rs
+  - crates/fleety-tools/src/service.rs
+  - crates/fleety-textarea/src/lib.rs
+  - docs/tools.md
+  - crates/fleety-tools/Cargo.toml
+  - docs/acp.md
+  - crates/fleety-cli/src/config.rs
+  - crates/fleety-textarea/src/render/line_utils.rs
+  - crates/fleety-markdown/src/latex_delimiters.rs
+  - README.md
+  - crates/fleety-markdown/src/latex/environments.rs
+  - crates/fleety-daemon/Cargo.toml
+  - crates/fleety-inline/Cargo.toml
+  - crates/fleety-markdown/src/url_scan.rs
+  - crates/fleety-cli/src/auth.rs
+  - crates/fleety-tools/src/chrome.rs
+  - docs/design-cli-config.md
+  - crates/fleety-cli/src/input.rs
+  - .github/workflows/ci.yml
+  - crates/fleety-protocol/src/lib.rs
+  - crates/fleety-server/src/providers.rs
+  - crates/fleety-markdown/README.md
+  - crates/fleety-markdown/LICENSE
+  - crates/fleety-textarea/src/editor_tests/editing.rs
+  - crates/fleety-inline/src/tests.rs
+  - crates/fleety-inline/README.md
+  - crates/fleety-cli/src/config_panel.rs
+  - crates/fleety-markdown-core/src/lib.rs
+  - crates/fleety-daemon/src/winsvc.rs
+tests:
+  - crates/fleety-cli/src/test_terminal.rs
+  - crates/fleety-daemon/tests/fleetyd_smoke.rs
+  - crates/fleety-cli/tests/cli_smoke.rs
+-->

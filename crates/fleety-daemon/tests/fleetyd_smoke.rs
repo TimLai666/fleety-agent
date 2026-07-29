@@ -1,3 +1,4 @@
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1286,6 +1287,68 @@ fn saved_current_profile_skips_live_mdns_and_connects_with_its_token() {
 }
 
 #[test]
+fn daemon_rejects_a_downgraded_selected_profile_before_transport_use() {
+    let home = TempDir::new("daemon-rejects-versioned-generation-mismatch");
+    let root = TempDir::new("daemon-rejects-versioned-generation-mismatch-root");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind transport sentinel");
+    listener
+        .set_nonblocking(true)
+        .expect("make transport sentinel nonblocking");
+    let url = format!("ws://{}", listener.local_addr().expect("sentinel address"));
+    let conns_path = home.0.join(".fleety").join("connections.toml");
+    std::fs::create_dir_all(conns_path.parent().expect("connections parent"))
+        .expect("create Fleety directory");
+    std::fs::write(
+        &conns_path,
+        format!(
+            "current = \"office\"\n\n[profiles.office]\nurl = \"{url}\"\n\
+             token = \"old-token\"\nsecure = true\n\
+             generation = \"fleety-profile-v1:7:legacy-office-generation\"\n"
+        ),
+    )
+    .expect("simulate an old serializer dropping roaming fields");
+    let before = std::fs::read(&conns_path).expect("read seed");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_fleetyd"))
+        .env("HOME", &home.0)
+        .env("USERPROFILE", &home.0)
+        .env("FLEETY_CONNECTIONS", &conns_path)
+        .env("FLEETY_DEVICE_ROOT", &root.0)
+        .env("FLEETY_DEVICE_ID", "daemon-generation-mismatch")
+        .env("FLEETY_MDNS_DISABLED", "1")
+        .env_remove("FLEETY_AGENT_URL")
+        .env_remove("FLEETY_TOKEN")
+        .env_remove("FLEETY_PAIRING_CODE")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run fleetyd");
+    thread::sleep(Duration::from_millis(500));
+    assert!(
+        child.try_wait().expect("poll fleetyd").is_none(),
+        "fleetyd should remain available to observe a repaired profile"
+    );
+    assert!(
+        matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ),
+        "the incompatible profile must be rejected before transport connect"
+    );
+    child.kill().expect("stop retrying fleetyd");
+    let output = child.wait_with_output().expect("collect fleetyd output");
+
+    assert!(
+        !output.status.success(),
+        "the test terminated the retrying daemon"
+    );
+    assert_eq!(
+        std::fs::read(&conns_path).expect("read unchanged file"),
+        before
+    );
+}
+
+#[test]
 fn daemon_falls_back_to_a_learned_endpoint_and_promotes_it() {
     let home = TempDir::new("learned-endpoint-roaming");
     let root = TempDir::new("learned-endpoint-roaming-root");
@@ -2521,6 +2584,136 @@ fn an_owner_reconnect_reaches_a_learned_endpoint_when_the_configured_one_stalls(
 }
 
 #[test]
+fn daemon_revalidates_the_profile_before_advancing_to_a_learned_endpoint() {
+    let seq = COMMAND_SEQ.fetch_add(1, Ordering::Relaxed);
+    let home = TempDir::new(&format!("reconnect-owner-drift-{seq}"));
+    let root = TempDir::new(&format!("reconnect-owner-drift-root-{seq}"));
+    let (url_a, hello_a, _closed_a) = start_held_ws_server("owner-drift-a");
+    let (live_url, live_rx) = start_non_loopback_ws_server(
+        vec![vec![named_welcome(
+            "owner-drift-b",
+            Some("fingerprint-owner-drift"),
+        )]],
+        Some((
+            "owner-drift-token".to_string(),
+            "fingerprint-owner-drift".to_string(),
+        )),
+    );
+    let port: u16 = live_url
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse().ok())
+        .expect("live endpoint port");
+    let listener =
+        std::net::TcpListener::bind(("127.0.0.1", port)).expect("bind owner-drift stalling server");
+    let (stalled_tx, stalled_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept() {
+            if let Ok(ws) = accept(stream) {
+                let _ = stalled_tx.send(());
+                held.push(ws);
+            }
+        }
+    });
+
+    let conns_path = home.0.join(".fleety").join("connections.toml");
+    std::fs::create_dir_all(conns_path.parent().expect("connections parent"))
+        .expect("create fleety dir");
+    let mut conns = fleety_tools::connection::Connections {
+        device_id: "daemon-smoke".into(),
+        current: Some("A".into()),
+        ..Default::default()
+    };
+    conns.profiles.insert(
+        "A".into(),
+        fleety_tools::connection::Profile {
+            url: url_a,
+            token: Some("token-a".into()),
+            ..Default::default()
+        },
+    );
+    conns.profiles.insert(
+        "B".into(),
+        fleety_tools::connection::Profile {
+            url: format!("ws://127.0.0.1:{port}"),
+            endpoints: vec![live_url],
+            token: Some("owner-drift-token".into()),
+            fingerprint: Some("fingerprint-owner-drift".into()),
+            ..Default::default()
+        },
+    );
+    fleety_tools::connection::save_at(&conns_path, &conns).expect("seed owner-drift profiles");
+
+    let child = Command::new(env!("CARGO_BIN_EXE_fleetyd"))
+        .env("HOME", &home.0)
+        .env("USERPROFILE", &home.0)
+        .env("FLEETY_CONNECTIONS", &conns_path)
+        .env("FLEETY_DEVICE_ID", "daemon-smoke")
+        .env("FLEETY_DEVICE_ROOT", &root.0)
+        .env("FLEETY_MDNS_DISABLED", "1")
+        .env_remove("FLEETY_AGENT_URL")
+        .env_remove("FLEETY_TOKEN")
+        .env_remove("FLEETY_PAIRING_CODE")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("run fleetyd");
+    let mut child = ChildGuard(child);
+    hello_a
+        .recv_timeout(Duration::from_secs(15))
+        .expect("profile A hello");
+    let ready_path = home.0.join(".fleety").join("fleetyd.control-ready.json");
+    wait_until(|| ready_path.exists());
+    fleety_tools::connection::mutate_at(&conns_path, |live| {
+        live.current = Some("B".into());
+        Ok(())
+    })
+    .expect("switch to profile B");
+
+    let command_home = home.0.clone();
+    let command_path = conns_path.clone();
+    let (output_tx, output_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let output = Command::new(env!("CARGO_BIN_EXE_fleetyd"))
+            .args(["reconnect", "--profile", "B"])
+            .env("HOME", &command_home)
+            .env("USERPROFILE", &command_home)
+            .env("FLEETY_CONNECTIONS", &command_path)
+            .output()
+            .expect("invoke owner-drift reconnect");
+        output_tx.send(output).expect("publish reconnect output");
+    });
+    stalled_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("configured candidate opened");
+    fleety_tools::connection::mutate_at(&conns_path, |live| {
+        live.profiles.get_mut("B").expect("profile B").label = Some("repaired elsewhere".into());
+        Ok(())
+    })
+    .expect("replace the frozen owner while the first candidate stalls");
+
+    let output = output_rx
+        .recv_timeout(Duration::from_secs(15))
+        .expect("reconnect terminal result");
+    let reached = live_rx.recv_timeout(Duration::from_millis(500));
+    let _ = child.0.kill();
+
+    assert!(
+        !output.status.success(),
+        "owner drift must fail the reconnect instead of advancing"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("changed during connection"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        reached.is_err(),
+        "the learned endpoint must receive no transport after owner drift"
+    );
+}
+
+#[test]
 fn daemon_reconnect_handshake_deadline_settles_failure_without_welcome() {
     let output = run_gated_reconnect(None, Some("fingerprint-gated-b"), None);
 
@@ -2772,6 +2965,7 @@ fn durable_profile_rejects_control_when_welcome_identity_is_whitespace() {
         "A".into(),
         fleety_tools::connection::Profile {
             url: url.clone(),
+            generation: "fleety-profile-v1:0:whitespace-identity".to_string(),
             ..Default::default()
         },
     );

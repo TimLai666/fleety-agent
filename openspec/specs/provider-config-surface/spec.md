@@ -382,3 +382,413 @@ code:
 tests:
   - crates/fleety-cli/tests/cli_smoke.rs
 -->
+
+---
+### Requirement: Provider, authentication, model catalog, and roles form one workflow
+
+The canonical Provider surface SHALL show each Provider's type, endpoint class, non-secret API-key state, authentication state, catalog state, and bound roles. API Providers SHALL render `key=Set` or `key=Not set` from strictly parsed snapshot metadata; `Set` means a non-empty key and blank keys SHALL be rejected. Malformed metadata SHALL fail the snapshot instead of being silently discarded. JSON Provider lists SHALL retain the existing `data.output` compatibility field and additionally expose each API Provider's state as boolean `data.providers[].key_present` without a secret value. OAuth login, logout, and status SHALL be actions on a named Provider; model selection SHALL proceed through Provider selection, catalog load, model selection or manual ID, and role confirmation.
+
+#### Scenario: OAuth provider status is visible before model selection
+
+- **WHEN** an OAuth Provider is not signed in
+- **THEN** the Provider surface SHALL show Not signed in, offer Login, and prevent a catalog request from being represented as an anonymous endpoint failure
+
+##### Example: Codex OAuth before catalog
+
+- **GIVEN** Provider `tingzhen-codex` has type `oauth:codex` and no stored credential
+- **WHEN** the user starts main-model selection
+- **THEN** the row shows Not signed in and Login, and no model-catalog request is sent until authentication succeeds
+
+#### Scenario: API key presence is visible without exposing the secret
+
+- **GIVEN** the Server snapshot reports key presence for API Provider `openai`
+- **WHEN** the user views `fleety provider list` or the Provider TUI
+- **THEN** human and TUI rows SHALL show `key=Set`, JSON SHALL report `"key_present": true` for `openai`, and no surface SHALL contain the key value
+
+
+<!-- @trace
+source: redesign-cli-experience
+updated: 2026-07-29
+code:
+  - crates/fleety-tools/src/secure.rs
+  - crates/fleety-markdown/src/style.rs
+  - crates/fleety-cli/src/commands.rs
+  - crates/fleety-textarea/README.md
+  - scripts/check-spectra-archive-instructions.sh
+  - crates/fleety-cli/src/tui.rs
+  - docs/HANDOFF.md
+  - crates/fleety-textarea/src/editor_tests/keys.rs
+  - .agents/skills/spectra-archive/SKILL.md
+  - crates/fleety-textarea/src/editor_tests/mod.rs
+  - crates/fleety-daemon/src/main.rs
+  - crates/fleety-markdown/src/latex/mod.rs
+  - crates/fleety-tools/src/config.rs
+  - scripts/install-server.sh
+  - crates/fleety-markdown/src/latex/math_box.rs
+  - docs/STATUS.md
+  - crates/fleety-markdown/src/open_code_highlighter.rs
+  - crates/fleety-markdown/src/hyperlinks.rs
+  - .opencode/skills/spectra-archive/SKILL.md
+  - crates/fleety-inline/src/common.rs
+  - crates/fleety-server/Cargo.toml
+  - crates/fleety-textarea/LICENSE
+  - crates/fleety-markdown-core/Cargo.toml
+  - crates/fleety-inline/src/terminal.rs
+  - crates/fleety-textarea/src/editor_tests/planning.rs
+  - crates/fleety-cli/src/provider_tui.rs
+  - crates/fleety-textarea/Cargo.toml
+  - crates/fleety-markdown/src/parse.rs
+  - crates/fleety-cli/src/workspace.rs
+  - crates/agent-core/src/codex_responses.rs
+  - crates/fleety-cli/src/markdown.rs
+  - crates/fleety-server/src/main.rs
+  - crates/fleety-tools/src/oauth.rs
+  - Cargo.toml
+  - crates/fleety-tools/src/connection.rs
+  - crates/fleety-inline/src/scrollback.rs
+  - crates/fleety-textarea/src/editor_tests/viewport.rs
+  - AGENTS.md
+  - crates/fleety-cli/src/main.rs
+  - crates/fleety-markdown/src/syntax.rs
+  - crates/fleety-cli/src/acp.rs
+  - crates/fleety-textarea/src/editor_keys.rs
+  - crates/fleety-tools/src/provider_service.rs
+  - crates/fleety-tools/src/providers_config.rs
+  - crates/fleety-markdown/assets/tokyo-night.tmTheme
+  - crates/fleety-inline/src/segment.rs
+  - crates/fleety-markdown/src/latex/commands.rs
+  - crates/fleety-tools/src/lib.rs
+  - crates/fleety-tools/src/deps/runtime.rs
+  - crates/fleety-server/src/http.rs
+  - crates/fleety-markdown-core/LICENSE
+  - crates/fleety-server/src/mdns.rs
+  - .opencode/commands/spectra-archive.md
+  - crates/fleety-cli/src/server.rs
+  - crates/fleety-markdown/src/output.rs
+  - crates/fleety-inline/src/lib.rs
+  - crates/fleety-textarea/src/textarea.rs
+  - crates/fleety-textarea/src/editor.rs
+  - crates/fleety-markdown/src/streaming.rs
+  - crates/fleety-markdown/src/render.rs
+  - crates/fleety-inline/LICENSE
+  - crates/fleety-markdown/src/latex/tests.rs
+  - crates/fleety-markdown/src/buffers.rs
+  - crates/fleety-tools/src/device.rs
+  - crates/fleety-markdown/src/colors.rs
+  - docs/env.md
+  - crates/fleety-markdown/src/mermaid.rs
+  - crates/fleety-tools/src/transport.rs
+  - crates/fleety-markdown/src/checkpoint.rs
+  - crates/fleety-markdown/src/source_map.rs
+  - crates/fleety-markdown/Cargo.toml
+  - docs/roadmap.md
+  - crates/fleety-cli/src/provider_service.rs
+  - crates/fleety-inline/src/resize.rs
+  - crates/fleety-textarea/src/wrapping.rs
+  - crates/fleety-server/src/auth.rs
+  - crates/fleety-cli/Cargo.toml
+  - crates/fleety-markdown/src/latex/symbols.rs
+  - crates/fleety-markdown/src/latex/cursor.rs
+  - crates/fleety-markdown/src/lib.rs
+  - crates/fleety-server/src/conn.rs
+  - crates/fleety-textarea/src/render/mod.rs
+  - crates/fleety-tools/src/service.rs
+  - crates/fleety-textarea/src/lib.rs
+  - docs/tools.md
+  - crates/fleety-tools/Cargo.toml
+  - docs/acp.md
+  - crates/fleety-cli/src/config.rs
+  - crates/fleety-textarea/src/render/line_utils.rs
+  - crates/fleety-markdown/src/latex_delimiters.rs
+  - README.md
+  - crates/fleety-markdown/src/latex/environments.rs
+  - crates/fleety-daemon/Cargo.toml
+  - crates/fleety-inline/Cargo.toml
+  - crates/fleety-markdown/src/url_scan.rs
+  - crates/fleety-cli/src/auth.rs
+  - crates/fleety-tools/src/chrome.rs
+  - docs/design-cli-config.md
+  - crates/fleety-cli/src/input.rs
+  - .github/workflows/ci.yml
+  - crates/fleety-protocol/src/lib.rs
+  - crates/fleety-server/src/providers.rs
+  - crates/fleety-markdown/README.md
+  - crates/fleety-markdown/LICENSE
+  - crates/fleety-textarea/src/editor_tests/editing.rs
+  - crates/fleety-inline/src/tests.rs
+  - crates/fleety-inline/README.md
+  - crates/fleety-cli/src/config_panel.rs
+  - crates/fleety-markdown-core/src/lib.rs
+  - crates/fleety-daemon/src/winsvc.rs
+tests:
+  - crates/fleety-cli/src/test_terminal.rs
+  - crates/fleety-daemon/tests/fleetyd_smoke.rs
+  - crates/fleety-cli/tests/cli_smoke.rs
+-->
+
+---
+### Requirement: Model discovery failure has retry and manual recovery
+
+Catalog loading SHALL expose Loading, Available, Failed, and Unavailable states. A failure SHALL retain the backend error details and offer Retry and Enter model ID without losing the selected Provider or role.
+
+#### Scenario: retry preserves selection
+
+- **WHEN** catalog loading fails for Provider `tingzhen-codex`, role `main`, and the user selects Retry
+- **THEN** the next request SHALL use the same connected Server, Provider, and role, while the previous error remains inspectable until the retry completes
+
+
+<!-- @trace
+source: redesign-cli-experience
+updated: 2026-07-29
+code:
+  - crates/fleety-tools/src/secure.rs
+  - crates/fleety-markdown/src/style.rs
+  - crates/fleety-cli/src/commands.rs
+  - crates/fleety-textarea/README.md
+  - scripts/check-spectra-archive-instructions.sh
+  - crates/fleety-cli/src/tui.rs
+  - docs/HANDOFF.md
+  - crates/fleety-textarea/src/editor_tests/keys.rs
+  - .agents/skills/spectra-archive/SKILL.md
+  - crates/fleety-textarea/src/editor_tests/mod.rs
+  - crates/fleety-daemon/src/main.rs
+  - crates/fleety-markdown/src/latex/mod.rs
+  - crates/fleety-tools/src/config.rs
+  - scripts/install-server.sh
+  - crates/fleety-markdown/src/latex/math_box.rs
+  - docs/STATUS.md
+  - crates/fleety-markdown/src/open_code_highlighter.rs
+  - crates/fleety-markdown/src/hyperlinks.rs
+  - .opencode/skills/spectra-archive/SKILL.md
+  - crates/fleety-inline/src/common.rs
+  - crates/fleety-server/Cargo.toml
+  - crates/fleety-textarea/LICENSE
+  - crates/fleety-markdown-core/Cargo.toml
+  - crates/fleety-inline/src/terminal.rs
+  - crates/fleety-textarea/src/editor_tests/planning.rs
+  - crates/fleety-cli/src/provider_tui.rs
+  - crates/fleety-textarea/Cargo.toml
+  - crates/fleety-markdown/src/parse.rs
+  - crates/fleety-cli/src/workspace.rs
+  - crates/agent-core/src/codex_responses.rs
+  - crates/fleety-cli/src/markdown.rs
+  - crates/fleety-server/src/main.rs
+  - crates/fleety-tools/src/oauth.rs
+  - Cargo.toml
+  - crates/fleety-tools/src/connection.rs
+  - crates/fleety-inline/src/scrollback.rs
+  - crates/fleety-textarea/src/editor_tests/viewport.rs
+  - AGENTS.md
+  - crates/fleety-cli/src/main.rs
+  - crates/fleety-markdown/src/syntax.rs
+  - crates/fleety-cli/src/acp.rs
+  - crates/fleety-textarea/src/editor_keys.rs
+  - crates/fleety-tools/src/provider_service.rs
+  - crates/fleety-tools/src/providers_config.rs
+  - crates/fleety-markdown/assets/tokyo-night.tmTheme
+  - crates/fleety-inline/src/segment.rs
+  - crates/fleety-markdown/src/latex/commands.rs
+  - crates/fleety-tools/src/lib.rs
+  - crates/fleety-tools/src/deps/runtime.rs
+  - crates/fleety-server/src/http.rs
+  - crates/fleety-markdown-core/LICENSE
+  - crates/fleety-server/src/mdns.rs
+  - .opencode/commands/spectra-archive.md
+  - crates/fleety-cli/src/server.rs
+  - crates/fleety-markdown/src/output.rs
+  - crates/fleety-inline/src/lib.rs
+  - crates/fleety-textarea/src/textarea.rs
+  - crates/fleety-textarea/src/editor.rs
+  - crates/fleety-markdown/src/streaming.rs
+  - crates/fleety-markdown/src/render.rs
+  - crates/fleety-inline/LICENSE
+  - crates/fleety-markdown/src/latex/tests.rs
+  - crates/fleety-markdown/src/buffers.rs
+  - crates/fleety-tools/src/device.rs
+  - crates/fleety-markdown/src/colors.rs
+  - docs/env.md
+  - crates/fleety-markdown/src/mermaid.rs
+  - crates/fleety-tools/src/transport.rs
+  - crates/fleety-markdown/src/checkpoint.rs
+  - crates/fleety-markdown/src/source_map.rs
+  - crates/fleety-markdown/Cargo.toml
+  - docs/roadmap.md
+  - crates/fleety-cli/src/provider_service.rs
+  - crates/fleety-inline/src/resize.rs
+  - crates/fleety-textarea/src/wrapping.rs
+  - crates/fleety-server/src/auth.rs
+  - crates/fleety-cli/Cargo.toml
+  - crates/fleety-markdown/src/latex/symbols.rs
+  - crates/fleety-markdown/src/latex/cursor.rs
+  - crates/fleety-markdown/src/lib.rs
+  - crates/fleety-server/src/conn.rs
+  - crates/fleety-textarea/src/render/mod.rs
+  - crates/fleety-tools/src/service.rs
+  - crates/fleety-textarea/src/lib.rs
+  - docs/tools.md
+  - crates/fleety-tools/Cargo.toml
+  - docs/acp.md
+  - crates/fleety-cli/src/config.rs
+  - crates/fleety-textarea/src/render/line_utils.rs
+  - crates/fleety-markdown/src/latex_delimiters.rs
+  - README.md
+  - crates/fleety-markdown/src/latex/environments.rs
+  - crates/fleety-daemon/Cargo.toml
+  - crates/fleety-inline/Cargo.toml
+  - crates/fleety-markdown/src/url_scan.rs
+  - crates/fleety-cli/src/auth.rs
+  - crates/fleety-tools/src/chrome.rs
+  - docs/design-cli-config.md
+  - crates/fleety-cli/src/input.rs
+  - .github/workflows/ci.yml
+  - crates/fleety-protocol/src/lib.rs
+  - crates/fleety-server/src/providers.rs
+  - crates/fleety-markdown/README.md
+  - crates/fleety-markdown/LICENSE
+  - crates/fleety-textarea/src/editor_tests/editing.rs
+  - crates/fleety-inline/src/tests.rs
+  - crates/fleety-inline/README.md
+  - crates/fleety-cli/src/config_panel.rs
+  - crates/fleety-markdown-core/src/lib.rs
+  - crates/fleety-daemon/src/winsvc.rs
+tests:
+  - crates/fleety-cli/src/test_terminal.rs
+  - crates/fleety-daemon/tests/fleetyd_smoke.rs
+  - crates/fleety-cli/tests/cli_smoke.rs
+-->
+
+---
+### Requirement: Provider commands and TUI share one application service
+
+Canonical provider/model commands, compatibility aliases, and the TUI SHALL use the same validation, owner routing, OAuth status, catalog fetch, role binding, and error mapping service.
+
+#### Scenario: invalid provider input agrees across surfaces
+
+- **WHEN** the same invalid Provider name or endpoint is submitted through command mode and the TUI
+- **THEN** both surfaces SHALL reject it before mutation with the same error kind and remediation
+
+##### Example: unsafe Provider name
+
+- **GIVEN** the Provider name is `../outside`
+- **WHEN** it is submitted through `fleety provider add` and the TUI add wizard
+- **THEN** both return the same validation kind and safe-name remediation, and the Server records no mutation
+
+<!-- @trace
+source: redesign-cli-experience
+updated: 2026-07-29
+code:
+  - crates/fleety-tools/src/secure.rs
+  - crates/fleety-markdown/src/style.rs
+  - crates/fleety-cli/src/commands.rs
+  - crates/fleety-textarea/README.md
+  - scripts/check-spectra-archive-instructions.sh
+  - crates/fleety-cli/src/tui.rs
+  - docs/HANDOFF.md
+  - crates/fleety-textarea/src/editor_tests/keys.rs
+  - .agents/skills/spectra-archive/SKILL.md
+  - crates/fleety-textarea/src/editor_tests/mod.rs
+  - crates/fleety-daemon/src/main.rs
+  - crates/fleety-markdown/src/latex/mod.rs
+  - crates/fleety-tools/src/config.rs
+  - scripts/install-server.sh
+  - crates/fleety-markdown/src/latex/math_box.rs
+  - docs/STATUS.md
+  - crates/fleety-markdown/src/open_code_highlighter.rs
+  - crates/fleety-markdown/src/hyperlinks.rs
+  - .opencode/skills/spectra-archive/SKILL.md
+  - crates/fleety-inline/src/common.rs
+  - crates/fleety-server/Cargo.toml
+  - crates/fleety-textarea/LICENSE
+  - crates/fleety-markdown-core/Cargo.toml
+  - crates/fleety-inline/src/terminal.rs
+  - crates/fleety-textarea/src/editor_tests/planning.rs
+  - crates/fleety-cli/src/provider_tui.rs
+  - crates/fleety-textarea/Cargo.toml
+  - crates/fleety-markdown/src/parse.rs
+  - crates/fleety-cli/src/workspace.rs
+  - crates/agent-core/src/codex_responses.rs
+  - crates/fleety-cli/src/markdown.rs
+  - crates/fleety-server/src/main.rs
+  - crates/fleety-tools/src/oauth.rs
+  - Cargo.toml
+  - crates/fleety-tools/src/connection.rs
+  - crates/fleety-inline/src/scrollback.rs
+  - crates/fleety-textarea/src/editor_tests/viewport.rs
+  - AGENTS.md
+  - crates/fleety-cli/src/main.rs
+  - crates/fleety-markdown/src/syntax.rs
+  - crates/fleety-cli/src/acp.rs
+  - crates/fleety-textarea/src/editor_keys.rs
+  - crates/fleety-tools/src/provider_service.rs
+  - crates/fleety-tools/src/providers_config.rs
+  - crates/fleety-markdown/assets/tokyo-night.tmTheme
+  - crates/fleety-inline/src/segment.rs
+  - crates/fleety-markdown/src/latex/commands.rs
+  - crates/fleety-tools/src/lib.rs
+  - crates/fleety-tools/src/deps/runtime.rs
+  - crates/fleety-server/src/http.rs
+  - crates/fleety-markdown-core/LICENSE
+  - crates/fleety-server/src/mdns.rs
+  - .opencode/commands/spectra-archive.md
+  - crates/fleety-cli/src/server.rs
+  - crates/fleety-markdown/src/output.rs
+  - crates/fleety-inline/src/lib.rs
+  - crates/fleety-textarea/src/textarea.rs
+  - crates/fleety-textarea/src/editor.rs
+  - crates/fleety-markdown/src/streaming.rs
+  - crates/fleety-markdown/src/render.rs
+  - crates/fleety-inline/LICENSE
+  - crates/fleety-markdown/src/latex/tests.rs
+  - crates/fleety-markdown/src/buffers.rs
+  - crates/fleety-tools/src/device.rs
+  - crates/fleety-markdown/src/colors.rs
+  - docs/env.md
+  - crates/fleety-markdown/src/mermaid.rs
+  - crates/fleety-tools/src/transport.rs
+  - crates/fleety-markdown/src/checkpoint.rs
+  - crates/fleety-markdown/src/source_map.rs
+  - crates/fleety-markdown/Cargo.toml
+  - docs/roadmap.md
+  - crates/fleety-cli/src/provider_service.rs
+  - crates/fleety-inline/src/resize.rs
+  - crates/fleety-textarea/src/wrapping.rs
+  - crates/fleety-server/src/auth.rs
+  - crates/fleety-cli/Cargo.toml
+  - crates/fleety-markdown/src/latex/symbols.rs
+  - crates/fleety-markdown/src/latex/cursor.rs
+  - crates/fleety-markdown/src/lib.rs
+  - crates/fleety-server/src/conn.rs
+  - crates/fleety-textarea/src/render/mod.rs
+  - crates/fleety-tools/src/service.rs
+  - crates/fleety-textarea/src/lib.rs
+  - docs/tools.md
+  - crates/fleety-tools/Cargo.toml
+  - docs/acp.md
+  - crates/fleety-cli/src/config.rs
+  - crates/fleety-textarea/src/render/line_utils.rs
+  - crates/fleety-markdown/src/latex_delimiters.rs
+  - README.md
+  - crates/fleety-markdown/src/latex/environments.rs
+  - crates/fleety-daemon/Cargo.toml
+  - crates/fleety-inline/Cargo.toml
+  - crates/fleety-markdown/src/url_scan.rs
+  - crates/fleety-cli/src/auth.rs
+  - crates/fleety-tools/src/chrome.rs
+  - docs/design-cli-config.md
+  - crates/fleety-cli/src/input.rs
+  - .github/workflows/ci.yml
+  - crates/fleety-protocol/src/lib.rs
+  - crates/fleety-server/src/providers.rs
+  - crates/fleety-markdown/README.md
+  - crates/fleety-markdown/LICENSE
+  - crates/fleety-textarea/src/editor_tests/editing.rs
+  - crates/fleety-inline/src/tests.rs
+  - crates/fleety-inline/README.md
+  - crates/fleety-cli/src/config_panel.rs
+  - crates/fleety-markdown-core/src/lib.rs
+  - crates/fleety-daemon/src/winsvc.rs
+tests:
+  - crates/fleety-cli/src/test_terminal.rs
+  - crates/fleety-daemon/tests/fleetyd_smoke.rs
+  - crates/fleety-cli/tests/cli_smoke.rs
+-->

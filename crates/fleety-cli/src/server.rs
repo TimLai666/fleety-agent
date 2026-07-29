@@ -5,7 +5,8 @@
 //! `add`/`use`/`list`/`show`/`current`/`rename`/`remove`/`set-url`. They are
 //! pure file operations (no network); enrollment (`--pair`, and the `init`/`pair`
 //! sugar) lives in `main.rs` because it needs a connection. `use` changes only
-//! the `current` field — the CLI and this host's daemon both follow it.
+//! the user-visible `current` field, while atomically binding a selected legacy
+//! profile's internal security-state generation when needed.
 
 use std::path::Path;
 
@@ -195,19 +196,18 @@ pub fn apply_at(path: &Path, cmd: Cmd, _env_url: Option<String>) -> Result<Strin
                     )));
                 }
                 let becomes_current = use_current || conns.current.is_none();
-                conns.profiles.insert(
-                    name.clone(),
-                    Profile {
-                        url,
-                        endpoints: Vec::new(),
-                        configured_url: None,
-                        secure: false,
-                        token: None,
-                        label,
-                        fingerprint: None,
-                        generation: uuid::Uuid::new_v4().to_string(),
-                    },
-                );
+                let mut profile = Profile {
+                    url,
+                    endpoints: Vec::new(),
+                    configured_url: None,
+                    secure: false,
+                    token: None,
+                    label,
+                    fingerprint: None,
+                    generation: String::new(),
+                };
+                connection::rebind_profile_generation_after_authorized_mutation(&mut profile)?;
+                conns.profiles.insert(name.clone(), profile);
                 if becomes_current {
                     conns.current = Some(name.clone());
                 }
@@ -224,11 +224,23 @@ pub fn apply_at(path: &Path, cmd: Cmd, _env_url: Option<String>) -> Result<Strin
                 if !conns.profiles.contains_key(&name) {
                     return Err(unknown_server(&name, conns));
                 }
+                let profile = conns
+                    .profiles
+                    .get_mut(&name)
+                    .ok_or_else(|| CoreError::Message(format!("profile '{name}' disappeared")))?;
+                connection::validate_named_profile_generation(&name, profile)?;
+                connection::upgrade_legacy_profile_generation_binding(profile)?;
                 conns.current = Some(name.clone());
                 Ok(format!("now using profile '{name}'"))
             })
         }
-        Cmd::List => Ok(render_list(&connection::load_at(path)?)),
+        Cmd::List => {
+            let conns = connection::load_at(path)?;
+            for (name, profile) in &conns.profiles {
+                connection::validate_named_profile_generation(name, profile)?;
+            }
+            Ok(render_list(&conns))
+        }
         Cmd::Show(name) => {
             if let Some(name) = &name {
                 check_display_field("profile name", name)?;
@@ -246,6 +258,7 @@ pub fn apply_at(path: &Path, cmd: Cmd, _env_url: Option<String>) -> Result<Strin
                 .profiles
                 .get(&name)
                 .ok_or_else(|| unknown_server(&name, &conns))?;
+            connection::validate_named_profile_generation(&name, p)?;
             Ok(render_show(
                 &name,
                 p,
@@ -258,11 +271,13 @@ pub fn apply_at(path: &Path, cmd: Cmd, _env_url: Option<String>) -> Result<Strin
                 Some(n) => n.clone(),
                 None => return Ok("(no current profile)".to_string()),
             };
-            let url = conns
-                .profiles
-                .get(&name)
-                .map(|p| p.url.clone())
-                .unwrap_or_default();
+            let url = match conns.profiles.get(&name) {
+                Some(profile) => {
+                    connection::validate_named_profile_generation(&name, profile)?;
+                    profile.url.clone()
+                }
+                None => String::new(),
+            };
             Ok(if url.is_empty() {
                 safe_field(&name)
             } else {
@@ -280,8 +295,12 @@ pub fn apply_at(path: &Path, cmd: Cmd, _env_url: Option<String>) -> Result<Strin
                 }
                 let profile = conns
                     .profiles
-                    .remove(&old)
+                    .get(&old)
                     .ok_or_else(|| unknown_server(&old, conns))?;
+                connection::validate_named_profile_generation(&old, profile)?;
+                let profile = conns.profiles.remove(&old).ok_or_else(|| {
+                    CoreError::Message(format!("profile '{old}' disappeared during rename"))
+                })?;
                 conns.profiles.insert(new.clone(), profile);
                 if conns.current.as_deref() == Some(&old) {
                     conns.current = Some(new.clone());
@@ -314,7 +333,8 @@ pub fn apply_at(path: &Path, cmd: Cmd, _env_url: Option<String>) -> Result<Strin
                 let Some(profile) = conns.profiles.get_mut(&name) else {
                     return Err(unknown_server(&name, conns));
                 };
-                let cleared = connection::reselect_profile_endpoint(profile, url);
+                connection::validate_named_profile_generation(&name, profile)?;
+                let cleared = connection::reselect_profile_endpoint(profile, url)?;
                 Ok(if cleared {
                     format!(
                         "set url for server '{name}'; cleared the old token and identity pin — \
@@ -600,6 +620,66 @@ mod tests {
         }
     }
 
+    #[test]
+    fn use_and_rename_cannot_launder_an_incompatible_profile() {
+        let path = tmp();
+        std::fs::write(
+            &path,
+            "current = \"healthy\"\n\n\
+             [profiles.healthy]\nurl = \"ws://healthy:8787\"\n\
+             generation = \"fleety-profile-v1:0:healthy-generation\"\n\n\
+             [profiles.broken]\nurl = \"ws://broken:8787\"\nsecure = true\n\
+             generation = \"fleety-profile-v1:7:broken-generation\"\n",
+        )
+        .expect("seed incompatible profile");
+        let before = std::fs::read(&path).expect("read seed");
+
+        for command in [
+            Cmd::Use("broken".to_string()),
+            Cmd::Rename {
+                old: "broken".to_string(),
+                new: "renamed".to_string(),
+            },
+        ] {
+            let error = apply_at(&path, command, None)
+                .expect_err("ordinary profile mutation must fail closed");
+            assert!(error.report().message.contains("profile \"broken\""));
+            assert_eq!(std::fs::read(&path).expect("read rejected state"), before);
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn use_upgrades_the_selected_legacy_generation_inside_the_selection_write() {
+        let path = tmp();
+        std::fs::write(
+            &path,
+            "current = \"other\"\n\n\
+             [profiles.other]\nurl = \"ws://other:8787\"\ngeneration = \"other-generation\"\n\n\
+             [profiles.legacy]\nurl = \"ws://100.64.0.8:8787\"\n\
+             endpoints = [\"ws://192.168.1.20:8787\"]\n\
+             configured_url = \"ws://home.lan:8787\"\nsecure = true\n\
+             token = \"saved-token\"\nfingerprint = \"server-a\"\n\
+             generation = \"legacy-generation\"\n",
+        )
+        .expect("seed selectable legacy profile");
+
+        apply_at(&path, Cmd::Use("legacy".to_string()), None)
+            .expect("select and bind the legacy profile atomically");
+
+        let saved = connection::load_at(&path).expect("load selected profile");
+        assert_eq!(saved.current.as_deref(), Some("legacy"));
+        assert_eq!(
+            saved.profiles["legacy"].generation, "fleety-profile-v1:7:legacy-generation",
+            "selection must not leave a plain generation for a later resolve to launder"
+        );
+        assert_eq!(
+            saved.profiles["other"].generation, "other-generation",
+            "selection upgrades only the profile that becomes operational"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
     /// Roaming moves `url` to an address the user never typed and the latch
     /// decides which remediations work, so both have to be visible — a refusal
     /// that names the encrypted channel is unverifiable otherwise.
@@ -754,6 +834,13 @@ mod tests {
         assert!(
             cur.contains("home") && cur.contains("ws://home:8787"),
             "{cur}"
+        );
+        let saved = connection::load_at(&p).expect("load added profile");
+        assert!(
+            saved.profiles["home"]
+                .generation
+                .starts_with("fleety-profile-v1:0:"),
+            "{saved:?}"
         );
         let _ = std::fs::remove_file(&p);
     }

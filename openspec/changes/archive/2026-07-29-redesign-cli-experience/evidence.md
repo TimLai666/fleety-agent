@@ -842,3 +842,437 @@ TDD and regression proof:
 - Three context-isolated Sol medium reviewers independently reported exact
   `No findings.` after the final permission-cleanup and read-only-idempotence
   fixes.
+
+## 2026-07-29 — task 5.65 authenticates roaming endpoints before credentials
+
+Paired profiles now use the existing device token as a Noise `NNpsk0` PSK.
+The client proves the Server before entering the encrypted control channel, so
+the token is never sent as a plaintext bearer. `Welcome`, Server-advertised
+endpoint candidates, and every later frame are encrypted and integrity
+protected. Learned endpoints never fall back to cleartext; after a profile has
+observed a secure Server, its `secure` latch prevents later downgrade.
+
+Endpoint candidates come only from an already authenticated Server session,
+remain owned by that profile, are deduplicated with a bounded retention policy,
+and are tried last-successful-first. Server enumeration includes ordinary
+non-loopback interfaces and contains no Tailscale-specific integration. A
+user-installed overlay can therefore roam like any other reachable interface,
+without prior client-side endpoint registration, after the authenticated Server
+advertises it.
+
+The shared policy covers one-shot CLI connections, Chat startup and reconnect,
+ACP turn and cancel, Settings, Provider and OAuth reconnects, read-only doctor,
+and the fleetyd reconnect loop. Tests cover handshake success, wrong PSK,
+identity mismatch, replay, downgrade, tampering, truncation, learned overlay
+fallback, candidate promotion and eviction, and raw/environment non-persistence.
+
+No hostile live LAN advertiser, real network transition, externally exposed
+Server, real Tailscale topology, or Windows-native run was performed. The proof
+is deterministic protocol, resolver, fake-Server, CLI, and daemon coverage.
+
+## 2026-07-29 — continuation audit and tasks 5.66–5.68
+
+A context-isolated Sol review of the post-5.65 worktree found four material
+completion gaps:
+
+- reconnect recovery could preserve a terminal receipt and then reconstruct a
+  differently worded failure for the same nonce, permanently blocking control
+  ownership;
+- journal append could treat metadata failure as length zero and attempted
+  rollback through an append-only handle that cannot truncate on Windows;
+- an older serializer could silently remove endpoint and secure-channel fields
+  while retaining a profile that appeared usable;
+- evidence and HANDOFF no longer described the actual implementation or task
+  state.
+
+The first three findings became tasks 5.66–5.68. The documentation gap is task
+5.69. The same audit recorded reconnect budget, control lifecycle, quarantine,
+and smoke-test deadline concerns as follow-up risks rather than silently
+expanding this repair. There is no review artifact containing “Settings nine
+Medium” findings, so none are reconstructed here.
+
+Task 5.66 makes an existing terminal receipt authoritative for its nonce.
+Recovery reaps the matching unfinished journal, preserves the receipt, and
+allows the next `ControlGuard::claim`. Its restart regression seeds the exact
+crash boundary between durable receipt and journal reap.
+
+Task 5.67 obtains the original journal length before opening the append writer.
+Write or sync failure rolls back through an independent write-capable handle.
+Metadata, write, sync, rollback-open, and rollback-truncate injection tests
+prove previously durable bytes are never interpreted as an empty journal or
+silently shortened; the handle strategy is Windows-compatible.
+
+Task 5.68 upgrades opaque profile generations to
+`fleety-profile-v1:<presence-mask>:<opaque nonce>`. The mask binds endpoint,
+configured-URL, and secure-latch presence. Unknown or malformed envelopes and
+known-v1 field mismatches fail before network or credential use on CLI, TUI,
+ACP, doctor, connection/server commands, Settings, Provider/OAuth, and fleetyd.
+Legacy generations upgrade only for the selected durable owner under its lease.
+An unrelated mismatched profile remains detectable without blocking a healthy
+profile.
+
+Explicit repair does not reuse the old token or pin. Bare pairing refuses to
+guess a learned endpoint if downgrade removed the configured URL. Explicit
+`init <url> --name <profile> --pairing-code <code>` performs a generation-CAS
+reenrollment that replaces only the frozen profile, permitting sequential
+repair when multiple profiles were downgraded. Cached durable targets are
+revalidated before every new transport; ownerless raw and environment targets
+remain outside persistent generation authority.
+
+Focused verification after the final 5.68 source change:
+
+- `cargo test -p fleety-tools --lib --locked -- --test-threads=1`: 289 passed.
+- `cargo test -p fleety-cli --bin fleety --locked -- --test-threads=1`: 335
+  passed.
+- `cargo test -p fleety-cli --test cli_smoke --locked -- --test-threads=1`:
+  116 passed.
+- `cargo test -p fleety-daemon --bin fleetyd --locked -- --test-threads=1`: 77
+  passed.
+- `cargo test -p fleety-daemon --test fleetyd_smoke --locked --
+  --test-threads=1`: 46 passed.
+
+## 2026-07-29 — first clean review after the generation-boundary repairs
+
+The context-isolated `generation_boundary_r2` Sol high reviewer independently
+inspected the complete 5.66–5.68 diff and relevant call paths. It rechecked
+receipt recovery, journal durability, versioned-generation validation,
+explicit reenrollment, sequential multi-profile repair, unrelated-profile
+isolation, every cached durable target, and ownerless-target exemptions.
+
+The final result was zero Critical, zero High, zero Medium, and zero actionable
+Low findings. This is clean round one after the latest source modification.
+Task 5.3 remains open until a second consecutive independent review satisfies
+the same threshold after artifact synchronization.
+
+## 2026-07-29 — convergence review found three post-5.68 gaps
+
+The context-isolated `final_convergence_r1` Sol high reviewer inspected the
+complete diff and artifacts. It reported zero Critical, zero High, one Medium,
+and two actionable Low findings, resetting the clean-review streak to zero:
+
+- Medium: CLI and fleetyd validated a frozen profile before entering a
+  multi-candidate sweep, but not again before each later transport. A profile
+  replacement while the first endpoint stalled could therefore let the second
+  endpoint open with stale token／pin authority.
+- Low: a named `--profile` pairing selection was rejected whenever
+  `FLEETY_AGENT_URL` existed, even though named profile resolution is explicitly
+  stronger and the remediation recommended that same command.
+- Low: `pair` skipped the one-time legacy `config.json` migration, so an
+  existing pre-profile device appeared to have no current named profile.
+
+Task 5.70 fixes all three. Shared CLI candidate sweeps and fleetyd now
+revalidate the exact frozen owner before every candidate transport. Explicit
+named pairing overrides the environment URL, while current pairing still
+rejects a non-empty transient environment target. Pairing now performs legacy
+migration before owner resolution and never sends the migrated old token.
+
+Focused red-to-green proof:
+
+- `candidate_sweep_revalidates_owner_before_every_transport`: the first
+  endpoint opens, the profile changes, and the configured alternative receives
+  no transport.
+- `daemon_revalidates_the_profile_before_advancing_to_a_learned_endpoint`: a
+  stalling configured endpoint plus concurrent owner mutation prevents fleetyd
+  from reaching the learned endpoint and settles failure.
+- `named_profile_pairing_overrides_an_environment_url`: the named Server
+  receives the pairing code and no old token despite a conflicting environment
+  URL.
+- `pair_migrates_a_legacy_config_before_redeeming_the_code`: the legacy record
+  migrates, the code is redeemed, and the old token never appears in `Hello`.
+
+## 2026-07-29 — Doctor read-only convergence gap
+
+The context-isolated `final_clean_r1` Sol high reviewer found one additional
+Medium after task 5.70. `Resolved::into_read_only` correctly removed mutation
+authority by moving the owner snapshot into `diagnostic_owner`, but the shared
+per-candidate validator checked only the writable owner. Doctor could therefore
+continue from a failed endpoint to an alternative with its stale token and pin
+after another process replaced the profile. The finding reset the clean-review
+streak to zero.
+
+Task 5.71 makes the read-only validation path compare the same complete frozen
+generation before every transport while leaving `has_profile_owner()` false.
+`read_only_candidate_sweep_revalidates_diagnostic_owner_before_every_transport`
+changes the profile after the first candidate, proves the alternative receives
+no transport, and separately asserts that the diagnostic target is still
+rejected by the writable-owner validator. The shared snapshot comparison stays
+private so publication and mutation-authorized paths cannot accept diagnostic
+authority.
+
+## 2026-07-29 — post-5.71 review found two surface budget gaps
+
+The context-isolated `post_571_clean_r1b` Sol high reviewer reported zero
+Critical, zero High, one Medium, and one actionable Low, so the clean streak
+remained zero:
+
+- Medium: Doctor's five-second and initial Settings' ten-second outer timeouts
+  could cancel the shared multi-candidate sweep before a later saved endpoint
+  was attempted.
+- Low: named profile pairing ignored a valid conflicting
+  `FLEETY_AGENT_URL`, but the earlier global validator still rejected a
+  malformed unused environment URL before pairing could resolve the named
+  profile.
+
+Task 5.72 removes Doctor's shorter outer cancellation and lets the shared
+aggregate sweep bound it. Settings retains a ten-second whole-operation bound
+but derives its per-candidate wait from the shared three-candidate sweep limit;
+profile switching uses the same helper. Named pairing bypasses validation only
+for its unused environment endpoint, while current pairing and every other
+command keep the existing validation. Regressions cover malformed-env pairing,
+a stalled Doctor primary followed by a working saved alternative, and the same
+fixed-budget Settings sequence.
+
+## 2026-07-29 — post-5.72 review found three bounded-failure gaps
+
+The context-isolated `post_572_clean_r1` Sol high reviewer found two Medium
+findings and one actionable Low:
+
+- Doctor's candidate bound ended at authenticated `Welcome`; Provider and
+  Daemon snapshot receives could then wait forever on a proven but silent
+  Server.
+- fleetyd's ordinary automatic path could open an SSE downstream and block
+  forever while sending `Hello` through a POST whose response never arrived,
+  so a learned endpoint was never attempted.
+- torn-tail repair ignored journal read failures other than `NotFound`, which
+  could append valid JSON behind an unreadable or torn final record.
+
+Task 5.73 gives each Doctor post-`Welcome` snapshot request a separate bounded
+reply wait and converts timeout into an actionable diagnostic check. fleetyd's
+`serve` now requires a candidate deadline rather than accepting `None`; the
+deadline is created before transport open and reused for `Hello` and
+authenticated `Welcome` in ordinary and owner-requested paths. Journal repair
+accepts only `NotFound` as absence and fails before append on every other read
+error.
+
+The three regressions cover a config-protocol-v5 Server that sends `Welcome`
+then stays silent, an SSE GET that succeeds while the Hello POST never responds,
+and a write-only journal carrying a torn final record. The SSE regression failed
+by exceeding its 300 ms outer bound before the mandatory deadline change, then
+passed after the change. Mutation checks also proved that ignoring the journal
+read error or bypassing Doctor's injected reply budget makes the corresponding
+regression fail.
+
+Focused verification after task 5.73:
+
+- `cargo test -p fleety-daemon --bin fleetyd --locked --
+  --test-threads=1`: 79 passed.
+- `cargo test -p fleety-cli --bin fleety --locked -- --test-threads=1`: 338
+  passed.
+- `cargo test -p fleety-daemon --test fleetyd_smoke --locked --
+  --test-threads=1`: 47 passed.
+- `cargo test -p fleety-cli --test cli_smoke --locked -- --test-threads=1`:
+  119 passed.
+
+## 2026-07-29 — post-5.73 review found an uncorrelated late-reply race
+
+The `post_573_clean_r1` Sol high review confirmed one Medium before its broader
+inspection was interrupted: after a Provider snapshot timeout, Doctor reused
+the same receive stream for the Daemon snapshot. `ConfigSnapshotResult` has no
+request identifier, so a delayed Server-owner result could arrive during the
+Daemon receive and be misreported as a successful Daemon connection. The
+finding resets the clean-review streak to zero.
+
+Task 5.74 closes the diagnostic session after any snapshot timeout and marks
+later owner checks as blocked by the earlier timeout. Its regression delays the
+Server snapshot past the Provider budget and proves it cannot become a Daemon
+Pass; the test failed with `Pass` before the fix and passed afterward.
+
+Focused verification after task 5.74:
+
+- `cargo test -p fleety-cli --bin fleety --locked -- --test-threads=1`: 339
+  passed.
+- `cargo test -p fleety-cli --test cli_smoke --locked -- --test-threads=1`:
+  119 passed.
+- `cargo clippy -p fleety-cli --all-targets --locked -- -D warnings`: passed.
+
+## 2026-07-29 — post-5.74 review found three profile activation and recovery gaps
+
+The context-isolated `post_574_clean_r1` Sol high reviewer inspected the full
+diff, every connection surface, generation ownership, Doctor timeout handling,
+reconnect durability, tests, and artifacts. It reported zero Critical, one
+High, one Medium, and one actionable Low, so the clean-review streak remains
+zero:
+
+- High: re-running same-URL `init` for an existing paired but not-yet-latched
+  profile read the saved token, opened a direct cleartext transport, and sent
+  `Hello` before attempting the shared secure handshake.
+- Medium: `connection use` selected a legacy plain-generation profile without
+  binding its roaming／secure presence state inside the selection mutation
+  lease. A stale writer could remove that state before the next resolver
+  upgraded it, laundering the downgrade evidence.
+- Low: when a versioned generation recorded a now-missing `configured_url`, the
+  generic error recommended bare `pair`, even though that command correctly
+  refuses to send a pairing code to the learned primary.
+
+Task 5.75 resolves all three. Existing-credential `init` now resolves the named
+durable owner and opens it through the secure candidate helper before sending
+`Hello`; new enrollment and explicit pairing-code repair remain token-free.
+`connection use` validates and upgrades the selected legacy generation before
+changing `current` under the same lease. Lost-configured-address remediation
+now points directly to explicit-URL `init --pairing-code`.
+
+Red-to-green proof:
+
+- `init_reusing_a_paired_profile_proves_the_server_before_sending_hello` first
+  observed a cleartext `Hello { token: Some("saved-token") }`, then observed a
+  `SecureHandshake` followed by a sealed Hello and a persisted secure latch.
+- `use_upgrades_the_selected_legacy_generation_inside_the_selection_write`
+  first preserved `legacy-generation`, then persisted
+  `fleety-profile-v1:7:legacy-generation` while leaving the unrelated profile
+  unchanged.
+- `lost_configured_url_guidance_names_the_only_safe_recovery_command` first
+  received the rejected bare-pair command, then received only the explicit-URL
+  init recovery.
+
+Focused verification after task 5.75:
+
+- `cargo test -p fleety-tools --lib --locked -- --test-threads=1`: 293 passed.
+- `cargo test -p fleety-cli --bin fleety --locked -- --test-threads=1`: 340
+  passed.
+- `cargo test -p fleety-cli --test cli_smoke --locked -- --test-threads=1`:
+  120 passed.
+
+Full current-tree gates after task 5.75 and artifact synchronization:
+
+- `cargo test --workspace --locked -- --test-threads=1`: passed with zero
+  failures across all unit, smoke, integration, and doc-test groups.
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`: passed.
+- `cargo build --release --locked -p fleety-cli -p fleety-server
+  -p fleety-daemon`: passed.
+
+## 2026-07-29 — post-5.76 review and task 5.77
+
+The first post-5.76 review found one High and stopped the clean streak. A second
+bounded review found zero Critical／High／Medium but one actionable Low, so it
+also did not count as clean:
+
+- High: a reachable `secure=true`, `token=None` profile was protected at its
+  existing URL but could still be moved to a different URL without a pairing
+  code because endpoint-change protection checked only token presence. The new
+  endpoint then received an ownerless cleartext session and could replace the
+  credential while reusing the public pin.
+- Low: the 5.76 unit regression exercised the pure snapshot planner but did not
+  inject changes into the production preflight-load → generation-migration →
+  final-load sequence, so a future call-site regression could escape it.
+
+Task 5.77 treats any token, non-empty pin, secure latch, learned endpoint, or
+separately configured endpoint as protected connection state. Moving that
+profile to a different URL without explicit pairing now fails before transport
+and leaves the file byte-identical. A test-only preflight barrier drives the
+real `init_selected` path while token clear, token rotation, and
+unpaired-to-paired changes occur between its two loads; captured `Hello` frames
+and final profile bytes prove only the authoritative post-migration owner is
+used.
+
+Red-to-green and focused verification:
+
+- The different-URL tokenless-latch smoke first reached the transport sentinel
+  and timed out, then passed with zero accepted connection and byte-identical
+  state.
+- The production interleaving test first failed to compile without the barrier,
+  then passed for token clear, rotation, and concurrent pairing.
+- `cargo test -p fleety-cli --bin fleety --locked -- --test-threads=1`: 343
+  passed.
+- `cargo test -p fleety-cli --test cli_smoke --locked -- --test-threads=1`: 122
+  passed.
+- `cargo clippy -p fleety-cli --all-targets --locked -- -D warnings`: passed.
+- Final 5.77 gates passed: complete workspace tests with zero failures,
+  workspace clippy with warnings denied, all three release binaries, fmt, diff
+  check, Spectra strict validation, Spectra analyze with zero Critical／Warning,
+  and the archive instruction guard.
+
+## 2026-07-29 — post-5.77 clean review round 1
+
+The context-isolated `post_577_clean_r1` Sol reviewer inspected the complete
+`0fcb818..worktree` diff and reported zero Critical, High, Medium, or actionable
+Low findings. It independently traced the different-URL protected-state gate,
+the production init interleavings, channel fallback policy, all CLI／Chat／
+Provider／Settings／Doctor／ACP connection surfaces, fleetyd candidate owner
+revalidation and authenticated credential commit, reconnect journal recovery,
+Settings current-owner freeze, and command generation binding. This is clean
+streak 1. It did not run Cargo, Windows-native, live LAN／overlay／OAuth, or live
+multi-Server roaming.
+- `cargo fmt --all -- --check` and `git diff --check HEAD`: passed.
+- `spectra validate redesign-cli-experience --strict`: passed.
+- `spectra analyze redesign-cli-experience --json`: zero Critical or Warning;
+  two pre-existing Suggestions remain.
+- `scripts/check-spectra-archive-instructions.sh`: passed for all four generated
+  instructions.
+
+## 2026-07-29 — post-5.77 clean review round 2
+
+The fresh context-isolated `post_577_clean_r2` Sol reviewer independently
+inspected the complete `0fcb818..worktree` diff and reported zero Critical,
+High, Medium, or actionable Low findings. It did not rely on round 1 and traced
+the protected-state gate, production init double-load interleavings, shared
+candidate policy and per-candidate owner validation, secure／cleartext boundary,
+authenticated commit, all CLI／Chat／ACP／Settings／Provider／Doctor／fleetyd
+surfaces, Settings current-owner freeze, and reconnect recovery／rollback.
+
+This is clean streak 2 and satisfies task 5.3. The reviewer was read-only and
+did not run Cargo, Windows-native, live LAN／overlay／OAuth, or live multi-Server
+roaming. `git diff --check 0fcb818 --` passed and the worktree was unchanged.
+
+Final task 5.69 verification after both clean reviews:
+
+- `cargo test --workspace --locked -- --test-threads=1`: passed with zero
+  failures across unit, smoke, integration, and doc-test groups.
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`: passed.
+- `cargo build --release --locked -p fleety-cli -p fleety-server
+  -p fleety-daemon`: passed.
+- `cargo fmt --all -- --check` and `git diff --check HEAD`: passed.
+- `spectra validate redesign-cli-experience --strict`: passed.
+- `spectra analyze redesign-cli-experience --json`: zero Critical or Warning;
+  two pre-existing Suggestions remain.
+- `scripts/check-spectra-archive-instructions.sh`: passed for all four generated
+  instructions.
+- The full status search found no stale task count, incomplete 5.3 marker, or
+  fabricated Settings-nine-Medium list.
+
+## 2026-07-29 — post-5.75 review and task 5.76
+
+The first context-isolated post-5.75 review reported zero Critical, one High,
+two Medium, and zero Low, so the clean-review streak remains zero. A second
+read-only source pass independently confirmed the credential race and found its
+tokenless-latch variant:
+
+- High: `init` performed a preflight load, upgraded a legacy generation, then
+  reloaded the profile but mixed the first snapshot's token／pin decisions with
+  the second snapshot's owner and commit CAS. Concurrent token clear, rotation,
+  or unpaired-to-paired transition could send stale credentials or overwrite
+  the newer owner.
+- Medium: same-URL `init` rejected every already-latched profile instead of
+  using its required secure channel.
+- Medium: Settings persisted `B` but froze it as an explicit named target, so a
+  later current switch to `C` did not invalidate the pending `B` transport.
+- High variant: a reachable `secure=true`, `token=None` profile was treated as
+  ownerless because target ownership was conditioned on token presence. That
+  discarded the secure latch and admitted a cleartext takeover path.
+
+Task 5.76 derives every standard init transport, `Hello`, pin check, and commit
+precondition from one authoritative post-migration snapshot. A same-name,
+same-URL profile retains its durable owner even without a token; a tokenless
+secure latch now fails before opening any transport, while a latched paired
+profile succeeds only through `SecureRequired`. Settings now sets the selected
+profile current and resolves `Target::Current` inside the same mutation lease,
+so later current-owner drift fails before transport.
+
+Red-to-green proof and focused verification:
+
+- The new init snapshot and Settings owner-drift unit tests first failed to
+  compile because neither boundary existed, then passed.
+- The former latched-init refusal smoke now completes a sealed same-URL init
+  without rotating its token or pin.
+- A `secure=true`, tokenless profile opens zero transport, reports the required
+  re-pair recovery, and remains byte-identical.
+- `cargo test -p fleety-cli --bin fleety --locked -- --test-threads=1`: 342
+  passed.
+- `cargo test -p fleety-cli --test cli_smoke --locked -- --test-threads=1`: 121
+  passed.
+- `cargo clippy -p fleety-cli --all-targets --locked -- -D warnings`, fmt, diff
+  check, Spectra strict validation, and Spectra analyze with zero
+  Critical／Warning: passed.
+- `cargo test --workspace --locked -- --test-threads=1`: passed with zero
+  failures after the final 5.76 source and artifact changes.
+- `cargo build --release --locked -p fleety-cli -p fleety-server
+  -p fleety-daemon`: passed.

@@ -1,287 +1,21 @@
-# owner-routed-configuration Specification
+# terminal-workspace Specification
 
 ## Purpose
 
-TBD - created by archiving change 'route-config-to-owning-runtime'. Update Purpose after archive.
+TBD - created by archiving change 'redesign-cli-experience'. Update Purpose after archive.
 
 ## Requirements
 
-### Requirement: CLI configuration routes by owning runtime
+### Requirement: Interactive entry points share one terminal workspace
 
-The CLI SHALL determine the owner of a flat config key from the registry before performing I/O. Server scope SHALL route to the connected fleety-server. Daemon and Shared scopes SHALL route to fleetyd for the selected device. Cli scope SHALL be handled only by the fleety CLI. Provider, model, and credential operations SHALL route to the connected server.
+Bare `fleety` on a TTY SHALL open the terminal workspace at Chat; bare `fleety` on non-TTY SHALL print help and exit zero. `fleety chat`, legacy `fleety tui`, and bare TTY `fleety config` SHALL open the same workspace at Chat or Settings without duplicating connection or owner state.
 
-#### Scenario: server key routes to the server
+#### Scenario: terminal detection selects a safe entry
 
-- **WHEN** the user runs fleety config set FLEETY_ADDR 127.0.0.1:8787 without an explicit target
-- **THEN** the CLI sends the mutation to the connected server and does not modify config.toml on the CLI host
-
-#### Scenario: daemon key routes to fleetyd
-
-- **WHEN** the user runs fleety config set FLEETY_PRESENCE on without an explicit target
-- **THEN** the CLI sends the mutation to fleetyd for the current device id and neither the CLI nor server writes the daemon config file
-
-#### Scenario: shared key routes to fleetyd
-
-- **WHEN** the user runs fleety config set FLEETY_TZ Asia/Taipei without an explicit target
-- **THEN** the CLI sends the Shared-scope mutation to fleetyd and does not write it through the Cli owner path
-
-#### Scenario: cli key stays with the CLI owner
-
-- **WHEN** the user runs fleety config set FLEETY_VOICE_AUDIO auto without an explicit target
-- **THEN** only the Cli-scoped value is persisted by the CLI owner
-
-
-<!-- @trace
-source: route-config-to-owning-runtime
-updated: 2026-07-14
-code:
-  - crates/fleety-server/src/main.rs
-  - crates/fleety-server/src/http.rs
-  - crates/fleety-tools/src/oauth.rs
-  - crates/fleety-cli/src/config_panel.rs
-  - crates/fleety-cli/src/provider_tui.rs
-  - docs/design-cli-config.md
-  - docs/roadmap.md
-  - README.md
-  - crates/fleety-cli/src/model_picker.rs
-  - crates/fleety-daemon/src/main.rs
-  - crates/fleety-server/src/conn.rs
-  - crates/fleety-tools/src/connection.rs
-  - crates/fleety-cli/src/auth.rs
-  - crates/fleety-tools/src/config.rs
-  - crates/fleety-tools/src/providers_config.rs
-  - crates/fleety-cli/src/main.rs
-  - docs/STATUS.md
-  - crates/fleety-cli/src/config.rs
-  - crates/fleety-server/src/bridge.rs
-  - crates/fleety-cli/src/acp.rs
-  - docs/env.md
-  - crates/fleety-cli/src/server.rs
-tests:
-  - crates/fleety-cli/tests/cli_smoke.rs
-  - crates/fleety-daemon/tests/fleetyd_smoke.rs
-  - crates/fleety-server/tests/server_smoke.rs
--->
-
----
-### Requirement: Explicit targets enforce ownership
-
-The CLI SHALL accept server, daemon, cli, and a device id as explicit config targets. local SHALL remain an alias for cli for command compatibility. A target that does not own the requested key SHALL fail before mutation and SHALL identify the correct owner.
-
-#### Scenario: foreign server key is rejected by daemon target
-
-- **WHEN** the user runs fleety config --target daemon set FLEETY_ADDR 0.0.0.0:8787
-- **THEN** the command fails before sending or writing and identifies server as the owner
-
-#### Scenario: foreign daemon key is rejected by server target
-
-- **WHEN** the user runs fleety config --target server set FLEETY_DEVICE_ID laptop
-- **THEN** the command fails and neither runtime persists the value
-
-#### Scenario: local alias is cli only
-
-- **WHEN** the user runs fleety config --target local set FLEETY_TZ Asia/Taipei
-- **THEN** the command fails because Shared is daemon-owned and identifies daemon as the owner
-
-
-<!-- @trace
-source: route-config-to-owning-runtime
-updated: 2026-07-14
-code:
-  - crates/fleety-server/src/main.rs
-  - crates/fleety-server/src/http.rs
-  - crates/fleety-tools/src/oauth.rs
-  - crates/fleety-cli/src/config_panel.rs
-  - crates/fleety-cli/src/provider_tui.rs
-  - docs/design-cli-config.md
-  - docs/roadmap.md
-  - README.md
-  - crates/fleety-cli/src/model_picker.rs
-  - crates/fleety-daemon/src/main.rs
-  - crates/fleety-server/src/conn.rs
-  - crates/fleety-tools/src/connection.rs
-  - crates/fleety-cli/src/auth.rs
-  - crates/fleety-tools/src/config.rs
-  - crates/fleety-tools/src/providers_config.rs
-  - crates/fleety-cli/src/main.rs
-  - docs/STATUS.md
-  - crates/fleety-cli/src/config.rs
-  - crates/fleety-server/src/bridge.rs
-  - crates/fleety-cli/src/acp.rs
-  - docs/env.md
-  - crates/fleety-cli/src/server.rs
-tests:
-  - crates/fleety-cli/tests/cli_smoke.rs
-  - crates/fleety-daemon/tests/fleetyd_smoke.rs
-  - crates/fleety-server/tests/server_smoke.rs
--->
-
----
-### Requirement: Routing failures never fall back to config files
-
-If the target server or fleetyd is unavailable, rejects the request, times out, or returns a malformed reply, the CLI SHALL fail with a non-zero exit status. It SHALL NOT modify config.toml or providers.toml as a fallback. Connection-profile healing remains governed by the connection-profiles specification and is not a config persistence fallback.
-
-#### Scenario: unavailable owner does not trigger a local write
-
-- **GIVEN** the selected owner is unreachable and local config file bytes are recorded
-- **WHEN** the user runs a config mutation owned by that runtime
-- **THEN** the command exits non-zero and every recorded local config file remains byte-for-byte unchanged
-
-
-<!-- @trace
-source: route-config-to-owning-runtime
-updated: 2026-07-14
-code:
-  - crates/fleety-server/src/main.rs
-  - crates/fleety-server/src/http.rs
-  - crates/fleety-tools/src/oauth.rs
-  - crates/fleety-cli/src/config_panel.rs
-  - crates/fleety-cli/src/provider_tui.rs
-  - docs/design-cli-config.md
-  - docs/roadmap.md
-  - README.md
-  - crates/fleety-cli/src/model_picker.rs
-  - crates/fleety-daemon/src/main.rs
-  - crates/fleety-server/src/conn.rs
-  - crates/fleety-tools/src/connection.rs
-  - crates/fleety-cli/src/auth.rs
-  - crates/fleety-tools/src/config.rs
-  - crates/fleety-tools/src/providers_config.rs
-  - crates/fleety-cli/src/main.rs
-  - docs/STATUS.md
-  - crates/fleety-cli/src/config.rs
-  - crates/fleety-server/src/bridge.rs
-  - crates/fleety-cli/src/acp.rs
-  - docs/env.md
-  - crates/fleety-cli/src/server.rs
-tests:
-  - crates/fleety-cli/tests/cli_smoke.rs
-  - crates/fleety-daemon/tests/fleetyd_smoke.rs
-  - crates/fleety-server/tests/server_smoke.rs
--->
-
----
-### Requirement: Config mutation rejects corrupt input and no-op identity keys
-
-Every config mutation SHALL strict-load a present file before modifying it. A malformed file SHALL be reported and left byte-for-byte unchanged. FLEETY_DEVICE_ID SHALL NOT be accepted as a config key because the stable identity is owned by connections.toml.
-
-#### Scenario: corrupt config is preserved
-
-- **GIVEN** config.toml contains malformed TOML and its bytes are recorded
-- **WHEN** any owner processes a set or unset command
-- **THEN** the command fails and the recorded bytes are unchanged
-
-#### Scenario: device id config key is rejected
-
-- **WHEN** the user runs fleety config set FLEETY_DEVICE_ID laptop
-- **THEN** the command reports that device identity is managed through connections.toml and writes nothing
-
-#### Scenario: daemon offline causes no write
-
-- **GIVEN** the target fleetyd is not connected and the local config file bytes are recorded
-- **WHEN** a daemon-owned set command is run
-- **THEN** the command exits non-zero and the config file bytes remain unchanged
-
-#### Scenario: server rejection causes no local write
-
-- **GIVEN** the server replies with ConfigResult ok false
-- **WHEN** a server-owned set command is run
-- **THEN** the CLI exits non-zero and does not modify local config.toml or providers.toml
-
-
-<!-- @trace
-source: route-config-to-owning-runtime
-updated: 2026-07-14
-code:
-  - crates/fleety-server/src/main.rs
-  - crates/fleety-server/src/http.rs
-  - crates/fleety-tools/src/oauth.rs
-  - crates/fleety-cli/src/config_panel.rs
-  - crates/fleety-cli/src/provider_tui.rs
-  - docs/design-cli-config.md
-  - docs/roadmap.md
-  - README.md
-  - crates/fleety-cli/src/model_picker.rs
-  - crates/fleety-daemon/src/main.rs
-  - crates/fleety-server/src/conn.rs
-  - crates/fleety-tools/src/connection.rs
-  - crates/fleety-cli/src/auth.rs
-  - crates/fleety-tools/src/config.rs
-  - crates/fleety-tools/src/providers_config.rs
-  - crates/fleety-cli/src/main.rs
-  - docs/STATUS.md
-  - crates/fleety-cli/src/config.rs
-  - crates/fleety-server/src/bridge.rs
-  - crates/fleety-cli/src/acp.rs
-  - docs/env.md
-  - crates/fleety-cli/src/server.rs
-tests:
-  - crates/fleety-cli/tests/cli_smoke.rs
-  - crates/fleety-daemon/tests/fleetyd_smoke.rs
-  - crates/fleety-server/tests/server_smoke.rs
--->
-
----
-### Requirement: Usage and command failures are machine-detectable
-
-Unknown commands, missing required arguments, malformed target flags, ConfigResult ok false, and ServerMsg Error SHALL produce a non-zero exit status. Bare help requests and explicit help flags SHALL produce a zero exit status.
-
-#### Scenario: remote config rejection is non-zero
-
-- **WHEN** the server rejects a config mutation with ConfigResult ok false
-- **THEN** the CLI prints the actionable error and exits non-zero
-
-#### Scenario: unknown command is non-zero
-
-- **WHEN** the user runs an unknown top-level or group subcommand
-- **THEN** the CLI prints usage with the unknown command and exits non-zero
-
-#### Scenario: explicit help succeeds
-
-- **WHEN** the user runs fleety --help or a group help command
-- **THEN** usage is printed and the process exits zero
-
-<!-- @trace
-source: route-config-to-owning-runtime
-updated: 2026-07-14
-code:
-  - crates/fleety-server/src/main.rs
-  - crates/fleety-server/src/http.rs
-  - crates/fleety-tools/src/oauth.rs
-  - crates/fleety-cli/src/config_panel.rs
-  - crates/fleety-cli/src/provider_tui.rs
-  - docs/design-cli-config.md
-  - docs/roadmap.md
-  - README.md
-  - crates/fleety-cli/src/model_picker.rs
-  - crates/fleety-daemon/src/main.rs
-  - crates/fleety-server/src/conn.rs
-  - crates/fleety-tools/src/connection.rs
-  - crates/fleety-cli/src/auth.rs
-  - crates/fleety-tools/src/config.rs
-  - crates/fleety-tools/src/providers_config.rs
-  - crates/fleety-cli/src/main.rs
-  - docs/STATUS.md
-  - crates/fleety-cli/src/config.rs
-  - crates/fleety-server/src/bridge.rs
-  - crates/fleety-cli/src/acp.rs
-  - docs/env.md
-  - crates/fleety-cli/src/server.rs
-tests:
-  - crates/fleety-cli/tests/cli_smoke.rs
-  - crates/fleety-daemon/tests/fleetyd_smoke.rs
-  - crates/fleety-server/tests/server_smoke.rs
--->
-
----
-### Requirement: Multi-owner reads preserve available results and owner failures
-
-A read requesting multiple owners SHALL query each requested owner independently, return every available result, identify every unavailable or failed owner, and exit non-zero when any requested owner failed. It SHALL NOT synthesize defaults for a failed owner or suppress successful owner data.
-
-#### Scenario: list remains useful with daemon offline
-
-- **WHEN** `fleety config list` can read CLI and Server settings but the selected Daemon is offline
-- **THEN** it SHALL output CLI and Server settings, report Daemon unavailable with remediation, and exit 1
+- **WHEN** bare `fleety` runs with an interactive terminal
+- **THEN** it SHALL open Chat with the current connection context
+- **WHEN** bare `fleety` runs with piped stdin or captured stdout
+- **THEN** it SHALL print help and SHALL NOT connect or consume input as a prompt
 
 
 <!-- @trace
@@ -405,151 +139,20 @@ tests:
 -->
 
 ---
-### Requirement: Configuration results identify the actual owner context
+### Requirement: The workspace keeps context and navigation visible
 
-Human and machine output for config reads and mutations SHALL identify the resolved owner, selected profile or device, and endpoint when applicable. This presentation requirement SHALL NOT expose credentials or change owner inference.
+The workspace SHALL display the selected profile, connection state, active provider/model, and current route in a persistent header. It SHALL provide Chat, Conversations, Settings, profile picker, contextual help, and command palette routes with a footer generated from the active route and modal state.
 
-#### Scenario: automatic server routing is visible
+#### Scenario: reconnect state remains understandable
 
-- **WHEN** the user sets a Server-owned key without `--owner`
-- **THEN** the result SHALL state that it was applied by the Server for the resolved profile and SHALL NOT imply that the CLI edited a local file
+- **WHEN** the active Server connection drops and automatic reconnection begins
+- **THEN** the header SHALL show Reconnecting with attempt/backoff information while the current input and route remain available
 
+##### Example: editable draft during backoff
 
-<!-- @trace
-source: redesign-cli-experience
-updated: 2026-07-29
-code:
-  - crates/fleety-tools/src/secure.rs
-  - crates/fleety-markdown/src/style.rs
-  - crates/fleety-cli/src/commands.rs
-  - crates/fleety-textarea/README.md
-  - scripts/check-spectra-archive-instructions.sh
-  - crates/fleety-cli/src/tui.rs
-  - docs/HANDOFF.md
-  - crates/fleety-textarea/src/editor_tests/keys.rs
-  - .agents/skills/spectra-archive/SKILL.md
-  - crates/fleety-textarea/src/editor_tests/mod.rs
-  - crates/fleety-daemon/src/main.rs
-  - crates/fleety-markdown/src/latex/mod.rs
-  - crates/fleety-tools/src/config.rs
-  - scripts/install-server.sh
-  - crates/fleety-markdown/src/latex/math_box.rs
-  - docs/STATUS.md
-  - crates/fleety-markdown/src/open_code_highlighter.rs
-  - crates/fleety-markdown/src/hyperlinks.rs
-  - .opencode/skills/spectra-archive/SKILL.md
-  - crates/fleety-inline/src/common.rs
-  - crates/fleety-server/Cargo.toml
-  - crates/fleety-textarea/LICENSE
-  - crates/fleety-markdown-core/Cargo.toml
-  - crates/fleety-inline/src/terminal.rs
-  - crates/fleety-textarea/src/editor_tests/planning.rs
-  - crates/fleety-cli/src/provider_tui.rs
-  - crates/fleety-textarea/Cargo.toml
-  - crates/fleety-markdown/src/parse.rs
-  - crates/fleety-cli/src/workspace.rs
-  - crates/agent-core/src/codex_responses.rs
-  - crates/fleety-cli/src/markdown.rs
-  - crates/fleety-server/src/main.rs
-  - crates/fleety-tools/src/oauth.rs
-  - Cargo.toml
-  - crates/fleety-tools/src/connection.rs
-  - crates/fleety-inline/src/scrollback.rs
-  - crates/fleety-textarea/src/editor_tests/viewport.rs
-  - AGENTS.md
-  - crates/fleety-cli/src/main.rs
-  - crates/fleety-markdown/src/syntax.rs
-  - crates/fleety-cli/src/acp.rs
-  - crates/fleety-textarea/src/editor_keys.rs
-  - crates/fleety-tools/src/provider_service.rs
-  - crates/fleety-tools/src/providers_config.rs
-  - crates/fleety-markdown/assets/tokyo-night.tmTheme
-  - crates/fleety-inline/src/segment.rs
-  - crates/fleety-markdown/src/latex/commands.rs
-  - crates/fleety-tools/src/lib.rs
-  - crates/fleety-tools/src/deps/runtime.rs
-  - crates/fleety-server/src/http.rs
-  - crates/fleety-markdown-core/LICENSE
-  - crates/fleety-server/src/mdns.rs
-  - .opencode/commands/spectra-archive.md
-  - crates/fleety-cli/src/server.rs
-  - crates/fleety-markdown/src/output.rs
-  - crates/fleety-inline/src/lib.rs
-  - crates/fleety-textarea/src/textarea.rs
-  - crates/fleety-textarea/src/editor.rs
-  - crates/fleety-markdown/src/streaming.rs
-  - crates/fleety-markdown/src/render.rs
-  - crates/fleety-inline/LICENSE
-  - crates/fleety-markdown/src/latex/tests.rs
-  - crates/fleety-markdown/src/buffers.rs
-  - crates/fleety-tools/src/device.rs
-  - crates/fleety-markdown/src/colors.rs
-  - docs/env.md
-  - crates/fleety-markdown/src/mermaid.rs
-  - crates/fleety-tools/src/transport.rs
-  - crates/fleety-markdown/src/checkpoint.rs
-  - crates/fleety-markdown/src/source_map.rs
-  - crates/fleety-markdown/Cargo.toml
-  - docs/roadmap.md
-  - crates/fleety-cli/src/provider_service.rs
-  - crates/fleety-inline/src/resize.rs
-  - crates/fleety-textarea/src/wrapping.rs
-  - crates/fleety-server/src/auth.rs
-  - crates/fleety-cli/Cargo.toml
-  - crates/fleety-markdown/src/latex/symbols.rs
-  - crates/fleety-markdown/src/latex/cursor.rs
-  - crates/fleety-markdown/src/lib.rs
-  - crates/fleety-server/src/conn.rs
-  - crates/fleety-textarea/src/render/mod.rs
-  - crates/fleety-tools/src/service.rs
-  - crates/fleety-textarea/src/lib.rs
-  - docs/tools.md
-  - crates/fleety-tools/Cargo.toml
-  - docs/acp.md
-  - crates/fleety-cli/src/config.rs
-  - crates/fleety-textarea/src/render/line_utils.rs
-  - crates/fleety-markdown/src/latex_delimiters.rs
-  - README.md
-  - crates/fleety-markdown/src/latex/environments.rs
-  - crates/fleety-daemon/Cargo.toml
-  - crates/fleety-inline/Cargo.toml
-  - crates/fleety-markdown/src/url_scan.rs
-  - crates/fleety-cli/src/auth.rs
-  - crates/fleety-tools/src/chrome.rs
-  - docs/design-cli-config.md
-  - crates/fleety-cli/src/input.rs
-  - .github/workflows/ci.yml
-  - crates/fleety-protocol/src/lib.rs
-  - crates/fleety-server/src/providers.rs
-  - crates/fleety-markdown/README.md
-  - crates/fleety-markdown/LICENSE
-  - crates/fleety-textarea/src/editor_tests/editing.rs
-  - crates/fleety-inline/src/tests.rs
-  - crates/fleety-inline/README.md
-  - crates/fleety-cli/src/config_panel.rs
-  - crates/fleety-markdown-core/src/lib.rs
-  - crates/fleety-daemon/src/winsvc.rs
-tests:
-  - crates/fleety-cli/src/test_terminal.rs
-  - crates/fleety-daemon/tests/fleetyd_smoke.rs
-  - crates/fleety-cli/tests/cli_smoke.rs
--->
-
----
-### Requirement: Provider credentials are Server-owned write-only secrets
-
-Provider snapshots SHALL omit every plaintext API key and SHALL expose only non-secret key-presence metadata. Provider Apply SHALL distinguish Keep, Set, and Clear explicitly, merge the operation under the Server configuration transaction lease, and fail closed when either endpoint does not support the write-only protocol. A redacted or omitted key SHALL mean Keep and SHALL never silently clear an existing Server credential.
-
-#### Scenario: redacted snapshot round-trip keeps the key
-
-- **GIVEN** an API Provider has a Server-stored key
-- **WHEN** an authenticated client reads and reapplies its unchanged Provider snapshot
-- **THEN** no response byte contains the key and the stored key remains unchanged
-
-#### Scenario: explicit clear removes the key
-
-- **WHEN** the user confirms `provider set <name> --clear-key` or the equivalent Provider editor action
-- **THEN** the apply payload SHALL carry a separate Clear intent and the Server SHALL remove only that Provider's key
+- **GIVEN** Chat contains draft `deploy` when the link drops
+- **WHEN** reconnect attempt 3 waits 2000 ms and the user types ` now` or opens Help
+- **THEN** the header shows `Reconnecting 3 (2000 ms)`, the draft becomes `deploy now`, and Help can open without cancelling recovery
 
 
 <!-- @trace
@@ -673,157 +276,15 @@ tests:
 -->
 
 ---
-### Requirement: Provider credential operations require an authenticated owner boundary
+### Requirement: Workspace key behavior is state-consistent
 
-The Server SHALL reject model-catalog operations before reading or using any stored Provider API key or OAuth token when Server authentication is disabled or the caller is not authenticated. The failure SHALL be typed and actionable and SHALL cause zero outbound Provider requests.
+Esc SHALL close the active modal or navigate back one route; `?` SHALL open contextual help; Ctrl+K SHALL open the command palette. Ctrl+C SHALL request cancellation while a turn is active and SHALL only exit while idle or after explicit confirmation when unsent or dirty state exists.
 
-#### Scenario: auth-disabled catalog cannot proxy a stored key
+#### Scenario: Esc does not discard hidden state
 
-- **GIVEN** a Provider has a stored key and Server authentication is disabled
-- **WHEN** a client requests that Provider's model catalog
-- **THEN** the Server SHALL return an unauthenticated or auth-disabled error without contacting the Provider endpoint
-
-
-<!-- @trace
-source: redesign-cli-experience
-updated: 2026-07-29
-code:
-  - crates/fleety-tools/src/secure.rs
-  - crates/fleety-markdown/src/style.rs
-  - crates/fleety-cli/src/commands.rs
-  - crates/fleety-textarea/README.md
-  - scripts/check-spectra-archive-instructions.sh
-  - crates/fleety-cli/src/tui.rs
-  - docs/HANDOFF.md
-  - crates/fleety-textarea/src/editor_tests/keys.rs
-  - .agents/skills/spectra-archive/SKILL.md
-  - crates/fleety-textarea/src/editor_tests/mod.rs
-  - crates/fleety-daemon/src/main.rs
-  - crates/fleety-markdown/src/latex/mod.rs
-  - crates/fleety-tools/src/config.rs
-  - scripts/install-server.sh
-  - crates/fleety-markdown/src/latex/math_box.rs
-  - docs/STATUS.md
-  - crates/fleety-markdown/src/open_code_highlighter.rs
-  - crates/fleety-markdown/src/hyperlinks.rs
-  - .opencode/skills/spectra-archive/SKILL.md
-  - crates/fleety-inline/src/common.rs
-  - crates/fleety-server/Cargo.toml
-  - crates/fleety-textarea/LICENSE
-  - crates/fleety-markdown-core/Cargo.toml
-  - crates/fleety-inline/src/terminal.rs
-  - crates/fleety-textarea/src/editor_tests/planning.rs
-  - crates/fleety-cli/src/provider_tui.rs
-  - crates/fleety-textarea/Cargo.toml
-  - crates/fleety-markdown/src/parse.rs
-  - crates/fleety-cli/src/workspace.rs
-  - crates/agent-core/src/codex_responses.rs
-  - crates/fleety-cli/src/markdown.rs
-  - crates/fleety-server/src/main.rs
-  - crates/fleety-tools/src/oauth.rs
-  - Cargo.toml
-  - crates/fleety-tools/src/connection.rs
-  - crates/fleety-inline/src/scrollback.rs
-  - crates/fleety-textarea/src/editor_tests/viewport.rs
-  - AGENTS.md
-  - crates/fleety-cli/src/main.rs
-  - crates/fleety-markdown/src/syntax.rs
-  - crates/fleety-cli/src/acp.rs
-  - crates/fleety-textarea/src/editor_keys.rs
-  - crates/fleety-tools/src/provider_service.rs
-  - crates/fleety-tools/src/providers_config.rs
-  - crates/fleety-markdown/assets/tokyo-night.tmTheme
-  - crates/fleety-inline/src/segment.rs
-  - crates/fleety-markdown/src/latex/commands.rs
-  - crates/fleety-tools/src/lib.rs
-  - crates/fleety-tools/src/deps/runtime.rs
-  - crates/fleety-server/src/http.rs
-  - crates/fleety-markdown-core/LICENSE
-  - crates/fleety-server/src/mdns.rs
-  - .opencode/commands/spectra-archive.md
-  - crates/fleety-cli/src/server.rs
-  - crates/fleety-markdown/src/output.rs
-  - crates/fleety-inline/src/lib.rs
-  - crates/fleety-textarea/src/textarea.rs
-  - crates/fleety-textarea/src/editor.rs
-  - crates/fleety-markdown/src/streaming.rs
-  - crates/fleety-markdown/src/render.rs
-  - crates/fleety-inline/LICENSE
-  - crates/fleety-markdown/src/latex/tests.rs
-  - crates/fleety-markdown/src/buffers.rs
-  - crates/fleety-tools/src/device.rs
-  - crates/fleety-markdown/src/colors.rs
-  - docs/env.md
-  - crates/fleety-markdown/src/mermaid.rs
-  - crates/fleety-tools/src/transport.rs
-  - crates/fleety-markdown/src/checkpoint.rs
-  - crates/fleety-markdown/src/source_map.rs
-  - crates/fleety-markdown/Cargo.toml
-  - docs/roadmap.md
-  - crates/fleety-cli/src/provider_service.rs
-  - crates/fleety-inline/src/resize.rs
-  - crates/fleety-textarea/src/wrapping.rs
-  - crates/fleety-server/src/auth.rs
-  - crates/fleety-cli/Cargo.toml
-  - crates/fleety-markdown/src/latex/symbols.rs
-  - crates/fleety-markdown/src/latex/cursor.rs
-  - crates/fleety-markdown/src/lib.rs
-  - crates/fleety-server/src/conn.rs
-  - crates/fleety-textarea/src/render/mod.rs
-  - crates/fleety-tools/src/service.rs
-  - crates/fleety-textarea/src/lib.rs
-  - docs/tools.md
-  - crates/fleety-tools/Cargo.toml
-  - docs/acp.md
-  - crates/fleety-cli/src/config.rs
-  - crates/fleety-textarea/src/render/line_utils.rs
-  - crates/fleety-markdown/src/latex_delimiters.rs
-  - README.md
-  - crates/fleety-markdown/src/latex/environments.rs
-  - crates/fleety-daemon/Cargo.toml
-  - crates/fleety-inline/Cargo.toml
-  - crates/fleety-markdown/src/url_scan.rs
-  - crates/fleety-cli/src/auth.rs
-  - crates/fleety-tools/src/chrome.rs
-  - docs/design-cli-config.md
-  - crates/fleety-cli/src/input.rs
-  - .github/workflows/ci.yml
-  - crates/fleety-protocol/src/lib.rs
-  - crates/fleety-server/src/providers.rs
-  - crates/fleety-markdown/README.md
-  - crates/fleety-markdown/LICENSE
-  - crates/fleety-textarea/src/editor_tests/editing.rs
-  - crates/fleety-inline/src/tests.rs
-  - crates/fleety-inline/README.md
-  - crates/fleety-cli/src/config_panel.rs
-  - crates/fleety-markdown-core/src/lib.rs
-  - crates/fleety-daemon/src/winsvc.rs
-tests:
-  - crates/fleety-cli/src/test_terminal.rs
-  - crates/fleety-daemon/tests/fleetyd_smoke.rs
-  - crates/fleety-cli/tests/cli_smoke.rs
--->
-
----
-### Requirement: Structured configuration mutations require an authenticated owner boundary
-
-The Server SHALL apply one shared authentication gate to structured `ConfigApply` before dispatching to the Server or a selected Device owner. Local targets SHALL retain their `invalid` response. When Server authentication is disabled, a Server target SHALL reject Provider payloads and any non-`Keep` change, while a Device target SHALL reject every `ConfigApply`, including empty and all-`Keep` payloads because the Device owner persists every apply. Rejection SHALL return a typed actionable error and SHALL NOT write Server configuration, route `RunTool`, or otherwise contact a Daemon owner. When authentication is required, the existing authenticated connection and owner validation SHALL continue unchanged.
-
-#### Scenario: auth-disabled Device apply sends no owner frame
-
-- **GIVEN** Server authentication is disabled and device `remote-B` is connected
-- **WHEN** a client sends structured `ConfigApply` for `remote-B`
-- **THEN** the Server SHALL reject it before owner dispatch and the device SHALL receive zero `RunTool` frames
-
-#### Scenario: auth-disabled owner matrix preserves non-writing behavior
-
-- **GIVEN** Server authentication is disabled
-- **WHEN** a client applies an empty or all-`Keep` payload to the Server target
-- **THEN** the no-op SHALL continue without a write
-- **AND WHEN** the same payload targets a Device
-- **THEN** the Server SHALL reject it before owner dispatch
-- **AND WHEN** the payload targets Local
-- **THEN** the Server SHALL retain the `invalid` owner response
+- **GIVEN** a Settings editor has an unsaved value
+- **WHEN** the user presses Esc
+- **THEN** the editor SHALL close or ask for a dirty-state decision and SHALL NOT silently discard the value or exit the workspace
 
 
 <!-- @trace
@@ -947,14 +408,151 @@ tests:
 -->
 
 ---
-### Requirement: Provider and model mutations report activation timing
+### Requirement: Workspace rendering is responsive and Unicode-safe
 
-A successful Provider or model mutation SHALL report `NextConnection`. Read-only Provider and model queries SHALL report no effect.
+Supported terminal sizes SHALL render header, active content, status/error details, and contextual keys without overlap. Below the minimum size, the workspace SHALL render a stable resize message and retain quit/help handling. Rendering SHALL account for CJK and emoji display width and SHALL NOT emit replacement glyphs.
 
-#### Scenario: model role update names its effect
+#### Scenario: size and text matrix renders safely
 
-- **WHEN** `fleety model set` succeeds
-- **THEN** human output SHALL explain that the change applies on the next connection and JSON SHALL encode the same effect
+- **WHEN** the workspace renders at 120×30, 80×24, 50×16, and a below-minimum size with ASCII, CJK, emoji, and long endpoints
+- **THEN** supported sizes SHALL keep essential context and actions visible, and the below-minimum size SHALL show only resize guidance without panic
+
+
+<!-- @trace
+source: redesign-cli-experience
+updated: 2026-07-29
+code:
+  - crates/fleety-tools/src/secure.rs
+  - crates/fleety-markdown/src/style.rs
+  - crates/fleety-cli/src/commands.rs
+  - crates/fleety-textarea/README.md
+  - scripts/check-spectra-archive-instructions.sh
+  - crates/fleety-cli/src/tui.rs
+  - docs/HANDOFF.md
+  - crates/fleety-textarea/src/editor_tests/keys.rs
+  - .agents/skills/spectra-archive/SKILL.md
+  - crates/fleety-textarea/src/editor_tests/mod.rs
+  - crates/fleety-daemon/src/main.rs
+  - crates/fleety-markdown/src/latex/mod.rs
+  - crates/fleety-tools/src/config.rs
+  - scripts/install-server.sh
+  - crates/fleety-markdown/src/latex/math_box.rs
+  - docs/STATUS.md
+  - crates/fleety-markdown/src/open_code_highlighter.rs
+  - crates/fleety-markdown/src/hyperlinks.rs
+  - .opencode/skills/spectra-archive/SKILL.md
+  - crates/fleety-inline/src/common.rs
+  - crates/fleety-server/Cargo.toml
+  - crates/fleety-textarea/LICENSE
+  - crates/fleety-markdown-core/Cargo.toml
+  - crates/fleety-inline/src/terminal.rs
+  - crates/fleety-textarea/src/editor_tests/planning.rs
+  - crates/fleety-cli/src/provider_tui.rs
+  - crates/fleety-textarea/Cargo.toml
+  - crates/fleety-markdown/src/parse.rs
+  - crates/fleety-cli/src/workspace.rs
+  - crates/agent-core/src/codex_responses.rs
+  - crates/fleety-cli/src/markdown.rs
+  - crates/fleety-server/src/main.rs
+  - crates/fleety-tools/src/oauth.rs
+  - Cargo.toml
+  - crates/fleety-tools/src/connection.rs
+  - crates/fleety-inline/src/scrollback.rs
+  - crates/fleety-textarea/src/editor_tests/viewport.rs
+  - AGENTS.md
+  - crates/fleety-cli/src/main.rs
+  - crates/fleety-markdown/src/syntax.rs
+  - crates/fleety-cli/src/acp.rs
+  - crates/fleety-textarea/src/editor_keys.rs
+  - crates/fleety-tools/src/provider_service.rs
+  - crates/fleety-tools/src/providers_config.rs
+  - crates/fleety-markdown/assets/tokyo-night.tmTheme
+  - crates/fleety-inline/src/segment.rs
+  - crates/fleety-markdown/src/latex/commands.rs
+  - crates/fleety-tools/src/lib.rs
+  - crates/fleety-tools/src/deps/runtime.rs
+  - crates/fleety-server/src/http.rs
+  - crates/fleety-markdown-core/LICENSE
+  - crates/fleety-server/src/mdns.rs
+  - .opencode/commands/spectra-archive.md
+  - crates/fleety-cli/src/server.rs
+  - crates/fleety-markdown/src/output.rs
+  - crates/fleety-inline/src/lib.rs
+  - crates/fleety-textarea/src/textarea.rs
+  - crates/fleety-textarea/src/editor.rs
+  - crates/fleety-markdown/src/streaming.rs
+  - crates/fleety-markdown/src/render.rs
+  - crates/fleety-inline/LICENSE
+  - crates/fleety-markdown/src/latex/tests.rs
+  - crates/fleety-markdown/src/buffers.rs
+  - crates/fleety-tools/src/device.rs
+  - crates/fleety-markdown/src/colors.rs
+  - docs/env.md
+  - crates/fleety-markdown/src/mermaid.rs
+  - crates/fleety-tools/src/transport.rs
+  - crates/fleety-markdown/src/checkpoint.rs
+  - crates/fleety-markdown/src/source_map.rs
+  - crates/fleety-markdown/Cargo.toml
+  - docs/roadmap.md
+  - crates/fleety-cli/src/provider_service.rs
+  - crates/fleety-inline/src/resize.rs
+  - crates/fleety-textarea/src/wrapping.rs
+  - crates/fleety-server/src/auth.rs
+  - crates/fleety-cli/Cargo.toml
+  - crates/fleety-markdown/src/latex/symbols.rs
+  - crates/fleety-markdown/src/latex/cursor.rs
+  - crates/fleety-markdown/src/lib.rs
+  - crates/fleety-server/src/conn.rs
+  - crates/fleety-textarea/src/render/mod.rs
+  - crates/fleety-tools/src/service.rs
+  - crates/fleety-textarea/src/lib.rs
+  - docs/tools.md
+  - crates/fleety-tools/Cargo.toml
+  - docs/acp.md
+  - crates/fleety-cli/src/config.rs
+  - crates/fleety-textarea/src/render/line_utils.rs
+  - crates/fleety-markdown/src/latex_delimiters.rs
+  - README.md
+  - crates/fleety-markdown/src/latex/environments.rs
+  - crates/fleety-daemon/Cargo.toml
+  - crates/fleety-inline/Cargo.toml
+  - crates/fleety-markdown/src/url_scan.rs
+  - crates/fleety-cli/src/auth.rs
+  - crates/fleety-tools/src/chrome.rs
+  - docs/design-cli-config.md
+  - crates/fleety-cli/src/input.rs
+  - .github/workflows/ci.yml
+  - crates/fleety-protocol/src/lib.rs
+  - crates/fleety-server/src/providers.rs
+  - crates/fleety-markdown/README.md
+  - crates/fleety-markdown/LICENSE
+  - crates/fleety-textarea/src/editor_tests/editing.rs
+  - crates/fleety-inline/src/tests.rs
+  - crates/fleety-inline/README.md
+  - crates/fleety-cli/src/config_panel.rs
+  - crates/fleety-markdown-core/src/lib.rs
+  - crates/fleety-daemon/src/winsvc.rs
+tests:
+  - crates/fleety-cli/src/test_terminal.rs
+  - crates/fleety-daemon/tests/fleetyd_smoke.rs
+  - crates/fleety-cli/tests/cli_smoke.rs
+-->
+
+---
+### Requirement: Notices preserve actionable errors
+
+Errors SHALL be represented as notices with severity, summary, optional details, remediation, and persistence policy. A new transient status SHALL NOT overwrite an unresolved mutation error or conflict; the user SHALL be able to inspect details, retry, or dismiss it.
+
+#### Scenario: catalog failure survives navigation
+
+- **WHEN** model discovery fails and the user opens then closes contextual help
+- **THEN** the model error and Retry/manual-entry remediation SHALL remain available until retried or dismissed
+
+##### Example: unresolved catalog notice
+
+- **GIVEN** catalog loading failed with `backend unavailable`
+- **WHEN** the user opens Help, returns, and a transient Connected status arrives
+- **THEN** the original details plus Retry and Enter model ID actions remain the visible unresolved notice
 
 <!-- @trace
 source: redesign-cli-experience
