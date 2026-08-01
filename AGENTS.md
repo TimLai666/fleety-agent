@@ -90,6 +90,23 @@ no Fleety crate). This file holds things that aren't derivable from the code.
 
 ## Follow-ups
 
+### [2026-08-01] — CI's clippy gate cannot be run locally on Windows
+
+- **Where:** `crates/fleety-tools/src/connection.rs:306` (`dir`),
+  `crates/fleety-tools/src/service.rs:934` (`created`)
+- **What:** Both bindings are read only inside a `#[cfg(unix)]` block, so on
+  Windows they are genuinely unused and `cargo clippy -- -D warnings` errors.
+  CI runs on `ubuntu-latest`, where both are used, so the gate is green there —
+  the failure is invisible to CI and hits only Windows developers, who then
+  cannot run `cargo clippy --workspace --all-targets -- -D warnings` (CI's exact
+  command) before pushing. Because dependents build `fleety-tools` first, it
+  also breaks a clippy run scoped to `fleety-server` or the CLI. Present on
+  `main` at `6188624`, independent of any local change.
+- **Suggestion:** mark both with `#[cfg_attr(not(unix), allow(unused))]` (or
+  `cfg`-gate the binding itself) so the lint gate is runnable on every platform
+  the project is developed on, not just CI's.
+- **Status:** pending
+
 ### [2026-07-28] — Reconnect journal: a crash between the drift receipt and the reap bricks startup
 
 - **Where:** `crates/fleety-daemon/src/main.rs` — `reject_frozen_authenticated_reconnect`

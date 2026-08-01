@@ -243,7 +243,7 @@ async fn collect_conversation_hooks(
                 let path = std::path::Path::new(base)
                     .join(".claude")
                     .join("settings.json");
-                let args = serde_json::json!({ "file": path.to_string_lossy() });
+                let args = serde_json::json!({ "path": path.to_string_lossy() });
                 if let Ok(res) =
                     bridge::route_run_tool_via(&sender, pending, "read_file", args).await
                 {
@@ -3380,7 +3380,7 @@ async fn build_instruction_preamble_remote(
         let args = serde_json::json!({
             "device": device,
             "tool": "read_file",
-            "args": { "file": path.to_string_lossy() },
+            "args": { "path": path.to_string_lossy() },
         });
         if let Ok(res) = tools.call("device_exec", args).await {
             if let Some(content) = res.get("content").and_then(|c| c.as_str()) {
@@ -4730,6 +4730,67 @@ mod tests {
         assert_eq!(got[0].command, "p.sh");
         assert_eq!(got[0].scope, crate::hooks_compat::HookScope::Project);
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn collect_conversation_hooks_cross_device_reads_settings_via_bridge() {
+        // Regression: the bridge read must name read_file's argument `path`.
+        // A wrong key makes the daemon error, the `if let Ok(..)` swallows it,
+        // and the origin device's hooks silently vanish — so the fake daemon
+        // here rejects anything but `path`, exactly like the real tool.
+        let hub = crate::bridge::new_hub();
+        let pending = crate::bridge::new_pending();
+        let (tx, mut frames) = tokio::sync::mpsc::unbounded_channel();
+        hub.lock().await.insert("dev2".to_string(), tx);
+        let daemon = {
+            let pending = Arc::clone(&pending);
+            tokio::spawn(async move {
+                while let Some(msg) = frames.recv().await {
+                    let tokio_tungstenite::tungstenite::Message::Text(text) = msg else {
+                        continue;
+                    };
+                    let Ok(fleety_protocol::ServerMsg::RunTool {
+                        call_id,
+                        tool,
+                        args_json,
+                    }) = serde_json::from_str(&text)
+                    else {
+                        continue;
+                    };
+                    let args: serde_json::Value =
+                        serde_json::from_str(&args_json).unwrap_or(serde_json::Value::Null);
+                    let path = args.get("path").and_then(serde_json::Value::as_str);
+                    let reply = match (tool.as_str(), path) {
+                        ("read_file", Some(p)) if p.ends_with("settings.json") => Ok(
+                            serde_json::json!({ "content": r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"remote.sh"}]}]}}"# }),
+                        ),
+                        _ => Err(format!(
+                            "missing required string argument 'path' (got {args_json})"
+                        )),
+                    };
+                    if let Some(reply_tx) = pending.lock().await.remove(&call_id) {
+                        let _ = reply_tx.send(reply);
+                    }
+                }
+            })
+        };
+        let got = collect_conversation_hooks(
+            Some("dev2"),
+            Some("/home/bob/proj"),
+            None,
+            None,
+            &hub,
+            &pending,
+        )
+        .await;
+        daemon.abort();
+        assert_eq!(
+            got.len(),
+            1,
+            "the origin device's project hook is collected"
+        );
+        assert_eq!(got[0].command, "remote.sh");
+        assert_eq!(got[0].scope, crate::hooks_compat::HookScope::Project);
     }
 
     // A minimal tool to wrap in the hook-registry tests below.
@@ -6123,10 +6184,19 @@ mod tests {
                     risk: RiskLevel::Read,
                 }
             }
-            async fn call(
-                &self,
-                _args: serde_json::Value,
-            ) -> agent_core::Result<serde_json::Value> {
+            async fn call(&self, args: serde_json::Value) -> agent_core::Result<serde_json::Value> {
+                // Regression: reject anything but read_file's real `path`
+                // argument, so a wrong key fails here instead of being
+                // swallowed by the caller's best-effort `if let Ok(..)`.
+                assert_eq!(args["tool"], "read_file");
+                assert_eq!(args["device"], "dev2");
+                let path = args["args"]["path"].as_str().ok_or_else(|| {
+                    agent_core::CoreError::Message(format!(
+                        "missing required string argument 'path' (got {})",
+                        args["args"]
+                    ))
+                })?;
+                assert!(path.ends_with(".md"), "reads an instruction file: {path}");
                 Ok(serde_json::json!({ "content": "remote-rule" }))
             }
         }
