@@ -263,8 +263,6 @@ pub async fn run_turn_streaming_cached(
     cache: &mut Option<CompactionCache>,
     cancel: Option<&AtomicBool>,
 ) -> Result<TurnOutcome> {
-    let specs = tools.specs();
-
     // Voice mode: teach the model the dual-channel contract via the system
     // prompt before the loop. Off → nothing injected, no extra tokens.
     if config.voice {
@@ -276,6 +274,12 @@ pub async fn run_turn_streaming_cached(
     let mut turn_usage: Option<TokenUsage> = None;
 
     for step in 1..=config.max_steps {
+        // Re-read the offered tools every step, not once per turn: a tool the
+        // model activates mid-turn (a tool-search entry point widening the set)
+        // must reach the very next model call, or discovering a capability would
+        // leave it unusable until a later turn. `risk_of` below reads the same
+        // snapshot, so gating stays consistent with what was offered.
+        let specs = tools.specs();
         // Cancellation checkpoint: before each model call (compaction included —
         // it also spends a provider call). `steps` counts completed provider
         // calls, so a turn cancelled here reports `step - 1`.
@@ -1069,6 +1073,102 @@ mod tests {
         .expect("turn ok");
 
         assert!(outcome.usage.is_none());
+    }
+
+    /// A tool that widens the offered set when called — the shape of a real
+    /// tool-search entry point, reduced to the part the loop must cooperate with.
+    struct ActivatingTool {
+        active: crate::tools::ActiveTools,
+        grants: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for ActivatingTool {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                name: "tool_search".to_string(),
+                description: "activate more tools".to_string(),
+                parameters: json!({"type": "object"}),
+                risk: RiskLevel::Read,
+            }
+        }
+        async fn call(&self, _args: Value) -> Result<Value> {
+            self.active.activate([self.grants.to_string()]);
+            Ok(json!({ "activated": self.grants }))
+        }
+    }
+
+    /// Records the tool names offered on each provider call, so a test can prove
+    /// a mid-turn activation reached the very next call of the same turn.
+    struct OfferedSpecRecorder {
+        seen: std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+        responses: std::sync::Mutex<std::collections::VecDeque<ModelResponse>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::model::ModelProvider for OfferedSpecRecorder {
+        async fn complete(
+            &self,
+            _messages: &[Message],
+            tools: &[ToolSpec],
+        ) -> Result<ModelResponse> {
+            let mut names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
+            names.sort();
+            self.seen.lock().unwrap().push(names);
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| CoreError::Provider("script exhausted".into()))
+        }
+    }
+
+    /// A group activated at one step must be visible to the next model call of
+    /// the SAME turn — otherwise discovery is useless in the case it exists for.
+    #[tokio::test]
+    async fn activation_mid_turn_reaches_the_next_call_of_the_same_turn() {
+        let mut tools = ToolRegistry::new();
+        let active = tools.active_tools();
+        tools.register(Box::new(ActivatingTool {
+            active: active.clone(),
+            grants: "echo",
+        }));
+        tools.register(Box::new(EchoTool));
+        // Open with the search entry point only; `echo` is registered but hidden.
+        active.restrict_to(["tool_search".to_string()]);
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = OfferedSpecRecorder {
+            seen: std::sync::Arc::clone(&seen),
+            responses: std::sync::Mutex::new(
+                [tool_call_response("tool_search"), final_response()]
+                    .into_iter()
+                    .collect(),
+            ),
+        };
+
+        let mut messages = vec![Message::user("do it")];
+        let mut events = EventLog::new();
+        run_turn(
+            &provider,
+            &tools,
+            &mut messages,
+            &mut events,
+            &LoopConfig::default(),
+            Policy::FullAccess,
+            &mut AutoApprove,
+        )
+        .await
+        .expect("turn ok");
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "two provider calls");
+        assert_eq!(seen[0], vec!["tool_search"], "opens with the search entry");
+        assert_eq!(
+            seen[1],
+            vec!["echo", "tool_search"],
+            "the activated tool is offered on the next call of the same turn"
+        );
     }
 
     /// Counts `complete` calls, so a test can assert compaction made no provider

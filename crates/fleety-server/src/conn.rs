@@ -3485,6 +3485,15 @@ pub(crate) async fn drive_turn(
     // every turn/reload). A missing/stale cache safely falls back to a full
     // summary. Saved back after the turn; a save failure is non-fatal.
     let mut compaction = storage.load_compaction(device_id, conversation);
+    // Progressive tool loading: open on the resident set plus whatever this
+    // conversation has activated before. `tool_search` widens this handle during
+    // the turn, and the loop re-reads the offered specs each step, so a group
+    // found mid-turn is usable immediately.
+    let active_tools = tools.active_tools();
+    crate::tool_groups::apply_activation(
+        &active_tools,
+        storage.load_active_tools(device_id, conversation).as_ref(),
+    );
     let outcome = run_turn_streaming_cached(
         provider,
         tools,
@@ -3506,6 +3515,13 @@ pub(crate) async fn drive_turn(
     if let Some(cache) = &compaction {
         if let Err(e) = storage.save_compaction(device_id, conversation, cache) {
             tracing::warn!(%conversation, error = %e, "could not persist compaction cache");
+        }
+    }
+    // Persist what the turn activated, so a group found once need not be found
+    // again. Non-fatal: losing this only costs a future search.
+    if let Some(active) = active_tools.snapshot() {
+        if let Err(e) = storage.save_active_tools(device_id, conversation, &active) {
+            tracing::warn!(%conversation, error = %e, "could not persist activated tools");
         }
     }
     for event in events.events() {
@@ -3784,6 +3800,11 @@ pub(crate) fn build_full_registry(
         workspace.to_path_buf(),
         storage.backups_dir(),
     );
+    // The model's route from the resident set to everything else. Holds the
+    // registry's own activation handle, so a search widens what the next model
+    // call of the same turn is shown.
+    let active = tools.active_tools();
+    tools.register(Box::new(crate::tool_groups::ToolSearch::new(active)));
     tools
 }
 
@@ -4815,6 +4836,65 @@ mod tests {
         );
     }
 
+    /// Build the registry a real connection gets, for tests that need the whole
+    /// tool surface rather than the base one.
+    fn full_registry_for_test(home: &std::path::Path) -> (Arc<Storage>, ToolRegistry) {
+        let storage = Arc::new(Storage::new(home.to_path_buf()));
+        let workspace = std::env::current_dir().expect("cwd");
+        let tools = build_full_registry(
+            &storage,
+            &workspace,
+            "dev1",
+            &crate::bridge::new_hub(),
+            &crate::bridge::new_pending(),
+            &crate::bridge::new_handles(),
+            &Arc::new(crate::auth::AuthStore::load(
+                home.join("auth.toml"),
+                None,
+                false,
+            )),
+            &crate::bridge::new_device_tools(),
+            &[],
+            Vec::new(),
+        );
+        (storage, tools)
+    }
+
+    /// The resident set and the groups must between them name every registered
+    /// tool, and name nothing that is not registered. Without this, adding a tool
+    /// would silently make it unreachable — the model would never be shown it and
+    /// no search would ever surface it.
+    #[tokio::test]
+    async fn groups_cover_every_registered_tool() {
+        use std::collections::BTreeSet;
+        let home = std::env::temp_dir().join(format!("fleety-groups-{}", uuid::Uuid::new_v4()));
+        let (_storage, tools) = full_registry_for_test(&home);
+
+        let registered: BTreeSet<String> =
+            tools.specs().into_iter().map(|spec| spec.name).collect();
+        let mut classified: BTreeSet<String> = crate::tool_groups::RESIDENT
+            .iter()
+            .map(|t| t.to_string())
+            .collect();
+        for group in crate::tool_groups::GROUPS {
+            classified.extend(group.tools.iter().map(|t| t.to_string()));
+        }
+        // The search entry point is resident by construction, never in a group.
+        classified.insert(crate::tool_groups::SEARCH_TOOL.to_string());
+
+        let unclassified: Vec<&String> = registered.difference(&classified).collect();
+        let phantom: Vec<&String> = classified.difference(&registered).collect();
+        assert!(
+            unclassified.is_empty(),
+            "registered tools missing from RESIDENT/GROUPS: {unclassified:?}"
+        );
+        assert!(
+            phantom.is_empty(),
+            "RESIDENT/GROUPS name tools that are not registered: {phantom:?}"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     /// Measure the whole per-request harness footprint: the system prompt plus
     /// every tool schema the model is shown. Run with `--nocapture` to print it.
     ///
@@ -4841,29 +4921,54 @@ mod tests {
             &[],
             Vec::new(),
         );
-        let specs = tools.specs();
-        let tool_bytes: usize = specs
-            .iter()
-            .map(|s| s.description.len() + s.parameters.to_string().len() + s.name.len() + 60)
-            .sum();
+        let wire = |specs: &[agent_core::ToolSpec]| -> usize {
+            specs
+                .iter()
+                .map(|s| s.description.len() + s.parameters.to_string().len() + s.name.len() + 60)
+                .sum()
+        };
+        // Everything registered — what every request cost before this change.
+        let registered = tools.specs();
+        let registered_bytes = wire(&registered);
+        // What a fresh conversation is actually offered.
+        crate::tool_groups::apply_activation(&tools.active_tools(), None);
+        let offered = tools.specs();
+        let offered_bytes = wire(&offered);
+
         let prompt = storage
             .system_prompt_for(&storage.acting_for_device("dev1"))
             .expect("system prompt");
-        let total = prompt.len() + tool_bytes;
+        let total = prompt.len() + offered_bytes;
 
         println!("\n=== per-request harness footprint ===");
         println!(
-            "system prompt : {} chars / {} bytes",
+            "system prompt   : {} chars / {} bytes",
             prompt.chars().count(),
             prompt.len()
         );
-        println!("tool schemas  : {} tools / {tool_bytes} bytes", specs.len());
-        println!("total         : {total} bytes (~{} KB)", total / 1024);
-        println!("est. tokens   : ~{} (bytes/4)", total / 4);
+        println!(
+            "tools offered   : {} tools / {offered_bytes} bytes",
+            offered.len()
+        );
+        println!(
+            "tools registered: {} tools / {registered_bytes} bytes (deferred until searched)",
+            registered.len()
+        );
+        println!("total per call  : {total} bytes (~{} KB)", total / 1024);
+        println!("est. tokens     : ~{} (bytes/4)", total / 4);
+        println!(
+            "schema deferred : {} bytes (~{} tokens)",
+            registered_bytes - offered_bytes,
+            (registered_bytes - offered_bytes) / 4
+        );
 
         assert!(
-            specs.len() > 50,
+            registered.len() > 50,
             "full registry should be the whole surface"
+        );
+        assert!(
+            offered.len() < registered.len(),
+            "a fresh conversation is offered less than the whole registry"
         );
         let _ = std::fs::remove_dir_all(&home);
     }

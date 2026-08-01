@@ -57,6 +57,7 @@ mod skills;
 mod ssh;
 mod storage;
 mod subagent;
+mod tool_groups;
 mod tools;
 mod web;
 mod wiki;

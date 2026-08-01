@@ -1600,6 +1600,46 @@ impl Storage {
         Ok(())
     }
 
+    /// Path to a conversation's activated tool set, alongside its `.jsonl`.
+    fn active_tools_path(&self, device_id: &str, conversation_id: &str) -> PathBuf {
+        self.conversation_path(device_id, conversation_id)
+            .with_extension("tools.json")
+    }
+
+    /// Load the tools a conversation has activated. Missing or unparsable →
+    /// `None`, which the caller treats as "nothing activated yet" and opens on
+    /// the resident set. Activation is an optimization, never a correctness
+    /// requirement, so corrupt state must not fail a conversation.
+    pub fn load_active_tools(
+        &self,
+        device_id: &str,
+        conversation_id: &str,
+    ) -> Option<std::collections::BTreeSet<String>> {
+        let text = fs::read_to_string(self.active_tools_path(device_id, conversation_id)).ok()?;
+        serde_json::from_str(&text).ok()
+    }
+
+    /// Persist the tools a conversation has activated, so a group found once
+    /// stays available across later turns and across a restart.
+    pub fn save_active_tools(
+        &self,
+        device_id: &str,
+        conversation_id: &str,
+        active: &std::collections::BTreeSet<String>,
+    ) -> Result<()> {
+        let path = self.active_tools_path(device_id, conversation_id);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| {
+                CoreError::Message(format!("cannot create {}: {e}", parent.display()))
+            })?;
+        }
+        let text = serde_json::to_string(active)
+            .map_err(|e| CoreError::Message(format!("serialize active tools failed: {e}")))?;
+        fs::write(&path, text)
+            .map_err(|e| CoreError::Message(format!("write {} failed: {e}", path.display())))?;
+        Ok(())
+    }
+
     /// Path to a conversation's in-flight turn journal (durable record of the
     /// current turn's events, removed once the turn completes).
     fn journal_path(&self, device_id: &str, conversation_id: &str) -> PathBuf {
@@ -1813,6 +1853,34 @@ mod tests {
         // Corrupt file → None (safe fallback to a full summary).
         std::fs::write(storage.compaction_path("dev", "conv"), "not json").expect("clobber");
         assert!(storage.load_compaction("dev", "conv").is_none());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A group activated once stays available across later turns and a restart;
+    /// unreadable state degrades to "nothing activated" rather than erroring.
+    #[test]
+    fn active_tools_round_trip_and_degrade_safely() {
+        use std::collections::BTreeSet;
+        let home = temp_home();
+        let storage = Storage::new(home.clone());
+        assert!(storage.load_active_tools("dev", "conv").is_none()); // missing → None
+
+        let active: BTreeSet<String> = ["browser_open", "browser_navigate"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        storage
+            .save_active_tools("dev", "conv", &active)
+            .expect("save");
+        assert_eq!(
+            storage.load_active_tools("dev", "conv"),
+            Some(active),
+            "a restart finds the same activated set"
+        );
+
+        // Corrupt file → None: treated as unset, never as a failure.
+        std::fs::write(storage.active_tools_path("dev", "conv"), "not json").expect("clobber");
+        assert!(storage.load_active_tools("dev", "conv").is_none());
         let _ = std::fs::remove_dir_all(&home);
     }
 

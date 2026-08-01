@@ -45,7 +45,7 @@ pub use subagent::{
     register_orchestration, SpawnRequest, SubagentHost, SubagentManager, SubagentMode,
     SubagentState,
 };
-pub use tools::{Tool, ToolRegistry};
+pub use tools::{ActiveTools, Tool, ToolRegistry};
 
 /// Version of agent-core. In M0 this also stands in for the runtime version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
