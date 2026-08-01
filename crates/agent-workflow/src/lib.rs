@@ -389,9 +389,9 @@ mod tests {
     impl SubagentHost for EchoHost {
         fn resolve_provider(&self, _tier: &str) -> Arc<dyn ModelProvider> {
             // Each subagent run pops one scripted reply.
-            Arc::new(MockProvider::new(vec![ModelResponse {
-                message: Message::assistant("ok"),
-            }]))
+            Arc::new(MockProvider::new(vec![ModelResponse::new(
+                Message::assistant("ok"),
+            )]))
         }
         async fn capture_context(&self) -> String {
             String::new()
@@ -459,9 +459,7 @@ mod tests {
                 .rev()
                 .find_map(|m| m.content.clone())
                 .unwrap_or_default();
-            Ok(ModelResponse {
-                message: Message::assistant(last),
-            })
+            Ok(ModelResponse::new(Message::assistant(last)))
         }
     }
 

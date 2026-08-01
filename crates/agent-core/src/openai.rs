@@ -10,8 +10,8 @@ use serde_json::{json, Map, Value};
 use std::sync::Arc;
 
 use crate::model::{
-    Effort, EffortScheme, Message, ModelCapabilities, ModelProvider, ModelResponse, Role, ToolCall,
-    ToolSpec,
+    Effort, EffortScheme, Message, ModelCapabilities, ModelProvider, ModelResponse, Role,
+    TokenUsage, ToolCall, ToolSpec,
 };
 use crate::{CoreError, Result};
 
@@ -348,6 +348,12 @@ impl OpenAiCompat {
         }
         if self.stream {
             body.insert("stream".to_string(), json!(true));
+            // Ask for token usage on the final chunk. Endpoints that don't know
+            // this option ignore it; we never fail a stream to obtain usage.
+            body.insert(
+                "stream_options".to_string(),
+                json!({ "include_usage": true }),
+            );
         }
         if let Some((key, value)) = crate::model::effort_field(self.effort_scheme, self.effort) {
             body.insert(key.to_string(), value);
@@ -363,10 +369,22 @@ impl OpenAiCompat {
 struct SseAccumulator {
     content: String,
     calls: Vec<(String, String, String)>,
+    /// Usage from the final chunk, when the endpoint reports it (we ask for it
+    /// via `stream_options.include_usage`). Endpoints that ignore the option
+    /// simply leave this `None` — the stream still completes normally.
+    usage: Option<TokenUsage>,
 }
 
 impl SseAccumulator {
     fn push<F: FnMut(&str) + ?Sized>(&mut self, chunk: &Value, on_delta: &mut F) {
+        // The usage-bearing chunk typically carries an empty `choices` array.
+        if let Some(u) = chunk.get("usage") {
+            if !u.is_null() {
+                if let Ok(parsed) = serde_json::from_value::<WireUsage>(u.clone()) {
+                    self.usage = Some(TokenUsage::from(parsed));
+                }
+            }
+        }
         let delta = &chunk["choices"][0]["delta"];
         if let Some(c) = delta.get("content").and_then(Value::as_str) {
             self.content.push_str(c);
@@ -416,14 +434,16 @@ impl SseAccumulator {
         } else {
             Some(self.content)
         };
-        ModelResponse {
-            message: Message {
-                role: Role::Assistant,
-                content,
-                tool_calls,
-                tool_call_id: None,
-                attachments: Vec::new(),
-            },
+        let response = ModelResponse::new(Message {
+            role: Role::Assistant,
+            content,
+            tool_calls,
+            tool_call_id: None,
+            attachments: Vec::new(),
+        });
+        match self.usage {
+            Some(u) => response.with_usage(u),
+            None => response,
         }
     }
 }
@@ -591,6 +611,7 @@ fn parse_args(raw: &str) -> Value {
 }
 
 fn parse_response(parsed: ChatResponse) -> Result<ModelResponse> {
+    let usage = parsed.usage.map(TokenUsage::from);
     let choice = parsed
         .choices
         .into_iter()
@@ -606,20 +627,55 @@ fn parse_response(parsed: ChatResponse) -> Result<ModelResponse> {
             arguments: parse_args(&tc.function.arguments),
         })
         .collect();
-    Ok(ModelResponse {
-        message: Message {
-            role: Role::Assistant,
-            content: choice.message.content,
-            tool_calls,
-            tool_call_id: None,
-            attachments: Vec::new(),
-        },
+    let response = ModelResponse::new(Message {
+        role: Role::Assistant,
+        content: choice.message.content,
+        tool_calls,
+        tool_call_id: None,
+        attachments: Vec::new(),
+    });
+    Ok(match usage {
+        Some(u) => response.with_usage(u),
+        None => response,
     })
 }
 
 #[derive(Debug, Deserialize)]
 struct ChatResponse {
     choices: Vec<Choice>,
+    #[serde(default)]
+    usage: Option<WireUsage>,
+}
+
+/// OpenAI's `usage` object. Absent when the endpoint doesn't report it — kept
+/// `Option` all the way through so "unknown" never becomes "zero".
+#[derive(Debug, Deserialize)]
+struct WireUsage {
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    completion_tokens: u64,
+    #[serde(default)]
+    total_tokens: u64,
+    #[serde(default)]
+    prompt_tokens_details: Option<WirePromptDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WirePromptDetails {
+    #[serde(default)]
+    cached_tokens: Option<u64>,
+}
+
+impl From<WireUsage> for TokenUsage {
+    fn from(u: WireUsage) -> Self {
+        Self {
+            input: u.prompt_tokens,
+            output: u.completion_tokens,
+            total: u.total_tokens,
+            cached_input: u.prompt_tokens_details.and_then(|d| d.cached_tokens),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -875,6 +931,66 @@ mod tests {
         let response = parse_response(parsed).expect("map");
         assert_eq!(response.message.content.as_deref(), Some("hello"));
         assert!(response.message.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn parse_response_maps_usage_when_reported_and_leaves_it_none_otherwise() {
+        // Reported: prompt/completion/total plus the cached slice of the prompt.
+        let raw = r#"{"choices":[{"message":{"content":"hi","tool_calls":[]}}],
+            "usage":{"prompt_tokens":1000,"completion_tokens":50,"total_tokens":1050,
+                     "prompt_tokens_details":{"cached_tokens":800}}}"#;
+        let parsed: ChatResponse = serde_json::from_str(raw).expect("parse");
+        let usage = parse_response(parsed).expect("map").usage.expect("usage");
+        assert_eq!(usage.input, 1000);
+        assert_eq!(usage.output, 50);
+        assert_eq!(usage.total, 1050);
+        assert_eq!(usage.cached_input, Some(800));
+
+        // Reported without cache details: cached_input stays unknown.
+        let raw = r#"{"choices":[{"message":{"content":"hi","tool_calls":[]}}],
+            "usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}"#;
+        let parsed: ChatResponse = serde_json::from_str(raw).expect("parse");
+        let usage = parse_response(parsed).expect("map").usage.expect("usage");
+        assert_eq!((usage.input, usage.output, usage.total), (7, 3, 10));
+        assert_eq!(usage.cached_input, None);
+
+        // Not reported at all: unknown, not zero.
+        let raw = r#"{"choices":[{"message":{"content":"hi","tool_calls":[]}}]}"#;
+        let parsed: ChatResponse = serde_json::from_str(raw).expect("parse");
+        assert!(parse_response(parsed).expect("map").usage.is_none());
+    }
+
+    #[test]
+    fn streaming_request_asks_for_usage_and_accumulator_reads_it() {
+        let provider =
+            OpenAiCompat::new("http://localhost:1234/v1", "model-a", None).with_streaming(true);
+        let body = provider.request_body(&[Message::user("hi")], &[]);
+        assert_eq!(body["stream_options"]["include_usage"], json!(true));
+
+        // Non-streaming requests must not carry stream_options at all.
+        let plain = OpenAiCompat::new("http://localhost:1234/v1", "model-a", None);
+        assert!(plain
+            .request_body(&[Message::user("hi")], &[])
+            .get("stream_options")
+            .is_none());
+
+        // A final chunk carrying usage populates it...
+        let mut acc = SseAccumulator::default();
+        let mut sink = |_: &str| {};
+        acc.push(&json!({"choices":[{"delta":{"content":"hi"}}]}), &mut sink);
+        acc.push(
+            &json!({"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":2,"total_tokens":13}}),
+            &mut sink,
+        );
+        let usage = acc.finish().usage.expect("usage");
+        assert_eq!((usage.input, usage.output, usage.total), (11, 2, 13));
+
+        // ...and a stream that never reports usage still finishes, usage unknown.
+        let mut acc = SseAccumulator::default();
+        acc.push(&json!({"choices":[{"delta":{"content":"hi"}}]}), &mut sink);
+        let done = acc.finish();
+        assert_eq!(done.message.content.as_deref(), Some("hi"));
+        assert!(done.usage.is_none());
     }
 
     #[test]

@@ -8,51 +8,41 @@ TBD - created by archiving change 'baseline-tool-surface-specs'. Update Purpose 
 
 ### Requirement: Read and inspect workspace files
 
-The system SHALL provide `read_file`, `list_dir`, and `search_files` tools. `read_file` SHALL return the raw `content`, a line-numbered `numbered` view, and `line_count`, and SHALL accept optional 1-based `start_line`/`end_line` to return a slice. `list_dir` SHALL list a directory (default `.`). `search_files` SHALL run a ripgrep search that respects `.gitignore` and skips binaries.
+The system SHALL provide `read_file`, `list_dir`, and `search_files` tools. `read_file` SHALL return exactly one view of the requested slice: a line-numbered `numbered` view, together with `start_line`, `end_line`, and `line_count`. `read_file` SHALL NOT also return an unnumbered copy of the same slice, because a tool result carries a fixed character budget and returning the same bytes twice halves how much of a file reaches the model. `read_file` SHALL accept optional 1-based `start_line`/`end_line` to return a slice. The tool description SHALL state that the line-number prefix is not part of the file content, so that a caller constructing an exact-text match for an edit knows to strip it. `list_dir` SHALL list a directory (default `.`). `search_files` SHALL run a ripgrep search that respects `.gitignore` and skips binaries.
 
 #### Scenario: read a slice with line numbers
 
 - **WHEN** `read_file` is called with `start_line=2` and `end_line=3` on a file of 5 lines
-- **THEN** `content` contains only lines 2-3, `numbered` shows those lines prefixed with their 1-based numbers, and `line_count` is 5
+- **THEN** `numbered` shows only lines 2-3 prefixed with their 1-based numbers, `start_line` is 2, `end_line` is 3, and `line_count` is 5
+
+#### Scenario: the result carries no duplicate unnumbered copy
+
+- **WHEN** `read_file` returns successfully for any path
+- **THEN** the result contains the numbered view and no separate unnumbered copy of the same slice
 
 
 <!-- @trace
-source: baseline-tool-surface-specs
-updated: 2026-06-28
+source: context-budget-accounting
+updated: 2026-08-01
 code:
-  - .agents/skills/spectra-commit/SKILL.md
-  - .opencode/skills/spectra-commit/SKILL.md
-  - CLAUDE.md
-  - .agents/skills/spectra-ingest/SKILL.md
-  - .agents/skills/spectra-debug/SKILL.md
-  - .opencode/skills/spectra-audit/SKILL.md
-  - .spectra.yaml
-  - .opencode/skills/spectra-ask/SKILL.md
-  - .opencode/commands/spectra-drift.md
-  - .opencode/skills/spectra-propose/SKILL.md
-  - AGENTS.md
-  - .opencode/skills/spectra-discuss/SKILL.md
-  - .agents/skills/spectra-propose/SKILL.md
-  - .agents/skills/spectra-archive/SKILL.md
-  - .agents/skills/spectra-apply/SKILL.md
-  - .agents/skills/spectra-ask/SKILL.md
-  - .opencode/commands/spectra-discuss.md
-  - .opencode/commands/spectra-ingest.md
-  - .opencode/skills/spectra-apply/SKILL.md
-  - .opencode/skills/spectra-archive/SKILL.md
-  - .opencode/commands/spectra-propose.md
-  - .opencode/skills/spectra-drift/SKILL.md
-  - .opencode/commands/spectra-archive.md
-  - .agents/skills/spectra-audit/SKILL.md
-  - .opencode/commands/spectra-audit.md
-  - .opencode/commands/spectra-apply.md
-  - .opencode/skills/spectra-ingest/SKILL.md
-  - .opencode/commands/spectra-ask.md
-  - .opencode/commands/spectra-debug.md
-  - .agents/skills/spectra-discuss/SKILL.md
-  - .opencode/skills/spectra-debug/SKILL.md
-  - .opencode/commands/spectra-commit.md
-  - .agents/skills/spectra-drift/SKILL.md
+  - crates/fleety-eval/src/runner.rs
+  - crates/agent-workflow/src/lib.rs
+  - crates/agent-core/src/gemini.rs
+  - crates/fleety-server/src/subagent.rs
+  - crates/fleety-tools/src/lib.rs
+  - crates/fleety-daemon/src/ondevice.rs
+  - crates/fleety-server/src/pool.rs
+  - crates/fleety-server/src/scheduler.rs
+  - crates/fleety-server/src/tools.rs
+  - crates/fleety-server/src/skills.rs
+  - crates/fleety-server/src/conn.rs
+  - crates/fleety-server/src/wiki.rs
+  - crates/agent-core/src/openai.rs
+  - crates/agent-core/src/model.rs
+  - crates/agent-core/src/subagent.rs
+  - crates/agent-core/src/agent.rs
+  - crates/agent-core/src/codex_responses.rs
+  - crates/fleety-server/src/echo.rs
 -->
 
 ---

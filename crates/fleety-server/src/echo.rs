@@ -21,8 +21,8 @@ impl ModelProvider for EchoProvider {
             .find(|m| m.role == Role::User)
             .and_then(|m| m.content.clone())
             .unwrap_or_default();
-        Ok(ModelResponse {
-            message: Message::assistant(format!("echo: {last_user}")),
-        })
+        Ok(ModelResponse::new(Message::assistant(format!(
+            "echo: {last_user}"
+        ))))
     }
 }

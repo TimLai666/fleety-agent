@@ -10,7 +10,7 @@ use serde_json::json;
 
 use crate::approval::{ApprovalDecision, ApprovalGate, Policy};
 use crate::event::{Event, EventLog};
-use crate::model::{Message, ModelProvider, RiskLevel, Role, ToolSpec};
+use crate::model::{Message, ModelProvider, RiskLevel, Role, TokenUsage, ToolSpec};
 use crate::tools::ToolRegistry;
 use crate::{CoreError, Result};
 
@@ -23,8 +23,11 @@ pub struct LoopConfig {
     /// truncated for the model (spec §10.1 tool-output budgeting); the **full**
     /// result is always kept in the event log, so truncation is reversible.
     pub max_tool_result_chars: usize,
-    /// When the in-context messages exceed this many characters, older turns are
-    /// summarized (compaction); the full history stays in the event log.
+    /// The budget for **compactable history**: when the messages after the
+    /// leading non-compactable preamble exceed this many characters, older turns
+    /// are summarized (compaction); the full history stays in the event log. The
+    /// preamble is excluded because it is re-sent verbatim every turn regardless
+    /// of compaction, so counting it would make the threshold always exceeded.
     pub compact_threshold_chars: usize,
     /// Number of most-recent messages kept verbatim during compaction.
     pub recent_keep_messages: usize,
@@ -64,6 +67,11 @@ pub struct TurnOutcome {
     /// and no further model call was made. Work completed before the checkpoint
     /// is preserved. Always false when no flag was passed or it was never set.
     pub cancelled: bool,
+    /// Token usage summed across every model call this turn made, including the
+    /// summarization call compaction spends on its own behalf. `None` when no
+    /// call reported usage — never a zeroed total, which would claim the turn was
+    /// free rather than unmeasured. Not written to the event log.
+    pub usage: Option<TokenUsage>,
 }
 
 /// A device-deixis attention hint parsed from a voice-mode reply: which device
@@ -263,6 +271,10 @@ pub async fn run_turn_streaming_cached(
         apply_voice_prompt(messages);
     }
 
+    // Running total of every model call this turn makes, compaction's own
+    // summarization call included. Stays `None` while nothing has reported.
+    let mut turn_usage: Option<TokenUsage> = None;
+
     for step in 1..=config.max_steps {
         // Cancellation checkpoint: before each model call (compaction included —
         // it also spends a provider call). `steps` counts completed provider
@@ -274,12 +286,15 @@ pub async fn run_turn_streaming_cached(
                 attention: None,
                 steps: step - 1,
                 cancelled: true,
+                usage: turn_usage,
             });
         }
-        compact_if_needed(provider, messages, config, cache).await?;
+        let compaction_usage = compact_if_needed(provider, messages, config, cache).await?;
+        turn_usage = TokenUsage::sum([turn_usage, compaction_usage]);
         let response = provider
             .complete_streaming(messages, &specs, on_delta)
             .await?;
+        turn_usage = TokenUsage::sum([turn_usage, response.usage]);
         let assistant = response.message;
         events.push(Event::Assistant(assistant.clone()));
         messages.push(assistant.clone());
@@ -298,6 +313,7 @@ pub async fn run_turn_streaming_cached(
                 attention,
                 steps: step,
                 cancelled: false,
+                usage: turn_usage,
             });
         }
 
@@ -327,6 +343,7 @@ pub async fn run_turn_streaming_cached(
                     attention: None,
                     steps: step,
                     cancelled: true,
+                    usage: turn_usage,
                 });
             }
             events.push(Event::ToolCall(call.clone()));
@@ -449,6 +466,26 @@ pub fn is_cache_usable(cache: &CompactionCache, history_len: usize, config: &Loo
         && cache.threshold == config.compact_threshold_chars
 }
 
+/// How many leading messages are non-compactable preamble: the maximal run of
+/// system messages at the head of the context.
+///
+/// The caller rebuilds this whole run every turn — the system prompt plus
+/// ephemeral context such as the current time, the origin binding, and injected
+/// instruction files — so all of it must reach the model verbatim each turn
+/// rather than being folded into a summary (and a summary built on one turn's
+/// preamble would go stale the moment the next turn rebuilds it).
+///
+/// This assumes persisted conversation history never begins with a system
+/// message: such a message would be treated as preamble and preserved forever.
+/// Callers append user/assistant/tool messages to history, so the assumption
+/// holds; the preamble is the only source of leading system messages.
+fn leading_preamble_len(messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .take_while(|m| m.role == Role::System)
+        .count()
+}
+
 /// The slice of the middle that still needs summarizing, given how many leading
 /// messages (`covered`) are already in the summary. `None` means nothing new (the
 /// cached summary already covers the whole middle). Indices are into `messages`.
@@ -461,8 +498,9 @@ fn new_middle_range(keep_head: usize, covered: usize, split: usize) -> Option<(u
     }
 }
 
-/// If the context is over budget, summarize the older middle messages via the
-/// provider, keeping a leading system message and the most recent ones verbatim.
+/// If the compactable history is over budget, summarize the older middle
+/// messages via the provider, keeping the whole leading system preamble (see
+/// [`leading_preamble_len`]) and the most recent messages verbatim.
 /// Reversible: the full history lives in the event log; only the in-context view
 /// shrinks. Incremental: with a usable `cache`, only the messages added since the
 /// cache's watermark are summarized and folded into the cached summary; otherwise
@@ -473,18 +511,18 @@ async fn compact_if_needed(
     messages: &mut Vec<Message>,
     config: &LoopConfig,
     cache: &mut Option<CompactionCache>,
-) -> Result<()> {
-    if estimate_chars(messages) <= config.compact_threshold_chars {
-        return Ok(());
+) -> Result<Option<TokenUsage>> {
+    let keep_head = leading_preamble_len(messages);
+    // The budget measures only what compaction can actually compact. The leading
+    // preamble is re-sent verbatim every turn no matter what compaction does, so
+    // counting it here would make the threshold unconditionally exceeded once the
+    // preamble alone outgrew it — degrading this decision into a bare
+    // message-count check.
+    if estimate_chars(&messages[keep_head..]) <= config.compact_threshold_chars {
+        return Ok(None);
     }
-    let keep_head = usize::from(
-        messages
-            .first()
-            .map(|m| m.role == Role::System)
-            .unwrap_or(false),
-    );
     if messages.len() <= keep_head + config.recent_keep_messages + 1 {
-        return Ok(());
+        return Ok(None);
     }
     let mut split = messages.len() - config.recent_keep_messages;
     // Don't let the kept tail begin with an orphaned `tool` message (its
@@ -503,11 +541,14 @@ async fn compact_if_needed(
         _ => 0,
     };
 
+    // Usage spent summarizing, when the provider reported it. Reusing a cached
+    // summary spends nothing, so it stays `None`.
+    let mut spent: Option<TokenUsage> = None;
     let summary = match new_middle_range(keep_head, covered, split) {
         // Nothing new to summarize: reuse the cached summary verbatim (no LLM).
         None => match cache.as_ref() {
             Some(c) if covered > 0 => c.summary.clone(),
-            _ => return Ok(()),
+            _ => return Ok(None),
         },
         Some((start, end)) => {
             let middle_text = messages[start..end]
@@ -527,6 +568,7 @@ async fn compact_if_needed(
                 )
             };
             let response = provider.complete(&[Message::user(prompt)], &[]).await?;
+            spent = response.usage;
             response.message.content.unwrap_or_default()
         }
     };
@@ -544,7 +586,7 @@ async fn compact_if_needed(
         recent_keep: config.recent_keep_messages,
         threshold: config.compact_threshold_chars,
     });
-    Ok(())
+    Ok(spent)
 }
 
 #[cfg(test)]
@@ -578,25 +620,21 @@ mod tests {
     }
 
     fn tool_call_response(name: &str) -> ModelResponse {
-        ModelResponse {
-            message: Message {
-                role: Role::Assistant,
-                content: None,
-                tool_calls: vec![ToolCall {
-                    id: "c1".to_string(),
-                    name: name.to_string(),
-                    arguments: json!({ "text": "hi" }),
-                }],
-                tool_call_id: None,
-                attachments: Vec::new(),
-            },
-        }
+        ModelResponse::new(Message {
+            role: Role::Assistant,
+            content: None,
+            tool_calls: vec![ToolCall {
+                id: "c1".to_string(),
+                name: name.to_string(),
+                arguments: json!({ "text": "hi" }),
+            }],
+            tool_call_id: None,
+            attachments: Vec::new(),
+        })
     }
 
     fn final_response() -> ModelResponse {
-        ModelResponse {
-            message: Message::assistant("done"),
-        }
+        ModelResponse::new(Message::assistant("done"))
     }
 
     #[tokio::test]
@@ -746,9 +784,7 @@ mod tests {
     async fn compaction_summarizes_old_messages() {
         // Provider returns a summary (for compaction), then a final answer.
         let provider = MockProvider::new(vec![
-            ModelResponse {
-                message: Message::assistant("SUMMARY"),
-            },
+            ModelResponse::new(Message::assistant("SUMMARY")),
             final_response(),
         ]);
         let tools = ToolRegistry::new();
@@ -796,9 +832,7 @@ mod tests {
         // split = len(7) - recent_keep(2) = 5 -> messages[5] is a tool result
         // whose assistant tool-call would land in the summary. The guard must
         // advance the split so no orphaned tool message survives.
-        let provider = MockProvider::new(vec![ModelResponse {
-            message: Message::assistant("SUMMARY"),
-        }]);
+        let provider = MockProvider::new(vec![ModelResponse::new(Message::assistant("SUMMARY"))]);
         let assistant_tc = |id: &str| Message {
             role: Role::Assistant,
             content: Some("calling".to_string()),
@@ -850,9 +884,7 @@ mod tests {
     async fn compaction_keeps_recent_when_tail_is_all_tools() {
         // recent_keep=2 and the tail is [tool, tool]; backing up to the owning
         // assistant must keep that block verbatim (not summarize everything).
-        let provider = MockProvider::new(vec![ModelResponse {
-            message: Message::assistant("SUMMARY"),
-        }]);
+        let provider = MockProvider::new(vec![ModelResponse::new(Message::assistant("SUMMARY"))]);
         let mut messages = vec![
             Message::system("sys padding to exceed the tiny threshold"),
             Message::user("hello there padding padding"),
@@ -945,6 +977,216 @@ mod tests {
         assert_eq!(new_middle_range(1, 9, 7), None);
     }
 
+    /// Returns scripted responses whose usage is scripted alongside them, so a
+    /// test can assert how a turn folds reported and unreported calls together.
+    struct ScriptedUsageProvider {
+        responses: std::sync::Mutex<std::collections::VecDeque<ModelResponse>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::model::ModelProvider for ScriptedUsageProvider {
+        async fn complete(
+            &self,
+            _messages: &[Message],
+            _tools: &[crate::model::ToolSpec],
+        ) -> Result<ModelResponse> {
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| CoreError::Provider("script exhausted".into()))
+        }
+    }
+
+    /// A turn reports the sum of the calls that reported usage, skipping the ones
+    /// that did not — it never treats "unreported" as zero.
+    #[tokio::test]
+    async fn turn_usage_sums_reported_calls_and_skips_unknown() {
+        // Two tool-call steps then a final answer; the middle call reports nothing.
+        let provider = ScriptedUsageProvider {
+            responses: std::sync::Mutex::new(
+                [
+                    tool_call_response("echo").with_usage(TokenUsage {
+                        input: 1000,
+                        output: 50,
+                        total: 1050,
+                        cached_input: Some(200),
+                    }),
+                    tool_call_response("echo"),
+                    final_response().with_usage(TokenUsage {
+                        input: 1200,
+                        output: 80,
+                        total: 1280,
+                        cached_input: None,
+                    }),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+        };
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(EchoTool));
+        let mut messages = vec![Message::user("go")];
+        let mut events = EventLog::new();
+
+        let outcome = run_turn(
+            &provider,
+            &tools,
+            &mut messages,
+            &mut events,
+            &LoopConfig::default(),
+            Policy::FullAccess,
+            &mut AutoApprove,
+        )
+        .await
+        .expect("turn ok");
+
+        let usage = outcome.usage.expect("usage reported");
+        assert_eq!(usage.input, 2200);
+        assert_eq!(usage.output, 130);
+        assert_eq!(usage.total, 2330);
+        assert_eq!(usage.cached_input, Some(200));
+    }
+
+    /// When nothing reported, the turn reports unknown rather than a zero total.
+    #[tokio::test]
+    async fn turn_usage_is_none_when_no_call_reports() {
+        let provider = MockProvider::new(vec![final_response()]);
+        let tools = ToolRegistry::new();
+        let mut messages = vec![Message::user("go")];
+        let mut events = EventLog::new();
+
+        let outcome = run_turn(
+            &provider,
+            &tools,
+            &mut messages,
+            &mut events,
+            &LoopConfig::default(),
+            Policy::FullAccess,
+            &mut AutoApprove,
+        )
+        .await
+        .expect("turn ok");
+
+        assert!(outcome.usage.is_none());
+    }
+
+    /// Counts `complete` calls, so a test can assert compaction made no provider
+    /// call at all — a summarization is a provider call, so zero calls proves
+    /// compaction did not run.
+    struct SummaryCallCounter {
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::model::ModelProvider for SummaryCallCounter {
+        async fn complete(
+            &self,
+            _messages: &[Message],
+            _tools: &[crate::model::ToolSpec],
+        ) -> Result<crate::model::ModelResponse> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(crate::model::ModelResponse::new(Message::assistant(
+                "SUMMARY",
+            )))
+        }
+    }
+
+    /// The budget gates on compactable history only. A preamble far larger than
+    /// the threshold must not, by itself, trigger compaction — otherwise the
+    /// threshold is unconditionally exceeded and the decision degrades into a
+    /// bare message-count check.
+    #[tokio::test]
+    async fn compaction_budget_ignores_the_leading_preamble() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = SummaryCallCounter {
+            calls: std::sync::Arc::clone(&calls),
+        };
+        let config = LoopConfig {
+            compact_threshold_chars: 24_000,
+            recent_keep_messages: 8,
+            ..LoopConfig::default()
+        };
+
+        // Spec example: a 58000-char preamble, 12 history messages totalling 3000.
+        let mut messages = vec![Message::system("P".repeat(58_000))];
+        for _ in 0..12 {
+            messages.push(Message::user("h".repeat(250)));
+        }
+        let before_len = messages.len();
+
+        compact_if_needed(&provider, &mut messages, &config, &mut None)
+            .await
+            .expect("compact");
+
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "compaction must make no summarization call when compactable history is under budget"
+        );
+        assert_eq!(messages.len(), before_len, "context must be sent unchanged");
+        assert!(!messages.iter().any(|m| m
+            .content
+            .as_deref()
+            .unwrap_or("")
+            .contains("Summary of earlier conversation")));
+    }
+
+    /// Every leading system message is preamble, not just the first: the caller
+    /// rebuilds the whole run each turn (system prompt, current time, origin,
+    /// instruction files), so all of it must survive compaction verbatim.
+    #[tokio::test]
+    async fn compaction_keeps_every_leading_system_message() {
+        let last_prompt = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let provider = RecordingProvider {
+            last_prompt: std::sync::Arc::clone(&last_prompt),
+            responses: std::sync::Mutex::new(["SUMMARY".to_string()].into_iter().collect()),
+        };
+        let preamble = [
+            "system prompt: you are an agent",
+            "Current time: 2026-07-25 10:00 (Asia/Taipei)",
+            "Origin: device alpha, cwd /srv/app",
+            "Local instructions: AGENTS.md says keep answers terse",
+            "Remote instructions: CLAUDE.md says prefer tabs",
+        ];
+        let mut messages: Vec<Message> = preamble.iter().map(|p| Message::system(*p)).collect();
+        for i in 0..30 {
+            messages.push(Message::user(format!("user message {i} with padding text")));
+        }
+        let config = LoopConfig {
+            compact_threshold_chars: 10,
+            recent_keep_messages: 4,
+            ..LoopConfig::default()
+        };
+
+        compact_if_needed(&provider, &mut messages, &config, &mut None)
+            .await
+            .expect("compact");
+
+        // The whole preamble survived verbatim, in order, at the head.
+        for (i, expected) in preamble.iter().enumerate() {
+            assert_eq!(
+                messages[i].content.as_deref(),
+                Some(*expected),
+                "leading system message {i} must survive compaction unchanged"
+            );
+        }
+        // The summary follows the preamble.
+        assert!(messages[preamble.len()]
+            .content
+            .as_deref()
+            .unwrap_or("")
+            .contains("Summary of earlier conversation"));
+        // None of the preamble was fed into the summarization prompt.
+        let summarized = last_prompt.lock().unwrap().clone();
+        for expected in &preamble[1..] {
+            assert!(
+                !summarized.contains(expected),
+                "preamble text must not be folded into the summary: {expected}"
+            );
+        }
+    }
+
     /// Records the last prompt the provider was asked to complete, and returns
     /// scripted summaries, so a test can assert what the fold actually summarized.
     struct RecordingProvider {
@@ -968,9 +1210,7 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .unwrap_or_default();
-            Ok(crate::model::ModelResponse {
-                message: Message::assistant(next),
-            })
+            Ok(crate::model::ModelResponse::new(Message::assistant(next)))
         }
     }
 
@@ -1086,9 +1326,9 @@ mod tests {
             _m: &[Message],
             _t: &[crate::model::ToolSpec],
         ) -> Result<crate::model::ModelResponse> {
-            Ok(crate::model::ModelResponse {
-                message: Message::assistant("hello world"),
-            })
+            Ok(crate::model::ModelResponse::new(Message::assistant(
+                "hello world",
+            )))
         }
         async fn complete_streaming(
             &self,
@@ -1098,9 +1338,9 @@ mod tests {
         ) -> Result<crate::model::ModelResponse> {
             on_delta("hello ");
             on_delta("world");
-            Ok(crate::model::ModelResponse {
-                message: Message::assistant("hello world"),
-            })
+            Ok(crate::model::ModelResponse::new(Message::assistant(
+                "hello world",
+            )))
         }
     }
 
@@ -1233,9 +1473,7 @@ mod tests {
     async fn voice_on_splits_display_and_speech() {
         // Spec Example row 1: text before the sentinel is display, after is speech.
         let raw = format!("Here is the diff.\n{SPEECH_SENTINEL}\nDone — check the diff.");
-        let provider = MockProvider::new(vec![ModelResponse {
-            message: Message::assistant(raw),
-        }]);
+        let provider = MockProvider::new(vec![ModelResponse::new(Message::assistant(raw))]);
         let tools = ToolRegistry::new();
         let mut messages = vec![Message::system("base"), Message::user("show diff")];
         let mut events = EventLog::new();
@@ -1267,9 +1505,9 @@ mod tests {
     #[tokio::test]
     async fn voice_on_without_sentinel_yields_no_speech() {
         // Spec Example row 2: no sentinel → whole text is display, speech None.
-        let provider = MockProvider::new(vec![ModelResponse {
-            message: Message::assistant("All set, no sentinel here."),
-        }]);
+        let provider = MockProvider::new(vec![ModelResponse::new(Message::assistant(
+            "All set, no sentinel here.",
+        ))]);
         let tools = ToolRegistry::new();
         let mut messages = vec![Message::system("base"), Message::user("status")];
         let mut events = EventLog::new();
@@ -1334,9 +1572,7 @@ mod tests {
         let raw = format!(
             "All set.\n{SPEECH_SENTINEL}\nAll set, take a look.\n{ATTENTION_SENTINEL}\ndevice=nas; look=the plex log"
         );
-        let provider = MockProvider::new(vec![ModelResponse {
-            message: Message::assistant(raw),
-        }]);
+        let provider = MockProvider::new(vec![ModelResponse::new(Message::assistant(raw))]);
         let tools = ToolRegistry::new();
         let mut messages = vec![Message::system("base"), Message::user("status")];
         let mut events = EventLog::new();
@@ -1366,9 +1602,7 @@ mod tests {
     async fn voice_off_yields_no_attention() {
         // voice off: no parsing — attention is None and the text is untouched.
         let raw = format!("hi\n{ATTENTION_SENTINEL}\ndevice=x; look=y");
-        let provider = MockProvider::new(vec![ModelResponse {
-            message: Message::assistant(raw.clone()),
-        }]);
+        let provider = MockProvider::new(vec![ModelResponse::new(Message::assistant(raw.clone()))]);
         let tools = ToolRegistry::new();
         let mut messages = vec![Message::user("x")];
         let mut events = EventLog::new();
@@ -1438,26 +1672,24 @@ mod tests {
 
         // One model reply with two tool calls: the first sets the cancel flag
         // while executing, so the checkpoint before the second must skip it.
-        let two_calls = ModelResponse {
-            message: Message {
-                role: Role::Assistant,
-                content: None,
-                tool_calls: vec![
-                    ToolCall {
-                        id: "c1".to_string(),
-                        name: "set_flag".to_string(),
-                        arguments: json!({}),
-                    },
-                    ToolCall {
-                        id: "c2".to_string(),
-                        name: "echo".to_string(),
-                        arguments: json!({ "text": "hi" }),
-                    },
-                ],
-                tool_call_id: None,
-                attachments: Vec::new(),
-            },
-        };
+        let two_calls = ModelResponse::new(Message {
+            role: Role::Assistant,
+            content: None,
+            tool_calls: vec![
+                ToolCall {
+                    id: "c1".to_string(),
+                    name: "set_flag".to_string(),
+                    arguments: json!({}),
+                },
+                ToolCall {
+                    id: "c2".to_string(),
+                    name: "echo".to_string(),
+                    arguments: json!({ "text": "hi" }),
+                },
+            ],
+            tool_call_id: None,
+            attachments: Vec::new(),
+        });
         // A final response is scripted on purpose: a buggy second model call
         // would succeed and be caught by the call-count assertion below,
         // instead of masquerading as an out-of-script provider error.

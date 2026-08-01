@@ -157,7 +157,7 @@ fn scripted_to_response(s: &ScriptedResponse) -> ModelResponse {
             arguments: c.arguments.clone(),
         })
         .collect();
-    ModelResponse { message: msg }
+    ModelResponse::new(msg)
 }
 
 fn walk_tool_calls(events: &[Event]) -> Vec<String> {

@@ -5410,26 +5410,22 @@ mod tests {
 
     /// A scripted assistant turn that calls one tool.
     fn call_resp(id: &str, name: &str, args: serde_json::Value) -> ModelResponse {
-        ModelResponse {
-            message: Message {
-                role: CoreRole::Assistant,
-                content: None,
-                tool_calls: vec![ToolCall {
-                    id: id.to_string(),
-                    name: name.to_string(),
-                    arguments: args,
-                }],
-                tool_call_id: None,
-                attachments: Vec::new(),
-            },
-        }
+        ModelResponse::new(Message {
+            role: CoreRole::Assistant,
+            content: None,
+            tool_calls: vec![ToolCall {
+                id: id.to_string(),
+                name: name.to_string(),
+                arguments: args,
+            }],
+            tool_call_id: None,
+            attachments: Vec::new(),
+        })
     }
 
     /// A scripted assistant turn that just replies with text (ends the turn).
     fn text_resp(text: &str) -> ModelResponse {
-        ModelResponse {
-            message: Message::assistant(text),
-        }
+        ModelResponse::new(Message::assistant(text))
     }
 
     /// A pre-set cancel flag stops the run cleanly rather than looping and
@@ -5901,9 +5897,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .pop_front()
-                .unwrap_or_else(|| ModelResponse {
-                    message: Message::assistant("done"),
-                });
+                .unwrap_or_else(|| ModelResponse::new(Message::assistant("done")));
             Ok(resp)
         }
 
@@ -7378,22 +7372,18 @@ mod tests {
     async fn require_approval_denies_over_websocket() {
         // Provider asks to write a file, then (after denial) finishes.
         let provider: Arc<dyn ModelProvider> = Arc::new(MockProvider::new(vec![
-            ModelResponse {
-                message: Message {
-                    role: CoreRole::Assistant,
-                    content: None,
-                    tool_calls: vec![ToolCall {
-                        id: "c1".to_string(),
-                        name: "write_file".to_string(),
-                        arguments: serde_json::json!({ "path": "x.txt", "content": "hi" }),
-                    }],
-                    tool_call_id: None,
-                    attachments: Vec::new(),
-                },
-            },
-            ModelResponse {
-                message: Message::assistant("done"),
-            },
+            ModelResponse::new(Message {
+                role: CoreRole::Assistant,
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: "c1".to_string(),
+                    name: "write_file".to_string(),
+                    arguments: serde_json::json!({ "path": "x.txt", "content": "hi" }),
+                }],
+                tool_call_id: None,
+                attachments: Vec::new(),
+            }),
+            ModelResponse::new(Message::assistant("done")),
         ]));
 
         let home = std::env::temp_dir().join(format!("fleety-wsapp-{}", uuid::Uuid::new_v4()));
@@ -7506,9 +7496,10 @@ mod tests {
 
         // If the block fails, the provider would answer "processed" — a clear
         // failure signal versus the expected "blocked" notice.
-        let provider: Arc<dyn ModelProvider> = Arc::new(MockProvider::new(vec![ModelResponse {
-            message: Message::assistant("PROVIDER_REACHED_SENTINEL"),
-        }]));
+        let provider: Arc<dyn ModelProvider> =
+            Arc::new(MockProvider::new(vec![ModelResponse::new(
+                Message::assistant("PROVIDER_REACHED_SENTINEL"),
+            )]));
         let storage = Arc::new(Storage::new(home.clone()));
         let workspace = Arc::new(ws_root.clone());
 
@@ -7606,22 +7597,18 @@ mod tests {
         // is never written — while the turn still finishes. Exercises the tool
         // wrapper inside a live turn with the real local shell runner.
         let provider: Arc<dyn ModelProvider> = Arc::new(MockProvider::new(vec![
-            ModelResponse {
-                message: Message {
-                    role: CoreRole::Assistant,
-                    content: None,
-                    tool_calls: vec![ToolCall {
-                        id: "c1".to_string(),
-                        name: "write_file".to_string(),
-                        arguments: serde_json::json!({ "path": "x.txt", "content": "hi" }),
-                    }],
-                    tool_call_id: None,
-                    attachments: Vec::new(),
-                },
-            },
-            ModelResponse {
-                message: Message::assistant("done"),
-            },
+            ModelResponse::new(Message {
+                role: CoreRole::Assistant,
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: "c1".to_string(),
+                    name: "write_file".to_string(),
+                    arguments: serde_json::json!({ "path": "x.txt", "content": "hi" }),
+                }],
+                tool_call_id: None,
+                attachments: Vec::new(),
+            }),
+            ModelResponse::new(Message::assistant("done")),
         ]));
 
         let home = std::env::temp_dir().join(format!("fleety-pretool-{}", uuid::Uuid::new_v4()));
@@ -7744,9 +7731,9 @@ mod tests {
             if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
                 self.gate.notified().await;
             }
-            Ok(ModelResponse {
-                message: Message::assistant("partial work before cancel"),
-            })
+            Ok(ModelResponse::new(Message::assistant(
+                "partial work before cancel",
+            )))
         }
     }
 
@@ -7864,9 +7851,10 @@ mod tests {
     /// emits nothing for it, so a following ping-like turn still works.
     #[tokio::test]
     async fn idle_cancel_turn_is_ignored_silently() {
-        let provider: Arc<dyn ModelProvider> = Arc::new(MockProvider::new(vec![ModelResponse {
-            message: Message::assistant("hello there"),
-        }]));
+        let provider: Arc<dyn ModelProvider> =
+            Arc::new(MockProvider::new(vec![ModelResponse::new(
+                Message::assistant("hello there"),
+            )]));
         let home = std::env::temp_dir().join(format!("fleety-idlecancel-{}", uuid::Uuid::new_v4()));
         let ws_root = home.join("ws");
         std::fs::create_dir_all(&ws_root).expect("mk ws");
@@ -7948,22 +7936,18 @@ mod tests {
         // daemon connection -> daemon replies -> the result returns to the agent
         // loop and is audited. Exercises the full three-party bridge.
         let provider: Arc<dyn ModelProvider> = Arc::new(MockProvider::new(vec![
-            ModelResponse {
-                message: Message {
-                    role: CoreRole::Assistant,
-                    content: None,
-                    tool_calls: vec![ToolCall {
-                        id: "c1".to_string(),
-                        name: "device_exec".to_string(),
-                        arguments: serde_json::json!({ "device": "pi", "tool": "read_file", "args": { "path": "x" } }),
-                    }],
-                    tool_call_id: None,
-                    attachments: Vec::new(),
-                },
-            },
-            ModelResponse {
-                message: Message::assistant("done"),
-            },
+            ModelResponse::new(Message {
+                role: CoreRole::Assistant,
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: "c1".to_string(),
+                    name: "device_exec".to_string(),
+                    arguments: serde_json::json!({ "device": "pi", "tool": "read_file", "args": { "path": "x" } }),
+                }],
+                tool_call_id: None,
+                attachments: Vec::new(),
+            }),
+            ModelResponse::new(Message::assistant("done")),
         ]));
 
         let home = std::env::temp_dir().join(format!("fleety-bridge-{}", uuid::Uuid::new_v4()));

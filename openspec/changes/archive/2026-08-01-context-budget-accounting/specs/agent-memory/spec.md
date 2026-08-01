@@ -1,10 +1,4 @@
-# agent-memory Specification
-
-## Purpose
-
-TBD - created by archiving change 'baseline-tool-surface-specs'. Update Purpose after archive.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: Read and edit agent core memory files
 
@@ -21,27 +15,3 @@ The `applied` region returned by `memory_edit` is a post-edit confirmation view,
 
 - **WHEN** `memory_read` returns successfully for a core memory file
 - **THEN** the result contains the numbered view and no separate unnumbered copy of the same slice
-
-<!-- @trace
-source: context-budget-accounting
-updated: 2026-08-01
-code:
-  - crates/fleety-eval/src/runner.rs
-  - crates/agent-workflow/src/lib.rs
-  - crates/agent-core/src/gemini.rs
-  - crates/fleety-server/src/subagent.rs
-  - crates/fleety-tools/src/lib.rs
-  - crates/fleety-daemon/src/ondevice.rs
-  - crates/fleety-server/src/pool.rs
-  - crates/fleety-server/src/scheduler.rs
-  - crates/fleety-server/src/tools.rs
-  - crates/fleety-server/src/skills.rs
-  - crates/fleety-server/src/conn.rs
-  - crates/fleety-server/src/wiki.rs
-  - crates/agent-core/src/openai.rs
-  - crates/agent-core/src/model.rs
-  - crates/agent-core/src/subagent.rs
-  - crates/agent-core/src/agent.rs
-  - crates/agent-core/src/codex_responses.rs
-  - crates/fleety-server/src/echo.rs
--->

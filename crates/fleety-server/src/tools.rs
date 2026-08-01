@@ -84,9 +84,10 @@ impl Tool for MemoryRead {
         ToolSpec {
             name: "memory_read".to_string(),
             description: "Read an agent core memory file (ME.md, USER.md, TODO.md, or TOOLS.md). \
-                 Returns raw `content` plus a line-numbered `numbered` view and `line_count`; pass \
+                 Returns a line-numbered `numbered` view of the slice and `line_count`; pass \
                  `start_line`/`end_line` for a slice. Use the line numbers for memory_edit's \
-                 line-range mode."
+                 line-range mode. The `NNN\\t` line-number prefix is NOT part of the file \
+                 content — strip it before using text as memory_edit's `old` match."
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -118,9 +119,11 @@ impl Tool for MemoryRead {
             Err(e) => return Err(CoreError::Message(format!("cannot read {file}: {e}"))),
         };
         let (slice, start, end, total) = fleety_tools::slice_lines(&full, start_line, end_line);
+        // One view of the slice, not two — mirrors `read_file`: the numbered view
+        // already carries the content, and all slice-returning read tools share
+        // the same tool-result character budget.
         Ok(json!({
             "file": file,
-            "content": slice,
             "numbered": fleety_tools::line_numbered(&slice, start.max(1)),
             "start_line": start,
             "end_line": end,
@@ -851,7 +854,15 @@ mod tests {
             .call("memory_read", json!({ "file": "USER.md" }))
             .await
             .expect("read");
-        assert_eq!(read["content"], json!("likes Rust"));
+        assert!(read["numbered"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("     1\tlikes Rust"));
+        assert_eq!(read["line_count"], json!(1));
+        assert!(
+            read.get("content").is_none(),
+            "memory_read must not also return an unnumbered copy of the same slice"
+        );
 
         assert!(registry
             .call(
@@ -920,10 +931,15 @@ mod tests {
             .call("memory_read", json!({ "file": "TODO.md" }))
             .await
             .expect("read");
-        let body = read["content"].as_str().unwrap_or_default();
+        let body = read["numbered"].as_str().unwrap_or_default();
         assert!(body.contains("buy oat milk"));
         assert!(body.contains("call Tim about release"));
-        assert!(read["numbered"].as_str().unwrap_or_default().contains('\t'));
+        assert!(body.contains('\t'));
+        // The slice is returned once, as the numbered view: no duplicate raw copy.
+        assert!(
+            read.get("content").is_none(),
+            "memory_read must not also return an unnumbered copy of the same slice"
+        );
 
         // Line-range mode: replace line 3 (the "call Tim" line).
         registry
@@ -940,7 +956,12 @@ mod tests {
             )
             .await
             .expect("read slice");
-        assert_eq!(after["content"], json!("- done"));
+        assert!(after["numbered"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("     3\t- done"));
+        assert_eq!(after["start_line"], json!(3));
+        assert_eq!(after["end_line"], json!(3));
 
         // Missing 'old' text errors; editing an empty file errors.
         assert!(registry

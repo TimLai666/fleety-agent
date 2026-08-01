@@ -189,9 +189,7 @@ mod tests {
             _tools: &[ToolSpec],
         ) -> Result<ModelResponse> {
             if self.ok {
-                Ok(ModelResponse {
-                    message: Message::assistant(self.tag),
-                })
+                Ok(ModelResponse::new(Message::assistant(self.tag)))
             } else {
                 Err(CoreError::Message("boom".to_string()))
             }

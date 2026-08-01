@@ -766,11 +766,11 @@ impl Tool for SkillReadFile {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "skill_read_file".to_string(),
-            description:
-                "Read a file inside a skill (default SKILL.md). Returns raw `content` plus \
-                 a line-numbered `numbered` view and `line_count`; pass `start_line`/`end_line` \
-                 for a slice. Works on any tier."
-                    .to_string(),
+            description: "Read a file inside a skill (default SKILL.md). Returns a line-numbered \
+                 `numbered` view of the slice and `line_count`; pass `start_line`/`end_line` \
+                 for a slice. Works on any tier. The `NNN\\t` line-number prefix is NOT part \
+                 of the file content — strip it before using text as an edit match."
+                .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -806,11 +806,13 @@ impl Tool for SkillReadFile {
             CoreError::Message(format!("cannot read '{file}' in skill '{name}': {e}"))
         })?;
         let (slice, start, end, total) = fleety_tools::slice_lines(&full, start_line, end_line);
+        // One view of the slice, not two — mirrors `read_file`: the numbered view
+        // already carries the content, and both tools share the same tool-result
+        // character budget.
         Ok(json!({
             "name": name,
             "source": source,
             "file": file,
-            "content": slice,
             "numbered": fleety_tools::line_numbered(&slice, start.max(1)),
             "start_line": start,
             "end_line": end,
@@ -1070,6 +1072,44 @@ mod tests {
             .await
             .expect("use");
         assert_eq!(used["source"], json!("installed"));
+
+        for d in [&b, &a, &i, &s] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// `skill_read_file` returns one view of the slice — the numbered one. A
+    /// second, unnumbered copy of the same bytes would spend half the shared
+    /// tool-result character budget on a duplicate.
+    #[tokio::test]
+    async fn skill_read_file_returns_only_the_numbered_view() {
+        let (b, a, i, s) = (temp(), temp(), temp(), temp());
+        write_skill(&b, "triage", "alpha\nbeta\ngamma\n");
+        let mut reg = ToolRegistry::new();
+        register(&mut reg, &b, &a, &i, &s, &[]);
+
+        let r = reg
+            .call(
+                "skill_read_file",
+                json!({ "name": "triage", "start_line": 2, "end_line": 3 }),
+            )
+            .await
+            .expect("read skill file");
+
+        assert!(
+            r.get("content").is_none(),
+            "skill_read_file must not also return an unnumbered copy of the same slice"
+        );
+        let numbered = r["numbered"].as_str().unwrap_or_default();
+        assert!(numbered.contains("     2\tbeta"));
+        assert!(numbered.contains("     3\tgamma"));
+        assert!(!numbered.contains("alpha"));
+        assert_eq!(r["start_line"], json!(2));
+        assert_eq!(r["end_line"], json!(3));
+        assert_eq!(r["line_count"], json!(3));
+        assert_eq!(r["name"], json!("triage"));
+        assert_eq!(r["file"], json!("SKILL.md"));
+        assert_eq!(r["source"], json!("builtin"));
 
         for d in [&b, &a, &i, &s] {
             let _ = std::fs::remove_dir_all(d);

@@ -412,9 +412,9 @@ mod tests {
                     "simulated provider failure".to_string(),
                 ));
             }
-            Ok(agent_core::ModelResponse {
-                message: Message::assistant(format!("echo: {last_user}")),
-            })
+            Ok(agent_core::ModelResponse::new(Message::assistant(format!(
+                "echo: {last_user}"
+            ))))
         }
     }
 

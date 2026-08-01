@@ -179,10 +179,78 @@ pub struct ToolSpec {
     pub risk: RiskLevel,
 }
 
+/// Token usage a provider reported for one model call.
+///
+/// Only ever present when the provider actually reported it: a missing usage is
+/// `Option::None`, never a zeroed `TokenUsage`, so "unknown" stays
+/// distinguishable from "spent zero tokens". `cached_input` is the part of
+/// `input` the provider served from its own prompt cache, when it says so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct TokenUsage {
+    pub input: u64,
+    pub output: u64,
+    pub total: u64,
+    /// Input tokens served from the provider's cache, when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_input: Option<u64>,
+}
+
+impl TokenUsage {
+    /// Fold two usages together, summing every counter. `cached_input` is summed
+    /// only across the sides that reported one; if neither did, it stays `None`.
+    pub fn merge(self, other: Self) -> Self {
+        Self {
+            input: self.input.saturating_add(other.input),
+            output: self.output.saturating_add(other.output),
+            total: self.total.saturating_add(other.total),
+            cached_input: match (self.cached_input, other.cached_input) {
+                (None, None) => None,
+                (a, b) => Some(a.unwrap_or(0).saturating_add(b.unwrap_or(0))),
+            },
+        }
+    }
+
+    /// Sum the reported usages in `parts`, ignoring the unknown ones. Returns
+    /// `None` when nothing reported — never a zeroed total, which would claim
+    /// the calls were free rather than unmeasured.
+    pub fn sum(parts: impl IntoIterator<Item = Option<Self>>) -> Option<Self> {
+        parts
+            .into_iter()
+            .flatten()
+            .fold(None, |acc: Option<Self>, u| {
+                Some(acc.map_or(u, |a| a.merge(u)))
+            })
+    }
+}
+
 /// A provider's response for one step of the loop.
 #[derive(Debug, Clone)]
 pub struct ModelResponse {
     pub message: Message,
+    /// Token usage for this call, when the provider reported it.
+    pub usage: Option<TokenUsage>,
+}
+
+impl ModelResponse {
+    /// A response with no usage reported.
+    pub fn new(message: Message) -> Self {
+        Self {
+            message,
+            usage: None,
+        }
+    }
+
+    /// Attach provider-reported usage.
+    pub fn with_usage(mut self, usage: TokenUsage) -> Self {
+        self.usage = Some(usage);
+        self
+    }
+}
+
+impl From<Message> for ModelResponse {
+    fn from(message: Message) -> Self {
+        Self::new(message)
+    }
 }
 
 /// A pluggable LLM backend. Implementations: [`MockProvider`] (tests) and the
@@ -465,6 +533,49 @@ mod tests {
         assert!(tool.tool_calls.is_empty());
     }
 
+    /// Usage is optional and "unknown" must stay distinguishable from "zero
+    /// tokens": a provider that reports nothing leaves `usage` as `None`, never
+    /// as a zeroed `TokenUsage`.
+    #[test]
+    fn unreported_usage_is_none_not_zero() {
+        let silent = ModelResponse::new(Message::assistant("hi"));
+        assert!(silent.usage.is_none());
+        assert_ne!(silent.usage, Some(TokenUsage::default()));
+
+        let reported = ModelResponse::new(Message::assistant("hi")).with_usage(TokenUsage {
+            input: 1000,
+            output: 50,
+            total: 1050,
+            cached_input: Some(800),
+        });
+        assert_eq!(reported.usage.map(|u| u.total), Some(1050));
+        assert_eq!(reported.usage.and_then(|u| u.cached_input), Some(800));
+    }
+
+    /// Summing folds only the calls that reported, and stays `None` when none did.
+    #[test]
+    fn usage_sum_skips_unknown_and_stays_none_when_all_unknown() {
+        assert_eq!(TokenUsage::sum([None, None]), None);
+
+        let a = TokenUsage {
+            input: 1000,
+            output: 50,
+            total: 1050,
+            cached_input: Some(200),
+        };
+        let c = TokenUsage {
+            input: 1200,
+            output: 80,
+            total: 1280,
+            cached_input: None,
+        };
+        let summed = TokenUsage::sum([Some(a), None, Some(c)]).expect("some reported");
+        assert_eq!(summed.input, 2200);
+        assert_eq!(summed.output, 130);
+        assert_eq!(summed.total, 2330);
+        assert_eq!(summed.cached_input, Some(200));
+    }
+
     #[test]
     fn tool_spec_deserializes_default_risk_as_read() {
         let spec: ToolSpec = serde_json::from_value(json!({
@@ -478,9 +589,7 @@ mod tests {
 
     #[tokio::test]
     async fn mock_provider_returns_scripted_responses_then_errors() {
-        let provider = MockProvider::new(vec![ModelResponse {
-            message: Message::assistant("one"),
-        }]);
+        let provider = MockProvider::new(vec![ModelResponse::new(Message::assistant("one"))]);
 
         let first = provider.complete(&[], &[]).await.expect("first response");
         assert_eq!(first.message.content.as_deref(), Some("one"));

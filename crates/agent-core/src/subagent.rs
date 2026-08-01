@@ -658,9 +658,9 @@ mod tests {
     use std::sync::Mutex as StdMutex;
 
     fn one_shot(text: &str) -> Arc<dyn ModelProvider> {
-        Arc::new(MockProvider::new(vec![ModelResponse {
-            message: Message::assistant(text),
-        }]))
+        Arc::new(MockProvider::new(vec![ModelResponse::new(
+            Message::assistant(text),
+        )]))
     }
 
     struct Ping;
@@ -883,12 +883,8 @@ mod tests {
     async fn addresses_workers_by_name_and_lists_team() {
         // Agent-team layer: name a worker, see the roster, address it by name.
         let main: Arc<dyn ModelProvider> = Arc::new(MockProvider::new(vec![
-            ModelResponse {
-                message: Message::assistant("v1"),
-            },
-            ModelResponse {
-                message: Message::assistant("v2"),
-            },
+            ModelResponse::new(Message::assistant("v1")),
+            ModelResponse::new(Message::assistant("v2")),
         ]));
         let (mgr, _h, _) = mk(main, one_shot("y"), 4);
         let spawned = mgr
@@ -931,9 +927,9 @@ mod tests {
                 _t: &[ToolSpec],
             ) -> Result<crate::model::ModelResponse> {
                 self.gate.notified().await;
-                Ok(crate::model::ModelResponse {
-                    message: Message::assistant("released"),
-                })
+                Ok(crate::model::ModelResponse::new(Message::assistant(
+                    "released",
+                )))
             }
         }
 
@@ -964,9 +960,7 @@ mod tests {
                 _m: &[Message],
                 _t: &[ToolSpec],
             ) -> Result<crate::model::ModelResponse> {
-                Ok(crate::model::ModelResponse {
-                    message: Message::assistant("x"),
-                })
+                Ok(crate::model::ModelResponse::new(Message::assistant("x")))
             }
             fn with_effort(&self, effort: Option<Effort>) -> Option<Arc<dyn ModelProvider>> {
                 self.calls.lock().unwrap().push(effort);
