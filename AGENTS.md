@@ -110,7 +110,12 @@ no Fleety crate). This file holds things that aren't derivable from the code.
   2026-08-02 `start_roaming_budget_server` binds a best-effort companion
   listener on `[::1]:<same port>`, so the roaming tests answer on whichever
   family `localhost` prefers and no longer surface the v4-only gap.
-- **Status:** pending
+- **Status:** resolved by the `localhost-dual-stack-reachability` change
+  (2026-08-02): the server grows a best-effort same-port IPv6 companion for the
+  two IPv4 default forms (`bind_with_companion` in `fleety-server/src/main.rs`),
+  and the transport dials a host spelled exactly `localhost` as `127.0.0.1`
+  (`dial_target` in `fleety-tools/src/transport.rs`) so old v4-only servers stay
+  fast too. A v6-only server is reached by spelling `ws://[::1]:8787`.
 
 ### [2026-08-01] — CI's clippy gate cannot be run locally on Windows
 

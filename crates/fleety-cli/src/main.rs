@@ -6535,14 +6535,17 @@ mod tests {
         // connections have arrived: a single candidate opens one or two of them
         // depending on whether its policy falls back to cleartext, and none at
         // all when its host resolves to an address that nothing answers on.
-        let stalled_host = format!("localhost:{}", address.port());
-        // `localhost` prefers `::1` on a dual-stack host, and a connect to an
-        // unbound `::1` takes seconds to fall through to `127.0.0.1` — longer
-        // than any budget these tests hand a candidate. Answering on both
-        // loopback families keeps the primary reachable there, so it stalls,
-        // which is the case under test, instead of never arriving at all. Best
-        // effort: where `::1` cannot be bound, the v4 listener alone still
-        // serves both host spellings.
+        // The one host spelling the client is guaranteed to reach as written:
+        // `dial_target` rewrites `localhost` to this, and rewrites nothing else,
+        // so the primary below is spelled `[::1]` — a host-alone difference the
+        // transport never touches. Anything that did not dial this exact v4
+        // host is therefore the stalled primary.
+        let real_host = format!("127.0.0.1:{}", address.port());
+        // The `[::1]` primary needs something listening on the v6 loopback so
+        // it stalls (the case under test) instead of never arriving. Best
+        // effort: where `::1` cannot be bound, that primary is refused
+        // instantly — the sweep still reaches the alternative, it just is not
+        // budget-pressured on such hosts.
         let listeners = std::iter::once(listener).chain(
             tokio::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, address.port()))
                 .await
@@ -6551,20 +6554,20 @@ mod tests {
         let identity = identity.to_string();
         for listener in listeners {
             let identity = identity.clone();
-            let stalled_host = stalled_host.clone();
+            let real_host = real_host.clone();
             tokio::spawn(async move {
                 loop {
                     let (stream, _) = listener.accept().await.expect("accept roaming client");
                     tokio::spawn(serve_roaming_budget_client(
                         stream,
                         identity.clone(),
-                        stalled_host.clone(),
+                        real_host.clone(),
                     ));
                 }
             });
         }
         (
-            format!("ws://localhost:{}", address.port()),
+            format!("ws://[::1]:{}", address.port()),
             format!("ws://{address}"),
         )
     }
@@ -6574,7 +6577,7 @@ mod tests {
     async fn serve_roaming_budget_client(
         stream: tokio::net::TcpStream,
         identity: String,
-        stalled_host: String,
+        real_host: String,
     ) {
         let (dialled_tx, dialled_rx) = tokio::sync::oneshot::channel();
         // The large `Err` is tungstenite's own rejection response type; this
@@ -6603,7 +6606,10 @@ mod tests {
             .await
             .expect("client frame")
             .expect("frame");
-        if dialled == stalled_host {
+        // Matching on "not the real v4 host" rather than an exact stalled
+        // spelling keeps this robust to how the client formats a bracketed
+        // IPv6 Host header.
+        if dialled != real_host {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             return;
         }
