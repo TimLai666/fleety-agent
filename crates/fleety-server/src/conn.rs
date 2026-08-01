@@ -243,12 +243,16 @@ async fn collect_conversation_hooks(
                 let path = std::path::Path::new(base)
                     .join(".claude")
                     .join("settings.json");
+                // `read_file` takes `path` (not `file`), and returns only the
+                // line-numbered view, so the numbering is undone before parsing.
                 let args = serde_json::json!({ "path": path.to_string_lossy() });
                 if let Ok(res) =
                     bridge::route_run_tool_via(&sender, pending, "read_file", args).await
                 {
-                    if let Some(content) = res.get("content").and_then(serde_json::Value::as_str) {
-                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(content) {
+                    if let Some(numbered) = res.get("numbered").and_then(serde_json::Value::as_str)
+                    {
+                        let content = fleety_tools::strip_line_numbers(numbered);
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
                             out.extend(parse_hooks(&v, scope));
                         }
                     }
@@ -3377,14 +3381,17 @@ async fn build_instruction_preamble_remote(
     let mut items = Vec::new();
     for name in ["AGENTS.md", "CLAUDE.md"] {
         let path = cwd.join(name);
+        // `read_file` takes `path` (not `file`), and returns only the
+        // line-numbered view, so the numbering is undone before injection —
+        // instruction files must reach the model as their original text.
         let args = serde_json::json!({
             "device": device,
             "tool": "read_file",
             "args": { "path": path.to_string_lossy() },
         });
         if let Ok(res) = tools.call("device_exec", args).await {
-            if let Some(content) = res.get("content").and_then(|c| c.as_str()) {
-                items.push((path, content.to_string()));
+            if let Some(numbered) = res.get("numbered").and_then(|c| c.as_str()) {
+                items.push((path, fleety_tools::strip_line_numbers(numbered)));
             }
         }
     }
@@ -4732,65 +4739,80 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// The cross-device hook read must ask `read_file` for a `path` and cope with
+    /// its line-numbered reply. The fake device here asserts the argument key and
+    /// answers in `read_file`'s real shape, so a wrong key or a wrong result field
+    /// fails the test instead of silently yielding no hooks.
     #[tokio::test]
     async fn collect_conversation_hooks_cross_device_reads_settings_via_bridge() {
-        // Regression: the bridge read must name read_file's argument `path`.
-        // A wrong key makes the daemon error, the `if let Ok(..)` swallows it,
-        // and the origin device's hooks silently vanish — so the fake daemon
-        // here rejects anything but `path`, exactly like the real tool.
+        use fleety_protocol::ServerMsg;
+
         let hub = crate::bridge::new_hub();
         let pending = crate::bridge::new_pending();
-        let (tx, mut frames) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<WsMessage>();
         hub.lock().await.insert("dev2".to_string(), tx);
-        let daemon = {
-            let pending = Arc::clone(&pending);
-            tokio::spawn(async move {
-                while let Some(msg) = frames.recv().await {
-                    let tokio_tungstenite::tungstenite::Message::Text(text) = msg else {
-                        continue;
-                    };
-                    let Ok(fleety_protocol::ServerMsg::RunTool {
-                        call_id,
-                        tool,
-                        args_json,
-                    }) = serde_json::from_str(&text)
-                    else {
-                        continue;
-                    };
-                    let args: serde_json::Value =
-                        serde_json::from_str(&args_json).unwrap_or(serde_json::Value::Null);
-                    let path = args.get("path").and_then(serde_json::Value::as_str);
-                    let reply = match (tool.as_str(), path) {
-                        ("read_file", Some(p)) if p.ends_with("settings.json") => Ok(
-                            serde_json::json!({ "content": r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"remote.sh"}]}]}}"# }),
-                        ),
-                        _ => Err(format!(
-                            "missing required string argument 'path' (got {args_json})"
-                        )),
-                    };
-                    if let Some(reply_tx) = pending.lock().await.remove(&call_id) {
-                        let _ = reply_tx.send(reply);
-                    }
+
+        // Stand in for the device: answer every RunTool as `read_file` would.
+        let device_pending = pending.clone();
+        let seen_paths = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let recorder = Arc::clone(&seen_paths);
+        let device = tokio::spawn(async move {
+            while let Some(WsMessage::Text(text)) = rx.recv().await {
+                let Ok(ServerMsg::RunTool {
+                    call_id,
+                    tool,
+                    args_json,
+                }) = serde_json::from_str::<ServerMsg>(&text)
+                else {
+                    continue;
+                };
+                assert_eq!(tool, "read_file");
+                let args: serde_json::Value = serde_json::from_str(&args_json).expect("args parse");
+                let path = args
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_else(|| {
+                        panic!("read_file requires a 'path' argument; got {args_json}")
+                    })
+                    .to_string();
+                recorder.lock().expect("lock").push(path.clone());
+                // Only the project settings exist; the user one is missing.
+                let reply = if path.contains("proj") {
+                    let body = r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"x.sh"}]}]}}"#;
+                    Ok(serde_json::json!({
+                        "path": path,
+                        "numbered": fleety_tools::line_numbered(body, 1),
+                        "line_count": 1,
+                    }))
+                } else {
+                    Err("no such file".to_string())
+                };
+                if let Some(slot) = device_pending.lock().await.remove(&call_id) {
+                    let _ = slot.send(reply);
                 }
-            })
-        };
+            }
+        });
+
         let got = collect_conversation_hooks(
             Some("dev2"),
             Some("/home/bob/proj"),
-            None,
+            Some("/home/bob"),
             None,
             &hub,
             &pending,
         )
         .await;
-        daemon.abort();
-        assert_eq!(
-            got.len(),
-            1,
-            "the origin device's project hook is collected"
-        );
-        assert_eq!(got[0].command, "remote.sh");
+
+        device.abort();
+        assert_eq!(got.len(), 1, "the project hook is parsed: {got:?}");
+        assert_eq!(got[0].command, "x.sh");
         assert_eq!(got[0].scope, crate::hooks_compat::HookScope::Project);
+        let paths = seen_paths.lock().expect("lock").clone();
+        assert_eq!(paths.len(), 2, "project and user settings both attempted");
+        assert!(
+            paths.iter().all(|p| p.ends_with("settings.json")),
+            "{paths:?}"
+        );
     }
 
     // A minimal tool to wrap in the hook-registry tests below.
@@ -6166,7 +6188,13 @@ mod tests {
 
     #[tokio::test]
     async fn cross_device_reads_via_device_exec() {
-        use agent_core::{RiskLevel, Tool, ToolSpec};
+        use agent_core::{CoreError, RiskLevel, Tool, ToolSpec};
+        /// Stands in for a device's `read_file`. Unlike a mock that answers
+        /// anything, this one **enforces the tool's contract**: it demands the
+        /// `path` argument `read_file` actually requires and replies in the shape
+        /// `read_file` actually returns (a line-numbered view only). A caller that
+        /// passes the wrong key, or reads the wrong field, therefore fails here
+        /// instead of silently injecting nothing.
         struct MockExec;
         #[async_trait::async_trait]
         impl Tool for MockExec {
@@ -6179,19 +6207,23 @@ mod tests {
                 }
             }
             async fn call(&self, args: serde_json::Value) -> agent_core::Result<serde_json::Value> {
-                // Regression: reject anything but read_file's real `path`
-                // argument, so a wrong key fails here instead of being
-                // swallowed by the caller's best-effort `if let Ok(..)`.
+                // The outer device_exec envelope must be right too, not just the
+                // inner read_file arguments.
                 assert_eq!(args["tool"], "read_file");
                 assert_eq!(args["device"], "dev2");
-                let path = args["args"]["path"].as_str().ok_or_else(|| {
-                    agent_core::CoreError::Message(format!(
-                        "missing required string argument 'path' (got {})",
-                        args["args"]
-                    ))
+                let inner = args.get("args").cloned().unwrap_or_default();
+                let path = inner.get("path").and_then(serde_json::Value::as_str);
+                let path = path.ok_or_else(|| {
+                    CoreError::Message(format!("read_file requires a 'path' argument; got {inner}"))
                 })?;
                 assert!(path.ends_with(".md"), "reads an instruction file: {path}");
-                Ok(serde_json::json!({ "content": "remote-rule" }))
+                Ok(serde_json::json!({
+                    "path": path,
+                    "numbered": fleety_tools::line_numbered("remote-rule\nsecond\tline", 1),
+                    "start_line": 1,
+                    "end_line": 2,
+                    "line_count": 2,
+                }))
             }
         }
         let home = std::env::temp_dir().join(format!("fleety-xdev-{}", uuid::Uuid::new_v4()));
@@ -6205,6 +6237,16 @@ mod tests {
             .await
             .expect("remote preamble");
         assert!(out.contains("remote-rule"), "cross-device content injected");
+        // Injected as the file's own text: the numbering is undone, and a tab
+        // inside the content survives.
+        assert!(
+            out.contains("second\tline"),
+            "content round-trips through the numbered view: {out}"
+        );
+        assert!(
+            !out.contains("     1\tremote-rule"),
+            "line-number prefixes must not reach the model: {out}"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 

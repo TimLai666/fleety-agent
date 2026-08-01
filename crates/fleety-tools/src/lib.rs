@@ -496,6 +496,28 @@ pub fn line_numbered(content: &str, start_line: usize) -> String {
         .join("\n")
 }
 
+/// The inverse of [`line_numbered`]: recover the original text from a numbered
+/// view by dropping each line's number prefix up to and including the first tab.
+///
+/// The read tools return only the numbered view, so any caller that needs the
+/// raw bytes — parsing a settings file as JSON, injecting an instruction file —
+/// must undo the numbering. This lives beside `line_numbered` and is the single
+/// shared inverse precisely so the format and its reverse cannot drift apart.
+///
+/// A line with no tab is left untouched (it was not produced by `line_numbered`),
+/// and only the *first* tab is consumed, so content that itself contains tabs
+/// round-trips intact.
+pub fn strip_line_numbers(numbered: &str) -> String {
+    numbered
+        .lines()
+        .map(|line| match line.split_once('\t') {
+            Some((_number, rest)) => rest,
+            None => line,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Slice `[start, end]` (1-based, inclusive, clamped to the file) of `content`'s
 /// logical lines. Returns `(slice_text, start, end, total_lines)`; an empty file
 /// yields `("", 0, 0, 0)`.
@@ -1777,6 +1799,14 @@ mod tests {
         // numbered (tab-separated, right-aligned)
         assert!(line_numbered("x\ny", 1).contains("     1\tx"));
         assert!(line_numbered("x\ny", 5).contains("     6\ty"));
+        // ...and the inverse recovers the original, including a line whose own
+        // content contains a tab (only the first tab is the number separator).
+        let with_tab = "alpha\nbeta\tgamma";
+        assert_eq!(strip_line_numbers(&line_numbered(with_tab, 1)), with_tab);
+        assert_eq!(strip_line_numbers(&line_numbered(c, 7)), c.trim_end());
+        // A line that was never numbered (no tab) is passed through untouched.
+        assert_eq!(strip_line_numbers("plain line"), "plain line");
+        assert_eq!(strip_line_numbers(""), "");
         // replace a middle line, trailing newline preserved
         let (out, n) = replace_line_range(c, 2, 3, "B\nC2").expect("range");
         assert_eq!(out, "a\nB\nC2\nd\n");
