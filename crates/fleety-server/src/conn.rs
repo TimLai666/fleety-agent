@@ -4815,6 +4815,59 @@ mod tests {
         );
     }
 
+    /// Measure the whole per-request harness footprint: the system prompt plus
+    /// every tool schema the model is shown. Run with `--nocapture` to print it.
+    ///
+    /// A measurement, not a budget assertion — it exists so the cost of the
+    /// context is a number someone can look up instead of estimating.
+    #[tokio::test]
+    async fn measure_harness_footprint() {
+        let home = std::env::temp_dir().join(format!("fleety-footprint-{}", uuid::Uuid::new_v4()));
+        let storage = Arc::new(Storage::new(home.clone()));
+        let workspace = std::env::current_dir().expect("cwd");
+        let tools = build_full_registry(
+            &storage,
+            &workspace,
+            "dev1",
+            &crate::bridge::new_hub(),
+            &crate::bridge::new_pending(),
+            &crate::bridge::new_handles(),
+            &Arc::new(crate::auth::AuthStore::load(
+                home.join("auth.toml"),
+                None,
+                false,
+            )),
+            &crate::bridge::new_device_tools(),
+            &[],
+            Vec::new(),
+        );
+        let specs = tools.specs();
+        let tool_bytes: usize = specs
+            .iter()
+            .map(|s| s.description.len() + s.parameters.to_string().len() + s.name.len() + 60)
+            .sum();
+        let prompt = storage
+            .system_prompt_for(&storage.acting_for_device("dev1"))
+            .expect("system prompt");
+        let total = prompt.len() + tool_bytes;
+
+        println!("\n=== per-request harness footprint ===");
+        println!(
+            "system prompt : {} chars / {} bytes",
+            prompt.chars().count(),
+            prompt.len()
+        );
+        println!("tool schemas  : {} tools / {tool_bytes} bytes", specs.len());
+        println!("total         : {total} bytes (~{} KB)", total / 1024);
+        println!("est. tokens   : ~{} (bytes/4)", total / 4);
+
+        assert!(
+            specs.len() > 50,
+            "full registry should be the whole surface"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     // A minimal tool to wrap in the hook-registry tests below.
     struct RanTool(Arc<std::sync::Mutex<bool>>);
     #[async_trait::async_trait]

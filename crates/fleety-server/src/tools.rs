@@ -752,6 +752,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// Measure what the base registry costs on the wire, every request.
+    ///
+    /// Run with `--nocapture` to print the breakdown. This is a measurement, not
+    /// an assertion of a budget: the only thing asserted is that the registry is
+    /// non-trivial, so the test cannot silently pass against an empty registry.
+    #[tokio::test]
+    async fn measure_tool_schema_wire_size() {
+        let root = std::env::current_dir().expect("cwd");
+        let registry = build_registry(
+            &root,
+            &root,
+            &root,
+            &root,
+            &root,
+            &root,
+            crate::bridge::new_device_tools(),
+        );
+        let specs = registry.specs();
+        let mut rows: Vec<(String, usize, usize, usize)> = specs
+            .iter()
+            .map(|s| {
+                let desc = s.description.len();
+                let params = s.parameters.to_string().len();
+                // Approximate the OpenAI function-tool envelope around each spec.
+                let wire = desc + params + s.name.len() + 60;
+                (s.name.clone(), desc, params, wire)
+            })
+            .collect();
+        rows.sort_by_key(|row| std::cmp::Reverse(row.3));
+        let total: usize = rows.iter().map(|r| r.3).sum();
+
+        println!("\n=== base registry: {} tools ===", rows.len());
+        println!("total wire size: {total} bytes (~{} KB)", total / 1024);
+        println!("est. tokens (bytes/4): ~{}", total / 4);
+        println!("\ntop 15 by wire size:");
+        for (name, desc, params, wire) in rows.iter().take(15) {
+            println!("  {wire:>6}B  {name:<24} desc={desc:<5} params={params}");
+        }
+
+        assert!(
+            rows.len() > 20,
+            "the base registry should carry the full tool surface"
+        );
+    }
+
     // Workspace tools come from fleety-tools; these confirm the wiring works.
     #[tokio::test]
     async fn list_dir_and_escape_via_registry() {
