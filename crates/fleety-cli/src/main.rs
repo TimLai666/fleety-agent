@@ -6528,92 +6528,148 @@ mod tests {
             .await
             .expect("bind roaming server");
         let address = listener.local_addr().expect("roaming server address");
+        // Both endpoints have to live on one listener, because a profile only
+        // attempts a configured alternative that differs from its primary in
+        // the host alone. Which of the two a connection belongs to is therefore
+        // read from the host the client dialled, never from how many
+        // connections have arrived: a single candidate opens one or two of them
+        // depending on whether its policy falls back to cleartext, and none at
+        // all when its host resolves to an address that nothing answers on.
+        // The one host spelling the client is guaranteed to reach as written:
+        // `dial_target` rewrites `localhost` to this, and rewrites nothing else,
+        // so the primary below is spelled `[::1]` — a host-alone difference the
+        // transport never touches. Anything that did not dial this exact v4
+        // host is therefore the stalled primary.
+        let real_host = format!("127.0.0.1:{}", address.port());
+        // The `[::1]` primary needs something listening on the v6 loopback so
+        // it stalls (the case under test) instead of never arriving. Best
+        // effort: where `::1` cannot be bound, that primary is refused
+        // instantly — the sweep still reaches the alternative, it just is not
+        // budget-pressured on such hosts.
+        let listeners = std::iter::once(listener).chain(
+            tokio::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, address.port()))
+                .await
+                .ok(),
+        );
         let identity = identity.to_string();
-        tokio::spawn(async move {
-            for index in 0..3 {
-                let (stream, _) = listener.accept().await.expect("accept roaming client");
-                let identity = identity.clone();
-                tokio::spawn(async move {
-                    let mut websocket = tokio_tungstenite::accept_async(stream)
-                        .await
-                        .expect("accept roaming websocket");
-                    let frame = websocket
-                        .next()
-                        .await
-                        .expect("client frame")
-                        .expect("frame");
-                    if index < 2 {
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                        return;
-                    }
-                    let ClientMsg::SecureHandshake { version, msg, .. } =
-                        serde_json::from_str(frame.to_text().expect("handshake text"))
-                            .expect("parse secure handshake")
-                    else {
-                        panic!("expected secure handshake");
-                    };
-                    let (responder, reply) = fleety_tools::secure::Responder::accept(
-                        version,
-                        "saved-token",
-                        &identity,
-                        &msg,
-                    )
-                    .expect("answer secure handshake");
-                    websocket
-                        .send(Message::Text(
-                            serde_json::to_string(&ServerMsg::SecureAccept {
-                                version,
-                                msg: reply,
-                            })
-                            .expect("serialize secure accept"),
-                        ))
-                        .await
-                        .expect("send secure accept");
-                    let mut session = responder.finish().expect("finish secure handshake");
-                    let sealed = websocket
-                        .next()
-                        .await
-                        .expect("sealed hello frame")
-                        .expect("sealed hello");
-                    let ClientMsg::SecureFrame { payload } =
-                        serde_json::from_str(sealed.to_text().expect("sealed hello text"))
-                            .expect("parse sealed hello")
-                    else {
-                        panic!("expected sealed hello");
-                    };
-                    let hello = session.open(&payload).expect("open sealed hello");
-                    assert!(matches!(
-                        serde_json::from_str::<ClientMsg>(&hello).expect("parse hello"),
-                        ClientMsg::Hello { .. }
+        for listener in listeners {
+            let identity = identity.clone();
+            let real_host = real_host.clone();
+            tokio::spawn(async move {
+                loop {
+                    let (stream, _) = listener.accept().await.expect("accept roaming client");
+                    tokio::spawn(serve_roaming_budget_client(
+                        stream,
+                        identity.clone(),
+                        real_host.clone(),
                     ));
-                    let welcome = serde_json::to_string(&ServerMsg::Welcome {
-                        session_id: "session-roaming".into(),
-                        conversation_id: "conversation-roaming".into(),
-                        protocol: PROTOCOL_VERSION,
-                        server_version: "2.0.0".into(),
-                        audio_input: false,
-                        config_protocol: 0,
-                        server_fingerprint: Some(identity),
-                        server_endpoints: Vec::new(),
-                        loopback_trusted: false,
-                        token: None,
-                    })
-                    .expect("serialize welcome");
-                    let payload = session.seal(&welcome).expect("seal welcome");
-                    websocket
-                        .send(Message::Text(
-                            serde_json::to_string(&ServerMsg::SecureFrame { payload })
-                                .expect("serialize sealed welcome"),
-                        ))
-                        .await
-                        .expect("send sealed welcome");
-                });
-            }
-        });
+                }
+            });
+        }
         (
-            format!("ws://localhost:{}", address.port()),
+            format!("ws://[::1]:{}", address.port()),
             format!("ws://{address}"),
         )
+    }
+
+    /// One connection to the roaming server, stalled or answered according to
+    /// the host the client dialled.
+    async fn serve_roaming_budget_client(
+        stream: tokio::net::TcpStream,
+        identity: String,
+        real_host: String,
+    ) {
+        let (dialled_tx, dialled_rx) = tokio::sync::oneshot::channel();
+        // The large `Err` is tungstenite's own rejection response type; this
+        // callback exists to read a header, not to reject anything.
+        #[allow(clippy::result_large_err)]
+        let mut websocket = tokio_tungstenite::accept_hdr_async(
+            stream,
+            move |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                  response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                let _ = dialled_tx.send(
+                    request
+                        .headers()
+                        .get("host")
+                        .and_then(|host| host.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+                Ok(response)
+            },
+        )
+        .await
+        .expect("accept roaming websocket");
+        let dialled = dialled_rx.await.unwrap_or_default();
+        let frame = websocket
+            .next()
+            .await
+            .expect("client frame")
+            .expect("frame");
+        // Matching on "not the real v4 host" rather than an exact stalled
+        // spelling keeps this robust to how the client formats a bracketed
+        // IPv6 Host header.
+        if dialled != real_host {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            return;
+        }
+        let ClientMsg::SecureHandshake { version, msg, .. } =
+            serde_json::from_str(frame.to_text().expect("handshake text"))
+                .expect("parse secure handshake")
+        else {
+            panic!("expected secure handshake");
+        };
+        let (responder, reply) =
+            fleety_tools::secure::Responder::accept(version, "saved-token", &identity, &msg)
+                .expect("answer secure handshake");
+        websocket
+            .send(Message::Text(
+                serde_json::to_string(&ServerMsg::SecureAccept {
+                    version,
+                    msg: reply,
+                })
+                .expect("serialize secure accept"),
+            ))
+            .await
+            .expect("send secure accept");
+        let mut session = responder.finish().expect("finish secure handshake");
+        let sealed = websocket
+            .next()
+            .await
+            .expect("sealed hello frame")
+            .expect("sealed hello");
+        let ClientMsg::SecureFrame { payload } =
+            serde_json::from_str(sealed.to_text().expect("sealed hello text"))
+                .expect("parse sealed hello")
+        else {
+            panic!("expected sealed hello");
+        };
+        let hello = session.open(&payload).expect("open sealed hello");
+        assert!(matches!(
+            serde_json::from_str::<ClientMsg>(&hello).expect("parse hello"),
+            ClientMsg::Hello { .. }
+        ));
+        let welcome = serde_json::to_string(&ServerMsg::Welcome {
+            session_id: "session-roaming".into(),
+            conversation_id: "conversation-roaming".into(),
+            protocol: PROTOCOL_VERSION,
+            server_version: "2.0.0".into(),
+            audio_input: false,
+            config_protocol: 0,
+            server_fingerprint: Some(identity),
+            server_endpoints: Vec::new(),
+            loopback_trusted: false,
+            token: None,
+        })
+        .expect("serialize welcome");
+        let payload = session.seal(&welcome).expect("seal welcome");
+        websocket
+            .send(Message::Text(
+                serde_json::to_string(&ServerMsg::SecureFrame { payload })
+                    .expect("serialize sealed welcome"),
+            ))
+            .await
+            .expect("send sealed welcome");
     }
 
     async fn start_stalled_snapshot_server() -> String {
@@ -7599,12 +7655,17 @@ mod tests {
             Err(error) => error,
             Ok(_) => panic!("silent Settings server must time out"),
         };
+        // A silent server's bounded failure legitimately surfaces from either
+        // of two racing timers: the per-candidate `open_candidate` deadline
+        // ("never finished opening it") or the sweep's own handshake deadline
+        // ("never completed the handshake"). Both prove the bound held.
         assert!(
             error.report().message.contains("timed out waiting")
                 || error
                     .report()
                     .message
-                    .contains("never completed the handshake"),
+                    .contains("never completed the handshake")
+                || error.report().message.contains("never finished opening it"),
             "{}",
             error.report().message
         );
@@ -7634,12 +7695,17 @@ mod tests {
             Err(error) => error,
             Ok(_) => panic!("silent initial Settings server must time out"),
         };
+        // A silent server's bounded failure legitimately surfaces from either
+        // of two racing timers: the per-candidate `open_candidate` deadline
+        // ("never finished opening it") or the sweep's own handshake deadline
+        // ("never completed the handshake"). Both prove the bound held.
         assert!(
             error.report().message.contains("timed out waiting")
                 || error
                     .report()
                     .message
-                    .contains("never completed the handshake"),
+                    .contains("never completed the handshake")
+                || error.report().message.contains("never finished opening it"),
             "{}",
             error.report().message
         );

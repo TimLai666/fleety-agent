@@ -613,12 +613,49 @@ pub fn terminal_safe_multiline(value: &str) -> String {
     safe
 }
 
+/// Where the socket actually connects for `agent_url`.
+///
+/// A host spelled exactly `localhost` is dialed as `127.0.0.1`: on a dual-stack
+/// host the resolver offers `::1` first, and a server bound only to IPv4 costs
+/// a multi-second fallback — longer than every per-candidate budget in the
+/// connection sweep, so such an endpoint would be unreachable as a candidate,
+/// not merely slow. Only the dial changes; the URL as displayed, stored, and
+/// used for identity keeps the user's spelling (error paths render
+/// `agent_url`, never this). Any other host — `[::1]`, an IP literal, a real
+/// hostname — is dialed exactly as spelled, so a v6-only server stays
+/// reachable by writing `[::1]`.
+fn dial_target(agent_url: &str) -> String {
+    // A byte-preserving rewrite, not a parse/re-serialize round trip: `url::Url`
+    // normalizes on output (an empty path becomes `/`), and everything except
+    // the host must keep the user's exact spelling.
+    let Some((scheme, rest)) = agent_url.split_once("://") else {
+        return agent_url.to_string();
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    let (userinfo, hostport) = match authority.rsplit_once('@') {
+        Some((userinfo, hostport)) => (Some(userinfo), hostport),
+        None => (None, authority),
+    };
+    let rewritten = if hostport == "localhost" {
+        "127.0.0.1".to_string()
+    } else if let Some(port) = hostport.strip_prefix("localhost:") {
+        format!("127.0.0.1:{port}")
+    } else {
+        return agent_url.to_string();
+    };
+    match userinfo {
+        Some(userinfo) => format!("{scheme}://{userinfo}@{rewritten}{tail}"),
+        None => format!("{scheme}://{rewritten}{tail}"),
+    }
+}
+
 async fn connect_ws(agent_url: &str) -> Result<Connection> {
     // Deliberately NOT CoreError::Provider: that variant's remediation says to
     // check the model endpoint/key, which is misleading for a connection-layer
     // failure (the most common first-run error is simply "server not running").
     let endpoint = redact_endpoint(agent_url);
-    let (ws, _) = connect_async(agent_url).await.map_err(|e| {
+    let (ws, _) = connect_async(dial_target(agent_url)).await.map_err(|e| {
         let error = redact_urls_in_text(&e.to_string());
         CoreError::Message(format!(
             "cannot connect (ws) to {endpoint}: {error} — is the Fleety server running at this \
@@ -643,6 +680,9 @@ async fn connect_ws(agent_url: &str) -> Result<Connection> {
 }
 
 async fn connect_sse(agent_url: &str, token: Option<&str>) -> Result<Connection> {
+    // Same localhost→IPv4 preference as the WebSocket path; error rendering
+    // below still redacts the derived URLs, never exposing more than before.
+    let agent_url = &dial_target(agent_url);
     let base = http_base(agent_url);
     let session = uuid::Uuid::new_v4().to_string();
     let sse_url = format!("{base}/sse?session={session}");
@@ -719,6 +759,51 @@ async fn read_sse(mut resp: reqwest::Response, tx: mpsc::UnboundedSender<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only the exact host `localhost` is rewritten to the IPv4 loopback, and
+    /// only the host: scheme, port, and path survive untouched. Everything else
+    /// dials exactly as spelled — including `[::1]`, which is the documented
+    /// spelling for a v6-only server.
+    #[test]
+    fn dial_target_rewrites_only_the_exact_localhost_host() {
+        assert_eq!(dial_target("ws://localhost:8787"), "ws://127.0.0.1:8787");
+        assert_eq!(
+            dial_target("wss://localhost:9/path"),
+            "wss://127.0.0.1:9/path"
+        );
+        for unchanged in [
+            "ws://[::1]:8787",
+            "ws://myhost:8787",
+            "ws://127.0.0.1:8787",
+            "ws://localhost.example:8787",
+            "not a url at all",
+        ] {
+            assert_eq!(dial_target(unchanged), unchanged);
+        }
+    }
+
+    /// The rewrite reaches the socket, not the user: a server listening only on
+    /// the IPv4 loopback answers a `localhost` URL without any resolver
+    /// fallback.
+    #[tokio::test]
+    async fn localhost_url_reaches_a_v4_only_server() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind v4-only server");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut ws = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("ws accept");
+            let _ = ws.next().await;
+        });
+
+        let connection = connect(&format!("ws://localhost:{port}"), None)
+            .await
+            .expect("localhost dials the v4 loopback directly");
+        drop(connection);
+    }
 
     /// A fake WebSocket server for the read-deadline tests: accepts one client,
     /// optionally sends a single Ping, then holds the socket open in silence.

@@ -15,7 +15,8 @@ use std::sync::Arc;
 use serde_json::{json, Map, Value};
 
 use crate::model::{
-    Effort, Message, ModelCapabilities, ModelProvider, ModelResponse, Role, ToolCall, ToolSpec,
+    Effort, Message, ModelCapabilities, ModelProvider, ModelResponse, Role, TokenUsage, ToolCall,
+    ToolSpec,
 };
 use crate::{CoreError, Result};
 
@@ -196,6 +197,8 @@ pub fn assemble_responses_sse(
 ) -> ModelResponse {
     let mut text = String::new();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
+    // Usage rides on the terminal `response.completed` event. Absent → unknown.
+    let mut usage: Option<TokenUsage> = None;
     for line in body.lines() {
         let Some(data) = line.trim().strip_prefix("data:") else {
             continue;
@@ -223,19 +226,45 @@ pub fn assemble_responses_sse(
                     }
                 }
             }
+            Some("response.completed") => {
+                if let Some(u) = event.get("response").and_then(usage_from_response) {
+                    usage = Some(u);
+                }
+            }
             _ => {}
         }
     }
     let content = if text.is_empty() { None } else { Some(text) };
-    ModelResponse {
-        message: Message {
-            role: Role::Assistant,
-            content,
-            tool_calls,
-            tool_call_id: None,
-            attachments: Vec::new(),
-        },
+    let response = ModelResponse::new(Message {
+        role: Role::Assistant,
+        content,
+        tool_calls,
+        tool_call_id: None,
+        attachments: Vec::new(),
+    });
+    match usage {
+        Some(u) => response.with_usage(u),
+        None => response,
     }
+}
+
+/// Read the `usage` block off a Responses-API `response` object. Returns `None`
+/// when the provider reported none, so "unknown" never becomes "zero". A missing
+/// `total_tokens` is derived from input + output.
+fn usage_from_response(response: &Value) -> Option<TokenUsage> {
+    let usage = response.get("usage")?;
+    let count = |key: &str| usage.get(key).and_then(Value::as_u64);
+    let input = count("input_tokens").unwrap_or(0);
+    let output = count("output_tokens").unwrap_or(0);
+    Some(TokenUsage {
+        input,
+        output,
+        total: count("total_tokens").unwrap_or_else(|| input.saturating_add(output)),
+        cached_input: usage
+            .get("input_tokens_details")
+            .and_then(|d| d.get("cached_tokens"))
+            .and_then(Value::as_u64),
+    })
 }
 
 /// Parse a `function_call` output item into a `ToolCall` (arguments are a JSON
@@ -494,5 +523,37 @@ mod tests {
         assert_eq!(resp.message.tool_calls[0].name, "run");
         assert_eq!(resp.message.tool_calls[0].id, "c9");
         assert_eq!(resp.message.tool_calls[0].arguments, json!({ "x": 1 }));
+        // That stream's `response.completed` carried no usage → unknown, not zero.
+        assert!(resp.usage.is_none());
+    }
+
+    #[test]
+    fn sse_reads_usage_from_response_completed() {
+        // Reported, with the cached slice of the input.
+        let body = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1000,\"output_tokens\":50,\"total_tokens\":1050,\"input_tokens_details\":{\"cached_tokens\":800}}}}\n",
+            "data: [DONE]\n",
+        );
+        let mut sink = |_: &str| {};
+        let usage = assemble_responses_sse(body, &mut sink)
+            .usage
+            .expect("usage");
+        assert_eq!(usage.input, 1000);
+        assert_eq!(usage.output, 50);
+        assert_eq!(usage.total, 1050);
+        assert_eq!(usage.cached_input, Some(800));
+
+        // Reported without cache details: cached_input stays unknown, and a
+        // missing total is derived from input + output rather than left at zero.
+        let body = concat!(
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":7,\"output_tokens\":3}}}\n",
+            "data: [DONE]\n",
+        );
+        let usage = assemble_responses_sse(body, &mut sink)
+            .usage
+            .expect("usage");
+        assert_eq!((usage.input, usage.output, usage.total), (7, 3, 10));
+        assert_eq!(usage.cached_input, None);
     }
 }

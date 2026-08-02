@@ -11,6 +11,29 @@ use tokio_tungstenite::tungstenite::{accept, Message};
 
 static RUN_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Where `fleety acp install zed` writes settings when the fake home is `home`.
+///
+/// Mirrors `zed_settings_path()`: Windows resolves through `%APPDATA%`, not
+/// `%USERPROFILE%`, so a test that overrides only HOME/USERPROFILE would read —
+/// and on success write — the developer's real Zed settings. Every Zed test
+/// must therefore also point APPDATA inside its temp home (see
+/// [`zed_appdata_in`]) and assert against this path.
+fn zed_settings_in(home: &std::path::Path) -> std::path::PathBuf {
+    if cfg!(windows) {
+        home.join("AppData")
+            .join("Roaming")
+            .join("Zed")
+            .join("settings.json")
+    } else {
+        home.join(".config").join("zed").join("settings.json")
+    }
+}
+
+/// The APPDATA value that confines Zed-settings writes under `home`.
+fn zed_appdata_in(home: &std::path::Path) -> std::path::PathBuf {
+    home.join("AppData").join("Roaming")
+}
+
 /// Run the CLI in an isolated temp HOME so a command never reads or migrates the
 /// developer's real `~/.fleety` (main() runs the one-time config.json migration).
 fn run(args: &[&str]) -> std::process::Output {
@@ -28,11 +51,12 @@ fn run(args: &[&str]) -> std::process::Output {
 #[test]
 fn acp_install_accepts_editor_after_server_option_and_writes_the_validated_endpoint() {
     let home = TempHome::new("acp-install-order");
-    let settings = home.0.join(".config/zed/settings.json");
+    let settings = zed_settings_in(&home.0);
     let output = Command::new(env!("CARGO_BIN_EXE_fleety"))
         .args(["acp", "install", "--server", "ws://127.0.0.1:8787", "zed"])
         .env("HOME", &home.0)
         .env("USERPROFILE", &home.0)
+        .env("APPDATA", zed_appdata_in(&home.0))
         .output()
         .expect("run acp install");
     assert!(
@@ -52,13 +76,14 @@ fn acp_install_accepts_editor_after_server_option_and_writes_the_validated_endpo
 #[test]
 fn acp_install_rejects_an_invalid_endpoint_without_touching_zed_settings() {
     let home = TempHome::new("acp-install-invalid");
-    let settings = home.0.join(".config/zed/settings.json");
+    let settings = zed_settings_in(&home.0);
     std::fs::create_dir_all(settings.parent().expect("settings parent")).expect("settings dir");
     std::fs::write(&settings, b"{\"theme\":\"keep\"}").expect("settings fixture");
     let output = Command::new(env!("CARGO_BIN_EXE_fleety"))
         .args(["acp", "install", "zed", "--server", "not-a-websocket"])
         .env("HOME", &home.0)
         .env("USERPROFILE", &home.0)
+        .env("APPDATA", zed_appdata_in(&home.0))
         .output()
         .expect("run invalid acp install");
     assert!(!output.status.success());
@@ -71,7 +96,7 @@ fn acp_install_rejects_an_invalid_endpoint_without_touching_zed_settings() {
 #[test]
 fn acp_install_rejects_a_fragment_without_touching_zed_settings() {
     let home = TempHome::new("acp-install-fragment");
-    let settings = home.0.join(".config/zed/settings.json");
+    let settings = zed_settings_in(&home.0);
     std::fs::create_dir_all(settings.parent().expect("settings parent")).expect("settings dir");
     std::fs::write(&settings, b"{\"theme\":\"keep\"}").expect("settings fixture");
     let output = Command::new(env!("CARGO_BIN_EXE_fleety"))
@@ -84,6 +109,7 @@ fn acp_install_rejects_a_fragment_without_touching_zed_settings() {
         ])
         .env("HOME", &home.0)
         .env("USERPROFILE", &home.0)
+        .env("APPDATA", zed_appdata_in(&home.0))
         .output()
         .expect("run fragment acp install");
     assert!(!output.status.success());
@@ -101,10 +127,11 @@ fn acp_install_rejects_an_empty_settings_base() {
         .current_dir(&cwd.0)
         .env("HOME", "")
         .env("USERPROFILE", "")
+        .env("APPDATA", "")
         .output()
         .expect("run empty-home acp install");
     assert!(!output.status.success());
-    assert!(!cwd.0.join(".config/zed/settings.json").exists());
+    assert!(!zed_settings_in(&cwd.0).exists());
 }
 
 #[test]
@@ -114,6 +141,7 @@ fn acp_install_unknown_editor_fails_with_the_generic_setup() {
         .args(["acp", "install", "neovim"])
         .env("HOME", &home.0)
         .env("USERPROFILE", &home.0)
+        .env("APPDATA", zed_appdata_in(&home.0))
         .output()
         .expect("run generic acp install");
     // Naming an editor asks for an install. Nothing was installed, so exiting 0
@@ -132,7 +160,7 @@ fn acp_install_unknown_editor_fails_with_the_generic_setup() {
         String::from_utf8_lossy(&output.stdout).is_empty(),
         "a failure must not write to stdout"
     );
-    assert!(!home.0.join(".config/zed/settings.json").exists());
+    assert!(!zed_settings_in(&home.0).exists());
 
     // Naming no editor is the documented "print the setup" path and still
     // succeeds on stdout.
@@ -140,6 +168,7 @@ fn acp_install_unknown_editor_fails_with_the_generic_setup() {
         .args(["acp", "install"])
         .env("HOME", &home.0)
         .env("USERPROFILE", &home.0)
+        .env("APPDATA", zed_appdata_in(&home.0))
         .output()
         .expect("run generic acp install");
     assert!(printed.status.success());

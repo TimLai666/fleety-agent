@@ -90,6 +90,33 @@ no Fleety crate). This file holds things that aren't derivable from the code.
 
 ## Follow-ups
 
+### [2026-08-02] — A `localhost` endpoint costs ~2 s on Windows, and the Server binds v4 only
+
+- **Where:** `crates/fleety-server/src/main.rs` (`FLEETY_ADDR`, default
+  `0.0.0.0:8787`), reached through any profile whose URL spells the host
+  `localhost`
+- **What:** on a dual-stack Windows host `localhost` resolves to `::1` before
+  `127.0.0.1`, and a connect to `[::1]:<port>` with nothing bound there takes
+  **~2.04 s** to fall through to the v4 address (measured against one
+  127.0.0.1-bound listener: `localhost` 2.0365 s, `127.0.0.1` 1.7 ms). The
+  Server's default bind is v4 only, so a Windows user who types
+  `ws://localhost:8787` pays that on every connect. Worse, it exceeds every
+  per-candidate budget in the sweep — `open_budget_within` halves the caller's
+  share before the transport even starts — so such an endpoint does not merely
+  feel slow, it is *never* reachable as a candidate. `DEFAULT_URL` sidesteps
+  this by being the IPv4 literal; a hand-typed or pasted `localhost` does not.
+- **Suggestion:** listen dual-stack, or normalise `localhost` to `127.0.0.1` in
+  `fleety init` and say why. Note the tests can no longer warn about this: since
+  2026-08-02 `start_roaming_budget_server` binds a best-effort companion
+  listener on `[::1]:<same port>`, so the roaming tests answer on whichever
+  family `localhost` prefers and no longer surface the v4-only gap.
+- **Status:** resolved by the `localhost-dual-stack-reachability` change
+  (2026-08-02): the server grows a best-effort same-port IPv6 companion for the
+  two IPv4 default forms (`bind_with_companion` in `fleety-server/src/main.rs`),
+  and the transport dials a host spelled exactly `localhost` as `127.0.0.1`
+  (`dial_target` in `fleety-tools/src/transport.rs`) so old v4-only servers stay
+  fast too. A v6-only server is reached by spelling `ws://[::1]:8787`.
+
 ### [2026-08-01] — CI's clippy gate cannot be run locally on Windows
 
 - **Where:** `crates/fleety-tools/src/connection.rs:306` (`dir`),

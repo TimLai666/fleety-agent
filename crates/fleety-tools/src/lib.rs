@@ -496,6 +496,28 @@ pub fn line_numbered(content: &str, start_line: usize) -> String {
         .join("\n")
 }
 
+/// The inverse of [`line_numbered`]: recover the original text from a numbered
+/// view by dropping each line's number prefix up to and including the first tab.
+///
+/// The read tools return only the numbered view, so any caller that needs the
+/// raw bytes — parsing a settings file as JSON, injecting an instruction file —
+/// must undo the numbering. This lives beside `line_numbered` and is the single
+/// shared inverse precisely so the format and its reverse cannot drift apart.
+///
+/// A line with no tab is left untouched (it was not produced by `line_numbered`),
+/// and only the *first* tab is consumed, so content that itself contains tabs
+/// round-trips intact.
+pub fn strip_line_numbers(numbered: &str) -> String {
+    numbered
+        .lines()
+        .map(|line| match line.split_once('\t') {
+            Some((_number, rest)) => rest,
+            None => line,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Slice `[start, end]` (1-based, inclusive, clamped to the file) of `content`'s
 /// logical lines. Returns `(slice_text, start, end, total_lines)`; an empty file
 /// yields `("", 0, 0, 0)`.
@@ -835,12 +857,12 @@ impl Tool for ReadFile {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "read_file".to_string(),
-            description:
-                "Read a UTF-8 text file within the workspace. Returns raw `content` plus a \
-                 line-numbered `numbered` view and `line_count`; pass `start_line`/`end_line` \
+            description: "Read a UTF-8 text file within the workspace. Returns a line-numbered \
+                 `numbered` view of the slice plus `line_count`; pass `start_line`/`end_line` \
                  (1-based, inclusive) to read just a slice. Use the line numbers to target \
-                 edit_file's line-range mode."
-                    .to_string(),
+                 edit_file's line-range mode. The `NNN\\t` line-number prefix is NOT part of \
+                 the file content — strip it before using text as edit_file's `old` match."
+                .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -868,9 +890,11 @@ impl Tool for ReadFile {
         let full = std::fs::read_to_string(&resolved)
             .map_err(|e| CoreError::Message(format!("cannot read '{path}': {e}")))?;
         let (slice, start, end, total) = slice_lines(&full, start_line, end_line);
+        // One view of the slice, not two: the numbered view already carries the
+        // content, so also returning a raw copy would spend half the tool-result
+        // character budget on the same bytes.
         Ok(json!({
             "path": path,
-            "content": slice,
             "numbered": line_numbered(&slice, start.max(1)),
             "start_line": start,
             "end_line": end,
@@ -1647,10 +1671,14 @@ mod tests {
             .call("read_file", json!({ "path": "a.txt" }))
             .await
             .expect("read");
-        assert!(r["content"]
+        assert!(r["numbered"]
             .as_str()
             .unwrap_or_default()
-            .contains("foo bar"));
+            .contains("     2\tfoo bar"));
+        assert!(
+            r.get("content").is_none(),
+            "read_file must not also return an unnumbered copy of the same slice"
+        );
 
         // ripgrep search (regex)
         let s = reg
@@ -1771,6 +1799,14 @@ mod tests {
         // numbered (tab-separated, right-aligned)
         assert!(line_numbered("x\ny", 1).contains("     1\tx"));
         assert!(line_numbered("x\ny", 5).contains("     6\ty"));
+        // ...and the inverse recovers the original, including a line whose own
+        // content contains a tab (only the first tab is the number separator).
+        let with_tab = "alpha\nbeta\tgamma";
+        assert_eq!(strip_line_numbers(&line_numbered(with_tab, 1)), with_tab);
+        assert_eq!(strip_line_numbers(&line_numbered(c, 7)), c.trim_end());
+        // A line that was never numbered (no tab) is passed through untouched.
+        assert_eq!(strip_line_numbers("plain line"), "plain line");
+        assert_eq!(strip_line_numbers(""), "");
         // replace a middle line, trailing newline preserved
         let (out, n) = replace_line_range(c, 2, 3, "B\nC2").expect("range");
         assert_eq!(out, "a\nB\nC2\nd\n");
@@ -1801,12 +1837,22 @@ mod tests {
             )
             .await
             .expect("read");
-        assert_eq!(r["content"], json!("beta\ngamma"));
         assert_eq!(r["line_count"], json!(3));
+        assert_eq!(r["start_line"], json!(2));
+        assert_eq!(r["end_line"], json!(3));
         assert!(r["numbered"]
             .as_str()
             .unwrap_or_default()
             .contains("     2\tbeta"));
+        assert!(r["numbered"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("     3\tgamma"));
+        // The slice is returned once, as the numbered view: no duplicate raw copy.
+        assert!(
+            r.get("content").is_none(),
+            "read_file must not also return an unnumbered copy of the same slice"
+        );
 
         // edit by line range; result carries the post-edit numbered region
         let e = reg

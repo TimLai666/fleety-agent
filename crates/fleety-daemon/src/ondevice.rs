@@ -74,7 +74,14 @@ mod tests {
             .call("read_file", json!({ "path": "note.txt" }))
             .await
             .expect("read");
-        assert_eq!(read["content"], json!("hi device"));
+        assert!(read["numbered"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("     1\thi device"));
+        assert!(
+            read.get("content").is_none(),
+            "read_file must not also return an unnumbered copy of the same slice"
+        );
         // search (ripgrep) now works on-device too
         let found = reg
             .call("search_files", json!({ "query": "device" }))

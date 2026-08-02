@@ -111,7 +111,7 @@ pub fn registry() -> &'static [Setting] {
             key: "FLEETY_ADDR",
             scope: Server,
             default: "0.0.0.0:8787",
-            description: "WebSocket listen address; defaults to all interfaces so it is reachable across devices (auth is required by default). Set 127.0.0.1:8787 for loopback-only.",
+            description: "WebSocket listen address; defaults to all interfaces so it is reachable across devices (auth is required by default). Set 127.0.0.1:8787 for loopback-only. The 0.0.0.0 / 127.0.0.1 forms also grow a best-effort same-port IPv6 companion so `localhost` connects without a v6-to-v4 fallback; other explicit addresses bind exactly as given.",
             secret: false,
             validator: None,
         },

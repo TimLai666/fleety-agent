@@ -23,7 +23,7 @@ Grouped by which binary cares about it. Anything unset uses the default.
 
 | Var | Default | Meaning |
 |---|---|---|
-| `FLEETY_ADDR` | `0.0.0.0:8787` | WebSocket listen address. Defaults to all interfaces so it's reachable across devices out of the box (auth is required by default). Set `127.0.0.1:8787` for loopback-only. |
+| `FLEETY_ADDR` | `0.0.0.0:8787` | WebSocket listen address. Defaults to all interfaces so it's reachable across devices out of the box (auth is required by default). Set `127.0.0.1:8787` for loopback-only. The two IPv4 default forms (`0.0.0.0` / `127.0.0.1`) also grow a best-effort same-port IPv6 companion listener (`[::]` / `[::1]`), so a client that spells the endpoint `localhost` connects immediately instead of waiting out a v6→v4 fallback; a failed companion bind logs and serves IPv4-only. Any other explicit address is bound exactly as given. To reach a server bound only to IPv6 loopback, spell the URL `ws://[::1]:8787`. |
 | `FLEETY_AGENT_HOME` | `$HOME/.fleety/agent` | Durable store root: conversations, history, backups, skills, MCP config, schedules, wiki. |
 | `FLEETY_WORKSPACE` | cwd | Base directory the workspace tools (`read_file`/`write_file`/etc.) resolve **relative** paths against — the *fallback* workspace root (see below). |
 

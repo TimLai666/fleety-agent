@@ -84,9 +84,10 @@ impl Tool for MemoryRead {
         ToolSpec {
             name: "memory_read".to_string(),
             description: "Read an agent core memory file (ME.md, USER.md, TODO.md, or TOOLS.md). \
-                 Returns raw `content` plus a line-numbered `numbered` view and `line_count`; pass \
+                 Returns a line-numbered `numbered` view of the slice and `line_count`; pass \
                  `start_line`/`end_line` for a slice. Use the line numbers for memory_edit's \
-                 line-range mode."
+                 line-range mode. The `NNN\\t` line-number prefix is NOT part of the file \
+                 content — strip it before using text as memory_edit's `old` match."
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -118,9 +119,11 @@ impl Tool for MemoryRead {
             Err(e) => return Err(CoreError::Message(format!("cannot read {file}: {e}"))),
         };
         let (slice, start, end, total) = fleety_tools::slice_lines(&full, start_line, end_line);
+        // One view of the slice, not two — mirrors `read_file`: the numbered view
+        // already carries the content, and all slice-returning read tools share
+        // the same tool-result character budget.
         Ok(json!({
             "file": file,
-            "content": slice,
             "numbered": fleety_tools::line_numbered(&slice, start.max(1)),
             "start_line": start,
             "end_line": end,
@@ -749,6 +752,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// Measure what the base registry costs on the wire, every request.
+    ///
+    /// Run with `--nocapture` to print the breakdown. This is a measurement, not
+    /// an assertion of a budget: the only thing asserted is that the registry is
+    /// non-trivial, so the test cannot silently pass against an empty registry.
+    #[tokio::test]
+    async fn measure_tool_schema_wire_size() {
+        let root = std::env::current_dir().expect("cwd");
+        let registry = build_registry(
+            &root,
+            &root,
+            &root,
+            &root,
+            &root,
+            &root,
+            crate::bridge::new_device_tools(),
+        );
+        let specs = registry.specs();
+        let mut rows: Vec<(String, usize, usize, usize)> = specs
+            .iter()
+            .map(|s| {
+                let desc = s.description.len();
+                let params = s.parameters.to_string().len();
+                // Approximate the OpenAI function-tool envelope around each spec.
+                let wire = desc + params + s.name.len() + 60;
+                (s.name.clone(), desc, params, wire)
+            })
+            .collect();
+        rows.sort_by_key(|row| std::cmp::Reverse(row.3));
+        let total: usize = rows.iter().map(|r| r.3).sum();
+
+        println!("\n=== base registry: {} tools ===", rows.len());
+        println!("total wire size: {total} bytes (~{} KB)", total / 1024);
+        println!("est. tokens (bytes/4): ~{}", total / 4);
+        println!("\ntop 15 by wire size:");
+        for (name, desc, params, wire) in rows.iter().take(15) {
+            println!("  {wire:>6}B  {name:<24} desc={desc:<5} params={params}");
+        }
+
+        assert!(
+            rows.len() > 20,
+            "the base registry should carry the full tool surface"
+        );
+    }
+
     // Workspace tools come from fleety-tools; these confirm the wiring works.
     #[tokio::test]
     async fn list_dir_and_escape_via_registry() {
@@ -851,7 +899,15 @@ mod tests {
             .call("memory_read", json!({ "file": "USER.md" }))
             .await
             .expect("read");
-        assert_eq!(read["content"], json!("likes Rust"));
+        assert!(read["numbered"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("     1\tlikes Rust"));
+        assert_eq!(read["line_count"], json!(1));
+        assert!(
+            read.get("content").is_none(),
+            "memory_read must not also return an unnumbered copy of the same slice"
+        );
 
         assert!(registry
             .call(
@@ -920,10 +976,15 @@ mod tests {
             .call("memory_read", json!({ "file": "TODO.md" }))
             .await
             .expect("read");
-        let body = read["content"].as_str().unwrap_or_default();
+        let body = read["numbered"].as_str().unwrap_or_default();
         assert!(body.contains("buy oat milk"));
         assert!(body.contains("call Tim about release"));
-        assert!(read["numbered"].as_str().unwrap_or_default().contains('\t'));
+        assert!(body.contains('\t'));
+        // The slice is returned once, as the numbered view: no duplicate raw copy.
+        assert!(
+            read.get("content").is_none(),
+            "memory_read must not also return an unnumbered copy of the same slice"
+        );
 
         // Line-range mode: replace line 3 (the "call Tim" line).
         registry
@@ -940,7 +1001,12 @@ mod tests {
             )
             .await
             .expect("read slice");
-        assert_eq!(after["content"], json!("- done"));
+        assert!(after["numbered"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("     3\t- done"));
+        assert_eq!(after["start_line"], json!(3));
+        assert_eq!(after["end_line"], json!(3));
 
         // Missing 'old' text errors; editing an empty file errors.
         assert!(registry

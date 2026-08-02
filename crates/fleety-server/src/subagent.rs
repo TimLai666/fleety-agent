@@ -429,12 +429,8 @@ mod tests {
         let auth = Arc::new(AuthStore::load(home.join("auth.json"), None, false));
         let (out, rx) = tokio::sync::mpsc::unbounded_channel();
         let main: Arc<dyn ModelProvider> = Arc::new(MockProvider::new(vec![
-            ModelResponse {
-                message: Message::assistant("sub-result"),
-            },
-            ModelResponse {
-                message: Message::assistant("coordinator-ack"),
-            },
+            ModelResponse::new(Message::assistant("sub-result")),
+            ModelResponse::new(Message::assistant("coordinator-ack")),
         ]));
         let tiers = ProviderTiers::new(main, None);
         let host = FleetyHost::new(

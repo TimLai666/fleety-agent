@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use crate::model::{
     effort_field, Effort, EffortScheme, Message, ModelCapabilities, ModelProvider, ModelResponse,
-    Role, ToolCall, ToolSpec,
+    Role, TokenUsage, ToolCall, ToolSpec,
 };
 use crate::{CoreError, Result};
 
@@ -247,6 +247,10 @@ impl ModelProvider for Gemini {
         let mut content = String::new();
         let mut function_calls: Vec<ToolCall> = Vec::new();
         let mut buf = String::new();
+        // Gemini repeats a cumulative `usageMetadata` on its chunks; the last one
+        // seen is the final tally. A stream that never carries it leaves usage
+        // unknown rather than failing.
+        let mut usage: Option<TokenUsage> = None;
         while let Some(chunk) = stream.next().await {
             let bytes =
                 chunk.map_err(|e| CoreError::Provider(format!("gemini stream failed: {e}")))?;
@@ -259,6 +263,9 @@ impl ModelProvider for Gemini {
                         continue;
                     }
                     if let Ok(chunk_json) = serde_json::from_str::<Value>(data) {
+                        if let Some(u) = parse_usage(&chunk_json) {
+                            usage = Some(u);
+                        }
                         accumulate_sse_chunk(
                             &chunk_json,
                             &mut content,
@@ -269,18 +276,20 @@ impl ModelProvider for Gemini {
                 }
             }
         }
-        Ok(ModelResponse {
-            message: Message {
-                role: Role::Assistant,
-                content: if content.is_empty() {
-                    None
-                } else {
-                    Some(content)
-                },
-                tool_calls: function_calls,
-                tool_call_id: None,
-                attachments: Vec::new(),
+        let response = ModelResponse::new(Message {
+            role: Role::Assistant,
+            content: if content.is_empty() {
+                None
+            } else {
+                Some(content)
             },
+            tool_calls: function_calls,
+            tool_call_id: None,
+            attachments: Vec::new(),
+        });
+        Ok(match usage {
+            Some(u) => response.with_usage(u),
+            None => response,
         })
     }
 }
@@ -440,6 +449,20 @@ fn parse_tool_payload(content: &str) -> Value {
 }
 
 /// Parse a non-streaming Gemini response into the canonical ModelResponse shape.
+/// Read Gemini's `usageMetadata` block. Absent → `None` (unknown), never a
+/// zeroed usage. Gemini reports this on both the unary response and each
+/// streamed chunk, so no request option is needed to obtain it.
+fn parse_usage(value: &Value) -> Option<TokenUsage> {
+    let meta = value.get("usageMetadata")?;
+    let count = |key: &str| meta.get(key).and_then(Value::as_u64);
+    Some(TokenUsage {
+        input: count("promptTokenCount").unwrap_or(0),
+        output: count("candidatesTokenCount").unwrap_or(0),
+        total: count("totalTokenCount").unwrap_or(0),
+        cached_input: count("cachedContentTokenCount"),
+    })
+}
+
 fn parse_response(value: &Value) -> Result<ModelResponse> {
     let candidate = value
         .get("candidates")
@@ -472,18 +495,20 @@ fn parse_response(value: &Value) -> Result<ModelResponse> {
             });
         }
     }
-    Ok(ModelResponse {
-        message: Message {
-            role: Role::Assistant,
-            content: if content.is_empty() {
-                None
-            } else {
-                Some(content)
-            },
-            tool_calls,
-            tool_call_id: None,
-            attachments: Vec::new(),
+    let response = ModelResponse::new(Message {
+        role: Role::Assistant,
+        content: if content.is_empty() {
+            None
+        } else {
+            Some(content)
         },
+        tool_calls,
+        tool_call_id: None,
+        attachments: Vec::new(),
+    });
+    Ok(match parse_usage(value) {
+        Some(u) => response.with_usage(u),
+        None => response,
     })
 }
 
@@ -652,6 +677,42 @@ mod tests {
         assert_eq!(r.message.tool_calls.len(), 1);
         assert_eq!(r.message.tool_calls[0].name, "read_file");
         assert_eq!(r.message.tool_calls[0].arguments, json!({ "path": "x" }));
+    }
+
+    #[test]
+    fn parse_response_maps_usage_metadata_when_present() {
+        // Reported, including the cached slice of the prompt.
+        let v = json!({
+            "candidates": [{ "content": { "parts": [{ "text": "ok" }] } }],
+            "usageMetadata": {
+                "promptTokenCount": 1000,
+                "candidatesTokenCount": 50,
+                "totalTokenCount": 1050,
+                "cachedContentTokenCount": 800
+            }
+        });
+        let usage = parse_response(&v).expect("parse").usage.expect("usage");
+        assert_eq!(usage.input, 1000);
+        assert_eq!(usage.output, 50);
+        assert_eq!(usage.total, 1050);
+        assert_eq!(usage.cached_input, Some(800));
+
+        // Reported without the cache counter: cached_input stays unknown.
+        let v = json!({
+            "candidates": [{ "content": { "parts": [{ "text": "ok" }] } }],
+            "usageMetadata": {
+                "promptTokenCount": 7,
+                "candidatesTokenCount": 3,
+                "totalTokenCount": 10
+            }
+        });
+        let usage = parse_response(&v).expect("parse").usage.expect("usage");
+        assert_eq!((usage.input, usage.output, usage.total), (7, 3, 10));
+        assert_eq!(usage.cached_input, None);
+
+        // Absent entirely: unknown, not zero.
+        let v = json!({ "candidates": [{ "content": { "parts": [{ "text": "ok" }] } }] });
+        assert!(parse_response(&v).expect("parse").usage.is_none());
     }
 
     #[test]

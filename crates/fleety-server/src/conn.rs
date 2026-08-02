@@ -243,12 +243,16 @@ async fn collect_conversation_hooks(
                 let path = std::path::Path::new(base)
                     .join(".claude")
                     .join("settings.json");
+                // `read_file` takes `path` (not `file`), and returns only the
+                // line-numbered view, so the numbering is undone before parsing.
                 let args = serde_json::json!({ "path": path.to_string_lossy() });
                 if let Ok(res) =
                     bridge::route_run_tool_via(&sender, pending, "read_file", args).await
                 {
-                    if let Some(content) = res.get("content").and_then(serde_json::Value::as_str) {
-                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(content) {
+                    if let Some(numbered) = res.get("numbered").and_then(serde_json::Value::as_str)
+                    {
+                        let content = fleety_tools::strip_line_numbers(numbered);
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
                             out.extend(parse_hooks(&v, scope));
                         }
                     }
@@ -3377,14 +3381,17 @@ async fn build_instruction_preamble_remote(
     let mut items = Vec::new();
     for name in ["AGENTS.md", "CLAUDE.md"] {
         let path = cwd.join(name);
+        // `read_file` takes `path` (not `file`), and returns only the
+        // line-numbered view, so the numbering is undone before injection —
+        // instruction files must reach the model as their original text.
         let args = serde_json::json!({
             "device": device,
             "tool": "read_file",
             "args": { "path": path.to_string_lossy() },
         });
         if let Ok(res) = tools.call("device_exec", args).await {
-            if let Some(content) = res.get("content").and_then(|c| c.as_str()) {
-                items.push((path, content.to_string()));
+            if let Some(numbered) = res.get("numbered").and_then(|c| c.as_str()) {
+                items.push((path, fleety_tools::strip_line_numbers(numbered)));
             }
         }
     }
@@ -3478,6 +3485,15 @@ pub(crate) async fn drive_turn(
     // every turn/reload). A missing/stale cache safely falls back to a full
     // summary. Saved back after the turn; a save failure is non-fatal.
     let mut compaction = storage.load_compaction(device_id, conversation);
+    // Progressive tool loading: open on the resident set plus whatever this
+    // conversation has activated before. `tool_search` widens this handle during
+    // the turn, and the loop re-reads the offered specs each step, so a group
+    // found mid-turn is usable immediately.
+    let active_tools = tools.active_tools();
+    crate::tool_groups::apply_activation(
+        &active_tools,
+        storage.load_active_tools(device_id, conversation).as_ref(),
+    );
     let outcome = run_turn_streaming_cached(
         provider,
         tools,
@@ -3499,6 +3515,13 @@ pub(crate) async fn drive_turn(
     if let Some(cache) = &compaction {
         if let Err(e) = storage.save_compaction(device_id, conversation, cache) {
             tracing::warn!(%conversation, error = %e, "could not persist compaction cache");
+        }
+    }
+    // Persist what the turn activated, so a group found once need not be found
+    // again. Non-fatal: losing this only costs a future search.
+    if let Some(active) = active_tools.snapshot() {
+        if let Err(e) = storage.save_active_tools(device_id, conversation, &active) {
+            tracing::warn!(%conversation, error = %e, "could not persist activated tools");
         }
     }
     for event in events.events() {
@@ -3777,6 +3800,11 @@ pub(crate) fn build_full_registry(
         workspace.to_path_buf(),
         storage.backups_dir(),
     );
+    // The model's route from the resident set to everything else. Holds the
+    // registry's own activation handle, so a search widens what the next model
+    // call of the same turn is shown.
+    let active = tools.active_tools();
+    tools.register(Box::new(crate::tool_groups::ToolSearch::new(active)));
     tools
 }
 
@@ -4732,65 +4760,217 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// The cross-device hook read must ask `read_file` for a `path` and cope with
+    /// its line-numbered reply. The fake device here asserts the argument key and
+    /// answers in `read_file`'s real shape, so a wrong key or a wrong result field
+    /// fails the test instead of silently yielding no hooks.
     #[tokio::test]
     async fn collect_conversation_hooks_cross_device_reads_settings_via_bridge() {
-        // Regression: the bridge read must name read_file's argument `path`.
-        // A wrong key makes the daemon error, the `if let Ok(..)` swallows it,
-        // and the origin device's hooks silently vanish — so the fake daemon
-        // here rejects anything but `path`, exactly like the real tool.
+        use fleety_protocol::ServerMsg;
+
         let hub = crate::bridge::new_hub();
         let pending = crate::bridge::new_pending();
-        let (tx, mut frames) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<WsMessage>();
         hub.lock().await.insert("dev2".to_string(), tx);
-        let daemon = {
-            let pending = Arc::clone(&pending);
-            tokio::spawn(async move {
-                while let Some(msg) = frames.recv().await {
-                    let tokio_tungstenite::tungstenite::Message::Text(text) = msg else {
-                        continue;
-                    };
-                    let Ok(fleety_protocol::ServerMsg::RunTool {
-                        call_id,
-                        tool,
-                        args_json,
-                    }) = serde_json::from_str(&text)
-                    else {
-                        continue;
-                    };
-                    let args: serde_json::Value =
-                        serde_json::from_str(&args_json).unwrap_or(serde_json::Value::Null);
-                    let path = args.get("path").and_then(serde_json::Value::as_str);
-                    let reply = match (tool.as_str(), path) {
-                        ("read_file", Some(p)) if p.ends_with("settings.json") => Ok(
-                            serde_json::json!({ "content": r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"remote.sh"}]}]}}"# }),
-                        ),
-                        _ => Err(format!(
-                            "missing required string argument 'path' (got {args_json})"
-                        )),
-                    };
-                    if let Some(reply_tx) = pending.lock().await.remove(&call_id) {
-                        let _ = reply_tx.send(reply);
-                    }
+
+        // Stand in for the device: answer every RunTool as `read_file` would.
+        let device_pending = pending.clone();
+        let seen_paths = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let recorder = Arc::clone(&seen_paths);
+        let device = tokio::spawn(async move {
+            while let Some(WsMessage::Text(text)) = rx.recv().await {
+                let Ok(ServerMsg::RunTool {
+                    call_id,
+                    tool,
+                    args_json,
+                }) = serde_json::from_str::<ServerMsg>(&text)
+                else {
+                    continue;
+                };
+                assert_eq!(tool, "read_file");
+                let args: serde_json::Value = serde_json::from_str(&args_json).expect("args parse");
+                let path = args
+                    .get("path")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_else(|| {
+                        panic!("read_file requires a 'path' argument; got {args_json}")
+                    })
+                    .to_string();
+                recorder.lock().expect("lock").push(path.clone());
+                // Only the project settings exist; the user one is missing.
+                let reply = if path.contains("proj") {
+                    let body = r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"x.sh"}]}]}}"#;
+                    Ok(serde_json::json!({
+                        "path": path,
+                        "numbered": fleety_tools::line_numbered(body, 1),
+                        "line_count": 1,
+                    }))
+                } else {
+                    Err("no such file".to_string())
+                };
+                if let Some(slot) = device_pending.lock().await.remove(&call_id) {
+                    let _ = slot.send(reply);
                 }
-            })
-        };
+            }
+        });
+
         let got = collect_conversation_hooks(
             Some("dev2"),
             Some("/home/bob/proj"),
-            None,
+            Some("/home/bob"),
             None,
             &hub,
             &pending,
         )
         .await;
-        daemon.abort();
-        assert_eq!(
-            got.len(),
-            1,
-            "the origin device's project hook is collected"
-        );
-        assert_eq!(got[0].command, "remote.sh");
+
+        device.abort();
+        assert_eq!(got.len(), 1, "the project hook is parsed: {got:?}");
+        assert_eq!(got[0].command, "x.sh");
         assert_eq!(got[0].scope, crate::hooks_compat::HookScope::Project);
+        let paths = seen_paths.lock().expect("lock").clone();
+        assert_eq!(paths.len(), 2, "project and user settings both attempted");
+        assert!(
+            paths.iter().all(|p| p.ends_with("settings.json")),
+            "{paths:?}"
+        );
+    }
+
+    /// Build the registry a real connection gets, for tests that need the whole
+    /// tool surface rather than the base one.
+    fn full_registry_for_test(home: &std::path::Path) -> (Arc<Storage>, ToolRegistry) {
+        let storage = Arc::new(Storage::new(home.to_path_buf()));
+        let workspace = std::env::current_dir().expect("cwd");
+        let tools = build_full_registry(
+            &storage,
+            &workspace,
+            "dev1",
+            &crate::bridge::new_hub(),
+            &crate::bridge::new_pending(),
+            &crate::bridge::new_handles(),
+            &Arc::new(crate::auth::AuthStore::load(
+                home.join("auth.toml"),
+                None,
+                false,
+            )),
+            &crate::bridge::new_device_tools(),
+            &[],
+            Vec::new(),
+        );
+        (storage, tools)
+    }
+
+    /// The resident set and the groups must between them name every registered
+    /// tool, and name nothing that is not registered. Without this, adding a tool
+    /// would silently make it unreachable — the model would never be shown it and
+    /// no search would ever surface it.
+    #[tokio::test]
+    async fn groups_cover_every_registered_tool() {
+        use std::collections::BTreeSet;
+        let home = std::env::temp_dir().join(format!("fleety-groups-{}", uuid::Uuid::new_v4()));
+        let (_storage, tools) = full_registry_for_test(&home);
+
+        let registered: BTreeSet<String> =
+            tools.specs().into_iter().map(|spec| spec.name).collect();
+        let mut classified: BTreeSet<String> = crate::tool_groups::RESIDENT
+            .iter()
+            .map(|t| t.to_string())
+            .collect();
+        for group in crate::tool_groups::GROUPS {
+            classified.extend(group.tools.iter().map(|t| t.to_string()));
+        }
+        // The search entry point is resident by construction, never in a group.
+        classified.insert(crate::tool_groups::SEARCH_TOOL.to_string());
+
+        let unclassified: Vec<&String> = registered.difference(&classified).collect();
+        let phantom: Vec<&String> = classified.difference(&registered).collect();
+        assert!(
+            unclassified.is_empty(),
+            "registered tools missing from RESIDENT/GROUPS: {unclassified:?}"
+        );
+        assert!(
+            phantom.is_empty(),
+            "RESIDENT/GROUPS name tools that are not registered: {phantom:?}"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Measure the whole per-request harness footprint: the system prompt plus
+    /// every tool schema the model is shown. Run with `--nocapture` to print it.
+    ///
+    /// A measurement, not a budget assertion — it exists so the cost of the
+    /// context is a number someone can look up instead of estimating.
+    #[tokio::test]
+    async fn measure_harness_footprint() {
+        let home = std::env::temp_dir().join(format!("fleety-footprint-{}", uuid::Uuid::new_v4()));
+        let storage = Arc::new(Storage::new(home.clone()));
+        let workspace = std::env::current_dir().expect("cwd");
+        let tools = build_full_registry(
+            &storage,
+            &workspace,
+            "dev1",
+            &crate::bridge::new_hub(),
+            &crate::bridge::new_pending(),
+            &crate::bridge::new_handles(),
+            &Arc::new(crate::auth::AuthStore::load(
+                home.join("auth.toml"),
+                None,
+                false,
+            )),
+            &crate::bridge::new_device_tools(),
+            &[],
+            Vec::new(),
+        );
+        let wire = |specs: &[agent_core::ToolSpec]| -> usize {
+            specs
+                .iter()
+                .map(|s| s.description.len() + s.parameters.to_string().len() + s.name.len() + 60)
+                .sum()
+        };
+        // Everything registered — what every request cost before this change.
+        let registered = tools.specs();
+        let registered_bytes = wire(&registered);
+        // What a fresh conversation is actually offered.
+        crate::tool_groups::apply_activation(&tools.active_tools(), None);
+        let offered = tools.specs();
+        let offered_bytes = wire(&offered);
+
+        let prompt = storage
+            .system_prompt_for(&storage.acting_for_device("dev1"))
+            .expect("system prompt");
+        let total = prompt.len() + offered_bytes;
+
+        println!("\n=== per-request harness footprint ===");
+        println!(
+            "system prompt   : {} chars / {} bytes",
+            prompt.chars().count(),
+            prompt.len()
+        );
+        println!(
+            "tools offered   : {} tools / {offered_bytes} bytes",
+            offered.len()
+        );
+        println!(
+            "tools registered: {} tools / {registered_bytes} bytes (deferred until searched)",
+            registered.len()
+        );
+        println!("total per call  : {total} bytes (~{} KB)", total / 1024);
+        println!("est. tokens     : ~{} (bytes/4)", total / 4);
+        println!(
+            "schema deferred : {} bytes (~{} tokens)",
+            registered_bytes - offered_bytes,
+            (registered_bytes - offered_bytes) / 4
+        );
+
+        assert!(
+            registered.len() > 50,
+            "full registry should be the whole surface"
+        );
+        assert!(
+            offered.len() < registered.len(),
+            "a fresh conversation is offered less than the whole registry"
+        );
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     // A minimal tool to wrap in the hook-registry tests below.
@@ -5410,26 +5590,22 @@ mod tests {
 
     /// A scripted assistant turn that calls one tool.
     fn call_resp(id: &str, name: &str, args: serde_json::Value) -> ModelResponse {
-        ModelResponse {
-            message: Message {
-                role: CoreRole::Assistant,
-                content: None,
-                tool_calls: vec![ToolCall {
-                    id: id.to_string(),
-                    name: name.to_string(),
-                    arguments: args,
-                }],
-                tool_call_id: None,
-                attachments: Vec::new(),
-            },
-        }
+        ModelResponse::new(Message {
+            role: CoreRole::Assistant,
+            content: None,
+            tool_calls: vec![ToolCall {
+                id: id.to_string(),
+                name: name.to_string(),
+                arguments: args,
+            }],
+            tool_call_id: None,
+            attachments: Vec::new(),
+        })
     }
 
     /// A scripted assistant turn that just replies with text (ends the turn).
     fn text_resp(text: &str) -> ModelResponse {
-        ModelResponse {
-            message: Message::assistant(text),
-        }
+        ModelResponse::new(Message::assistant(text))
     }
 
     /// A pre-set cancel flag stops the run cleanly rather than looping and
@@ -5901,9 +6077,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .pop_front()
-                .unwrap_or_else(|| ModelResponse {
-                    message: Message::assistant("done"),
-                });
+                .unwrap_or_else(|| ModelResponse::new(Message::assistant("done")));
             Ok(resp)
         }
 
@@ -6172,7 +6346,13 @@ mod tests {
 
     #[tokio::test]
     async fn cross_device_reads_via_device_exec() {
-        use agent_core::{RiskLevel, Tool, ToolSpec};
+        use agent_core::{CoreError, RiskLevel, Tool, ToolSpec};
+        /// Stands in for a device's `read_file`. Unlike a mock that answers
+        /// anything, this one **enforces the tool's contract**: it demands the
+        /// `path` argument `read_file` actually requires and replies in the shape
+        /// `read_file` actually returns (a line-numbered view only). A caller that
+        /// passes the wrong key, or reads the wrong field, therefore fails here
+        /// instead of silently injecting nothing.
         struct MockExec;
         #[async_trait::async_trait]
         impl Tool for MockExec {
@@ -6185,19 +6365,23 @@ mod tests {
                 }
             }
             async fn call(&self, args: serde_json::Value) -> agent_core::Result<serde_json::Value> {
-                // Regression: reject anything but read_file's real `path`
-                // argument, so a wrong key fails here instead of being
-                // swallowed by the caller's best-effort `if let Ok(..)`.
+                // The outer device_exec envelope must be right too, not just the
+                // inner read_file arguments.
                 assert_eq!(args["tool"], "read_file");
                 assert_eq!(args["device"], "dev2");
-                let path = args["args"]["path"].as_str().ok_or_else(|| {
-                    agent_core::CoreError::Message(format!(
-                        "missing required string argument 'path' (got {})",
-                        args["args"]
-                    ))
+                let inner = args.get("args").cloned().unwrap_or_default();
+                let path = inner.get("path").and_then(serde_json::Value::as_str);
+                let path = path.ok_or_else(|| {
+                    CoreError::Message(format!("read_file requires a 'path' argument; got {inner}"))
                 })?;
                 assert!(path.ends_with(".md"), "reads an instruction file: {path}");
-                Ok(serde_json::json!({ "content": "remote-rule" }))
+                Ok(serde_json::json!({
+                    "path": path,
+                    "numbered": fleety_tools::line_numbered("remote-rule\nsecond\tline", 1),
+                    "start_line": 1,
+                    "end_line": 2,
+                    "line_count": 2,
+                }))
             }
         }
         let home = std::env::temp_dir().join(format!("fleety-xdev-{}", uuid::Uuid::new_v4()));
@@ -6211,6 +6395,16 @@ mod tests {
             .await
             .expect("remote preamble");
         assert!(out.contains("remote-rule"), "cross-device content injected");
+        // Injected as the file's own text: the numbering is undone, and a tab
+        // inside the content survives.
+        assert!(
+            out.contains("second\tline"),
+            "content round-trips through the numbered view: {out}"
+        );
+        assert!(
+            !out.contains("     1\tremote-rule"),
+            "line-number prefixes must not reach the model: {out}"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -7378,22 +7572,18 @@ mod tests {
     async fn require_approval_denies_over_websocket() {
         // Provider asks to write a file, then (after denial) finishes.
         let provider: Arc<dyn ModelProvider> = Arc::new(MockProvider::new(vec![
-            ModelResponse {
-                message: Message {
-                    role: CoreRole::Assistant,
-                    content: None,
-                    tool_calls: vec![ToolCall {
-                        id: "c1".to_string(),
-                        name: "write_file".to_string(),
-                        arguments: serde_json::json!({ "path": "x.txt", "content": "hi" }),
-                    }],
-                    tool_call_id: None,
-                    attachments: Vec::new(),
-                },
-            },
-            ModelResponse {
-                message: Message::assistant("done"),
-            },
+            ModelResponse::new(Message {
+                role: CoreRole::Assistant,
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: "c1".to_string(),
+                    name: "write_file".to_string(),
+                    arguments: serde_json::json!({ "path": "x.txt", "content": "hi" }),
+                }],
+                tool_call_id: None,
+                attachments: Vec::new(),
+            }),
+            ModelResponse::new(Message::assistant("done")),
         ]));
 
         let home = std::env::temp_dir().join(format!("fleety-wsapp-{}", uuid::Uuid::new_v4()));
@@ -7506,9 +7696,10 @@ mod tests {
 
         // If the block fails, the provider would answer "processed" — a clear
         // failure signal versus the expected "blocked" notice.
-        let provider: Arc<dyn ModelProvider> = Arc::new(MockProvider::new(vec![ModelResponse {
-            message: Message::assistant("PROVIDER_REACHED_SENTINEL"),
-        }]));
+        let provider: Arc<dyn ModelProvider> =
+            Arc::new(MockProvider::new(vec![ModelResponse::new(
+                Message::assistant("PROVIDER_REACHED_SENTINEL"),
+            )]));
         let storage = Arc::new(Storage::new(home.clone()));
         let workspace = Arc::new(ws_root.clone());
 
@@ -7606,22 +7797,18 @@ mod tests {
         // is never written — while the turn still finishes. Exercises the tool
         // wrapper inside a live turn with the real local shell runner.
         let provider: Arc<dyn ModelProvider> = Arc::new(MockProvider::new(vec![
-            ModelResponse {
-                message: Message {
-                    role: CoreRole::Assistant,
-                    content: None,
-                    tool_calls: vec![ToolCall {
-                        id: "c1".to_string(),
-                        name: "write_file".to_string(),
-                        arguments: serde_json::json!({ "path": "x.txt", "content": "hi" }),
-                    }],
-                    tool_call_id: None,
-                    attachments: Vec::new(),
-                },
-            },
-            ModelResponse {
-                message: Message::assistant("done"),
-            },
+            ModelResponse::new(Message {
+                role: CoreRole::Assistant,
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: "c1".to_string(),
+                    name: "write_file".to_string(),
+                    arguments: serde_json::json!({ "path": "x.txt", "content": "hi" }),
+                }],
+                tool_call_id: None,
+                attachments: Vec::new(),
+            }),
+            ModelResponse::new(Message::assistant("done")),
         ]));
 
         let home = std::env::temp_dir().join(format!("fleety-pretool-{}", uuid::Uuid::new_v4()));
@@ -7744,9 +7931,9 @@ mod tests {
             if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
                 self.gate.notified().await;
             }
-            Ok(ModelResponse {
-                message: Message::assistant("partial work before cancel"),
-            })
+            Ok(ModelResponse::new(Message::assistant(
+                "partial work before cancel",
+            )))
         }
     }
 
@@ -7864,9 +8051,10 @@ mod tests {
     /// emits nothing for it, so a following ping-like turn still works.
     #[tokio::test]
     async fn idle_cancel_turn_is_ignored_silently() {
-        let provider: Arc<dyn ModelProvider> = Arc::new(MockProvider::new(vec![ModelResponse {
-            message: Message::assistant("hello there"),
-        }]));
+        let provider: Arc<dyn ModelProvider> =
+            Arc::new(MockProvider::new(vec![ModelResponse::new(
+                Message::assistant("hello there"),
+            )]));
         let home = std::env::temp_dir().join(format!("fleety-idlecancel-{}", uuid::Uuid::new_v4()));
         let ws_root = home.join("ws");
         std::fs::create_dir_all(&ws_root).expect("mk ws");
@@ -7948,22 +8136,18 @@ mod tests {
         // daemon connection -> daemon replies -> the result returns to the agent
         // loop and is audited. Exercises the full three-party bridge.
         let provider: Arc<dyn ModelProvider> = Arc::new(MockProvider::new(vec![
-            ModelResponse {
-                message: Message {
-                    role: CoreRole::Assistant,
-                    content: None,
-                    tool_calls: vec![ToolCall {
-                        id: "c1".to_string(),
-                        name: "device_exec".to_string(),
-                        arguments: serde_json::json!({ "device": "pi", "tool": "read_file", "args": { "path": "x" } }),
-                    }],
-                    tool_call_id: None,
-                    attachments: Vec::new(),
-                },
-            },
-            ModelResponse {
-                message: Message::assistant("done"),
-            },
+            ModelResponse::new(Message {
+                role: CoreRole::Assistant,
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: "c1".to_string(),
+                    name: "device_exec".to_string(),
+                    arguments: serde_json::json!({ "device": "pi", "tool": "read_file", "args": { "path": "x" } }),
+                }],
+                tool_call_id: None,
+                attachments: Vec::new(),
+            }),
+            ModelResponse::new(Message::assistant("done")),
         ]));
 
         let home = std::env::temp_dir().join(format!("fleety-bridge-{}", uuid::Uuid::new_v4()));

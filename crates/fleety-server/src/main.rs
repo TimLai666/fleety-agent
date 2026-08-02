@@ -57,6 +57,7 @@ mod skills;
 mod ssh;
 mod storage;
 mod subagent;
+mod tool_groups;
 mod tools;
 mod web;
 mod wiki;
@@ -749,8 +750,8 @@ async fn run_server(shutdown: Option<tokio::sync::watch::Receiver<bool>>) {
         Arc::clone(&device_tools),
     ));
 
-    let listener = match TcpListener::bind(&addr).await {
-        Ok(listener) => listener,
+    let (listener, companion) = match bind_with_companion(&addr).await {
+        Ok(pair) => pair,
         Err(e) => {
             tracing::error!(%addr, "cannot bind: {e}; is the port already in use?");
             return;
@@ -790,6 +791,24 @@ async fn run_server(shutdown: Option<tokio::sync::watch::Receiver<bool>>) {
         ws_liveness: http::WsLiveness::from_env(),
     };
     let app = http::router(state);
+    // The IPv6 companion (see `bind_with_companion`) serves the exact same
+    // router: a client whose resolver preferred `::1` for `localhost` lands on
+    // the same app instead of waiting out a multi-second v4 fallback. It runs as
+    // a task so the select below stays shaped around the canonical listener; it
+    // is aborted on the same shutdown paths.
+    let companion_serve = companion.map(|companion| {
+        let app = app.clone();
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(
+                companion,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            {
+                tracing::error!(%e, "companion http server error");
+            }
+        })
+    });
     tokio::select! {
         // ConnectInfo carries each connection's peer socket address so the
         // handlers can grant same-host loopback trust (see conn::authenticate).
@@ -805,6 +824,9 @@ async fn run_server(shutdown: Option<tokio::sync::watch::Receiver<bool>>) {
             tracing::info!("stop signal received; shutting down");
         }
     }
+    if let Some(task) = companion_serve {
+        task.abort();
+    }
     // Close every live connection's writer channel so peers see the shutdown
     // immediately (an in-flight connection task ends when its writer closes).
     let mut hub = hub.lock().await;
@@ -814,8 +836,110 @@ async fn run_server(shutdown: Option<tokio::sync::watch::Receiver<bool>>) {
     tracing::info!("fleety-server stopped");
 }
 
+/// Bind the configured listen address, growing a best-effort IPv6 companion
+/// for the two IPv4 default forms.
+///
+/// On a dual-stack host a client that spells the endpoint `localhost` resolves
+/// to `::1` first, and a connect to an unbound `[::1]:<port>` costs a
+/// multi-second fallback (measured ~2 s on Windows) — long enough to exceed
+/// every per-candidate budget in the connection sweep, which makes such an
+/// endpoint unreachable as a candidate, not merely slow. So `0.0.0.0` also
+/// listens on `[::]` and `127.0.0.1` also listens on `[::1]`, same port.
+///
+/// The companion is strictly best-effort: no IPv6 on the host, or the port
+/// already taken on IPv6 (Linux dual-stack sockets make `[::]` conflict with an
+/// existing `0.0.0.0` bind), degrades to IPv4-only with a log line — never a
+/// startup failure. Any explicitly configured address that is not one of the
+/// two IPv4 default forms is bound exactly as given, with no companion: the
+/// operator's choice of listening surface is theirs.
+async fn bind_with_companion(addr: &str) -> std::io::Result<(TcpListener, Option<TcpListener>)> {
+    let listener = TcpListener::bind(addr).await?;
+    let bound = listener.local_addr()?;
+    let companion_ip = match bound.ip() {
+        std::net::IpAddr::V4(v4) if v4 == std::net::Ipv4Addr::UNSPECIFIED => {
+            Some(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED))
+        }
+        std::net::IpAddr::V4(v4) if v4 == std::net::Ipv4Addr::LOCALHOST => {
+            Some(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST))
+        }
+        _ => None,
+    };
+    let Some(ip) = companion_ip else {
+        return Ok((listener, None));
+    };
+    // The companion mirrors the *actual* bound port, so an ephemeral `:0`
+    // request still pairs up correctly.
+    match TcpListener::bind((ip, bound.port())).await {
+        Ok(companion) => Ok((listener, Some(companion))),
+        Err(e) => {
+            tracing::info!(
+                %e, port = bound.port(),
+                "IPv6 companion listener not established; serving IPv4 only \
+                 (a client spelling the endpoint `localhost` may pay a slow \
+                 v6→v4 fallback)"
+            );
+            Ok((listener, None))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// The two IPv4 default forms grow a same-port IPv6 companion; anything
+    /// explicit binds exactly as given. Companion failure must degrade, not fail.
+    #[tokio::test]
+    async fn bind_with_companion_covers_both_loopback_families() {
+        // 127.0.0.1 → companion on [::1], same port.
+        let (v4, companion) = super::bind_with_companion("127.0.0.1:0")
+            .await
+            .expect("v4 loopback binds");
+        let v4_addr = v4.local_addr().expect("v4 addr");
+        assert!(v4_addr.ip().is_loopback() && v4_addr.is_ipv4());
+        let companion = companion.expect("dual-stack host grows an IPv6 companion");
+        let c_addr = companion.local_addr().expect("companion addr");
+        assert!(c_addr.is_ipv6() && c_addr.ip().is_loopback());
+        assert_eq!(c_addr.port(), v4_addr.port(), "companion shares the port");
+
+        // The companion actually accepts: this is exactly the localhost→::1
+        // first-choice a dual-stack resolver makes.
+        let accept = tokio::spawn(async move { companion.accept().await.map(|_| ()) });
+        tokio::net::TcpStream::connect((std::net::Ipv6Addr::LOCALHOST, c_addr.port()))
+            .await
+            .expect("::1 connects immediately");
+        accept
+            .await
+            .expect("accept task")
+            .expect("companion accepted");
+    }
+
+    #[tokio::test]
+    async fn bind_with_companion_leaves_explicit_addresses_exact() {
+        // An explicit non-v4-default address binds exactly, no companion.
+        let (only, companion) = super::bind_with_companion("[::1]:0")
+            .await
+            .expect("explicit v6 loopback binds");
+        assert!(only.local_addr().expect("addr").is_ipv6());
+        assert!(companion.is_none(), "explicit addresses grow no companion");
+    }
+
+    #[tokio::test]
+    async fn bind_with_companion_degrades_when_the_v6_port_is_taken() {
+        // Occupy an IPv6 loopback port first, then ask for the v4 default form
+        // on that same port: the v4 bind must succeed with no companion.
+        let blocker = tokio::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0))
+            .await
+            .expect("bind v6 blocker");
+        let port = blocker.local_addr().expect("blocker addr").port();
+        let (v4, companion) = super::bind_with_companion(&format!("127.0.0.1:{port}"))
+            .await
+            .expect("v4 side still binds");
+        assert_eq!(v4.local_addr().expect("addr").port(), port);
+        assert!(
+            companion.is_none(),
+            "a taken IPv6 port degrades to IPv4-only instead of failing startup"
+        );
+    }
+
     #[test]
     fn server_id_is_minted_once_and_persists() {
         let dir = std::env::temp_dir().join(format!("fleety-srvid-{}", uuid::Uuid::new_v4()));

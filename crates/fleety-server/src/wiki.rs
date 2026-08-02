@@ -150,9 +150,10 @@ impl Tool for WikiRead {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "wiki_read".to_string(),
-            description: "Read a knowledge-wiki note by vault-relative path. Returns raw `content` \
-                 plus a line-numbered `numbered` view and `line_count`; pass `start_line`/`end_line` \
-                 for a slice."
+            description: "Read a knowledge-wiki note by vault-relative path. Returns a \
+                 line-numbered `numbered` view of the slice and `line_count`; pass \
+                 `start_line`/`end_line` for a slice. The `NNN\\t` line-number prefix is NOT \
+                 part of the note content — strip it before using text as an edit match."
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -181,9 +182,11 @@ impl Tool for WikiRead {
         let full = std::fs::read_to_string(&resolved)
             .map_err(|e| CoreError::Message(format!("cannot read wiki note '{path}': {e}")))?;
         let (slice, start, end, total) = fleety_tools::slice_lines(&full, start_line, end_line);
+        // One view of the slice, not two — mirrors `read_file`: the numbered view
+        // already carries the content, and all slice-returning read tools share
+        // the same tool-result character budget.
         Ok(json!({
             "path": path,
-            "content": slice,
             "numbered": fleety_tools::line_numbered(&slice, start.max(1)),
             "start_line": start,
             "end_line": end,
@@ -280,10 +283,30 @@ mod tests {
             .call("wiki_read", json!({ "path": "concepts/esp32" }))
             .await
             .expect("read");
-        assert!(read["content"]
+        assert!(read["numbered"]
             .as_str()
             .unwrap_or_default()
             .contains("espflash"));
+        assert_eq!(read["line_count"], json!(2));
+        // The slice is returned once, as the numbered view: no duplicate raw copy.
+        assert!(
+            read.get("content").is_none(),
+            "wiki_read must not also return an unnumbered copy of the same slice"
+        );
+
+        // A slice reports its bounds and numbers lines from the slice start.
+        let slice = registry
+            .call(
+                "wiki_read",
+                json!({ "path": "concepts/esp32", "start_line": 2, "end_line": 2 }),
+            )
+            .await
+            .expect("read slice");
+        let numbered = slice["numbered"].as_str().unwrap_or_default();
+        assert!(numbered.contains("     2\tflash via espflash"));
+        assert!(!numbered.contains("# ESP32"));
+        assert_eq!(slice["start_line"], json!(2));
+        assert_eq!(slice["end_line"], json!(2));
 
         let listed = registry.call("wiki_list", json!({})).await.expect("list");
         assert_eq!(listed["notes"], json!(["concepts/esp32.md"]));
