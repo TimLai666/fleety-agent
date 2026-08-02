@@ -151,13 +151,11 @@ no Fleety crate). This file holds things that aren't derivable from the code.
 - **Suggestion:** treat any existing terminal receipt for that nonce as
   authoritative during recovery — reap the journal and return — instead of
   constructing a second failure to publish.
-- **Status:** pending. Pre-dates 5.65 (the machinery is 5.60–5.63); found by an
-  isolated durability audit during 5.65 review, together with a torn-append
-  rollback that can truncate the journal to zero when `metadata()` fails, a
-  Windows rollback that cannot work because the handle is append-only, an
-  unbounded quarantine retry held under the `connections.toml` lease, and a
-  settle-failure loop that stops the daemon serving at all. Worth taking as one
-  follow-up change rather than piecemeal.
+- **Status:** resolved by `d6dbefe` (2026-08-02) and the archived
+  `reconnect-control-resilience` change. The receipt-authority, torn-append,
+  writable-rollback, bounded-retry, quarantine, and settlement paths now have
+  regression coverage. Windows-native runtime behavior remains untested on the
+  current macOS host.
 
 ### [2026-07-28] — An older binary silently drops a profile's secure-channel state
 
@@ -175,7 +173,11 @@ no Fleety crate). This file holds things that aren't derivable from the code.
   write or re-derive the latch. Note that a version field alone does not stop
   the loss — an old binary drops that too — so the value is detection, not
   prevention.
-- **Status:** pending
+- **Status:** partially resolved by `d6dbefe` (2026-08-02). Current writers emit
+  a store marker and profile generation evidence, and refuse incompatible state
+  before credential use or rewrite. A legacy binary can still discard fields it
+  does not understand before the newer binary detects the loss, so prevention
+  still requires upgrading all Fleety binaries. Residual risk remains pending.
 
 ### [2026-07-28] — Reconnect budget is tight for cross-network roaming
 
@@ -189,7 +191,10 @@ no Fleety crate). This file holds things that aren't derivable from the code.
   (non-reconnect) path uses `CONNECT_ENDPOINT_WAIT` (15 s) and is unaffected.
 - **Suggestion:** widen the sweep and the caller's wait together, or let the
   caller carry its own budget in the request so the two cannot drift.
-- **Status:** pending
+- **Status:** resolved by `d6dbefe` (2026-08-02) and the archived
+  `reconnect-control-resilience` change. The caller wait and candidate sweep now
+  share one documented budget, with deterministic slow and silent candidate
+  coverage. Real high-latency overlay networks remain untested here.
 
 ### [2026-07-27] — `server_smoke` command tests fail on a spawn deadline, and say the wrong thing
 
@@ -206,7 +211,9 @@ no Fleety crate). This file holds things that aren't derivable from the code.
 - **Suggestion:** Raise the deadline, or scale it from an env var, and reword the
   panic to say the command did not exit within N seconds. Worth checking whether
   the worktree and the main checkout fighting over one `target/` contributes.
-- **Status:** pending
+- **Status:** pending. The command remains a flaky spawn-deadline test candidate;
+  the current local workspace run passing once does not remove the recorded
+  deadline risk.
 
 ### [2026-07-23] — Reconnect control needs an explicit version boundary
 
@@ -220,7 +227,10 @@ no Fleety crate). This file holds things that aren't derivable from the code.
 - **Suggestion:** Version the ready/control contract and define migration or
   explicit incompatibility behavior, durable publication, and PID-start proof
   before the next release that can mix binary versions.
-- **Status:** pending
+- **Status:** resolved by `d6dbefe` (2026-08-02) and the archived
+  `reconnect-control-resilience` change. The control contract now carries an
+  explicit version, process-start identity, owner generation, and durable
+  publication checks, with malformed or conflicting records failing closed.
 
 ### [2026-07-23] — Reconnect requests lack lifecycle operations
 
@@ -233,7 +243,10 @@ no Fleety crate). This file holds things that aren't derivable from the code.
 - **Suggestion:** Design explicit status, cancel/supersede, retention, and owner
   drift observability together with safe stale-lock inspection/cleanup so
   recovery does not depend on retrying commands in a particular order.
-- **Status:** pending
+- **Status:** resolved by `d6dbefe` (2026-08-02) and the archived
+  `reconnect-control-resilience` change. Nonce status, cancel, supersede,
+  retention, control inspection, and owner-safe stale recovery are exposed and
+  covered by CLI, service, and daemon tests.
 
 ### [2026-07-23] — Automatic mDNS can still establish an untrusted control session
 
@@ -251,7 +264,11 @@ no Fleety crate). This file holds things that aren't derivable from the code.
   an unprivileged session. If picker-only, require an explicit URL/profile before
   sending any token, pairing code, or accepting control frames; cover rogue
   `Welcome`/`RunTool` and unsolicited token persistence in daemon smoke tests.
-- **Status:** pending
+- **Status:** resolved for automatic discovery on current `main`. The resolver
+  treats mDNS as display-only, and `fleetyd_smoke` verifies that a discovered
+  advertiser cannot receive credentials, open a control session, or persist a
+  rogue token. Explicit endpoint pairing remains governed by its separate
+  authenticated-pairing path.
 
 ## Releasing
 

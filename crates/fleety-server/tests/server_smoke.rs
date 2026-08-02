@@ -45,7 +45,7 @@ fn run_command_in(args: &[&str], home: &TempDir, workspace: &TempDir) -> Output 
         .stderr(Stdio::piped())
         .spawn()
         .expect("run fleety-server command");
-    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         if child.try_wait().expect("poll fleety-server").is_some() {
             return child
@@ -55,7 +55,7 @@ fn run_command_in(args: &[&str], home: &TempDir, workspace: &TempDir) -> Output 
         if std::time::Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            panic!("fleety-server {args:?} started the server instead of exiting");
+            panic!("fleety-server {args:?} did not exit within 10 seconds");
         }
         thread::sleep(Duration::from_millis(20));
     }

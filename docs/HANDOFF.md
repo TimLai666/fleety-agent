@@ -28,6 +28,18 @@ Low。
 - CLI 使用者可見輸出使用英文，並處理 terminal control、UTF-8 與 Windows 中文
   環境。
 
+## 目前狀態（2026-08-02）
+
+- `main` 與 `origin/main` 都包含本次 release commit，工作樹乾淨。
+- `redesign-cli-experience`、`reconnect-control-resilience` 與
+  `connection-store-downgrade-detection` 都已 archive；`spectra list --json` 沒有
+  active change。
+- `cargo test --workspace --locked -- --test-threads=1`、workspace clippy、CLI／
+  Server／Daemon release build、fmt 與 diff check 都已通過。
+- Workspace 版本為 `0.1.22`，本次 release tag 為 `v0.1.22`。Release workflow
+  會要求 tag 版本與 `Cargo.toml` 完全相同，遠端資產狀態以 GitHub workflow 與
+  release 頁面為準。
+
 ## Spectra 狀態
 
 - Change：`redesign-cli-experience`
@@ -35,13 +47,13 @@ Low。
 - 已完成：全部 task，包含 5.3、5.55、5.65～5.77
 - 未完成：無
 - Clean review streak：2
-- 尚未 archive、release、commit 或 push 本輪 worktree。
-- `.spectra/touched/redesign-cli-experience.json` 必須保留到
-  `spectra archive` 成功後。
+- 已 archive、commit、push 到目前 `main`；本次 release tag 為 `v0.1.22`。
+- archive 前已保留 `.spectra/touched/redesign-cli-experience.json` 到
+  `spectra archive` 成功；目前沒有 active change。
 
 5.3 已由 5.77 後兩個連續獨立 clean review 完成。5.69 的 evidence、HANDOFF、
 完整 Cargo gates、Spectra gates、archive guard 與全文狀態檢查也全部通過。
-Change 已完成實作與驗證，但尚未 archive、commit 或 push。
+Change 已完成實作與驗證，並已 archive、commit、push。
 
 目前沒有任何可追溯來源能證明存在「Settings 九項 Medium」清單。不得補寫、
 推測或把舊 reviewer 的其他 findings 改名成那九項。
@@ -91,9 +103,9 @@ Change 已完成實作與驗證，但尚未 archive、commit 或 push。
 - cached durable targets 在每次新 transport 前重新驗證。ownerless raw／environment
   targets 不套用持久化 generation 驗證。
 
-## 最新驗證證據
+## 驗證證據
 
-5.77 最後一次程式修改與 artifacts 同步後已通過：
+5.77 最後一次程式修改與 artifacts 同步後的 focused evidence：
 
 - `fleety-tools` unit：293 passed
 - `fleety-cli` unit：343 passed
@@ -103,6 +115,13 @@ Change 已完成實作與驗證，但尚未 archive、commit 或 push。
 - CLI／Server／Daemon release build：通過
 - fmt、diff check、Spectra strict validate、archive instruction guard：通過
 - Spectra analyze：零 Critical／Warning，保留兩個既有 Suggestion
+
+目前 HEAD 的 release 前本機 gates：
+
+- `cargo test --workspace --locked -- --test-threads=1`：通過，零失敗
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`：通過
+- `cargo build --release --locked -p fleety-cli -p fleety-server -p fleety-daemon`：通過
+- `cargo fmt --all -- --check` 與 `git diff --check HEAD`：通過
 
 Windows native build／runtime 未在這台 macOS 主機實測。Windows handle 契約有
 deterministic tests，但不得把它誤報為 Windows-native 驗證。沒有執行 hostile
@@ -173,10 +192,10 @@ Medium、需要處理的 Low。該 clean round 早於 5.70，不再計入目前 
 不一致、append rollback durability、舊 binary 丟失 secure state，以及 evidence／
 HANDOFF 缺口。該輪有實質 findings，不計入 clean streak。
 
-尚存的 follow-up 已記在 root `AGENTS.md`，包括 reconnect control lifecycle、
-reconnect budget、server smoke deadline、舊 binary schema downgrade 可偵測但
-無法阻止等。除非新 review 證明它們是目前 change 的 release blocker，不要在
-5.69 偽裝成已完成或擅自擴張處理。
+尚存的 follow-up 已記在 root `AGENTS.md`，包括 Windows native clippy、server
+smoke deadline，以及舊 binary 仍可能丟失欄位但目前只能偵測、無法阻止等。除非
+新 review 證明它們是目前 change 的 release blocker，不要把它們偽裝成已完成或
+擅自擴張處理。
 
 ## 接手與驗證順序
 
@@ -191,8 +210,9 @@ reconnect budget、server smoke deadline、舊 binary schema downgrade 可偵測
    `scripts/check-spectra-archive-instructions.sh`。
 7. 由新的獨立 Sol reviewer 檢查完整 diff。不要使用 Tera，也不要要求 reviewer
    提早收斂。
-8. 只有連續 clean threshold、5.69 所有 gates 與 artifact 狀態都成立，才完成
-   5.3／5.69。Archive、commit、push 與 release 仍是後續獨立動作。
+8. 連續 clean threshold、5.69 所有 gates 與 artifact 狀態都已成立；
+   `redesign-cli-experience` 已 archive、commit、push，並以 `v0.1.22` 作為
+   本次 release tag。遠端 workflow 與資產驗證結果需回到 GitHub 核對。
 
 ## 完成條件
 
