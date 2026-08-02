@@ -175,6 +175,15 @@ code, accepts control frames, or changes a profile. Select a LAN server through
 bare `fleety init` and pair it first. A saved current profile with an explicit
 URL reconnects automatically without scanning.
 
+The shared `~/.fleety/connections.toml` also carries a store compatibility contract:
+current writers emit `format_version = 1` and `writer_marker = "fleety-store-v1"`.
+If either marker is missing, malformed, or from a future writer, `fleety`, Settings,
+ACP, `fleety doctor`, and `fleetyd` stop before using the saved token or rewriting the
+file. Update both Fleety binaries on the device, preserve the old file as a backup and
+move it aside, then rebuild with explicit details:
+`fleety init <ws-url> --name <profile> --pairing-code <code>`.
+Do not use bare `fleety pair` for this recovery; it must not guess a learned endpoint.
+
 A paired profile opens its connection with an encrypted handshake keyed by the
 device token it already holds, so the Server proves which Server it is *before*
 anything is sent to it — the token itself never travels, and provider keys, OAuth
@@ -337,7 +346,7 @@ launchd / Windows SCM).
 
 | Command | What it does |
 |---|---|
-| `fleety init <ws-url>` | Point this device at a server (e.g. `ws://host:8787`) for later commands — guided sugar for adding and selecting a connection profile. |
+| `fleety init <ws-url>` | Point this device at a server (e.g. `ws://host:8787`) for later commands — guided sugar for adding and selecting a connection profile. Use `--name <profile> --pairing-code <code>` for explicit recovery after an incompatible shared store is moved aside. |
 | `fleety connection <add\|use\|list\|show\|rename\|remove\|set-url>` | Manage the Server profiles this device can connect to (`~/.fleety/connections.toml`). Current-profile changes notify `fleetyd`; removing any current profile is refused until you explicitly switch to its replacement. |
 | `fleety ask "<text>"` | One-shot prompt; prints the reply. Accepts file paths as attachments. |
 | `fleety chat` | Open the shared terminal workspace at Chat. Drafts, cursor, attachments, notices, conversation resume state, profile identity, and model context survive navigation through Conversations and Settings. |
@@ -406,7 +415,21 @@ server, plus self-update:
 | `fleetyd start` / `stop` / `restart` / `enable` / `disable` / `status` | as above; `start`/`restart` **wait for the daemon to actually come up** (report the new pid, or error). A manual restart is immediate; only the *self-update* path defers its restart until the daemon is idle (no running on-device tool). |
 | `fleetyd config <list\|get\|set\|unset\|edit>` | Inspect/edit **this host's** settings (incl. `config provider\|model …`); same surface as `fleety config`. |
 | `fleetyd update` | host-wide update: fleetyd + the `fleety-insyra` sidecar + the sibling `fleety`/`fleety-server` on this host. `fleety-server update` is the server-only-host equivalent. |
+| `fleetyd reconnect --profile NAME` | Ask the running daemon owner to reconnect. The request has a durable nonce and the wait covers the complete endpoint sweep plus settlement margin. |
+| `fleetyd reconnect status --nonce NONCE [--json]` | Read a reconnect lifecycle without changing its journal. Reports active, terminal, superseded, expired, or ambiguous state. |
+| `fleetyd reconnect cancel --nonce NONCE` | Cancel only a request owned by the current daemon, before authenticated success is proved. |
+| `fleetyd reconnect supersede --nonce OLD --replacement NEW` | Settle the owned request as superseded before accepting the replacement nonce. |
+| `fleetyd reconnect control inspect [--json]` / `control recover --confirm` | Inspect control ownership first; recover only a proven stale owner. Live, reused, or successor ownership is preserved. |
+| `fleetyd reconnect retention --reap` | Reap complete terminal receipts/proofs after the one-day retention deadline. Active or ambiguous records are preserved. |
 | `fleetyd run-service` | internal service entry point. |
+
+Reconnect control is append-only JSONL under the Fleety control directory. A
+terminal receipt and authenticated success proof remain queryable for one day
+after observation. If persistence is temporarily unavailable, the request
+stays visible as unsettled or ambiguous and ordinary daemon work is not
+silently converted into success. Inspect before recovering stale control:
+`fleetyd reconnect control inspect`, then use `control recover --confirm` only
+after the recorded process and successor lease are proven dead.
 
 Configuration for all three is environment-first (`FLEETY_*`) with a `config.toml`
 fallback — see the **full reference** in [`docs/env.md`](docs/env.md).

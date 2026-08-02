@@ -625,7 +625,8 @@ mod tests {
         let path = tmp();
         std::fs::write(
             &path,
-            "current = \"healthy\"\n\n\
+            "format_version = 1\nwriter_marker = \"fleety-store-v1\"\n\n\
+             current = \"healthy\"\n\n\
              [profiles.healthy]\nurl = \"ws://healthy:8787\"\n\
              generation = \"fleety-profile-v1:0:healthy-generation\"\n\n\
              [profiles.broken]\nurl = \"ws://broken:8787\"\nsecure = true\n\
@@ -654,7 +655,8 @@ mod tests {
         let path = tmp();
         std::fs::write(
             &path,
-            "current = \"other\"\n\n\
+            "format_version = 1\nwriter_marker = \"fleety-store-v1\"\n\n\
+             current = \"other\"\n\n\
              [profiles.other]\nurl = \"ws://other:8787\"\ngeneration = \"other-generation\"\n\n\
              [profiles.legacy]\nurl = \"ws://100.64.0.8:8787\"\n\
              endpoints = [\"ws://192.168.1.20:8787\"]\n\

@@ -18,10 +18,13 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use agent_core::{CoreError, Result};
-use serde::{Deserialize, Serialize};
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Serialize, Serializer};
 
 /// The connect target when nothing is configured and mDNS finds nothing.
 pub const DEFAULT_URL: &str = "ws://127.0.0.1:8787";
+const CONNECTION_STORE_FORMAT_VERSION: u32 = 1;
+const CONNECTION_STORE_WRITER_MARKER: &str = "fleety-store-v1";
 
 /// Validate an explicitly selected Server endpoint before it can replace a
 /// profile URL or receive a pairing credential.
@@ -232,7 +235,7 @@ pub fn rebind_profile_generation_after_authorized_mutation(profile: &mut Profile
 
 /// The whole `connections.toml`: this device's id, the current profile name, and
 /// the named profiles.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct Connections {
     #[serde(default)]
     pub device_id: String,
@@ -240,6 +243,61 @@ pub struct Connections {
     pub current: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub profiles: BTreeMap<String, Profile>,
+}
+
+impl Serialize for Connections {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("Connections", 5)?;
+        state.serialize_field("format_version", &CONNECTION_STORE_FORMAT_VERSION)?;
+        state.serialize_field("writer_marker", CONNECTION_STORE_WRITER_MARKER)?;
+        state.serialize_field("device_id", &self.device_id)?;
+        state.serialize_field("current", &self.current)?;
+        state.serialize_field("profiles", &self.profiles)?;
+        state.end()
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ConnectionsDocument {
+    #[serde(default)]
+    format_version: Option<u32>,
+    #[serde(default)]
+    writer_marker: Option<String>,
+    #[serde(flatten)]
+    connections: Connections,
+}
+
+fn incompatible_store_error(path: &Path, reason: &str) -> CoreError {
+    CoreError::ConnectionStoreIncompatible {
+        path: path.display().to_string(),
+        reason: reason.to_string(),
+    }
+}
+
+fn validate_connections_document(path: &Path, document: &ConnectionsDocument) -> Result<()> {
+    if document.format_version != Some(CONNECTION_STORE_FORMAT_VERSION) {
+        return Err(incompatible_store_error(
+            path,
+            "the store format version is missing or unsupported",
+        ));
+    }
+    if document.writer_marker.as_deref() != Some(CONNECTION_STORE_WRITER_MARKER) {
+        return Err(incompatible_store_error(
+            path,
+            "the current-writer marker is missing, malformed, or unsupported",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_existing_store_before_save(path: &Path) -> Result<()> {
+    if let Some(document) = read_connections_document_at(path)? {
+        validate_connections_document(path, &document)?;
+    }
+    Ok(())
 }
 
 impl Connections {
@@ -278,19 +336,25 @@ pub fn fleety_dir() -> PathBuf {
 /// (a fresh device); a present-but-unparseable file is an **error** — we never
 /// silently treat a corrupt file as empty and drift off the configured server.
 pub fn load_at(path: &Path) -> Result<Connections> {
-    load_at_unvalidated(path)
+    match read_connections_document_at(path)? {
+        Some(document) => {
+            validate_connections_document(path, &document)?;
+            Ok(document.connections)
+        }
+        None => Ok(Connections::default()),
+    }
 }
 
-fn load_at_unvalidated(path: &Path) -> Result<Connections> {
+fn read_connections_document_at(path: &Path) -> Result<Option<ConnectionsDocument>> {
     match std::fs::read_to_string(path) {
-        Ok(text) => toml::from_str(&text).map_err(|e| {
+        Ok(text) => toml::from_str(&text).map(Some).map_err(|e| {
             CoreError::Message(format!(
                 "invalid connections.toml at {} ({e}); fix or remove it — Fleety will not \
                  guess a server while it is unreadable",
                 path.display()
             ))
         }),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Connections::default()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(CoreError::Message(format!(
             "cannot read connections.toml at {}: {e}",
             path.display()
@@ -330,6 +394,7 @@ where
     S: FnOnce(&std::fs::File) -> std::io::Result<()>,
     P: FnOnce(&Path, Option<&Path>) -> std::io::Result<()>,
 {
+    validate_existing_store_before_save(path)?;
     // A known-v1 mismatch belongs to that profile and remains detectable after
     // reserialization. It must not block an authorized mutation of a different
     // healthy profile. Unknown or malformed envelopes still block every write
@@ -687,10 +752,10 @@ pub enum Migration {
 ///   requires an explicit endpoint selection and re-pair instead of mDNS.
 /// - **Backup, not delete:** the old `config.json` / `fleetyd.token` are renamed
 ///   to `*.migrated` (kept for rollback), never removed.
-/// - **Concurrency-safe:** `connections.toml` is created with an `O_EXCL`
-///   (`create_new`) latch, so the CLI and a same-host daemon starting at once
-///   cannot each migrate and mint two device ids — the loser leaves the winner's
-///   file untouched.
+/// - **Concurrency-safe:** migration takes the same mutation lease as normal
+///   profile writes, so the CLI and a same-host daemon starting at once cannot
+///   each migrate and mint two device ids — the loser leaves the winner's file
+///   untouched.
 pub fn migrate_from_config_json_at(dir: &Path) -> Result<Migration> {
     let conns_path = dir.join("connections.toml");
     // Migration participates in the same cross-process transaction as every
@@ -755,32 +820,15 @@ pub fn migrate_from_config_json_at(dir: &Path) -> Result<Migration> {
         conns.current = Some("default".to_string());
     }
 
-    let toml_text = toml::to_string_pretty(&conns)
-        .map_err(|e| CoreError::Message(format!("serialize connections.toml: {e}")))?;
-
     if let Some(parent) = conns_path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| CoreError::Message(format!("cannot create ~/.fleety: {e}")))?;
     }
-    // O_EXCL latch — the first creator wins; a concurrent starter that lost the
-    // race gets AlreadyExists and must not re-migrate or rename config.json.
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&conns_path)
-    {
-        Ok(mut f) => {
-            use std::io::Write;
-            f.write_all(toml_text.as_bytes())
-                .map_err(|e| CoreError::Message(format!("write connections.toml: {e}")))?;
-            drop(f);
-            set_owner_only(&conns_path);
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            return Ok(Migration::AlreadyPresent);
-        }
-        Err(e) => return Err(CoreError::Message(format!("create connections.toml: {e}"))),
-    }
+    // The mutation lease is the O_EXCL-equivalent first-writer latch. Reuse
+    // the normal private-temp/rename/sync writer so migration cannot expose a
+    // half-written store or report success before its directory entry is
+    // durable.
+    save_at(&conns_path, &conns)?;
 
     // Back up (never delete) the old files so the migration is reversible.
     let _ = std::fs::rename(&config_json, dir.join("config.json.migrated"));
@@ -1247,7 +1295,7 @@ pub fn resolve_profile_for_explicit_pairing_at(
     path: &Path,
     target: &Target,
 ) -> Result<ExplicitPairingTarget> {
-    let connections = load_at_unvalidated(path)?;
+    let connections = load_at(path)?;
     let (name, require_current, source) =
         match target {
             Target::Named(name) => (name.clone(), false, Source::OverrideProfile(name.clone())),
@@ -1321,7 +1369,7 @@ fn resolve_profile_for_explicit_reenrollment_at(
     url: &str,
 ) -> Result<ExplicitPairingTarget> {
     validate_ws_url(url)?;
-    let connections = load_at_unvalidated(path)?;
+    let connections = load_at(path)?;
     validate_profile_generation_envelopes(&connections)?;
     let profile = connections.profiles.get(name).ok_or_else(|| {
         CoreError::Message(format!(
@@ -2177,35 +2225,40 @@ pub fn pin_resolved_profile_fingerprint_and_refresh_at(
                 .to_string(),
         ));
     }
+    let mut snapshot = load_at(path)?;
+    let profile = resolved_profile_owner(&mut snapshot, target, "its fingerprint")?;
+    let decision = tofu_pin_decision(profile.fingerprint.as_deref(), seen);
+    if decision == PinDecision::IdentityChanged {
+        return Ok((decision, resolved_with_profile(target, profile.clone())?));
+    }
     mutate_at(path, |conns| {
         let profile = resolved_profile_owner(conns, target, "its fingerprint")?;
-        let decision = tofu_pin_decision(profile.fingerprint.as_deref(), seen);
         if decision == PinDecision::Pin {
             profile.fingerprint = Some(seen.to_string());
         }
-        let profile = profile.clone();
-        let owner = target.owner.as_ref().ok_or_else(|| {
-            CoreError::Message(
-                "the transient connection has no saved profile owner; its fingerprint was not applied"
-                    .to_string(),
-            )
-        })?;
-        Ok((
-            decision,
-            Resolved {
-                url: target.url.clone(),
-                token: target.token.clone(),
-                source: target.source.clone(),
-                owner: Some(ProfileOwnerSnapshot {
-                    name: owner.name.clone(),
-                    profile,
-                    require_current: owner.require_current,
-                }),
-                diagnostic_owner: None,
-                token_provenance: target.token_provenance,
-                fresh_default_owner: false,
-            },
-        ))
+        Ok((decision, resolved_with_profile(target, profile.clone())?))
+    })
+}
+
+fn resolved_with_profile(target: &Resolved, profile: Profile) -> Result<Resolved> {
+    let owner = target.owner.as_ref().ok_or_else(|| {
+        CoreError::Message(
+            "the transient connection has no saved profile owner; its fingerprint was not applied"
+                .to_string(),
+        )
+    })?;
+    Ok(Resolved {
+        url: target.url.clone(),
+        token: target.token.clone(),
+        source: target.source.clone(),
+        owner: Some(ProfileOwnerSnapshot {
+            name: owner.name.clone(),
+            profile,
+            require_current: owner.require_current,
+        }),
+        diagnostic_owner: None,
+        token_provenance: target.token_provenance,
+        fresh_default_owner: false,
     })
 }
 
@@ -2454,7 +2507,7 @@ fn store_explicit_profile_pairing_recoverable_at_with(
         validate_ws_url(url)?;
     }
     let _lease = acquire_mutation_lease(path)?;
-    let mut connections = load_at_unvalidated(path)?;
+    let mut connections = load_at(path)?;
     validate_profile_generation_envelopes(&connections)?;
     if target.owner.require_current
         && connections.current.as_deref() != Some(target.owner.name.as_str())
@@ -2760,6 +2813,108 @@ mod tests {
     }
 
     #[test]
+    fn current_store_round_trips_compatibility_marker() {
+        let p = tmp_path();
+        save_at(&p, &Connections::default()).expect("save current store");
+        let raw = std::fs::read_to_string(&p).expect("read current store");
+        assert!(raw.contains("format_version = 1"));
+        assert!(raw.contains("writer_marker = \"fleety-store-v1\""));
+        assert_eq!(
+            load_at(&p).expect("load current store"),
+            Connections::default()
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn incompatible_store_uses_the_shared_stable_error_category() {
+        let error = incompatible_store_error(
+            Path::new("/tmp/connections.toml"),
+            "the current-writer marker is missing",
+        );
+        let report = error.report();
+
+        assert_eq!(report.kind, "connection_store_incompatible");
+        assert!(report.message.contains("/tmp/connections.toml"));
+        assert!(report
+            .remediation
+            .as_deref()
+            .is_some_and(|remediation| remediation.contains("fleety init <ws-url>")));
+    }
+
+    #[test]
+    fn unmarked_store_fails_closed_without_rewriting_saved_credentials() {
+        let p = tmp_path();
+        let raw = "device_id = \"dev-1\"\ncurrent = \"home\"\n\n\
+                   [profiles.home]\nurl = \"ws://home:8787\"\ntoken = \"saved-secret\"\n";
+        std::fs::write(&p, raw).expect("seed legacy store");
+        let before = std::fs::read(&p).expect("read legacy store");
+
+        let error = load_at(&p).expect_err("unmarked store must fail closed");
+
+        assert!(error
+            .report()
+            .message
+            .contains("incompatible connections.toml"));
+        assert!(error
+            .report()
+            .message
+            .contains("update every Fleety binary"));
+        assert!(error.report().message.contains("re-pair"));
+        assert_eq!(std::fs::read(&p).expect("read rejected store"), before);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn unsupported_future_store_fails_closed_without_rewriting_the_file() {
+        let p = tmp_path();
+        let raw = "format_version = 99\nwriter_marker = \"fleety-store-v99\"\n\n\
+                   device_id = \"dev-1\"\ncurrent = \"home\"\n\n\
+                   [profiles.home]\nurl = \"ws://home:8787\"\ntoken = \"saved-secret\"\n";
+        std::fs::write(&p, raw).expect("seed future store");
+        let before = std::fs::read(&p).expect("read future store");
+
+        let error = load_at(&p).expect_err("future store must fail closed");
+
+        assert!(error.report().message.contains("format version"));
+        assert_eq!(
+            std::fs::read(&p).expect("read rejected future store"),
+            before
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn malformed_writer_marker_fails_closed_before_profile_use() {
+        let p = tmp_path();
+        let raw = "format_version = 1\nwriter_marker = \"\"\n\n\
+                   device_id = \"dev-1\"\ncurrent = \"home\"\n\n\
+                   [profiles.home]\nurl = \"ws://home:8787\"\ntoken = \"saved-secret\"\n";
+        std::fs::write(&p, raw).expect("seed malformed marker");
+
+        let error = load_at(&p).expect_err("malformed marker must fail closed");
+
+        assert!(error.report().message.contains("current-writer marker"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn explicit_pairing_rejects_an_unmarked_store_before_sending_a_code() {
+        let p = tmp_path();
+        let raw = "device_id = \"dev-1\"\ncurrent = \"home\"\n\n\
+                   [profiles.home]\nurl = \"ws://home:8787\"\ntoken = \"saved-secret\"\n";
+        std::fs::write(&p, raw).expect("seed unmarked store");
+        let before = std::fs::read(&p).expect("read unmarked store");
+
+        let error = resolve_profile_for_explicit_pairing_at(&p, &Target::Current)
+            .expect_err("pairing must reject an unmarked store");
+
+        assert!(error.report().message.contains("fleety init <ws-url>"));
+        assert_eq!(std::fs::read(&p).expect("read rejected store"), before);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
     fn save_load_roundtrip_preserves_url_token_label() {
         let p = tmp_path();
         let mut conns = Connections {
@@ -2792,7 +2947,8 @@ mod tests {
 
     #[test]
     fn versioned_generation_detects_each_old_serializer_field_drop() {
-        let original = "device_id = \"dev-1\"\ncurrent = \"home\"\n\n\
+        let original = "format_version = 1\nwriter_marker = \"fleety-store-v1\"\n\n\
+                        device_id = \"dev-1\"\ncurrent = \"home\"\n\n\
                         [profiles.home]\n\
                         url = \"ws://192.168.1.20:8787\"\n\
                         endpoints = [\"ws://100.64.0.8:8787\"]\n\
@@ -2854,7 +3010,8 @@ mod tests {
         let path = tmp_path();
         std::fs::write(
             &path,
-            "device_id = \"dev-1\"\ncurrent = \"broken\"\n\n\
+            "format_version = 1\nwriter_marker = \"fleety-store-v1\"\n\n\
+             device_id = \"dev-1\"\ncurrent = \"broken\"\n\n\
              [profiles.broken]\nurl = \"ws://broken:8787\"\nsecure = true\n\
              generation = \"fleety-profile-v1:7:broken-generation\"\n\n\
              [profiles.healthy]\nurl = \"ws://healthy:8787\"\n\
@@ -2881,7 +3038,8 @@ mod tests {
         let path = tmp_path();
         std::fs::write(
             &path,
-            "device_id = \"dev-1\"\ncurrent = \"healthy\"\n\n\
+            "format_version = 1\nwriter_marker = \"fleety-store-v1\"\n\n\
+             device_id = \"dev-1\"\ncurrent = \"healthy\"\n\n\
              [profiles.broken]\nurl = \"ws://broken:8787\"\nsecure = true\n\
              generation = \"fleety-profile-v1:7:broken-generation\"\n\n\
              [profiles.healthy]\nurl = \"ws://healthy:8787\"\ntoken = \"healthy-token\"\n\
@@ -2954,7 +3112,8 @@ mod tests {
     #[test]
     fn cached_profile_is_revalidated_before_a_new_transport() {
         let path = tmp_path();
-        let original = "device_id = \"dev-1\"\ncurrent = \"home\"\n\n\
+        let original = "format_version = 1\nwriter_marker = \"fleety-store-v1\"\n\n\
+                        device_id = \"dev-1\"\ncurrent = \"home\"\n\n\
                         [profiles.home]\nurl = \"ws://home:8787\"\n\
                         endpoints = [\"ws://100.64.0.8:8787\"]\n\
                         configured_url = \"ws://home:8787\"\nsecure = true\n\
@@ -3062,7 +3221,8 @@ mod tests {
         let path = tmp_path();
         std::fs::write(
             &path,
-            "device_id = \"dev-1\"\ncurrent = \"home\"\n\n\
+            "format_version = 1\nwriter_marker = \"fleety-store-v1\"\n\n\
+             device_id = \"dev-1\"\ncurrent = \"home\"\n\n\
              [profiles.home]\nurl = \"ws://home:8787\"\ntoken = \"old-token\"\n\
              fingerprint = \"old-pin\"\nconfigured_url = \"ws://home:8787\"\nsecure = true\n\
              generation = \"fleety-profile-v1:7:legacy-home-generation\"\n",
@@ -3093,7 +3253,8 @@ mod tests {
         let path = tmp_path();
         std::fs::write(
             &path,
-            "device_id = \"dev-1\"\ncurrent = \"home\"\n\n\
+            "format_version = 1\nwriter_marker = \"fleety-store-v1\"\n\n\
+             device_id = \"dev-1\"\ncurrent = \"home\"\n\n\
              [profiles.home]\nurl = \"ws://home:8787\"\ntoken = \"old-home-token\"\n\
              fingerprint = \"old-home-pin\"\nconfigured_url = \"ws://home:8787\"\nsecure = true\n\
              generation = \"fleety-profile-v1:7:home-generation\"\n\n\
@@ -3132,7 +3293,8 @@ mod tests {
         let path = tmp_path();
         std::fs::write(
             &path,
-            "device_id = \"dev-1\"\ncurrent = \"home\"\n\n\
+            "format_version = 1\nwriter_marker = \"fleety-store-v1\"\n\n\
+             device_id = \"dev-1\"\ncurrent = \"home\"\n\n\
              [profiles.home]\nurl = \"ws://learned:8787\"\ntoken = \"old-token\"\n\
              fingerprint = \"old-pin\"\nsecure = true\n\
              generation = \"fleety-profile-v1:7:home-generation\"\n",
@@ -3158,7 +3320,8 @@ mod tests {
         let path = tmp_path();
         std::fs::write(
             &path,
-            "device_id = \"dev-1\"\ncurrent = \"other\"\n\n\
+            "format_version = 1\nwriter_marker = \"fleety-store-v1\"\n\n\
+             device_id = \"dev-1\"\ncurrent = \"other\"\n\n\
              [profiles.office]\nurl = \"ws://learned:8787\"\ntoken = \"old-token\"\n\
              fingerprint = \"old-pin\"\nsecure = true\n\
              generation = \"fleety-profile-v1:7:office-generation\"\n\n\
@@ -3199,7 +3362,8 @@ mod tests {
         let p = tmp_path();
         std::fs::write(
             &p,
-            "device_id = \"dev-1\"\ncurrent = \"home\"\n\n\
+            "format_version = 1\nwriter_marker = \"fleety-store-v1\"\n\n\
+             device_id = \"dev-1\"\ncurrent = \"home\"\n\n\
              [profiles.home]\nurl = \"ws://old:8787\"\ntoken = \"old-token\"\n",
         )
         .expect("seed old credentials");
@@ -3411,7 +3575,12 @@ mod tests {
     fn migrate_latch_leaves_a_prior_connections_file_and_config_json_untouched() {
         let dir = tmp_dir();
         // Simulate another starter having already produced connections.toml.
-        std::fs::write(dir.join("connections.toml"), "device_id = \"other\"\n").expect("seed");
+        std::fs::write(
+            dir.join("connections.toml"),
+            "format_version = 1\nwriter_marker = \"fleety-store-v1\"\n\n\
+             device_id = \"other\"\n",
+        )
+        .expect("seed");
         std::fs::write(dir.join("config.json"), r#"{"agent_url":"ws://srv"}"#).expect("seed cfg");
         assert_eq!(
             migrate_from_config_json_at(&dir).expect("migrate"),
@@ -4491,6 +4660,23 @@ mod tests {
     }
 
     #[test]
+    fn transient_target_does_not_create_or_update_the_connection_store() {
+        let path = tmp_path();
+        let changed = ensure_resolvable_profile_generation_at(
+            &path,
+            &Target::Url("ws://transient:8787".to_string()),
+            true,
+        )
+        .expect("transient target remains side-effect free");
+
+        assert!(!changed);
+        assert!(
+            !path.exists(),
+            "transient resolution must not create the store"
+        );
+    }
+
+    #[test]
     fn resolve_env_url_does_not_inherit_a_different_profiles_token() {
         // Current profile home .20 exists, but FLEETY_AGENT_URL overrides it.
         let mut home = profile("ws://192.168.1.20:8787");
@@ -4624,7 +4810,8 @@ mod tests {
         let path = dir.join("connections.toml");
         std::fs::write(
             &path,
-            "device_id = \"dev-1\"\ncurrent = \"home\"\n\n\
+            "format_version = 1\nwriter_marker = \"fleety-store-v1\"\n\n\
+             device_id = \"dev-1\"\ncurrent = \"home\"\n\n\
              [profiles.home]\nurl = \"ws://home:8787\"\ntoken = \"token\"\n\
              generation = \"legacy-home-generation\"\n\n\
              [profiles.other]\nurl = \"ws://other:8787\"\ntoken = \"other-token\"\n\

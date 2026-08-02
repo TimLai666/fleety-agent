@@ -1782,7 +1782,9 @@ fn mark_reconnect_exhausted(app: &mut tui::App, workspace: &mut workspace::Works
     ));
     workspace.reduce(workspace::Action::PushNotice(
         workspace::Notice::error("Chat reconnect attempts exhausted")
-            .remediation("Check the selected profile and reconnect from Connection Settings"),
+            .remediation(
+                "Check Connection Settings. For a daemon-owned request, run `fleetyd reconnect status --nonce NONCE` before retrying",
+            ),
     ));
     workspace.reduce(workspace::Action::Navigate(workspace::Route::Settings(
         workspace::SettingsPage::Connection,
@@ -5075,6 +5077,7 @@ impl DoctorLevel {
 struct DoctorCheck {
     name: &'static str,
     level: DoctorLevel,
+    kind: String,
     detail: String,
     remediation: Option<String>,
 }
@@ -5090,6 +5093,7 @@ impl DoctorCheck {
         Self {
             name,
             level,
+            kind: "diagnostic".to_string(),
             detail,
             remediation: remediation
                 .map(Into::into)
@@ -5097,10 +5101,26 @@ impl DoctorCheck {
         }
     }
 
+    fn from_report(
+        name: &'static str,
+        level: DoctorLevel,
+        report: &agent_core::ErrorReport,
+    ) -> Self {
+        let mut check = Self::new(
+            name,
+            level,
+            report.message.clone(),
+            report.remediation.clone(),
+        );
+        check.kind = report.kind.clone();
+        check
+    }
+
     fn json(&self) -> serde_json::Value {
         let mut value = serde_json::json!({
             "name": self.name,
             "status": self.level.label(),
+            "kind": self.kind,
             "detail": self.detail,
         });
         if let Some(remediation) = &self.remediation {
@@ -5155,14 +5175,11 @@ async fn doctor() -> std::process::ExitCode {
             }
         }
         Err(error) => {
-            checks.push(DoctorCheck::new(
+            let report = error.report();
+            checks.push(DoctorCheck::from_report(
                 "Profile",
                 DoctorLevel::Fail,
-                error.report().message,
-                // `connection list` shows an empty table when there is no
-                // profile to resolve — a dead end. `init` is the path that ends
-                // with a saved, paired one.
-                Some("fleety init"),
+                &report,
             ));
             checks.push(DoctorCheck::new(
                 "Server",
@@ -5213,7 +5230,7 @@ async fn doctor() -> std::process::ExitCode {
             .map(|check| {
                 let mut error = serde_json::json!({
                     "owner": if check.name == "Profile" || check.name == "CLI" { "cli" } else { "server" },
-                    "kind": "diagnostic",
+                    "kind": check.kind,
                     "message": format!("{}: {}", check.name, check.detail),
                 });
                 if let Some(remediation) = &check.remediation {
@@ -6151,6 +6168,24 @@ mod tests {
     }
 
     #[test]
+    fn doctor_preserves_connection_store_error_classification_and_remediation() {
+        let report = agent_core::CoreError::ConnectionStoreIncompatible {
+            path: "/tmp/connections.toml".to_string(),
+            reason: "writer marker missing".to_string(),
+        }
+        .report();
+        let check = DoctorCheck::from_report("Profile", DoctorLevel::Fail, &report);
+
+        assert_eq!(check.kind, "connection_store_incompatible");
+        assert!(check.detail.contains("incompatible connections.toml"));
+        assert!(check
+            .remediation
+            .as_deref()
+            .is_some_and(|value| value.contains("fleety init <ws-url>")));
+        assert_eq!(check.json()["kind"], "connection_store_incompatible");
+    }
+
+    #[test]
     fn reconnect_keeps_local_input_and_can_navigate_to_settings() {
         let mut app = tui::App::new("reconnecting");
         tui::prefill(&mut app.input, "draft");
@@ -6395,7 +6430,8 @@ mod tests {
             std::fs::write(
                 &path,
                 format!(
-                    "current = \"home\"\n\n[profiles.home]\nurl = \"{clear_url}\"\n\
+                    "format_version = 1\nwriter_marker = \"fleety-store-v1\"\n\n\
+                 current = \"home\"\n\n[profiles.home]\nurl = \"{clear_url}\"\n\
                  token = \"stale-token\"\nfingerprint = \"server-a\"\n\
                  generation = \"clear-generation\"\n"
                 ),
@@ -6437,7 +6473,8 @@ mod tests {
             std::fs::write(
                 &path,
                 format!(
-                    "current = \"home\"\n\n[profiles.home]\nurl = \"{rotated_url}\"\n\
+                    "format_version = 1\nwriter_marker = \"fleety-store-v1\"\n\n\
+                 current = \"home\"\n\n[profiles.home]\nurl = \"{rotated_url}\"\n\
                  token = \"stale-token\"\nfingerprint = \"server-a\"\n\
                  generation = \"rotate-generation\"\n"
                 ),
@@ -6478,7 +6515,8 @@ mod tests {
             std::fs::write(
                 &path,
                 format!(
-                    "current = \"home\"\n\n[profiles.home]\nurl = \"{paired_url}\"\n\
+                    "format_version = 1\nwriter_marker = \"fleety-store-v1\"\n\n\
+                 current = \"home\"\n\n[profiles.home]\nurl = \"{paired_url}\"\n\
                  generation = \"pair-generation\"\n"
                 ),
             )
@@ -7310,7 +7348,7 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).expect("create connections directory");
         std::fs::write(
             &path,
-            "current = \"home\"\n\n[profiles.home]\nurl = \"ws://cfg:8787\"\ntoken = \"token\"\n",
+            "format_version = 1\nwriter_marker = \"fleety-store-v1\"\n\ncurrent = \"home\"\n\n[profiles.home]\nurl = \"ws://cfg:8787\"\ntoken = \"token\"\n",
         )
         .expect("seed legacy profile");
 
@@ -7332,7 +7370,7 @@ mod tests {
         let path = guard.temp_home.join(".fleety").join("connections.toml");
         std::fs::create_dir_all(path.parent().unwrap()).expect("create connections directory");
         let legacy =
-            b"current = \"home\"\n\n[profiles.home]\nurl = \"ws://cfg:8787\"\ntoken = \"token\"\n";
+            b"format_version = 1\nwriter_marker = \"fleety-store-v1\"\n\ncurrent = \"home\"\n\n[profiles.home]\nurl = \"ws://cfg:8787\"\ntoken = \"token\"\n";
         std::fs::write(&path, legacy).expect("seed legacy profile");
 
         let target = resolve_target_read_only().expect("resolve diagnostics target");

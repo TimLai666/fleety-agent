@@ -1131,6 +1131,9 @@ fn automatic_mdns_never_opens_a_control_session_or_persists_rogue_credentials() 
         .env("USERPROFILE", &home.0)
         .env("FLEETY_DEVICE_ROOT", &root.0)
         .env("FLEETY_DEVICE_ID", "mdns-display-only")
+        // Keep an unrelated host service on the default port from winning the
+        // trusted-loopback probe before this test exercises display-only mDNS.
+        .env("FLEETY_ADDR", "127.0.0.1:0")
         .env("FLEETY_TOKEN", "caller-secret")
         .env("FLEETY_PAIRING_CODE", "caller-pairing-code")
         .env_remove("FLEETY_AGENT_URL")
@@ -1301,7 +1304,8 @@ fn daemon_rejects_a_downgraded_selected_profile_before_transport_use() {
     std::fs::write(
         &conns_path,
         format!(
-            "current = \"office\"\n\n[profiles.office]\nurl = \"{url}\"\n\
+            "format_version = 1\nwriter_marker = \"fleety-store-v1\"\n\n\
+             current = \"office\"\n\n[profiles.office]\nurl = \"{url}\"\n\
              token = \"old-token\"\nsecure = true\n\
              generation = \"fleety-profile-v1:7:legacy-office-generation\"\n"
         ),
@@ -1776,7 +1780,8 @@ fn daemon_env_override_does_not_send_or_clear_another_profiles_token() {
     std::fs::create_dir_all(conns_path.parent().expect("parent")).expect("fleety dir");
     std::fs::write(
         &conns_path,
-        "device_id = \"daemon-smoke\"\ncurrent = \"default\"\n\n\
+        "format_version = 1\nwriter_marker = \"fleety-store-v1\"\n\n\
+         device_id = \"daemon-smoke\"\ncurrent = \"default\"\n\n\
          [profiles.default]\nurl = \"ws://placeholder:8787\"\ntoken = \"old-token\"\n",
     )
     .expect("seed connections");
@@ -1943,7 +1948,8 @@ fn daemon_env_override_never_borrows_or_mutates_same_url_profile_credentials() {
         std::fs::write(
             &conns_path,
             format!(
-                "device_id = \"daemon-smoke\"\ncurrent = \"{current}\"\n\n\
+                "format_version = 1\nwriter_marker = \"fleety-store-v1\"\n\n\
+                 device_id = \"daemon-smoke\"\ncurrent = \"{current}\"\n\n\
                  [profiles.A]\nurl = \"{url}\"\ntoken = \"token-a\"\n\n\
                  [profiles.B]\nurl = \"{url}\"\ntoken = \"token-b\"\n"
             ),

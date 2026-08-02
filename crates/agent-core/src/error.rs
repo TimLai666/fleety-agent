@@ -55,6 +55,11 @@ pub enum CoreError {
     /// A generic, already-described error.
     #[error("{0}")]
     Message(String),
+
+    /// The durable Fleety connection store was written by an incompatible
+    /// writer and must not be treated as trusted state.
+    #[error("incompatible connections.toml at {path} ({reason})")]
+    ConnectionStoreIncompatible { path: String, reason: String },
 }
 
 impl CoreError {
@@ -75,6 +80,15 @@ impl CoreError {
             CoreError::Provider(msg) => ErrorReport::new("provider", msg.clone())
                 .with_remediation("the model provider call failed — retry; if it persists, check the endpoint, key, and model id"),
             CoreError::Message(msg) => ErrorReport::new("error", msg.clone()),
+            CoreError::ConnectionStoreIncompatible { path, reason } => ErrorReport::new(
+                "connection_store_incompatible",
+                format!(
+                    "incompatible connections.toml at {path} ({reason}); update every Fleety binary that shares this configuration, preserve this file as a backup, move it aside, then re-pair with `fleety init <ws-url> --name <profile> --pairing-code <code>` — no saved token was used"
+                ),
+            )
+            .with_remediation(
+                "update every Fleety binary that shares this configuration, preserve connections.toml as a backup, move it aside, then run `fleety init <ws-url> --name <profile> --pairing-code <code>`; no saved token was used",
+            ),
         }
     }
 }
@@ -97,5 +111,18 @@ mod tests {
     fn with_remediation_sets_field() {
         let report = ErrorReport::new("io", "disk full").with_remediation("free space and retry");
         assert_eq!(report.remediation.as_deref(), Some("free space and retry"));
+    }
+
+    #[test]
+    fn connection_store_incompatibility_has_a_stable_report_category() {
+        let report = CoreError::ConnectionStoreIncompatible {
+            path: "/tmp/connections.toml".to_string(),
+            reason: "the writer marker is missing".to_string(),
+        }
+        .report();
+
+        assert_eq!(report.kind, "connection_store_incompatible");
+        assert!(report.message.contains("/tmp/connections.toml"));
+        assert!(report.remediation.is_some());
     }
 }

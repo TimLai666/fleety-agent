@@ -51,6 +51,8 @@ _狀態:設計定稿並已實作。共享 terminal workspace 的 Settings 分為
 CLI 與 daemon **共用**(同一台裝置的窗口與手連同一個 server;見 §決策 M6)。
 
 ```toml
+format_version = 1          # connections.toml writer contract
+writer_marker = "fleety-store-v1"
 device_id = "…"          # 裝置身分,跨 profile 共用(唯一權威,見 M7)
 current = "home-pi"      # 當前連哪台(CLI 與 daemon 都用它)
 
@@ -69,6 +71,13 @@ token = "…"
 ```
 
 - 檔案權限 **0600**(集中多把 token,見 §9 安全)。
+- present 的 `connections.toml` 必須同時有 `format_version = 1` 與
+  `writer_marker = "fleety-store-v1"`。缺少、格式錯誤或不支援時，CLI、TUI、ACP、Doctor
+  與 daemon 都在使用 token、連線或寫檔前回報 incompatible store，保留原檔，不把它當空檔。
+- 復原前先更新同一台裝置上共用這個檔案的 `fleety` 與 `fleetyd`。保留舊檔作備份並移開，
+  再用明確的 Server URL、profile 名稱與 pairing code 執行
+  `fleety init <ws-url> --name <profile> --pairing-code <code>`。不要用 bare `fleety pair`，
+  也不要讓 Fleety 猜 learned endpoint 或恢復遺失的 secure proof。
 - 型別在 `fleety-tools` 共用模組(CLI + daemon 同一 resolver,見 M6):
   `Connections { device_id, current: Option<String>, profiles: BTreeMap<String, Profile> }`;
   `Profile { url, token: Option<String>, label: Option<String>, fingerprint: Option<String>,
@@ -198,6 +207,8 @@ resolver):
 5. `ws://127.0.0.1:8787`。
 
 「檔案存在但解析失敗」要**報錯**,不可靜默越過 current 去探索(補 M6)。
+如果檔案存在但 compatibility marker 不相容，也要在同一個 shared gate 報錯；只有
+明確 URL、profile 與 pairing code 的 recovery flow 可以建立新的 marked store。
 
 ---
 
@@ -213,6 +224,10 @@ fleety init <url> [--name <name>] # guided add + use
 fleety pair <code>                # 對 current 配對；--profile <name> 精確配對其他 profile
 fleety --profile <name> <cmd> | --server <ws> <cmd>   # 單次覆寫,不改 current、不動 daemon
 ```
+
+若 `connections.toml` 被判定為 incompatible，先更新 `fleety` 與 `fleetyd`，保存並移開舊檔，
+再使用明確的 `fleety init <ws-url> --name <profile> --pairing-code <code>` 重建。這條路徑
+不會送出 rejected store 的 token；bare `fleety pair` 不會猜 endpoint。
 
 **本機 CLI 設定:**
 ```sh

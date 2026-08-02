@@ -70,6 +70,20 @@ pub fn response_err(id: Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
 
+/// Render an actionable core error without losing its stable category or
+/// remediation in the JSON-RPC envelope.
+pub fn response_err_report(id: Value, code: i64, report: &agent_core::ErrorReport) -> Value {
+    let mut data = json!({ "kind": report.kind });
+    if let Some(remediation) = &report.remediation {
+        data["remediation"] = Value::String(remediation.clone());
+    }
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": { "code": code, "message": report.message, "data": data }
+    })
+}
+
 pub fn notification(method: &str, params: Value) -> Value {
     json!({ "jsonrpc": "2.0", "method": method, "params": params })
 }
@@ -1098,11 +1112,7 @@ pub async fn handle_message(msg: &Value, bridge: &dyn AcpBridge) -> Vec<Value> {
                 .map(str::to_string);
             match bridge.new_session(cwd).await {
                 Ok(sid) => vec![response_ok(reply_id(), json!({ "sessionId": sid }))],
-                Err(e) => vec![response_err(
-                    reply_id(),
-                    INTERNAL_ERROR,
-                    &e.report().message,
-                )],
+                Err(e) => vec![response_err_report(reply_id(), INTERNAL_ERROR, &e.report())],
             }
         }
         "session/prompt" => {
@@ -1125,11 +1135,7 @@ pub async fn handle_message(msg: &Value, bridge: &dyn AcpBridge) -> Vec<Value> {
                     ));
                     out
                 }
-                Err(e) => vec![response_err(
-                    reply_id(),
-                    INTERNAL_ERROR,
-                    &e.report().message,
-                )],
+                Err(e) => vec![response_err_report(reply_id(), INTERNAL_ERROR, &e.report())],
             }
         }
         "session/load" => {
@@ -1145,11 +1151,7 @@ pub async fn handle_message(msg: &Value, bridge: &dyn AcpBridge) -> Vec<Value> {
                     out.push(response_ok(reply_id(), load_session_result()));
                     out
                 }
-                Err(e) => vec![response_err(
-                    reply_id(),
-                    INTERNAL_ERROR,
-                    &e.report().message,
-                )],
+                Err(e) => vec![response_err_report(reply_id(), INTERNAL_ERROR, &e.report())],
             }
         }
         // Cancel is a notification (no id → no response). Forward it to the
@@ -1891,6 +1893,19 @@ mod tests {
         assert_eq!(ok["result"]["a"], 1);
         let err = response_err(json!(2), METHOD_NOT_FOUND, "nope");
         assert_eq!(err["error"]["code"], METHOD_NOT_FOUND);
+        let report = agent_core::CoreError::ConnectionStoreIncompatible {
+            path: "/tmp/connections.toml".to_string(),
+            reason: "writer marker missing".to_string(),
+        }
+        .report();
+        let classified = response_err_report(json!(3), INTERNAL_ERROR, &report);
+        assert_eq!(
+            classified["error"]["data"]["kind"],
+            "connection_store_incompatible"
+        );
+        assert!(classified["error"]["data"]["remediation"]
+            .as_str()
+            .is_some_and(|value| value.contains("fleety init <ws-url>")));
         let note = notification("session/update", json!({"x":1}));
         assert!(note.get("id").is_none());
         assert_eq!(note["method"], "session/update");

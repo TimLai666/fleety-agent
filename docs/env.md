@@ -438,6 +438,21 @@ handoff is incomplete. Removing any current profile is refused, including with
 `--force`; explicitly switch to its replacement first so profile ordering cannot
 silently retarget `fleetyd`.
 
+### Durable reconnect control
+
+`fleetyd reconnect --profile NAME` creates a nonce-addressed JSONL request. Use
+`fleetyd reconnect status --nonce NONCE` for a read-only lifecycle view, or add
+`--json` for automation. The owner may cancel an active request or supersede it
+with a replacement nonce. A terminal receipt and authenticated success proof
+are retained for one day after observation, then can be reaped with
+`fleetyd reconnect retention --reap` when the complete record is eligible.
+
+Control recovery is owner-aware. Run `fleetyd reconnect control inspect` before
+`fleetyd reconnect control recover --confirm`; live owners, reused process
+identities, successor leases, and control-version mismatches refuse cleanup.
+Filesystem failures keep the request or proof available for diagnosis and do
+not claim cancellation, settlement, or cleanup succeeded.
+
 Resolution precedence: a one-shot `--profile <name>` (that profile's saved
 token) or `-s`/`--server`/`--url` (transient, caller-explicit token only) → the
 `FLEETY_AGENT_URL` env (transient, with no inherited saved token) → the current
@@ -446,6 +461,12 @@ with an empty value is treated as unset. It is **no longer a `config` key** —
 the connection target is managed here, not in
 `config.toml`. A legacy `config.json` / `fleetyd.token` is migrated once into
 `connections.toml` on first run (device_id preserved). The file is `0600`.
+Every current writer adds `format_version = 1` and
+`writer_marker = "fleety-store-v1"`. If a present store is missing, malformed, or
+uses an unsupported marker, `fleety` and `fleetyd` fail closed before loading its
+token, opening a connection, or mutating the file. The error is classified as
+`connection_store_incompatible` and carries the same recovery guidance through CLI
+JSON, Settings, ACP, Doctor, and daemon reports.
 Each profile also carries an internal lifecycle generation. An older selected
 profile receives one before it can become a durable connection owner; transient
 raw/environment commands do not rewrite unrelated legacy records. Deleting and
@@ -467,6 +488,21 @@ operational session, receive a token or pairing code, persist a `Welcome` token,
 or send control frames. A URL-less credentialed current profile stops with
 explicit reselect/re-pair guidance. A saved current profile with a URL reconnects
 automatically and skips discovery.
+
+### Incompatible store recovery
+
+Update every `fleety` and `fleetyd` binary that shares the store. Preserve the rejected
+`connections.toml` as a backup and move it aside. Then rebuild the profile from current,
+user-supplied details:
+
+```
+fleety init <ws-url> --name <profile> --pairing-code <code>
+```
+
+This is the only documented recovery path for an unmarked or future store. It creates a
+new marked file atomically and re-pairs at the URL supplied by the user. Do not run bare
+`fleety pair`, and do not let discovery or a learned endpoint choose where the pairing
+code goes. The rejected file's token and secure-channel proof are never reused.
 
 ## Transport (WebSocket + SSE fallback)
 

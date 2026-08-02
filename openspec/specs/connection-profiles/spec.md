@@ -2345,3 +2345,177 @@ code:
   - AGENTS.md
   - crates/fleety-cli/src/main.rs
 -->
+
+---
+### Requirement: Durable connection stores declare a compatible writer contract
+
+A present `connections.toml` SHALL declare a supported store format version and a current-writer marker. The shared connection layer SHALL validate both fields before returning a durable store to any caller. A missing, malformed, or unsupported marker SHALL classify the store as incompatible legacy or future state rather than as an empty store. Every current durable writer SHALL emit the supported fields through the shared atomic `0600` write path.
+
+#### Scenario: a current store round-trips its compatibility marker
+
+- **WHEN** a current Fleety binary writes a profile mutation and reloads `connections.toml`
+- **THEN** the store format version and writer marker SHALL remain present and the profile SHALL resolve normally
+
+#### Scenario: an old writer rewrite is rejected
+
+- **GIVEN** a current store has established the compatibility contract
+- **WHEN** an older binary rewrites the file and removes the current-only marker or fields
+- **THEN** every current durable reader SHALL return an incompatible-store error before credential use, network I/O, or profile mutation
+
+#### Scenario: an unmarked legacy store is not silently migrated
+
+- **WHEN** a current binary loads a present `connections.toml` without the supported format version or writer marker
+- **THEN** it SHALL preserve the file, refuse durable profile use, and report explicit update-all-binaries and re-pair recovery guidance
+
+#### Scenario: an unsupported future store is preserved
+
+- **WHEN** a current binary loads a store format version newer than it supports
+- **THEN** it SHALL refuse to parse the store as an operational profile set and SHALL not rewrite or delete the file
+
+##### Example:
+
+- **GIVEN** `format_version = 99` and a profile containing a token
+- **WHEN** `fleety server show` loads the store
+- **THEN** the command SHALL return an incompatible-store error and the file SHALL remain byte-for-byte unchanged
+
+
+<!-- @trace
+source: connection-store-downgrade-detection
+updated: 2026-08-02
+code:
+  - crates/fleety-cli/src/server.rs
+  - crates/fleety-tools/src/connection.rs
+  - docs/env.md
+  - README.md
+  - crates/fleety-daemon/src/main.rs
+  - docs/design-cli-config.md
+  - crates/fleety-cli/src/acp.rs
+  - crates/fleety-cli/src/main.rs
+  - crates/agent-core/src/error.rs
+-->
+
+---
+### Requirement: Incompatible connection stores have an explicit credential-safe recovery path
+
+A current Fleety surface that encounters an incompatible durable store SHALL expose one consistent recovery instruction. The recovery path SHALL require updated Fleety binaries and explicit user-supplied connection details or a new pairing flow. It SHALL not send a token loaded from the rejected store, guess a learned endpoint, or restore a missing secure-channel proof.
+
+#### Scenario: recovery rebuilds a profile from explicit details
+
+- **GIVEN** the durable store is rejected as incompatible
+- **WHEN** the user supplies a profile name, current Server URL, and pairing code through the documented recovery path
+- **THEN** Fleety SHALL create a marked store atomically and SHALL establish the profile through the existing authenticated pairing flow
+
+#### Scenario: rejected credentials never reach transport
+
+- **GIVEN** an incompatible store contains a token
+- **WHEN** the CLI, TUI, ACP, Doctor, or Daemon attempts to resolve its operational target
+- **THEN** the operation SHALL fail before loading that token into a transport or sending it to a Server
+
+#### Scenario: transient targets remain side-effect free
+
+- **WHEN** a caller uses a raw URL, environment URL, ACP target, or Doctor target without selecting a durable profile
+- **THEN** it SHALL not create, update, or repair the durable store compatibility marker
+
+##### Example:
+
+- **GIVEN** `connections.toml` is absent and `FLEETY_AGENT_URL=ws://127.0.0.1:8787` is set
+- **WHEN** `fleety --url ws://127.0.0.1:8787 status` runs
+- **THEN** the command SHALL use the transient target and `connections.toml` SHALL remain absent
+
+<!-- @trace
+source: connection-store-downgrade-detection
+updated: 2026-08-02
+code:
+  - crates/fleety-cli/src/server.rs
+  - crates/fleety-tools/src/connection.rs
+  - docs/env.md
+  - README.md
+  - crates/fleety-daemon/src/main.rs
+  - docs/design-cli-config.md
+  - crates/fleety-cli/src/acp.rs
+  - crates/fleety-cli/src/main.rs
+  - crates/agent-core/src/error.rs
+-->
+
+---
+### Requirement: Durable reconnect requests expose one nonce-addressed lifecycle
+
+The existing reconnect journal SHALL reconstruct one lifecycle for every nonce, including submitted, claimed, in-progress, settled, cancelled, superseded, expired, and ambiguous states where applicable. A status operation SHALL return the nonce, profile, owner identity, lifecycle state, timestamps, replacement nonce, and retained terminal result when present. A terminal receipt SHALL remain authoritative for its documented retention period.
+
+#### Scenario: status is repeatable
+
+- **GIVEN** a reconnect request has a durable journal record
+- **WHEN** an operator requests its status multiple times
+- **THEN** every response SHALL describe the same durable state and SHALL not mutate the journal or extend retention
+
+#### Scenario: duplicate nonces do not overwrite results
+
+- **GIVEN** a nonce is active or has a retained terminal receipt
+- **WHEN** another caller submits the same nonce
+- **THEN** the new submission SHALL be rejected without replacing the existing journal, receipt, or success proof
+
+#### Scenario: restart preserves the lifecycle
+
+- **GIVEN** the Daemon stops after recording a request or terminal result
+- **WHEN** the Daemon starts again and reads the control directory
+- **THEN** it SHALL reconstruct the same request state or an explicit ambiguous state and SHALL not invent a conflicting terminal result
+
+
+<!-- @trace
+source: reconnect-control-resilience
+updated: 2026-08-02
+code:
+  - crates/fleety-cli/src/acp.rs
+  - crates/agent-core/src/error.rs
+  - crates/fleety-daemon/src/main.rs
+  - crates/fleety-tools/src/connection.rs
+  - docs/env.md
+  - README.md
+  - crates/fleety-cli/src/main.rs
+  - docs/design-cli-config.md
+  - crates/fleety-cli/src/server.rs
+tests:
+  - crates/fleety-daemon/tests/fleetyd_smoke.rs
+  - crates/fleety-cli/tests/cli_smoke.rs
+-->
+
+---
+### Requirement: Reconnect cancellation and supersession are owner-safe
+
+Cancellation SHALL be accepted only from the current control owner and before a terminal authenticated success proof exists. Supersession SHALL record the replacement nonce and settle the old request before the replacement takes ownership. A foreign owner, stale owner, live successor, or mismatched control identity SHALL receive a refusal and SHALL not delete or rewrite another request's durable evidence.
+
+#### Scenario: the owner cancels before success
+
+- **GIVEN** the current owner has a pending reconnect without a durable authenticated success proof
+- **WHEN** the owner requests cancellation for that nonce
+- **THEN** the journal SHALL record a terminal cancelled state and the Daemon SHALL stop attempting that request
+
+#### Scenario: cancellation cannot erase success
+
+- **GIVEN** the nonce has a durable authenticated success proof
+- **WHEN** an operator requests cancellation
+- **THEN** the operation SHALL be rejected and SHALL preserve the success proof and terminal success result
+
+#### Scenario: supersession is ordered
+
+- **GIVEN** an active request is owned by the current control instance
+- **WHEN** the owner requests supersession with a new nonce
+- **THEN** the old request SHALL become terminal superseded before the new request is accepted as its replacement
+
+<!-- @trace
+source: reconnect-control-resilience
+updated: 2026-08-02
+code:
+  - crates/fleety-cli/src/acp.rs
+  - crates/agent-core/src/error.rs
+  - crates/fleety-daemon/src/main.rs
+  - crates/fleety-tools/src/connection.rs
+  - docs/env.md
+  - README.md
+  - crates/fleety-cli/src/main.rs
+  - docs/design-cli-config.md
+  - crates/fleety-cli/src/server.rs
+tests:
+  - crates/fleety-daemon/tests/fleetyd_smoke.rs
+  - crates/fleety-cli/tests/cli_smoke.rs
+-->

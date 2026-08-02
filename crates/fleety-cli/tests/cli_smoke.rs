@@ -11,6 +11,26 @@ use tokio_tungstenite::tungstenite::{accept, Message};
 
 static RUN_SEQ: AtomicU64 = AtomicU64::new(0);
 
+const VERSIONED_CONNECTION_STORE_HEADER: &str =
+    "format_version = 1\nwriter_marker = \"fleety-store-v1\"\n\n";
+
+/// Hand-written fixtures below describe the current store shape but omit the
+/// envelope for readability. Add the envelope at the process boundary so
+/// tests that intentionally exercise legacy stores can continue to seed them
+/// through direct `Command` calls without weakening the production loader.
+fn mark_current_connection_store(home: &TempHome) {
+    let path = home.0.join(".fleety").join("connections.toml");
+    let Ok(bytes) = std::fs::read(&path) else {
+        return;
+    };
+    let text = String::from_utf8(bytes).expect("connection fixture is UTF-8");
+    if text.contains("format_version = 1") && text.contains("writer_marker =") {
+        return;
+    }
+    std::fs::write(&path, format!("{VERSIONED_CONNECTION_STORE_HEADER}{text}"))
+        .expect("mark current connection fixture");
+}
+
 /// Where `fleety acp install zed` writes settings when the fake home is `home`.
 ///
 /// Mirrors `zed_settings_path()`: Windows resolves through `%APPDATA%`, not
@@ -528,6 +548,7 @@ fn run_against_server(
     home: &TempHome,
     rx: mpsc::Receiver<Vec<ClientMsg>>,
 ) -> (std::process::Output, Vec<ClientMsg>) {
+    mark_current_connection_store(home);
     let output = Command::new(env!("CARGO_BIN_EXE_fleety"))
         .args(args)
         .env("FLEETY_AGENT_URL", url)
@@ -555,6 +576,7 @@ fn run_against_profile(
     home: &TempHome,
     rx: mpsc::Receiver<Vec<ClientMsg>>,
 ) -> (std::process::Output, Vec<ClientMsg>) {
+    mark_current_connection_store(home);
     let output = Command::new(env!("CARGO_BIN_EXE_fleety"))
         .args(args)
         .env("HOME", &home.0)
@@ -1686,7 +1708,7 @@ fn pair_rejects_blank_tokens_and_missing_server_identity_without_mutation() {
         std::fs::write(
             &connections,
             format!(
-                "current = \"office\"\n\n\
+                "{VERSIONED_CONNECTION_STORE_HEADER}current = \"office\"\n\n\
                  [profiles.office]\nurl = \"{url}\"\ntoken = \"old-token\"\nfingerprint = \"pair-fingerprint\"\ngeneration = \"pair-generation\"\n"
             ),
         )
@@ -1907,7 +1929,7 @@ fn named_profile_pairing_overrides_an_environment_url() {
     std::fs::write(
         fleety.join("connections.toml"),
         format!(
-            "current = \"other\"\n\n[profiles.office]\nurl = \"{url}\"\n\n\
+            "{VERSIONED_CONNECTION_STORE_HEADER}current = \"other\"\n\n[profiles.office]\nurl = \"{url}\"\n\n\
              [profiles.other]\nurl = \"ws://127.0.0.1:9\"\n"
         ),
     )
@@ -1957,7 +1979,7 @@ fn named_profile_pairing_ignores_a_malformed_environment_url() {
     std::fs::create_dir_all(&fleety).expect("fleety dir");
     std::fs::write(
         fleety.join("connections.toml"),
-        format!("current = \"office\"\n\n[profiles.office]\nurl = \"{url}\"\n"),
+            format!("{VERSIONED_CONNECTION_STORE_HEADER}current = \"office\"\n\n[profiles.office]\nurl = \"{url}\"\n"),
     )
     .expect("write profile");
 
@@ -2140,9 +2162,11 @@ fn cli_rejects_a_downgraded_selected_profile_before_transport_use() {
     let connections_path = fleety.join("connections.toml");
     std::fs::write(
         &connections_path,
-        "current = \"office\"\n\n[profiles.office]\nurl = \"ws://127.0.0.1:9\"\n\
-         token = \"old-token\"\nsecure = true\n\
-         generation = \"fleety-profile-v1:7:legacy-office-generation\"\n",
+        format!(
+            "{VERSIONED_CONNECTION_STORE_HEADER}current = \"office\"\n\n[profiles.office]\nurl = \"ws://127.0.0.1:9\"\n\
+             token = \"old-token\"\nsecure = true\n\
+             generation = \"fleety-profile-v1:7:legacy-office-generation\"\n"
+        ),
     )
     .expect("simulate an old serializer dropping roaming fields");
     let before = std::fs::read(&connections_path).expect("read seed");
@@ -2280,7 +2304,7 @@ fn init_reusing_a_paired_profile_proves_the_server_before_sending_hello() {
     std::fs::write(
         &connections,
         format!(
-            "device_id = \"init-secure\"\ncurrent = \"office\"\n\n\
+            "{VERSIONED_CONNECTION_STORE_HEADER}device_id = \"init-secure\"\ncurrent = \"office\"\n\n\
              [profiles.office]\nurl = \"{url}\"\ntoken = \"saved-token\"\n\
              fingerprint = \"server-a\"\n\
              generation = \"fleety-profile-v1:0:init-secure-generation\"\n"
@@ -2333,7 +2357,7 @@ fn saved_profile_failure_never_heals_or_mutates_and_directs_explicit_repair() {
     std::fs::write(
         &connections_path,
         format!(
-            "current = \"office\"\n\n[profiles.office]\nurl = \"{unreachable}\"\ntoken = \"office-secret\"\nfingerprint = \"public-copyable-hint\"\ngeneration = \"fleety-profile-v1:0:failure-generation\"\n"
+            "{VERSIONED_CONNECTION_STORE_HEADER}current = \"office\"\n\n[profiles.office]\nurl = \"{unreachable}\"\ntoken = \"office-secret\"\nfingerprint = \"public-copyable-hint\"\ngeneration = \"fleety-profile-v1:0:failure-generation\"\n"
         ),
     )
     .expect("write paired profile");
@@ -2445,7 +2469,9 @@ fn connection_human_and_json_outputs_redact_legacy_secrets_and_controls() {
     std::fs::create_dir_all(&fleety).expect("create fleety home");
     std::fs::write(
         fleety.join("connections.toml"),
-        "current = \"legacy\"\n\n[profiles.legacy]\nurl = \"wss://user:password@example.test/ws?token=secret#fragment\"\nlabel = \"line\\n\\u001b[2Jclear\"\nfingerprint = \"fp\\r\\nvalue\"\n",
+        format!(
+            "{VERSIONED_CONNECTION_STORE_HEADER}current = \"legacy\"\n\n[profiles.legacy]\nurl = \"wss://user:password@example.test/ws?token=secret#fragment\"\nlabel = \"line\\n\\u001b[2Jclear\"\nfingerprint = \"fp\\r\\nvalue\"\n"
+        ),
     )
     .expect("seed legacy profile");
 
@@ -2678,7 +2704,7 @@ fn pair_sends_its_code_to_the_configured_address_not_the_roamed_one() {
     std::fs::write(
         &connections,
         format!(
-            "device_id = \"pair-configured\"\ncurrent = \"home\"\n\n\
+            "{VERSIONED_CONNECTION_STORE_HEADER}device_id = \"pair-configured\"\ncurrent = \"home\"\n\n\
              [profiles.home]\nurl = \"ws://127.0.0.1:9\"\n\
              configured_url = \"{configured_url}\"\ntoken = \"old-token\"\n\
              fingerprint = \"server-paired\"\ngeneration = \"pair-generation\"\n"
@@ -2811,7 +2837,7 @@ fn init_reuses_a_latched_profile_only_through_its_secure_channel() {
     std::fs::write(
         &connections,
         format!(
-            "device_id = \"init-latched\"\ncurrent = \"home\"\n\n\
+            "{VERSIONED_CONNECTION_STORE_HEADER}device_id = \"init-latched\"\ncurrent = \"home\"\n\n\
              [profiles.home]\nurl = \"{url}\"\ntoken = \"latched-token\"\n\
              fingerprint = \"server-a\"\nsecure = true\n\
              generation = \"fleety-profile-v1:4:latched-generation\"\n"
@@ -2876,7 +2902,7 @@ fn init_never_drops_a_tokenless_profiles_secure_latch_or_owner() {
     std::fs::write(
         &connections,
         format!(
-            "device_id = \"init-tokenless-latched\"\ncurrent = \"home\"\n\n\
+            "{VERSIONED_CONNECTION_STORE_HEADER}device_id = \"init-tokenless-latched\"\ncurrent = \"home\"\n\n\
              [profiles.home]\nurl = \"{url}\"\nfingerprint = \"server-a\"\n\
              secure = true\ngeneration = \"fleety-profile-v1:4:tokenless-generation\"\n"
         ),
@@ -2986,7 +3012,7 @@ fn durable_profile_rejects_unusable_server_identity_before_control() {
         std::fs::write(
             &connections,
             format!(
-                "device_id = \"identity-test\"\ncurrent = \"A\"\n\n\
+                "{VERSIONED_CONNECTION_STORE_HEADER}device_id = \"identity-test\"\ncurrent = \"A\"\n\n\
                  [profiles.A]\nurl = \"{url}\"\ntoken = \"token-a\"\nfingerprint = \"fp-a\"\ngeneration = \"fleety-profile-v1:0:identity-generation\"\n"
             ),
         )
@@ -3094,7 +3120,7 @@ fn raw_server_and_url_overrides_send_only_the_explicit_token() {
         std::fs::write(
             &connections,
             format!(
-                "current = \"{current}\"\n\n\
+                "{VERSIONED_CONNECTION_STORE_HEADER}current = \"{current}\"\n\n\
                  [profiles.A]\nurl = \"{url}\"\ntoken = \"token-a\"\n\n\
                  [profiles.B]\nurl = \"{url}\"\ntoken = \"token-b\"\n"
             ),
@@ -3200,7 +3226,7 @@ fn raw_auth_rejection_explains_the_transient_credential_boundary() {
     std::fs::write(
         &connections,
         format!(
-            "current = \"A\"\n\n\
+            "{VERSIONED_CONNECTION_STORE_HEADER}current = \"A\"\n\n\
              [profiles.A]\nurl = \"{url}\"\ntoken = \"saved-token\"\n"
         ),
     )
@@ -3257,7 +3283,7 @@ fn acp_environment_endpoint_does_not_borrow_a_same_url_profile_token() {
         std::fs::write(
             &connections,
             format!(
-                "current = \"{current}\"\n\n\
+                "{VERSIONED_CONNECTION_STORE_HEADER}current = \"{current}\"\n\n\
                  [profiles.A]\nurl = \"{url}\"\ntoken = \"token-a\"\n\n\
                  [profiles.B]\nurl = \"{url}\"\ntoken = \"token-b\"\n"
             ),
@@ -3710,7 +3736,9 @@ fn legacy_server_url_override_is_transient_and_never_selects_a_profile() {
     std::fs::create_dir_all(connections.parent().expect("parent")).expect("fleety home");
     std::fs::write(
         &connections,
-        "current = \"A\"\n\n[profiles.A]\nurl = \"ws://127.0.0.1:9\"\n",
+        format!(
+            "{VERSIONED_CONNECTION_STORE_HEADER}current = \"A\"\n\n[profiles.A]\nurl = \"ws://127.0.0.1:9\"\n"
+        ),
     )
     .expect("seed profile");
     let before = std::fs::read(&connections).expect("connections before");
@@ -4700,7 +4728,9 @@ fn json_runtime_failure_keeps_resolved_context() {
     std::fs::create_dir_all(connections.parent().expect("parent")).expect("fleety home");
     std::fs::write(
         &connections,
-        format!("current = \"B\"\n\n[profiles.B]\nurl = \"{url}\"\n"),
+        format!(
+            "{VERSIONED_CONNECTION_STORE_HEADER}current = \"B\"\n\n[profiles.B]\nurl = \"{url}\"\n"
+        ),
     )
     .expect("seed profile");
 
