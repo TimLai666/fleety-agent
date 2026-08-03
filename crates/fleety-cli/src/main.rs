@@ -1214,7 +1214,11 @@ async fn run_tui(session: workspace::WorkspaceSession) -> Result<workspace::Sess
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(120));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let result = loop {
-        if matches!(&workspace.route, workspace::Route::Settings(_)) {
+        // Settings and Provider create a full-screen alternate terminal. The
+        // inline Chat terminal must be restored first or the two terminal
+        // lifecycles can leave the primary viewport in the scrollback.
+        if inline_terminal_must_close_before_handoff(&workspace.route) {
+            close_inline_terminal(&mut terminal);
             break Ok(workspace::SessionResult::Continue(Box::new(
                 workspace::WorkspaceSession {
                     workspace,
@@ -1624,6 +1628,10 @@ async fn run_tui(session: workspace::WorkspaceSession) -> Result<workspace::Sess
     close_inline_terminal(&mut terminal);
     let _ = tx.close().await;
     result
+}
+
+fn inline_terminal_must_close_before_handoff(route: &workspace::Route) -> bool {
+    matches!(route, workspace::Route::Settings(_))
 }
 
 /// Reconnect after a dropped link, using capped exponential backoff. On success
@@ -6050,6 +6058,16 @@ mod tests {
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::sync::Mutex;
     use tokio_tungstenite::tungstenite::Message;
+
+    #[test]
+    fn settings_handoff_requires_closing_the_inline_terminal() {
+        assert!(inline_terminal_must_close_before_handoff(
+            &workspace::Route::Settings(workspace::SettingsPage::ProvidersAndModels,)
+        ));
+        assert!(!inline_terminal_must_close_before_handoff(
+            &workspace::Route::Chat
+        ));
+    }
 
     #[test]
     fn init_plan_uses_only_the_authoritative_profile_snapshot() {
