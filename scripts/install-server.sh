@@ -151,6 +151,10 @@ echo
 echo "Drive it from this host with the CLI (no pairing — the local server is trusted"
 echo "on loopback):  fleety init   (picks the local server), then  fleety chat"
 echo
+echo "For a separate client device, use the client installer; it installs and starts"
+echo "both fleety and fleetyd:"
+echo "  curl -fsSL https://raw.githubusercontent.com/${REPO}/main/scripts/install.sh | sh"
+echo
 echo "Update later with:  $BIN update   (self-update + sidecar refresh; restarts when idle)"
 case ":$PATH:" in
   *":$dir:"*) ;;

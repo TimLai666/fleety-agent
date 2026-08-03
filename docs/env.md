@@ -963,7 +963,14 @@ if none is found it installs one (OS package manager, then a chrome-for-testing
 
 | Var | Default | Meaning |
 |---|---|---|
-| `FLEETY_INSTALL_DIR` | `/usr/local/bin` if writable, else `~/.local/bin` (Windows: `%LOCALAPPDATA%\Programs\fleety`) | Where `scripts/install.sh` / `install-server.sh` (and `install.ps1`) land the binary. Explicit value always wins. |
+| `FLEETY_INSTALL_DIR` | `/usr/local/bin` if writable, else `~/.local/bin` (Windows: `%LOCALAPPDATA%\Programs\fleety`) | Where `scripts/install.sh` / `install-server.sh` (and `install.ps1`) land their binaries. Explicit value always wins. |
+
+The client installers (`scripts/install.sh` and `scripts/install.ps1`) install
+both `fleety` and `fleetyd`, register the daemon service, and start it for the
+current session. They do not enable login autostart and do not create or migrate
+connection credentials. On Windows, service registration requires an
+Administrator terminal. `scripts/install-server.sh` remains the server-only
+deployment path and does not register a client daemon on a server host.
 
 ---
 

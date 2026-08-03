@@ -1,6 +1,7 @@
 #!/bin/sh
-# Fleety CLI installer — downloads the latest release of `fleety` for this
-# platform and installs it onto your PATH.
+# Fleety client installer — downloads the latest release of `fleety` and
+# `fleetyd` for this platform, installs both onto your PATH, and starts the
+# local daemon service.
 #
 #   curl -fsSL https://raw.githubusercontent.com/TimLai666/fleety-agent/main/scripts/install.sh | sh
 #
@@ -8,7 +9,6 @@
 set -eu
 
 REPO="TimLai666/fleety-agent"
-BIN="fleety"
 
 os="$(uname -s)"
 arch="$(uname -m)"
@@ -32,9 +32,6 @@ case "$os" in
     exit 1
     ;;
 esac
-
-asset="${BIN}-${target}.tar.gz"
-url="https://github.com/${REPO}/releases/latest/download/${asset}"
 
 # Can we actually create a file in $1? Probe atomically (create then remove a
 # temporary file) instead of a bare `[ -w ]` test — `-w` misreports a directory
@@ -62,18 +59,44 @@ mkdir -p "$dir"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-echo "fleety: downloading $asset ..."
-if ! curl -fsSL "$url" -o "$tmp/$asset"; then
-  echo "fleety: download failed from $url" >&2
-  echo "        (has a release been published yet? see github.com/${REPO}/releases)" >&2
+download_binary() {
+  bin="$1"
+  asset="${bin}-${target}.tar.gz"
+  url="https://github.com/${REPO}/releases/latest/download/${asset}"
+
+  echo "$bin: downloading $asset ..."
+  if ! curl -fsSL "$url" -o "$tmp/$asset"; then
+    echo "$bin: download failed from $url" >&2
+    echo "      (has a release been published yet? see github.com/${REPO}/releases)" >&2
+    exit 1
+  fi
+
+  if ! tar -C "$tmp" -xzf "$tmp/$asset" || [ ! -f "$tmp/$bin" ]; then
+    echo "$bin: archive did not contain an executable named $bin" >&2
+    exit 1
+  fi
+  chmod 755 "$tmp/$bin"
+}
+
+# Stage and validate both binaries before replacing either installed file.
+download_binary fleety
+download_binary fleetyd
+mv "$tmp/fleety" "$dir/fleety"
+mv "$tmp/fleetyd" "$dir/fleetyd"
+
+echo "fleety: installed to $dir/fleety"
+echo "fleetyd: installed to $dir/fleetyd"
+
+if ! "$dir/fleetyd" install; then
+  echo "fleetyd: service registration failed; rerun '$dir/fleetyd install' with the required permissions" >&2
   exit 1
 fi
+if ! "$dir/fleetyd" start; then
+  echo "fleetyd: service start failed; rerun '$dir/fleetyd start' after fixing the service error" >&2
+  exit 1
+fi
+echo "fleetyd: service registered and started (login autostart remains disabled)"
 
-tar -C "$tmp" -xzf "$tmp/$asset"
-chmod 755 "$tmp/$BIN"
-mv "$tmp/$BIN" "$dir/$BIN"
-
-echo "fleety: installed to $dir/$BIN"
 # Whichever dir we landed on — including the ~/.local/bin fallback — warn when it
 # is not on PATH and show exactly how to add it.
 case ":$PATH:" in

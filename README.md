@@ -12,8 +12,10 @@ what each device can do, and routes each task to the device best able to finish 
 
 ## Install
 
-Install the `fleety` CLI with one line — it fetches the latest release for your
-platform and puts `fleety` on your PATH:
+Install the Fleety client with one line — it fetches the latest `fleety` and
+`fleetyd` release assets for your platform, puts both on your PATH, registers
+the daemon service, and starts it for the current session. Login autostart stays
+off until you explicitly run `fleetyd enable`:
 
 **macOS / Linux**
 
@@ -40,6 +42,8 @@ the newest [GitHub Release](https://github.com/TimLai666/fleety-agent/releases) 
 maintainers cut one by pushing a tag (`git tag v0.1.0 && git push origin v0.1.0`),
 which triggers [`.github/workflows/release.yml`](.github/workflows/release.yml) to
 build and attach the per-platform binaries (`fleety`, `fleety-server`, `fleetyd`).
+On Windows, daemon service registration requires an Administrator terminal; the
+installer reports that requirement instead of claiming success.
 
 ## Deploy the server
 
@@ -53,14 +57,18 @@ Listens on `:8787`, persists state in the `fleety-data` volume, and operates on
 `./workspace`. Configure a model and policy via env — see
 [`docker-compose.yml`](docker-compose.yml).
 
-**Without Docker** — one-line install of the `fleety-server` binary:
+**Without Docker** — one-line install of the server and local CLI:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/TimLai666/fleety-agent/main/scripts/install-server.sh | sh
 ```
 
-It installs `fleety-server` onto your PATH and prints how to run it; register
-it as a boot service with `fleety-server up` (systemd --user / launchd / SCM).
+It installs `fleety-server` onto your PATH and best-effort installs the matching
+`fleety` CLI beside it. If the CLI asset is unavailable, the server installation
+still succeeds and prints the client-install command. It does **not** install
+`fleetyd` or register a device daemon. Register the server as a boot service with
+`fleety-server up` (systemd --user / launchd / SCM). A separate client device
+gets both `fleety` and `fleetyd` from the client installer above.
 
 ## Workspace
 

@@ -179,6 +179,24 @@ jobs:
           foreach ($b in 'fleety', 'fleety-server', 'fleetyd') {
             Compress-Archive -Path "target/${{ matrix.target }}/release/$b.exe" -DestinationPath "$b-${{ matrix.target }}.zip"
           }
+      - name: Verify packaged archives (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          for b in fleety fleety-server fleetyd; do
+            archive="$b-${{ matrix.target }}.tar.gz"
+            test -s "$archive" || { echo "missing or empty $archive" >&2; exit 1; }
+          done
+      - name: Verify packaged archives (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          foreach ($b in 'fleety', 'fleety-server', 'fleetyd') {
+            $archive = "$b-${{ matrix.target }}.zip"
+            if (-not (Test-Path $archive) -or (Get-Item $archive).Length -le 0) {
+              throw "missing or empty $archive"
+            }
+          }
       # Only attach on a real tag push; `workflow_dispatch` is a build-only
       # dry-run that verifies every target compiles + packages before cutting a tag.
       - name: Attach to release
