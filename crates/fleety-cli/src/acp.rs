@@ -277,8 +277,9 @@ pub fn merge_zed_settings(
 /// Re-point any *already-installed* ACP agent configs at the current binary, for
 /// `fleety update` to call. This self-heals a changed binary path or an evolved
 /// `acp` invocation. It NEVER newly installs — only editors already set up for
-/// Fleety are touched; a missing config is a no-op, while unreadable or invalid
-/// existing settings are reported so `fleety update` cannot claim completion.
+/// Fleety are touched; a missing config or a settings file with no Fleety entry
+/// is a no-op, while unreadable or invalid existing Fleety settings are reported
+/// so `fleety update` cannot claim completion.
 pub fn refresh_installed(server: Option<&str>) -> agent_core::Result<()> {
     use agent_core::CoreError;
 
@@ -330,13 +331,21 @@ pub fn refresh_installed(server: Option<&str>) -> agent_core::Result<()> {
 
 /// Pure refresh decision for Zed: return the updated JSON only when a Fleety entry
 /// is already present AND re-pointing it at `command` changes something.
-/// Invalid existing JSON is an error; an absent Fleety entry or unchanged entry
-/// returns `Ok(None)` so refresh never newly installs or rewrites needlessly.
+/// A settings file without the literal Fleety key is a no-op before strict
+/// parsing, so unrelated JSONC is not allowed to make update fail. Once that
+/// key is present, invalid existing JSON remains an error and an unchanged
+/// entry returns `Ok(None)`.
 pub fn refresh_zed_settings(
     existing: &str,
     command: &str,
     server: Option<&str>,
 ) -> std::result::Result<Option<String>, String> {
+    // Zed settings are JSONC in practice. We only need to parse the file when
+    // there is an installed Fleety entry to refresh; otherwise unrelated
+    // comments/trailing commas must not make `fleety update` incomplete.
+    if !existing.contains("\"Fleety\"") {
+        return Ok(None);
+    }
     let mut root = serde_json::from_str::<Value>(existing).map_err(|error| error.to_string())?;
     let Some(entry) = root
         .get_mut("agent_servers")
@@ -2209,9 +2218,20 @@ mod tests {
             refresh_zed_settings(r#"{"theme":"dark"}"#, "/bin/fleety", None).unwrap(),
             None
         );
-        assert!(refresh_zed_settings("", "/bin/fleety", None).is_err());
-        // Unparseable (JSONC) is reported so update cannot claim completion.
-        assert!(refresh_zed_settings("// c\n{}", "/bin/fleety", None).is_err());
+        assert_eq!(refresh_zed_settings("", "/bin/fleety", None).unwrap(), None);
+        // Unrelated JSONC is ignored when Fleety is not installed.
+        let unrelated_jsonc = r#"// Zed settings
+{
+  "agent_servers": {"opencode": {"type": "registry"}},
+  "theme": {"dark": "One Dark",},
+}"#;
+        assert_eq!(
+            refresh_zed_settings(unrelated_jsonc, "/bin/fleety", None).unwrap(),
+            None
+        );
+        // Unparseable JSONC with an installed Fleety entry remains protected.
+        let jsonc_with_fleety = "// c\n{\"agent_servers\":{\"Fleety\":{}}}";
+        assert!(refresh_zed_settings(jsonc_with_fleety, "/bin/fleety", None).is_err());
         let invalid_endpoint = r#"{"agent_servers":{"Fleety":{"type":"custom","command":"/old/fleety","args":["acp"],"env":{"FLEETY_AGENT_URL":"wss://example.test/ws#fragment"}}}}"#;
         assert!(
             refresh_zed_settings(invalid_endpoint, "/new/fleety", None).is_err(),

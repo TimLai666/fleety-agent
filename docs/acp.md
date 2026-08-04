@@ -106,7 +106,8 @@ ACP is a shared protocol, so the installer is not Zed-only:
   writing relative to the working directory.
 - `fleety update` refreshes an already-installed Fleety entry. An unreadable,
   invalid, or unwritable existing Zed settings file makes the update incomplete
-  and returns non-zero instead of being silently skipped.
+  only when it contains that installed Fleety entry; unrelated JSONC settings
+  without a Fleety entry are treated as a no-op and do not block the update.
 
 Zed settings location: `%APPDATA%\Zed\settings.json` (Windows),
 `~/.config/zed/settings.json` (macOS/Linux).
