@@ -1829,6 +1829,13 @@ type ActiveCatalogFetch = (
     std::sync::Arc<std::sync::atomic::AtomicBool>,
 );
 
+/// Server-bound state shared by one Provider editor session.
+pub struct ProviderEditorContext {
+    pub auth_states: ProviderAuthStates,
+    pub connection_id: String,
+    pub config_protocol: u32,
+}
+
 fn cancel_hidden_catalog_fetch(app: &App, active_fetch: &mut Option<ActiveCatalogFetch>) {
     use std::sync::atomic::Ordering;
 
@@ -1856,7 +1863,7 @@ fn cancel_hidden_catalog_fetch(app: &App, active_fetch: &mut Option<ActiveCatalo
 /// to its existing authenticated Server target.
 pub fn run_with_saver_and_fetcher(
     initial: ProviderEditorInput,
-    mut save: impl FnMut(&ProvidersConfig, &BTreeSet<String>) -> Result<SaveOutcome>,
+    save: impl FnMut(&ProvidersConfig, &BTreeSet<String>) -> Result<SaveOutcome>,
     fetch_models: impl Fn(&CatalogRequest, std::sync::Arc<std::sync::atomic::AtomicBool>) -> CatalogFetchResult
         + Send
         + Sync
@@ -1866,6 +1873,37 @@ pub fn run_with_saver_and_fetcher(
     config_protocol: u32,
     terminal_input: &mut crate::workspace::WorkspaceInput,
 ) -> Result<EditorOutcome> {
+    let mut terminal = ratatui::init();
+    let result = run_with_terminal(
+        &mut terminal,
+        initial,
+        save,
+        fetch_models,
+        ProviderEditorContext {
+            auth_states,
+            connection_id,
+            config_protocol,
+        },
+        terminal_input,
+    );
+    ratatui::restore();
+    result
+}
+
+/// Run the Provider editor on a terminal owned by the caller. This core entry
+/// point never initializes or restores the terminal; embedded Settings flows
+/// therefore keep one continuous alternate-screen session.
+pub fn run_with_terminal<B: ratatui::backend::Backend>(
+    terminal: &mut ratatui::Terminal<B>,
+    initial: ProviderEditorInput,
+    mut save: impl FnMut(&ProvidersConfig, &BTreeSet<String>) -> Result<SaveOutcome>,
+    fetch_models: impl Fn(&CatalogRequest, std::sync::Arc<std::sync::atomic::AtomicBool>) -> CatalogFetchResult
+        + Send
+        + Sync
+        + 'static,
+    context: ProviderEditorContext,
+    terminal_input: &mut crate::workspace::WorkspaceInput,
+) -> Result<EditorOutcome> {
     use std::sync::atomic::AtomicBool;
     use std::sync::{mpsc, Arc};
     use std::time::Duration;
@@ -1873,13 +1911,12 @@ pub fn run_with_saver_and_fetcher(
     let mut app = App::with_auth_states(
         initial.config,
         initial.key_present,
-        auth_states,
-        connection_id,
-        config_protocol,
+        context.auth_states,
+        context.connection_id,
+        context.config_protocol,
     );
     let fetch_models = Arc::new(fetch_models);
     let mut active_fetch: Option<ActiveCatalogFetch> = None;
-    let mut terminal = ratatui::init();
     let result = (|| -> Result<()> {
         loop {
             cancel_hidden_catalog_fetch(&app, &mut active_fetch);
@@ -1961,7 +1998,6 @@ pub fn run_with_saver_and_fetcher(
         }
         Ok(())
     })();
-    ratatui::restore();
     let conflict = app.conflict.take();
     let auth_request = app.auth_request.take();
     result.map(|()| EditorOutcome {

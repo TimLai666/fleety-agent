@@ -1717,6 +1717,20 @@ async fn run_auth_action_for_target(
 
 /// The four-region settings editor (Connection / CLI / Daemon / Server),
 /// launched from the top-level menu's "Settings" item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderTerminalHandoff {
+    ReuseSettingsTerminal,
+    #[allow(dead_code)]
+    RestoreAndReinit,
+}
+
+/// Normal Settings → Provider navigation stays inside the terminal already
+/// owned by the Settings panel. Plain-terminal flows opt into the exceptional
+/// restore/reinitialize pair explicitly at their call site.
+fn provider_terminal_handoff_mode() -> ProviderTerminalHandoff {
+    ProviderTerminalHandoff::ReuseSettingsTerminal
+}
+
 async fn run_settings(
     session: crate::workspace::WorkspaceSession,
 ) -> Result<crate::workspace::SessionResult> {
@@ -2043,12 +2057,12 @@ async fn run_settings(
         }
         if app.open_provider_now {
             app.open_provider_now = false;
-            ratatui::restore();
             let provider_result = match active_target.as_ref() {
                 Some(target) => {
                     crate::config::provider_edit_remote_on_target(
                         target,
                         active_fingerprint.as_deref(),
+                        &mut terminal,
                         &mut input,
                     )
                     .await
@@ -2072,7 +2086,13 @@ async fn run_settings(
                 }
             }
             input.handoff().await;
-            terminal = ratatui::init();
+            if matches!(
+                provider_terminal_handoff_mode(),
+                ProviderTerminalHandoff::RestoreAndReinit
+            ) {
+                ratatui::restore();
+                terminal = ratatui::init();
+            }
         }
         if app.apply_now {
             sync_workspace_from_panel(&mut workspace, &app);
@@ -2316,6 +2336,14 @@ mod tests {
     use futures::{SinkExt, StreamExt};
     use tokio::sync::oneshot;
     use tokio_tungstenite::tungstenite::Message;
+
+    #[test]
+    fn provider_editor_from_settings_reuses_the_existing_terminal() {
+        assert_eq!(
+            provider_terminal_handoff_mode(),
+            ProviderTerminalHandoff::ReuseSettingsTerminal
+        );
+    }
 
     #[test]
     fn switched_profile_target_is_bound_to_the_new_current_owner() {

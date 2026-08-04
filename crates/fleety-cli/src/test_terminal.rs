@@ -21,6 +21,11 @@ pub(crate) struct Capture {
     /// Everything written, kept alongside the backend because its own writer is
     /// private.
     pub(crate) written: Vec<u8>,
+    /// Text snapshots of each frame passed to the backend. Tests that drive a
+    /// full-screen editor can inspect an intermediate frame without relying
+    /// on the terminal's final buffer.
+    pub(crate) frames: Vec<String>,
+    buffer: Vec<Vec<String>>,
     size: Size,
 }
 
@@ -29,6 +34,8 @@ impl Capture {
         Self {
             inner: CrosstermBackend::new(Vec::new()),
             written: Vec::new(),
+            frames: Vec::new(),
+            buffer: vec![vec![" ".to_string(); width as usize]; height as usize],
             size: Size { width, height },
         }
     }
@@ -49,7 +56,25 @@ impl Backend for Capture {
     where
         I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
     {
-        self.inner.draw(content)
+        let cells: Vec<_> = content.map(|(x, y, cell)| (x, y, cell.clone())).collect();
+        self.inner
+            .draw(cells.iter().map(|(x, y, cell)| (*x, *y, cell)))?;
+        for (x, y, cell) in &cells {
+            if let Some(row) = self.buffer.get_mut(*y as usize) {
+                if let Some(slot) = row.get_mut(*x as usize) {
+                    *slot = cell.symbol().to_string();
+                }
+            }
+        }
+        self.frames.push(
+            self.buffer
+                .clone()
+                .into_iter()
+                .map(|row| row.concat())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        Ok(())
     }
     fn hide_cursor(&mut self) -> std::io::Result<()> {
         self.inner.hide_cursor()

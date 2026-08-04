@@ -1233,6 +1233,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_editor_can_render_add_wizard_on_a_caller_owned_terminal() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use ratatui::Terminal;
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        for key in [
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        ] {
+            tx.send(StampedKey { epoch: 0, key }).unwrap();
+        }
+        let mut input = WorkspaceInput::from_stamped_receiver(rx);
+        let mut terminal =
+            Terminal::new(crate::test_terminal::Capture::new(100, 24)).expect("terminal");
+
+        crate::provider_tui::run_with_terminal(
+            &mut terminal,
+            crate::provider_tui::ProviderEditorInput {
+                config: fleety_tools::providers_config::ProvidersConfig::default(),
+                key_present: std::collections::BTreeSet::new(),
+            },
+            |_, _| Ok(crate::provider_tui::SaveOutcome::Saved),
+            |_, _| Ok(Vec::new()),
+            crate::provider_tui::ProviderEditorContext {
+                auth_states: crate::provider_tui::ProviderAuthStates::new(),
+                connection_id: "test-server".into(),
+                config_protocol: 5,
+            },
+            &mut input,
+        )
+        .expect("provider editor");
+
+        assert!(
+            terminal
+                .backend()
+                .frames
+                .iter()
+                .any(|frame| frame.contains("add provider")),
+            "frames: {:?}",
+            terminal.backend().frames
+        );
+        assert!(
+            terminal
+                .backend()
+                .frames
+                .iter()
+                .any(|frame| frame.contains("▶api")),
+            "frames: {:?}",
+            terminal.backend().frames
+        );
+    }
+
+    #[tokio::test]
     async fn oauth_acknowledgement_uses_workspace_input_and_consumes_enter() {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let mut input = WorkspaceInput::from_receiver(rx);

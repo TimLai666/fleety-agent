@@ -179,6 +179,7 @@ pub async fn provider_edit_remote() -> Result<()> {
         config_protocol,
         target,
         server_fingerprint,
+        None,
         &mut input,
     )
     .await
@@ -187,6 +188,7 @@ pub async fn provider_edit_remote() -> Result<()> {
 pub(crate) async fn provider_edit_remote_on_target(
     target: &fleety_tools::connection::Resolved,
     expected_fingerprint: Option<&str>,
+    terminal: &mut ratatui::DefaultTerminal,
     input: &mut crate::workspace::WorkspaceInput,
 ) -> Result<()> {
     let (tx, rx, config_protocol, fingerprint, committed_target) =
@@ -205,6 +207,7 @@ pub(crate) async fn provider_edit_remote_on_target(
         config_protocol,
         committed_target,
         fingerprint,
+        Some(terminal),
         input,
     )
     .await
@@ -216,8 +219,10 @@ async fn provider_edit_remote_loop(
     config_protocol: u32,
     target: fleety_tools::connection::Resolved,
     server_fingerprint: Option<String>,
+    terminal: Option<&mut ratatui::DefaultTerminal>,
     input: &mut crate::workspace::WorkspaceInput,
 ) -> Result<()> {
+    let mut terminal = terminal;
     let mut initial_connection = Some((tx, rx, config_protocol));
     loop {
         let (mut tx, mut rx, config_protocol) = match initial_connection.take() {
@@ -267,99 +272,123 @@ async fn provider_edit_remote_loop(
         let catalog_target = target.clone();
         let catalog_connection_id = connection_id.clone();
         let catalog_server_fingerprint = server_fingerprint.clone();
-        let outcome = tokio::task::block_in_place(|| {
-            crate::provider_tui::run_with_saver_and_fetcher(
-                editor_input,
-                |edited, clear_keys| {
-                    handle.block_on(async {
-                        let mut io = io.lock().await;
-                        let (apply_tx, apply_rx) = &mut *io;
-                        match crate::provider_service::apply_snapshot(
-                            apply_tx,
-                            apply_rx,
-                            revision.clone(),
-                            edited,
-                            clear_keys,
-                        )
-                        .await
-                        {
-                            Ok(()) => {
-                                // Our own write moved the server's revision; refresh
-                                // it so the next save in this session doesn't
-                                // conflict with our own edit.
-                                Ok(provider_refresh_outcome(
-                                    &mut revision,
-                                    refresh_provider_revision(apply_tx, apply_rx, config_protocol)
-                                        .await,
-                                ))
-                            }
-                            Err(issue) if issue.kind == "conflict" => {
-                                Ok(crate::provider_tui::SaveOutcome::Conflict(issue.message))
-                            }
-                            Err(issue) => Err(crate::provider_service::issue_as_error(issue)),
-                        }
-                    })
-                },
-                move |request, cancellation| {
-                    if request.connection_id != catalog_connection_id {
-                        return Err(crate::provider_service::ProviderIssue::new(
-                            "target_changed",
-                            "Provider catalog request no longer matches this Server",
-                            Some("Reopen the Provider editor"),
-                        ));
+        let save = |edited: &fleety_tools::providers_config::ProvidersConfig,
+                    clear_keys: &std::collections::BTreeSet<String>| {
+            handle.block_on(async {
+                let mut io = io.lock().await;
+                let (apply_tx, apply_rx) = &mut *io;
+                match crate::provider_service::apply_snapshot(
+                    apply_tx,
+                    apply_rx,
+                    revision.clone(),
+                    edited,
+                    clear_keys,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        // Our own write moved the server's revision; refresh
+                        // it so the next save in this session doesn't
+                        // conflict with our own edit.
+                        Ok(provider_refresh_outcome(
+                            &mut revision,
+                            refresh_provider_revision(apply_tx, apply_rx, config_protocol).await,
+                        ))
                     }
-                    catalog_handle.block_on(async {
-                        tokio::select! {
-                            result = async {
-                                let (
-                                    mut catalog_tx,
-                                    mut catalog_rx,
-                                    catalog_protocol,
-                                    catalog_fingerprint,
-                                ) = crate::connect_hello_for_auth_target(&catalog_target)
-                                    .await
-                                    .map_err(|error| {
-                                        crate::provider_service::ProviderIssue::new(
-                                            "transport",
-                                            error.report().message,
-                                            Some("Reconnect to this Server and retry"),
-                                        )
-                                    })?;
-                                crate::provider_service::validate_server_identity(
-                                    catalog_server_fingerprint.as_deref(),
-                                    catalog_fingerprint.as_deref(),
-                                    "Provider catalog fetch",
-                                )?;
-                                crate::provider_service::fetch_catalog(
-                                    &mut catalog_tx,
-                                    &mut catalog_rx,
-                                    catalog_protocol,
-                                    request,
-                                )
+                    Err(issue) if issue.kind == "conflict" => {
+                        Ok(crate::provider_tui::SaveOutcome::Conflict(issue.message))
+                    }
+                    Err(issue) => Err(crate::provider_service::issue_as_error(issue)),
+                }
+            })
+        };
+        let fetch =
+            move |request: &crate::provider_service::CatalogRequest,
+                  cancellation: std::sync::Arc<std::sync::atomic::AtomicBool>| {
+                if request.connection_id != catalog_connection_id {
+                    return Err(crate::provider_service::ProviderIssue::new(
+                        "target_changed",
+                        "Provider catalog request no longer matches this Server",
+                        Some("Reopen the Provider editor"),
+                    ));
+                }
+                catalog_handle.block_on(async {
+                    tokio::select! {
+                        result = async {
+                            let (
+                                mut catalog_tx,
+                                mut catalog_rx,
+                                catalog_protocol,
+                                catalog_fingerprint,
+                            ) = crate::connect_hello_for_auth_target(&catalog_target)
                                 .await
-                            } => result,
-                            () = wait_for_catalog_cancel(cancellation) => {
-                                Err(crate::provider_service::ProviderIssue::new(
-                                    "cancelled",
-                                    "Provider catalog request was cancelled",
-                                    None::<String>,
-                                ))
-                            }
+                                .map_err(|error| {
+                                    crate::provider_service::ProviderIssue::new(
+                                        "transport",
+                                        error.report().message,
+                                        Some("Reconnect to this Server and retry"),
+                                    )
+                                })?;
+                            crate::provider_service::validate_server_identity(
+                                catalog_server_fingerprint.as_deref(),
+                                catalog_fingerprint.as_deref(),
+                                "Provider catalog fetch",
+                            )?;
+                            crate::provider_service::fetch_catalog(
+                                &mut catalog_tx,
+                                &mut catalog_rx,
+                                catalog_protocol,
+                                request,
+                            )
+                            .await
+                        } => result,
+                        () = wait_for_catalog_cancel(cancellation) => {
+                            Err(crate::provider_service::ProviderIssue::new(
+                                "cancelled",
+                                "Provider catalog request was cancelled",
+                                None::<String>,
+                            ))
                         }
-                    })
-                },
-                auth_states,
-                connection_id.clone(),
-                config_protocol,
-                input,
-            )
+                    }
+                })
+            };
+        let outcome = tokio::task::block_in_place(|| {
+            if let Some(terminal) = terminal.as_deref_mut() {
+                crate::provider_tui::run_with_terminal(
+                    terminal,
+                    editor_input,
+                    save,
+                    fetch,
+                    crate::provider_tui::ProviderEditorContext {
+                        auth_states,
+                        connection_id: connection_id.clone(),
+                        config_protocol,
+                    },
+                    input,
+                )
+            } else {
+                crate::provider_tui::run_with_saver_and_fetcher(
+                    editor_input,
+                    save,
+                    fetch,
+                    auth_states,
+                    connection_id.clone(),
+                    config_protocol,
+                    input,
+                )
+            }
         })?;
         // An OAuth action the editor asked for: the just-added/edited provider is
-        // already applied to the server (the save above ran the ConfigApply), and
-        // the editor tore down the full-screen UI so the browser flow can use the
-        // plain terminal. Run the sign-in/out/switch against THIS server, then
-        // reopen the editor on a fresh snapshot.
+        // already applied to the server (the save above ran the ConfigApply).
+        // Embedded Settings temporarily restores its caller-owned terminal so
+        // the browser flow can use the plain terminal, then reopens the editor
+        // on a fresh snapshot. Standalone mode already owns this transition in
+        // the wrapper around the editor.
         if let Some(req) = outcome.auth_request {
+            let embedded = terminal.is_some();
+            if embedded {
+                ratatui::restore();
+            }
             crate::config_panel::run_auth_action_on_target(
                 &req,
                 &target,
@@ -367,6 +396,11 @@ async fn provider_edit_remote_loop(
                 input,
             )
             .await;
+            if embedded {
+                if let Some(terminal) = terminal.as_deref_mut() {
+                    *terminal = ratatui::init();
+                }
+            }
             continue;
         }
         // A concurrent-edit conflict: reload from a fresh snapshot and reopen.

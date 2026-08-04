@@ -8,7 +8,7 @@ TBD - created by archiving change 'redesign-cli-experience'. Update Purpose afte
 
 ### Requirement: Interactive entry points share one terminal workspace
 
-Bare `fleety` on a TTY SHALL open the terminal workspace at Chat; bare `fleety` on non-TTY SHALL print help and exit zero. `fleety chat`, legacy `fleety tui`, and bare TTY `fleety config` SHALL open the same workspace at Chat or Settings without duplicating connection or owner state.
+Bare `fleety` on a TTY SHALL open the terminal workspace at Chat; bare `fleety` on non-TTY SHALL print help and exit zero. `fleety chat`, legacy `fleety tui`, and bare TTY `fleety config` SHALL open the same workspace at Chat or Settings without duplicating connection or owner state. Settings and its nested Provider editor SHALL retain one continuous full-screen alternate-screen session during normal navigation and editing; the transition SHALL NOT expose the primary scrollback. A standalone Provider editor SHALL continue to initialize and restore its own terminal. A flow that explicitly requires a plain terminal, including OAuth browser interaction, SHALL suspend and restore the full-screen terminal as a paired exceptional transition.
 
 #### Scenario: terminal detection selects a safe entry
 
@@ -17,125 +17,44 @@ Bare `fleety` on a TTY SHALL open the terminal workspace at Chat; bare `fleety` 
 - **WHEN** bare `fleety` runs with piped stdin or captured stdout
 - **THEN** it SHALL print help and SHALL NOT connect or consume input as a prompt
 
+#### Scenario: Settings opens Add Provider without exposing scrollback
+
+- **GIVEN** Settings is displaying the Providers & Models page in a full-screen alternate-screen terminal
+- **WHEN** the user presses Enter and then presses `a`
+- **THEN** the Add Provider type picker SHALL render in the same alternate-screen session
+- **AND** the handoff SHALL NOT emit LeaveAlternateScreen followed by EnterAlternateScreen
+
+#### Scenario: Provider preparation failure stays in Settings terminal
+
+- **GIVEN** Settings is displaying the Providers & Models page
+- **WHEN** the Provider connection, identity validation, or snapshot preparation fails
+- **THEN** Settings SHALL remain on its existing full-screen terminal and display the failure state
+- **AND** the primary scrollback SHALL NOT become visible
+
+#### Scenario: standalone Provider editor owns its terminal
+
+- **WHEN** the Provider editor is launched outside Settings
+- **THEN** it SHALL initialize a full-screen terminal before drawing
+- **AND** it SHALL restore the terminal when the editor exits
+
+#### Scenario: OAuth uses an explicit paired plain-terminal transition
+
+- **GIVEN** the Provider editor is embedded in Settings
+- **WHEN** an OAuth action requires browser or plain-terminal interaction
+- **THEN** the full-screen terminal SHALL be restored before the OAuth interaction
+- **AND** a new full-screen terminal SHALL be initialized before interactive Provider or Settings drawing resumes
+
 
 <!-- @trace
-source: redesign-cli-experience
-updated: 2026-07-29
+source: preserve-provider-terminal-screen
+updated: 2026-08-04
 code:
-  - crates/fleety-tools/src/secure.rs
-  - crates/fleety-markdown/src/style.rs
-  - crates/fleety-cli/src/commands.rs
-  - crates/fleety-textarea/README.md
-  - scripts/check-spectra-archive-instructions.sh
-  - crates/fleety-cli/src/tui.rs
-  - docs/HANDOFF.md
-  - crates/fleety-textarea/src/editor_tests/keys.rs
-  - .agents/skills/spectra-archive/SKILL.md
-  - crates/fleety-textarea/src/editor_tests/mod.rs
-  - crates/fleety-daemon/src/main.rs
-  - crates/fleety-markdown/src/latex/mod.rs
-  - crates/fleety-tools/src/config.rs
-  - scripts/install-server.sh
-  - crates/fleety-markdown/src/latex/math_box.rs
-  - docs/STATUS.md
-  - crates/fleety-markdown/src/open_code_highlighter.rs
-  - crates/fleety-markdown/src/hyperlinks.rs
-  - .opencode/skills/spectra-archive/SKILL.md
-  - crates/fleety-inline/src/common.rs
-  - crates/fleety-server/Cargo.toml
-  - crates/fleety-textarea/LICENSE
-  - crates/fleety-markdown-core/Cargo.toml
-  - crates/fleety-inline/src/terminal.rs
-  - crates/fleety-textarea/src/editor_tests/planning.rs
-  - crates/fleety-cli/src/provider_tui.rs
-  - crates/fleety-textarea/Cargo.toml
-  - crates/fleety-markdown/src/parse.rs
-  - crates/fleety-cli/src/workspace.rs
-  - crates/agent-core/src/codex_responses.rs
-  - crates/fleety-cli/src/markdown.rs
-  - crates/fleety-server/src/main.rs
-  - crates/fleety-tools/src/oauth.rs
-  - Cargo.toml
-  - crates/fleety-tools/src/connection.rs
-  - crates/fleety-inline/src/scrollback.rs
-  - crates/fleety-textarea/src/editor_tests/viewport.rs
-  - AGENTS.md
-  - crates/fleety-cli/src/main.rs
-  - crates/fleety-markdown/src/syntax.rs
-  - crates/fleety-cli/src/acp.rs
-  - crates/fleety-textarea/src/editor_keys.rs
-  - crates/fleety-tools/src/provider_service.rs
-  - crates/fleety-tools/src/providers_config.rs
-  - crates/fleety-markdown/assets/tokyo-night.tmTheme
-  - crates/fleety-inline/src/segment.rs
-  - crates/fleety-markdown/src/latex/commands.rs
-  - crates/fleety-tools/src/lib.rs
-  - crates/fleety-tools/src/deps/runtime.rs
-  - crates/fleety-server/src/http.rs
-  - crates/fleety-markdown-core/LICENSE
-  - crates/fleety-server/src/mdns.rs
-  - .opencode/commands/spectra-archive.md
-  - crates/fleety-cli/src/server.rs
-  - crates/fleety-markdown/src/output.rs
-  - crates/fleety-inline/src/lib.rs
-  - crates/fleety-textarea/src/textarea.rs
-  - crates/fleety-textarea/src/editor.rs
-  - crates/fleety-markdown/src/streaming.rs
-  - crates/fleety-markdown/src/render.rs
-  - crates/fleety-inline/LICENSE
-  - crates/fleety-markdown/src/latex/tests.rs
-  - crates/fleety-markdown/src/buffers.rs
-  - crates/fleety-tools/src/device.rs
-  - crates/fleety-markdown/src/colors.rs
-  - docs/env.md
-  - crates/fleety-markdown/src/mermaid.rs
-  - crates/fleety-tools/src/transport.rs
-  - crates/fleety-markdown/src/checkpoint.rs
-  - crates/fleety-markdown/src/source_map.rs
-  - crates/fleety-markdown/Cargo.toml
-  - docs/roadmap.md
-  - crates/fleety-cli/src/provider_service.rs
-  - crates/fleety-inline/src/resize.rs
-  - crates/fleety-textarea/src/wrapping.rs
-  - crates/fleety-server/src/auth.rs
-  - crates/fleety-cli/Cargo.toml
-  - crates/fleety-markdown/src/latex/symbols.rs
-  - crates/fleety-markdown/src/latex/cursor.rs
-  - crates/fleety-markdown/src/lib.rs
-  - crates/fleety-server/src/conn.rs
-  - crates/fleety-textarea/src/render/mod.rs
-  - crates/fleety-tools/src/service.rs
-  - crates/fleety-textarea/src/lib.rs
-  - docs/tools.md
-  - crates/fleety-tools/Cargo.toml
-  - docs/acp.md
-  - crates/fleety-cli/src/config.rs
-  - crates/fleety-textarea/src/render/line_utils.rs
-  - crates/fleety-markdown/src/latex_delimiters.rs
-  - README.md
-  - crates/fleety-markdown/src/latex/environments.rs
-  - crates/fleety-daemon/Cargo.toml
-  - crates/fleety-inline/Cargo.toml
-  - crates/fleety-markdown/src/url_scan.rs
-  - crates/fleety-cli/src/auth.rs
-  - crates/fleety-tools/src/chrome.rs
-  - docs/design-cli-config.md
-  - crates/fleety-cli/src/input.rs
-  - .github/workflows/ci.yml
-  - crates/fleety-protocol/src/lib.rs
-  - crates/fleety-server/src/providers.rs
-  - crates/fleety-markdown/README.md
-  - crates/fleety-markdown/LICENSE
-  - crates/fleety-textarea/src/editor_tests/editing.rs
-  - crates/fleety-inline/src/tests.rs
-  - crates/fleety-inline/README.md
   - crates/fleety-cli/src/config_panel.rs
-  - crates/fleety-markdown-core/src/lib.rs
-  - crates/fleety-daemon/src/winsvc.rs
+  - crates/fleety-cli/src/provider_tui.rs
+  - crates/fleety-cli/src/workspace.rs
+  - crates/fleety-cli/src/config.rs
 tests:
   - crates/fleety-cli/src/test_terminal.rs
-  - crates/fleety-daemon/tests/fleetyd_smoke.rs
-  - crates/fleety-cli/tests/cli_smoke.rs
 -->
 
 ---
