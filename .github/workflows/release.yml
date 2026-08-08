@@ -361,7 +361,25 @@ jobs:
         run: |
           cd sidecars/fleety-insyra
           GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o "$GITHUB_WORKSPACE/fleety-insyra-aarch64-unknown-linux-gnu" .
-          GOOS=linux GOARCH=riscv64 go build -trimpath -ldflags "-s -w" -o "$GITHUB_WORKSPACE/fleety-insyra-riscv64gc-unknown-linux-gnu" .
+          # Insyra 0.3.1's wgpu/goffi dependency has no riscv64 implementation.
+          # Keep the RISC-V sidecar available by building the same DSL wrapper
+          # against the last release before that accelerator dependency landed.
+          # The main release targets still use the latest Insyra and the skills
+          # embedded in Fleety remain locked to that latest version.
+          riscv_tmp=$(mktemp -d "$RUNNER_TEMP/insyra-riscv.XXXXXX")
+          trap 'rm -rf "$riscv_tmp"' EXIT
+          cp -R . "$riscv_tmp/"
+          (
+            cd "$riscv_tmp"
+            go mod edit -require=github.com/HazelnutParadise/insyra@v0.3.0
+            go mod tidy
+            # The wrapper's latest-version tests include the accel command that
+            # was introduced after this compatibility release. Keep a
+            # version-independent normalization check, then compile the
+            # fallback binary.
+            go test ./... -run '^TestNormalizeInsyraTextRemovesStaleAccelRunFromHelp$'
+            GOOS=linux GOARCH=riscv64 go build -trimpath -ldflags "-s -w" -o "$GITHUB_WORKSPACE/fleety-insyra-riscv64gc-unknown-linux-gnu" .
+          )
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2

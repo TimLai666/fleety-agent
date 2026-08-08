@@ -1256,6 +1256,7 @@ mod tests {
                 key_present: std::collections::BTreeSet::new(),
             },
             |_, _| Ok(crate::provider_tui::SaveOutcome::Saved),
+            || Ok(()),
             |_, _| Ok(Vec::new()),
             crate::provider_tui::ProviderEditorContext {
                 auth_states: crate::provider_tui::ProviderAuthStates::new(),

@@ -53,6 +53,13 @@ pub fn new_sse_sessions() -> SseSessions {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
+/// Resolve the model provider for a newly accepted connection.
+///
+/// Keeping this as a factory rather than storing one provider instance lets a
+/// saved `providers.toml` take effect on the next connection without restarting
+/// the server.
+pub type ProviderFactory = Arc<dyn Fn() -> Arc<dyn ModelProvider> + Send + Sync>;
+
 /// WebSocket liveness timings (ws-liveness): how often the server pings each
 /// connection, and how long a connection may stay silent before it is treated
 /// as half-open and reclaimed. Read from env once at startup and carried in
@@ -89,7 +96,7 @@ fn env_secs(var: &str, default: u64) -> u64 {
 #[derive(Clone)]
 pub struct AppState {
     pub storage: Arc<Storage>,
-    pub provider: Arc<dyn ModelProvider>,
+    pub provider: ProviderFactory,
     pub workspace: Arc<PathBuf>,
     pub policy: Policy,
     pub hub: Hub,
@@ -132,11 +139,12 @@ async fn serve_ws(socket: WebSocket, state: AppState, peer_is_loopback: bool) {
     let owner = tokio::spawn(own_socket(socket, out_rx, in_tx, state.ws_liveness));
     let inbound: Box<dyn ClientInbound> = Box::new(WsChannelInbound { rx: in_rx });
     let writer: Box<dyn FrameWriter> = Box::new(WsChannelWriter { tx: out_tx });
+    let provider = (state.provider)();
     if let Err(e) = run_connection(
         inbound,
         writer,
         state.storage,
-        state.provider,
+        provider,
         state.workspace,
         state.policy,
         state.hub,
@@ -317,11 +325,12 @@ async fn sse_handler(
     tokio::spawn(async move {
         let inbound: Box<dyn ClientInbound> = Box::new(SseInbound { rx: in_rx });
         let writer: Box<dyn FrameWriter> = Box::new(SseFrameWriter { tx: out_tx });
+        let provider = (conn_state.provider)();
         if let Err(e) = run_connection(
             inbound,
             writer,
             conn_state.storage,
-            conn_state.provider,
+            provider,
             conn_state.workspace,
             conn_state.policy,
             conn_state.hub,
@@ -456,13 +465,14 @@ mod tests {
     use crate::storage::Storage;
     use fleety_protocol::{ClientMsg, ServerMsg, PROTOCOL_VERSION};
     use futures::SinkExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::time::timeout;
 
     fn state_with(home: &std::path::Path, auth: Arc<AuthStore>) -> AppState {
         AppState {
             storage: Arc::new(Storage::new(home.to_path_buf())),
-            provider: Arc::new(EchoProvider),
+            provider: Arc::new(|| -> Arc<dyn ModelProvider> { Arc::new(EchoProvider) }),
             workspace: Arc::new(home.to_path_buf()),
             policy: Policy::FullAccess,
             hub: bridge::new_hub(),
@@ -478,6 +488,23 @@ mod tests {
     fn test_state(home: &std::path::Path) -> AppState {
         let auth = Arc::new(AuthStore::load(home.join("auth.json"), None, false));
         state_with(home, auth)
+    }
+
+    #[test]
+    fn provider_factory_resolves_a_fresh_provider_for_each_connection() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let factory: ProviderFactory = {
+            let calls = Arc::clone(&calls);
+            Arc::new(move || {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Arc::new(EchoProvider) as Arc<dyn ModelProvider>
+            })
+        };
+
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        let _first = factory();
+        let _second = factory();
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 
     /// Serve `state` on a fresh port; returns the `http://addr` base.

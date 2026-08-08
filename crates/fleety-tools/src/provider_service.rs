@@ -412,9 +412,9 @@ pub fn provider_views(
 
 pub fn catalog_label(state: &CatalogState) -> &'static str {
     match state {
-        CatalogState::Idle => "Ready",
+        CatalogState::Idle => "Queryable",
         CatalogState::Loading { .. } => "Loading",
-        CatalogState::Available(_) => "Available",
+        CatalogState::Available(_) => "Loaded",
         CatalogState::Failed(_) => "Failed",
         CatalogState::Unavailable(_) => "Unavailable",
         CatalogState::Manual { .. } => "Manual ID",

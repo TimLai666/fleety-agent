@@ -182,3 +182,12 @@ This list is generated from `insyra help` in this repository state.
 - `scale inverse <scalerVar> <tableVar> as <outVar>`
   - Restores the original scale of fitted columns.
 - Unlike `encode`, `scale` is stateful: fit once, then transform train and test with the same parameters (no leakage). Scaler variables are session-only (not persisted to a named environment). `nil`/`NaN` are preserved and ignored when fitting; non-fitted columns pass through. `show <scalerVar>` prints the scaler kind and fitted columns.
+
+## GPU Acceleration Command
+
+- `accel devices` — list discovered acceleration devices, or report why none were found.
+- `accel cache` — show session-local resident buffers.
+- `accel plan` — planning report only; runs nothing.
+- The GPU backend is builtin, so nothing extra needs installing. `INSYRA_ACCEL_DISABLE_WGPU=1` turns it off.
+- Fleety's sidecar removes the obsolete `accel run` entry from returned help and reports `accel run was removed; use accel plan instead` if it is invoked. A standalone v0.3.1 upstream CLI may still display the stale entry; use `devices`, `cache`, or `plan` instead. These commands inspect the runtime; none of them executes anything.
+- `config accel.mode <auto|cpu|gpu|strict-gpu>`, `show accel.devices`, `show accel.cache`.

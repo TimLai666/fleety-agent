@@ -27,6 +27,7 @@ import (
 	"flag"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/HazelnutParadise/insyra/cli/env"
 	"github.com/HazelnutParadise/insyra/engine/dsl"
@@ -55,6 +56,19 @@ type session struct {
 type server struct {
 	mgr      *env.Manager
 	sessions map[string]*session
+}
+
+// Insyra v0.3.1 still advertises the removed `accel run` action in its help
+// text and returns a bare "unknown accel action" error when it is invoked.
+// Normalize that stale upstream surface at the sidecar boundary so Fleety's
+// users see the supported planning command instead.
+func normalizeInsyraText(text string) string {
+	text = strings.ReplaceAll(text, "accel <devices|cache|plan|run>", "accel <devices|cache|plan>")
+	return strings.ReplaceAll(
+		text,
+		"unknown accel action: run",
+		"accel run was removed; use accel plan instead",
+	)
 }
 
 func (sv *server) session(name string) (*session, error) {
@@ -118,9 +132,9 @@ func (sv *server) handle(req *request) response {
 		} else {
 			execErr = s.dsl.Execute(req.Command)
 		}
-		resp.Output = s.buf.String()
+		resp.Output = normalizeInsyraText(s.buf.String())
 		if execErr != nil {
-			resp.Error = execErr.Error()
+			resp.Error = normalizeInsyraText(execErr.Error())
 		} else {
 			resp.OK = true
 		}

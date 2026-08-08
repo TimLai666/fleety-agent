@@ -779,7 +779,7 @@ async fn run_server(shutdown: Option<tokio::sync::watch::Receiver<bool>>) {
     // same transport-agnostic `conn::run_connection`.
     let state = http::AppState {
         storage: Arc::clone(&storage),
-        provider: Arc::clone(&provider),
+        provider: Arc::new(|| providers::ProviderTiers::from_env().resolve("main")),
         workspace: Arc::clone(&workspace),
         policy,
         hub: Arc::clone(&hub),

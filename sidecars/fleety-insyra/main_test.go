@@ -64,3 +64,19 @@ func TestUnknownOp(t *testing.T) {
 		t.Fatalf("unknown op: %+v", r)
 	}
 }
+
+func TestAccelRunErrorExplainsReplacement(t *testing.T) {
+	sv := newServer(t)
+	r := sv.handle(&request{Op: "exec", Session: "s", Command: "accel run"})
+	if r.OK || !strings.Contains(r.Error, "accel run was removed; use accel plan instead") {
+		t.Fatalf("accel run: %+v", r)
+	}
+}
+
+func TestNormalizeInsyraTextRemovesStaleAccelRunFromHelp(t *testing.T) {
+	input := "accel <devices|cache|plan|run> [--mode auto|cpu|gpu|strict-gpu]"
+	got := normalizeInsyraText(input)
+	if strings.Contains(got, "|run") || !strings.Contains(got, "accel <devices|cache|plan>") {
+		t.Fatalf("normalized help: %q", got)
+	}
+}
