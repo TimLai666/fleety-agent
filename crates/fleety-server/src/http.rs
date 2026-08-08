@@ -717,6 +717,7 @@ mod tests {
 
         // Still fully routable after idling: a message round-trip completes.
         let msg = serde_json::to_string(&ClientMsg::UserMessage {
+            message_id: "idle-roundtrip".into(),
             conversation_id: Some(conversation),
             text: "still there?".into(),
             origin: Default::default(),
@@ -847,6 +848,7 @@ mod tests {
         post(
             "A",
             serde_json::to_string(&ClientMsg::UserMessage {
+                message_id: "sse-remember".into(),
                 conversation_id: Some(conv.clone()),
                 text: "remember this".into(),
                 origin: Default::default(),
@@ -1003,6 +1005,7 @@ mod tests {
         // POST a user message, read the echoed assistant reply.
         post(
             serde_json::to_string(&ClientMsg::UserMessage {
+                message_id: "sse-hi".into(),
                 conversation_id: Some(conversation_id),
                 text: "hi there".into(),
                 origin: Default::default(),

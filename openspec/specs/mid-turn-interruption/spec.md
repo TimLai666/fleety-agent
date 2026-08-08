@@ -15,6 +15,12 @@ The server SHALL read incoming client messages concurrently with an in-progress 
 - **WHEN** a turn is running and the user sends another message
 - **THEN** the server reads that message before the turn completes (rather than it waiting in the transport)
 
+#### Scenario: an approval gate never discards an early follow-up
+
+- **GIVEN** `require_approval` is active and a turn is waiting for an approval decision
+- **WHEN** one or more user messages arrive before the matching decision
+- **THEN** the gate retains those messages in arrival order and the connection processes them after the gated turn instead of discarding them
+
 
 <!-- @trace
 source: mid-turn-interruption
@@ -109,7 +115,7 @@ code:
 ---
 ### Requirement: A triage decides how to handle a mid-turn message
 
-When a new message arrives during a turn, the server SHALL classify it with one lightweight model call, given the new message and a compact summary of the active turn, producing one of: `interrupt_now`, `queue_after`, or `ignore`. The decision-text parsing SHALL be a pure function. A triage failure or unparseable output SHALL default to `queue_after` (do not interrupt in-progress work). (Routing triage to the cheap tier specifically is a follow-up.)
+When a new message arrives during a turn, the server SHALL classify it with one lightweight model call, given the new message and a compact summary of the active turn, producing one of: `interrupt_now`, `queue_after`, or `ignore`. The decision-text parsing SHALL be a pure function. A triage failure or unparseable output SHALL default to `queue_after` (do not interrupt in-progress work). Every user message SHALL carry a non-empty, bounded client-generated message id. The server SHALL echo that id in every structured acknowledgement (`interrupting`, `queued`, `ignored`, or `rejected`) so a client retires only the matching optimistic message, including when acknowledgements arrive out of order or are duplicated. Because this is a breaking frame-shape change, clients and servers SHALL require exact equality with `PROTOCOL_VERSION` before authentication, identity learning, credential publication, device registration, or other session state is committed. Pending interjections SHALL be FIFO and bounded by both count and total payload size; duplicate or invalid ids and overflow SHALL be rejected immediately before triage, attachment conversion, cancellation, or queue mutation. (Routing triage to the cheap tier specifically is a follow-up.)
 
 #### Scenario: interrupt_now cancels and starts a new turn
 
@@ -125,6 +131,36 @@ When a new message arrives during a turn, the server SHALL classify it with one 
 
 - **WHEN** the triage call fails or its output cannot be parsed
 - **THEN** the message is treated as `queue_after` (the in-progress turn is not interrupted)
+
+#### Scenario: ignored message does not leave a client turn pending
+
+- **WHEN** triage returns `ignore`
+- **THEN** the server acknowledges it with the `ignored` disposition and the client retires only that optimistic message without ending the active turn
+
+#### Scenario: a full interjection queue rejects new work
+
+- **WHEN** accepting another interjection would exceed the count or payload-size bound
+- **THEN** the server acknowledges it with the `rejected` disposition, does not retain it, and tells the user to resend after the active work completes
+
+#### Scenario: acknowledgements identify the exact optimistic message
+
+- **WHEN** acknowledgements for multiple mid-turn messages arrive out of order, are duplicated, or name an unknown id
+- **THEN** the client applies each acknowledgement only to the matching message id and leaves every other optimistic message unchanged
+
+#### Scenario: incompatible protocol is rejected before session state changes
+
+- **WHEN** either peer advertises a protocol version other than the exact current `PROTOCOL_VERSION`
+- **THEN** the connection is rejected before authentication, identity learning, credential publication, or device registration
+
+#### Scenario: overflow does not invoke triage
+
+- **WHEN** an interjection would exceed the count or byte bound
+- **THEN** the server rejects it before reading the active-turn summary, calling the triage provider, converting attachments, requesting cancellation, or changing the queue
+
+#### Scenario: failed-turn cleanup revokes queued acknowledgements safely
+
+- **WHEN** a provider turn fails and its journal cannot be closed
+- **THEN** the server rejects every accepted-but-not-started queued message by its exact id, emits one `turn_cleanup_failed` error that includes both failures, emits no `Done`, and closes the connection so the user can reconnect and resend
 
 ##### Example: triage decisions
 

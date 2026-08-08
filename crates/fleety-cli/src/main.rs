@@ -68,8 +68,8 @@ use std::path::{Path, PathBuf};
 
 use agent_core::{obs, CoreError, Result};
 use fleety_protocol::{
-    ClientMsg, ConfigTarget, Effect, OriginContext, ServerMsg, WireAttachment,
-    CONFIG_PROTOCOL_VERSION, PROTOCOL_VERSION,
+    ClientMsg, ConfigTarget, Effect, InterjectionDisposition, OriginContext, ServerMsg,
+    WireAttachment, CONFIG_PROTOCOL_VERSION, PROTOCOL_VERSION,
 };
 // The client transport (WebSocket with SSE+POST fallback) lives in fleety-tools;
 // `Tx`/`Rx` are its split halves so the existing connect sites barely change.
@@ -1399,6 +1399,7 @@ async fn run_tui(session: workspace::WorkspaceSession) -> Result<workspace::Sess
                                             error.report().message
                                         );
                                     } else {
+                                        app.begin_resume();
                                         app.last_conversation_id = Some(conversation_id.clone());
                                         app.last_seq = 0;
                                         workspace.context.conversation_id = Some(conversation_id);
@@ -1431,17 +1432,21 @@ async fn run_tui(session: workspace::WorkspaceSession) -> Result<workspace::Sess
                     }
                     match tui::on_key(&mut app, k) {
                     tui::Action::Send { text, attachments } => {
-                        if let Err(e) = send(&mut tx, &ClientMsg::UserMessage {
-                            conversation_id: None,
-                            text,
-                            origin: OriginContext::default(),
-                            attachments,
-                            voice: false,
-                            acting_user: None,
-                        }).await {
+                        let message_id = uuid::Uuid::new_v4().to_string();
+                        if let Err(e) = send(
+                            &mut tx,
+                            &interactive_chat_message(
+                                message_id.clone(),
+                                app.last_conversation_id.clone(),
+                                text,
+                                attachments,
+                            ),
+                        )
+                        .await
+                        {
                             app.status = format!("send failed: {}", e.report().message);
                         } else {
-                            app.commit_send();
+                            app.commit_send_with_id(message_id);
                             app.status = "sent; waiting…".to_string();
                         }
                     }
@@ -1505,9 +1510,31 @@ async fn run_tui(session: workspace::WorkspaceSession) -> Result<workspace::Sess
                     }
                     Ok(ServerMsg::Assistant { text, conversation_id, seq, .. }) => {
                         app.note_seq(&conversation_id, seq);
-                        app.finish_assistant(text);
-                        // Surface the id — it's what `fleety resume` needs later.
-                        app.status = format!("ready — conversation {conversation_id}");
+                        if seq == 0 {
+                            app.push_assistant_notice(text);
+                            app.status = format!("working — conversation {conversation_id}");
+                        } else {
+                            app.finish_assistant(text);
+                            // Surface the id — it's what `fleety resume` needs later.
+                            app.status = format!("ready — conversation {conversation_id}");
+                        }
+                    }
+                    Ok(ServerMsg::InterjectionAcknowledged {
+                        conversation_id,
+                        message_id,
+                        disposition,
+                        message,
+                    }) => {
+                        app.last_conversation_id = Some(conversation_id.clone());
+                        app.acknowledge_interjection(&message_id, disposition, message);
+                        app.status = if matches!(
+                            disposition,
+                            InterjectionDisposition::Ignored | InterjectionDisposition::Rejected
+                        ) {
+                            format!("working — conversation {conversation_id}")
+                        } else {
+                            format!("queued — conversation {conversation_id}")
+                        };
                     }
                     Ok(ServerMsg::Replay { conversation_id, seq, role, content }) => {
                         // Reconnect replay: apply only events we haven't shown.
@@ -1559,8 +1586,8 @@ async fn run_tui(session: workspace::WorkspaceSession) -> Result<workspace::Sess
                         }
                     }
                     Ok(ServerMsg::Error { error }) => {
-                        app.turn_in_flight = false;
                         if is_auth_rejection(&error.kind) {
+                            app.turn_in_flight = false;
                             // Not a transient drop — the server won't take us
                             // without pairing. Say so and stop, instead of
                             // reconnecting forever.
@@ -1573,6 +1600,7 @@ async fn run_tui(session: workspace::WorkspaceSession) -> Result<workspace::Sess
                         } else {
                             // The turn ended with an error: clear in-flight so
                             // Esc goes back to quitting.
+                            app.finish_error();
                             app.status = format!("agent error: {}", error.message);
                             workspace.reduce(workspace::Action::PushNotice(
                                 workspace::Notice::error("Agent error")
@@ -1582,6 +1610,14 @@ async fn run_tui(session: workspace::WorkspaceSession) -> Result<workspace::Sess
                                     ),
                             ));
                         }
+                    }
+                    Ok(ServerMsg::Done { conversation_id }) => {
+                        app.finish_done();
+                        app.status = if app.turn_in_flight {
+                            format!("working — conversation {conversation_id}")
+                        } else {
+                            format!("ready — conversation {conversation_id}")
+                        };
                     }
                     Ok(ServerMsg::Welcome { .. }) => {
                         app.turn_in_flight = false;
@@ -1805,7 +1841,7 @@ fn prepare_for_chat_reconnect(
 ) {
     // A dropped link ends the active turn and every approval gate owned by the
     // old transport. Draft text and attachments are deliberately untouched.
-    app.turn_in_flight = false;
+    app.prepare_for_reconnect();
     app.expire_pending_approvals();
     *chat_transport = None;
 }
@@ -1877,6 +1913,9 @@ async fn reconnect(
         match attempt_result {
             Ok((tx, rx, context, target)) => {
                 app.status = "reconnected".to_string();
+                if app.last_conversation_id.is_some() {
+                    app.begin_resume();
+                }
                 workspace::activate_chat_transport(workspace, chat_transport, context);
                 return Some((tx, rx, target));
             }
@@ -2212,6 +2251,7 @@ async fn open_resolved(
             match recv(&mut rx).await? {
                 Some(ServerMsg::Welcome {
                     conversation_id,
+                    protocol,
                     server_version,
                     config_protocol,
                     server_fingerprint,
@@ -2219,6 +2259,10 @@ async fn open_resolved(
                     audio_input,
                     ..
                 }) => {
+                    if let Err(error) = ensure_matching_protocol(protocol) {
+                        let _ = tx.close().await;
+                        return Err(error);
+                    }
                     let committed = verify_and_learn_welcome_identity(
                         server_fingerprint.as_deref(),
                         &server_endpoints,
@@ -2262,6 +2306,16 @@ async fn open_resolved(
         }
         _ => error,
     })
+}
+
+fn ensure_matching_protocol(protocol: u32) -> Result<()> {
+    if protocol == PROTOCOL_VERSION {
+        Ok(())
+    } else {
+        Err(CoreError::Message(format!(
+            "the Server uses incompatible protocol {protocol}; this client requires {PROTOCOL_VERSION} — update all Fleety binaries to the same release"
+        )))
+    }
 }
 
 /// Why a saved profile could not be reached.
@@ -2468,8 +2522,10 @@ pub(crate) async fn probe_local_server(
     let _ = tx.close().await;
     match reply {
         ServerMsg::Welcome {
-            server_fingerprint, ..
-        } => Some(DiscoveredServer {
+            protocol,
+            server_fingerprint,
+            ..
+        } if ensure_matching_protocol(protocol).is_ok() => Some(DiscoveredServer {
             name: "local".to_string(),
             url: url.to_string(),
             fingerprint: server_fingerprint,
@@ -2774,11 +2830,13 @@ async fn pair(code: String) -> Result<()> {
     send(&mut tx, &hello(None, Some(code))).await?;
     let result = match recv(&mut rx).await? {
         Some(ServerMsg::Welcome {
+            protocol,
             token: Some(tok),
             server_fingerprint: Some(server_fingerprint),
             server_endpoints,
             ..
         }) if !tok.trim().is_empty() && !server_fingerprint.trim().is_empty() => {
+            ensure_matching_protocol(protocol)?;
             let (initial_error, notify_daemon, committed) =
                 match connection::store_explicit_profile_pairing_recoverable(
                     &target,
@@ -2835,6 +2893,9 @@ async fn pair(code: String) -> Result<()> {
                 terminal_safe_text(&profile_name)
             );
             Ok(())
+        }
+        Some(ServerMsg::Welcome { protocol, .. }) if protocol != PROTOCOL_VERSION => {
+            ensure_matching_protocol(protocol)
         }
         Some(ServerMsg::Welcome { .. }) => Err(CoreError::Message(
             "the Server returned an empty token or no identity fingerprint; no credential was saved"
@@ -2929,6 +2990,23 @@ fn origin() -> OriginContext {
                 .to_string_lossy()
                 .into_owned()
         }),
+    }
+}
+
+fn interactive_chat_message(
+    message_id: String,
+    conversation_id: Option<String>,
+    text: String,
+    attachments: Vec<WireAttachment>,
+) -> ClientMsg {
+    ClientMsg::UserMessage {
+        message_id,
+        conversation_id,
+        text,
+        origin: origin(),
+        attachments,
+        voice: false,
+        acting_user: None,
     }
 }
 
@@ -3161,11 +3239,13 @@ where
     send(&mut tx, &hello(proposed_target.token_owned(), pairing_code)).await?;
     let recovery = match recv(&mut rx).await? {
         Some(ServerMsg::Welcome {
+            protocol,
             session_id,
             token: minted_token,
             server_fingerprint,
             ..
         }) => {
+            ensure_matching_protocol(protocol)?;
             if (protected_endpoint_change || pairing_attempted)
                 && !minted_token
                     .as_deref()
@@ -3395,6 +3475,7 @@ async fn ask(text: String, attachments: Vec<WireAttachment>) -> Result<()> {
     send(
         &mut tx,
         &ClientMsg::UserMessage {
+            message_id: uuid::Uuid::new_v4().to_string(),
             conversation_id: None,
             text,
             origin: origin(),
@@ -3484,6 +3565,7 @@ async fn ask(text: String, attachments: Vec<WireAttachment>) -> Result<()> {
             }
             Some(ServerMsg::Replay { .. })
             | Some(ServerMsg::AssistantDelta { .. })
+            | Some(ServerMsg::InterjectionAcknowledged { .. })
             | Some(ServerMsg::AuditListResult { .. })
             | Some(ServerMsg::AuditShowResult { .. })
             | Some(ServerMsg::ConversationListResult { .. })
@@ -3578,6 +3660,7 @@ async fn voice_chat() -> Result<()> {
         send(
             &mut tx,
             &ClientMsg::UserMessage {
+                message_id: uuid::Uuid::new_v4().to_string(),
                 conversation_id: Some(conversation.clone()),
                 text,
                 origin: origin(),
@@ -4256,12 +4339,14 @@ async fn connect_hello_for_auth_target_inner_with(
             send(&mut tx, &hello(target.token_owned(), None)).await?;
             match recv(&mut rx).await? {
                 Some(ServerMsg::Welcome {
+                    protocol,
                     server_version,
                     config_protocol,
                     server_fingerprint,
                     server_endpoints,
                     ..
                 }) => {
+                    ensure_matching_protocol(protocol)?;
                     // Settings' own profile-switch path reconnects without touching
                     // credential storage, so it opts out of the commit but still
                     // gets the endpoint that actually answered.
@@ -5343,11 +5428,13 @@ async fn doctor_remote_at(
                 send(&mut tx, &hello(target.token_owned(), None)).await?;
                 match recv(&mut rx).await? {
                     Some(ServerMsg::Welcome {
+                        protocol,
                         server_version,
                         config_protocol,
                         server_fingerprint,
                         ..
                     }) => {
+                        ensure_matching_protocol(protocol)?;
                         verify_welcome_identity_read_only(server_fingerprint.as_deref(), &target)?;
                         Ok((
                             tx,
@@ -6060,6 +6147,13 @@ mod tests {
     use tokio_tungstenite::tungstenite::Message;
 
     #[test]
+    fn welcome_protocol_requires_exact_current_version() {
+        assert!(ensure_matching_protocol(PROTOCOL_VERSION).is_ok());
+        assert!(ensure_matching_protocol(PROTOCOL_VERSION - 1).is_err());
+        assert!(ensure_matching_protocol(PROTOCOL_VERSION + 1).is_err());
+    }
+
+    #[test]
     fn settings_handoff_requires_closing_the_inline_terminal() {
         assert!(inline_terminal_must_close_before_handoff(
             &workspace::Route::Settings(workspace::SettingsPage::ProvidersAndModels,)
@@ -6287,6 +6381,7 @@ mod tests {
         tui::prefill(&mut app.input, "unsent");
         app.request_approval("old-id".into(), "run_command", "critical", "deploy");
         app.turn_in_flight = true;
+        app.finish_error();
         let mut transport = Some(workspace::ChatTransportContext {
             profile: "A".into(),
             endpoint: "ws://a:8787".into(),
@@ -6303,6 +6398,12 @@ mod tests {
         assert!(app.pending_approvals.is_empty());
         assert_eq!(app.input.text(), "unsent");
         assert!(app.status.contains("expired"));
+
+        tui::prefill(&mut app.input, "blocked after reconnect");
+        app.commit_send();
+        app.push_assistant_notice("That request is not available.".into());
+        app.finish_done();
+        assert!(!app.turn_in_flight);
     }
 
     #[test]
@@ -7810,6 +7911,34 @@ mod tests {
         let value = origin();
         assert_eq!(value.os.as_deref(), Some(std::env::consts::OS));
         assert!(value.cwd.is_some());
+    }
+
+    #[test]
+    fn interactive_chat_message_carries_origin_context() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _guard = EnvGuard::new("interactive-chat-origin");
+
+        match interactive_chat_message(
+            "message-id".to_string(),
+            Some("resumed-conversation".to_string()),
+            "hello".to_string(),
+            Vec::new(),
+        ) {
+            ClientMsg::UserMessage {
+                conversation_id,
+                origin,
+                ..
+            } => {
+                assert_eq!(conversation_id.as_deref(), Some("resumed-conversation"));
+                assert_eq!(origin.os.as_deref(), Some(std::env::consts::OS));
+                assert_eq!(
+                    origin.cwd.as_deref(),
+                    std::env::current_dir().expect("current dir").to_str(),
+                    "the interactive Chat turn must identify its source directory"
+                );
+            }
+            other => panic!("unexpected interactive Chat frame: {other:?}"),
+        }
     }
 
     #[test]

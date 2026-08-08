@@ -29,17 +29,21 @@ Grouped by which binary cares about it. Anything unset uses the default.
 
 **Per-conversation workspace root.** Each conversation roots its tools by this
 precedence: the originating CLI's working directory (`origin.cwd`, sent on every
-message) **when the CLI is on the same host as the server** → else `FLEETY_WORKSPACE`
-→ else the server's cwd. So opening the CLI inside a project directory on the box
-running the server makes Fleety a coding agent in that directory. The binding is
+message) **only when the connection was accepted through explicit same-host
+loopback trust** → else `FLEETY_WORKSPACE` → else the server's cwd. So opening an
+unpaired CLI inside a project directory on an auth-required Server host makes
+Fleety a coding agent in that directory when `FLEETY_TRUST_LOOPBACK` is enabled.
+Auth-disabled, token-authenticated, non-loopback, and loopback-trust-disabled
+sessions do not use client-supplied cwd as a local root; this prevents a reverse
+proxy from turning a remote cwd into local filesystem authority. The binding is
 resolved once per conversation and reused (and persisted across resume). `cwd` is
 treated as untrusted input (validated; the `FLEETY_FS_SCOPE` posture and the
-sensitive-path guard still apply). When the CLI runs on a *different* device, the
-server keeps the fallback root and records the originating device on the binding
-(running tools on that remote device at its cwd is a planned follow-up).
+sensitive-path guard still apply). For any session not explicitly same-host
+trusted, the server keeps the fallback root and records the originating device on
+the binding (running tools on that remote device at its cwd is a planned follow-up).
 
 | `FLEETY_FS_SCOPE` | (unset → `full`) | `full` (default): the structured file tools may read/write anywhere on the device (absolute paths allowed; still audited + rollback-backed; a sensitive-path guard refuses SSH keys/`/etc/shadow`/`/dev`/Windows system dirs/etc.). `workspace`: re-confine every path to the workspace/device root (`..`/absolute/symlink-tight sandbox). Set on `fleetyd` too for its `FLEETY_DEVICE_ROOT`. |
-| `FLEETY_POLICY` | `full_access` | `require_approval` gates every non-read tool through the approval flow. Limitation: under `require_approval` the server does not read frames mid-turn (the approval gate owns the inbound stream), so a `CancelTurn` sent during a gated turn has no effect — cancel works under the default full-access policy. |
+| `FLEETY_POLICY` | `full_access` | `require_approval` gates every non-read tool through the approval flow. While the approval gate owns the inbound stream, ordinary messages are retained in arrival order and processed after the gated turn; they are never discarded. A `CancelTurn` sent during a gated turn still has no effect because it is processed only after that turn ends — immediate cancel works under the default full-access policy. |
 | `FLEETY_REQUIRE_AUTH` | `1` | Require a valid token / pairing code on every `Hello`. **On by default** — set `0` to disable. A fresh auth-required server (no `FLEETY_TOKEN`, no paired device) prints a short-lived first-run pairing code at startup. |
 | `FLEETY_TRUST_LOOPBACK` | `1` | Trust same-host connections: a client whose transport peer is a loopback address (`127.0.0.0/8` / `::1`, taken from the connection socket — never a header) is accepted without a token even when auth is required, because a same-host process can already read the server's token and config files. Set `0` to require auth even on loopback (multi-tenant hosts, or a reverse proxy that forwards remote connections over loopback — otherwise it would falsely trust them). LAN/remote connections are always authenticated regardless. |
 | `FLEETY_TOKEN` | (unset) | Server-owned bootstrap admin token. Use it once to pair the first device. A value saved under the Server scope in `config.toml` is loaded only by `fleety-server`; it is never seeded into `fleety` or `fleetyd` as a client credential. |
@@ -837,7 +841,7 @@ to run it; `fleetyd update` (one-shot) restarts the installed service the same w
 
 | Var | Default | Meaning |
 |---|---|---|
-| `FLEETY_INSYRA_BIN` | (auto: beside exe) | Path to the `fleety-insyra` Go sidecar. The `insyra_exec` tool spawns this. |
+| `FLEETY_INSYRA_BIN` | (auto: beside exe) | Authoritative path to the `fleety-insyra` Go sidecar. When set, an invalid path fails actionably instead of falling back. The `insyra_exec` tool spawns this. |
 | `FLEETY_INSYRA_URL` | `releases/latest/download/…` | Override the download URL for `fleetyd install` / `fleetyd update`. |
 | `FLEETY_CRV_BIN` | (auto: `crv` on PATH) | Path to the `claude-real-video` CLI the `video_extract` tool spawns. |
 | `FLEETY_FFMPEG_BIN` | (auto: `ffmpeg` on PATH) | Path to the `ffmpeg` binary `video_extract`/`crv` use. |

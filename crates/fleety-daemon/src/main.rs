@@ -5117,11 +5117,28 @@ async fn serve(
             ServerMsg::Welcome {
                 session_id,
                 token,
+                protocol,
                 server_version,
                 server_fingerprint,
                 server_endpoints,
                 ..
             } => {
+                if protocol != PROTOCOL_VERSION {
+                    decide_pending_reconnect(
+                        pending_reconnect,
+                        false,
+                        format!(
+                            "fleetyd received incompatible protocol {protocol}; this binary requires {PROTOCOL_VERSION}"
+                        ),
+                    );
+                    tracing::warn!(
+                        client_protocol = PROTOCOL_VERSION,
+                        server_protocol = protocol,
+                        "fleetyd refused an incompatible Server protocol"
+                    );
+                    conn.close().await;
+                    return Outcome::Disconnected;
+                }
                 if token
                     .as_deref()
                     .is_some_and(|token| token.trim().is_empty())

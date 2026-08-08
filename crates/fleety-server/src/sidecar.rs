@@ -19,13 +19,12 @@ fn insyra_filename() -> &'static str {
 }
 
 /// Return the path to a usable `fleety-insyra` binary, or `None` if we can't
-/// find one. Soft-fails through every step.
+/// find one. An explicit environment override is authoritative; automatic
+/// discovery soft-fails from beside the executable to `PATH`.
 pub fn resolve_insyra() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var(INSYRA_ENV) {
-        let p = PathBuf::from(&path);
-        if p.is_file() {
-            return Some(p);
-        }
+    if let Some(path) = std::env::var_os(INSYRA_ENV) {
+        let candidate = PathBuf::from(path);
+        return candidate.is_file().then_some(candidate);
     }
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
@@ -64,6 +63,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn env_override_is_used_when_file_exists() {
         // Point the env at a known-good file (our own Cargo.toml will do); the
         // resolver must surface exactly that path. Use a unique temp name to
@@ -76,9 +76,11 @@ mod tests {
     }
 
     #[test]
-    fn missing_env_path_falls_through_to_other_strategies() {
+    #[serial_test::serial]
+    fn missing_env_override_is_authoritative_and_reports_unavailable() {
         std::env::set_var(INSYRA_ENV, "/definitely/not/here/fleety-insyra-xxx");
-        let _ = resolve_insyra(); // returns Some(...) or None; we just want no panic
+        let resolved = resolve_insyra();
         std::env::remove_var(INSYRA_ENV);
+        assert_eq!(resolved, None);
     }
 }

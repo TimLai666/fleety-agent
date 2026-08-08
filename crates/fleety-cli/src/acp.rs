@@ -1331,15 +1331,24 @@ async fn receive_authenticated_welcome(
     let welcome = serde_json::from_str::<fleety_protocol::ServerMsg>(&frame).ok();
     match welcome {
         Some(fleety_protocol::ServerMsg::Welcome {
+            protocol,
             server_fingerprint,
             server_endpoints,
             ..
-        }) => crate::verify_and_learn_welcome_identity(
-            server_fingerprint.as_deref(),
-            &server_endpoints,
-            target,
-            sealed,
-        ),
+        }) if protocol == fleety_protocol::PROTOCOL_VERSION => {
+            crate::verify_and_learn_welcome_identity(
+                server_fingerprint.as_deref(),
+                &server_endpoints,
+                target,
+                sealed,
+            )
+        }
+        Some(fleety_protocol::ServerMsg::Welcome { protocol, .. }) => Err(CoreError::Message(
+            format!(
+                "the Server uses incompatible protocol {protocol}; this client requires {} — update all Fleety binaries to the same release",
+                fleety_protocol::PROTOCOL_VERSION
+            ),
+        )),
         other => Err(CoreError::Message(crate::hello_failure_message_for_target(
             other.as_ref(),
             target,
@@ -1577,6 +1586,7 @@ impl<R: tokio::io::AsyncBufRead + Unpin + Send> WsBridge<R> {
             })
         } else {
             serde_json::to_string(&fleety_protocol::ClientMsg::UserMessage {
+                message_id: uuid::Uuid::new_v4().to_string(),
                 conversation_id: Some(conversation.to_string()),
                 text: text.to_string(),
                 origin: cwd_to_origin(cwd.as_deref()),
