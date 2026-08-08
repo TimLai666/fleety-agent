@@ -200,8 +200,9 @@ tool="insyra_exec", args={…})`.
 > Backed by the `fleety-insyra` Go sidecar that wraps Insyra's `engine/dsl`,
 > kept alive per session, with named environments persisted under
 > `<root>/.insyra`. Load the built-in `fleety-use-insyra-dsl` skill for the full
-> `.isr` DSL command reference. Resolved via `FLEETY_INSYRA_BIN` → beside the
-> exe → `PATH`. fleetyd auto-provisions it on `install` / `update`.
+> `.isr` DSL command reference. An explicit `FLEETY_INSYRA_BIN` is
+> authoritative; when unset, resolution checks beside the exe and then `PATH`.
+> fleetyd auto-provisions it on `install` / `update`.
 
 ## Video (scene-aware extraction)
 

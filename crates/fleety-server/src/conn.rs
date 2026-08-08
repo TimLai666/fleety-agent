@@ -1,5 +1,6 @@
 //! Per-connection handling: WebSocket handshake, session, and the turn loop.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -27,7 +28,9 @@ use agent_core::{
     ApprovalDecision, ApprovalGate, AutoDeny, CoreError, GoalState, LoopConfig, Message,
     ModelProvider, Policy, Result, RiskLevel, Role, Terminal, ToolRegistry,
 };
-use fleety_protocol::{AttentionHint, ClientMsg, ServerMsg, WireError, PROTOCOL_VERSION};
+use fleety_protocol::{
+    AttentionHint, ClientMsg, InterjectionDisposition, ServerMsg, WireError, PROTOCOL_VERSION,
+};
 
 use crate::auth::{self, AuthStore};
 use crate::bridge::{self, DeviceTools, Handles, Hub, Pending};
@@ -36,18 +39,82 @@ use crate::storage::Storage;
 /// Outbound frame sender (drained by the connection's writer task).
 pub(crate) type Out = mpsc::UnboundedSender<WsMessage>;
 
-#[cfg(test)]
-type Tx = SplitSink<WebSocketStream<TcpStream>, WsMessage>;
-#[cfg(test)]
-type Rx = SplitStream<WebSocketStream<TcpStream>>;
+const MAX_PENDING_INTERJECTIONS: usize = 16;
+const MAX_PENDING_INTERJECTION_BYTES: usize = 16 * 1024 * 1024;
+const MAX_CLIENT_MESSAGE_ID_BYTES: usize = 128;
+const WRITER_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// The server's own hostname (for deciding whether an originating CLI is on the
-/// same machine as the server). Empty if unknown — then no client is "same host".
+fn pending_interjection_fits(count: usize, bytes: usize, incoming_bytes: usize) -> bool {
+    count < MAX_PENDING_INTERJECTIONS
+        && bytes.saturating_add(incoming_bytes) <= MAX_PENDING_INTERJECTION_BYTES
+}
+
+fn client_message_wire_bytes(message: &ClientMsg) -> usize {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len());
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut counter = Counter(0);
+    if serde_json::to_writer(&mut counter, message).is_err() {
+        usize::MAX
+    } else {
+        counter.0
+    }
+}
+
+fn client_message_id_is_valid(message_id: &str) -> bool {
+    !message_id.is_empty() && message_id.len() <= MAX_CLIENT_MESSAGE_ID_BYTES
+}
+
+fn trusted_same_host_origin(loopback_trusted: bool) -> bool {
+    loopback_trusted
+}
+
+fn protocol_is_supported(protocol: u32) -> bool {
+    protocol == PROTOCOL_VERSION
+}
+
+fn interjection_decision(
+    action: crate::triage::TriageAction,
+) -> (InterjectionDisposition, &'static str, bool) {
+    match action {
+        crate::triage::TriageAction::InterruptNow => (
+            InterjectionDisposition::Interrupting,
+            "interrupting the current task to handle your new message",
+            true,
+        ),
+        crate::triage::TriageAction::QueueAfter => (
+            InterjectionDisposition::Queued,
+            "got it — I'll handle that right after the current task",
+            true,
+        ),
+        crate::triage::TriageAction::Ignore => (
+            InterjectionDisposition::Ignored,
+            "noted — this message won't start another turn",
+            false,
+        ),
+    }
+}
+
+#[cfg(test)]
 fn server_hostname() -> String {
     std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
         .unwrap_or_default()
 }
+
+#[cfg(test)]
+type Tx = SplitSink<WebSocketStream<TcpStream>, WsMessage>;
+#[cfg(test)]
+type Rx = SplitStream<WebSocketStream<TcpStream>>;
 
 /// Apply a rollover requested during a turn: set the old conversation aside with
 /// the new as its successor (old stays recall-able), claim the new for the acting
@@ -446,6 +513,37 @@ pub async fn handle_conn(
     auth: Arc<AuthStore>,
     device_tools: DeviceTools,
 ) -> Result<()> {
+    handle_conn_with_peer(
+        stream,
+        storage,
+        provider,
+        workspace,
+        policy,
+        hub,
+        pending,
+        handles,
+        auth,
+        device_tools,
+        false,
+    )
+    .await
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn handle_conn_with_peer(
+    stream: TcpStream,
+    storage: Arc<Storage>,
+    provider: Arc<dyn ModelProvider>,
+    workspace: Arc<PathBuf>,
+    policy: Policy,
+    hub: Hub,
+    pending: Pending,
+    handles: Handles,
+    auth: Arc<AuthStore>,
+    device_tools: DeviceTools,
+    peer_is_loopback: bool,
+) -> Result<()> {
     let ws = tokio_tungstenite::accept_async(stream)
         .await
         .map_err(|e| CoreError::Provider(format!("websocket handshake failed: {e}")))?;
@@ -462,9 +560,7 @@ pub async fn handle_conn(
         handles,
         auth,
         device_tools,
-        // The harness models a REMOTE client (peer not loopback) so the auth
-        // tests stay meaningful; loopback trust is unit-tested on `authenticate`.
-        false,
+        peer_is_loopback,
     )
     .await
 }
@@ -505,12 +601,22 @@ pub(crate) async fn run_connection(
                 local_tools_json,
                 hostname,
             }) => {
-                if protocol != PROTOCOL_VERSION {
+                if !protocol_is_supported(protocol) {
                     tracing::warn!(
                         client_protocol = protocol,
                         server_protocol = PROTOCOL_VERSION,
-                        "protocol version mismatch; proceeding (only v0 exists)"
+                        "rejecting incompatible protocol version"
                     );
+                    send_error_frame(
+                        &mut *writer,
+                        "protocol_mismatch",
+                        &format!(
+                            "client protocol {protocol} is incompatible with server protocol {PROTOCOL_VERSION}"
+                        ),
+                        "update all Fleety binaries to the same release",
+                    )
+                    .await;
+                    return Ok(());
                 }
                 // Trusted-loopback = accepted on same-host trust with no credential
                 // (a valid token still authenticates normally). Recorded so Welcome
@@ -605,6 +711,11 @@ pub(crate) async fn run_connection(
 
     // Register / refresh this device in the registry.
     storage.ensure_device(&device_id, "client_session")?;
+    // A socket peer being loopback is not, by itself, proof that the origin is
+    // the Server host: a reverse proxy can make a remote client look local.
+    // Require the same explicit loopback-trust decision used by authentication;
+    // auth-disabled servers therefore do not grant local-workspace access.
+    let same_host_origin = trusted_same_host_origin(loopback_trusted);
 
     // A single writer task owns the transport sink; everything else (this handler,
     // the approval gate, and other connections routing RunTool here) sends frames
@@ -639,6 +750,7 @@ pub(crate) async fn run_connection(
         minted_token,
         &device_id,
         loopback_trusted,
+        same_host_origin,
         &connection_tools,
         sealed_session,
     )
@@ -654,7 +766,14 @@ pub(crate) async fn run_connection(
             device_tools.lock().await.remove(&device_id);
         }
     }
-    writer_task.abort();
+    drop(out);
+    let mut writer_task = writer_task;
+    if tokio::time::timeout(WRITER_DRAIN_TIMEOUT, &mut writer_task)
+        .await
+        .is_err()
+    {
+        writer_task.abort();
+    }
     tracing::info!(%device_id, "client disconnected");
     result
 }
@@ -677,6 +796,7 @@ async fn serve(
     minted_token: Option<String>,
     device_id: &str,
     loopback_trusted: bool,
+    same_host_origin: bool,
     connection_tools: &[agent_core::ToolSpec],
     sealed_session: bool,
 ) -> Result<()> {
@@ -718,7 +838,6 @@ async fn serve(
     // message (see the UserMessage arm), making Fleety a coding agent in that
     // directory. The orchestration/workflow/goal tools live only at this top
     // level (subagent child registries omit them, capping nesting at one level).
-    let server_host = server_hostname();
     let mut current_root: std::path::PathBuf = workspace.to_path_buf();
     // Before the first message we don't yet know the acting user; default recall
     // scope to the device owner (rebuilt with the resolved user on first message).
@@ -754,8 +873,24 @@ async fn serve(
     let mut conv_hook_ctx: Option<Arc<HookContext>> = None;
     let goal_max_continues = goal_max_continues_from_env();
     let skill_reflect_min_steps = skill_reflect_min_steps_from_env();
+    // Approval gates temporarily own the transport reader. Any non-approval
+    // frame they observe is returned here in arrival order for normal service
+    // processing after the gated turn completes.
+    let mut deferred_inbound = std::collections::VecDeque::new();
+    let mut deferred_inbound_bytes = 0usize;
 
-    while let Some(msg) = inbound.next_client().await? {
+    loop {
+        let msg = match deferred_inbound.pop_front() {
+            Some(msg) => {
+                deferred_inbound_bytes =
+                    deferred_inbound_bytes.saturating_sub(client_message_wire_bytes(&msg));
+                msg
+            }
+            None => match inbound.next_client().await? {
+                Some(msg) => msg,
+                None => break,
+            },
+        };
         match msg {
             // Channel-setup frames belong to the handshake, which has already
             // run by the time the service loop sees anything. On a secure
@@ -768,6 +903,7 @@ async fn serve(
                 ))
             }
             ClientMsg::UserMessage {
+                message_id: active_message_id,
                 conversation_id,
                 text,
                 origin,
@@ -775,6 +911,23 @@ async fn serve(
                 voice,
                 acting_user,
             } => {
+                if !client_message_id_is_valid(&active_message_id) {
+                    emit(
+                        out,
+                        &ServerMsg::Error {
+                            error: WireError {
+                                kind: "invalid_message_id".to_string(),
+                                message: format!(
+                                    "message_id must contain 1 to {MAX_CLIENT_MESSAGE_ID_BYTES} bytes"
+                                ),
+                                remediation: Some(
+                                    "update the Fleety client and reconnect".to_string(),
+                                ),
+                            },
+                        },
+                    )?;
+                    return Ok(());
+                }
                 let conversation = conversation_id.unwrap_or_else(|| default_conversation.clone());
                 // Transparent redirect: if this conversation has rolled over,
                 // follow the successor chain to the active one (clients that
@@ -842,7 +995,7 @@ async fn serve(
                                 origin.hostname.as_deref(),
                                 origin.os.as_deref(),
                                 device_id,
-                                &server_host,
+                                same_host_origin,
                                 workspace,
                             );
                             let _ = storage.set_conversation_workspace(&conversation, &b);
@@ -1009,6 +1162,9 @@ async fn serve(
                     policy,
                     device_id,
                     &conversation,
+                    RecoveryEmission::LiveTurn,
+                    &mut deferred_inbound,
+                    &mut deferred_inbound_bytes,
                 )
                 .await
                 {
@@ -1110,16 +1266,53 @@ async fn serve(
                         turn_baseline,
                     );
                     tokio::pin!(turn);
-                    let mut pending: Option<(String, Vec<agent_core::Attachment>)> = None;
+                    let mut pending: VecDeque<(String, String, Vec<agent_core::Attachment>)> =
+                        VecDeque::new();
+                    let mut pending_bytes = 0usize;
                     let mut client_open = true;
                     let first_steps = loop {
                         if !client_open {
-                            break (&mut turn).await?;
+                            break (&mut turn).await;
                         }
                         tokio::select! {
-                            res = &mut turn => break res?,
+                            res = &mut turn => break res,
                             next = inbound.next_client() => match next {
-                                Ok(Some(ClientMsg::UserMessage { text: t2, attachments: a2, .. })) => {
+                                Ok(Some(ClientMsg::UserMessage { message_id, text: t2, attachments: a2, .. })) => {
+                                    let duplicate_message_id = message_id == active_message_id
+                                        || pending.iter().any(|(id, _, _)| id == &message_id);
+                                    if !client_message_id_is_valid(&message_id) || duplicate_message_id {
+                                        let _ = emit(out, &ServerMsg::InterjectionAcknowledged {
+                                            conversation_id: conversation.to_string(),
+                                            message_id,
+                                            disposition: InterjectionDisposition::Rejected,
+                                            message: "message_id is invalid or already in use — resend with a new id".to_string(),
+                                        });
+                                        continue;
+                                    }
+                                    let message_bytes = a2.iter().fold(
+                                        t2.len().saturating_add(message_id.len()),
+                                        |total, attachment| {
+                                        total
+                                            .saturating_add(attachment.mime.len())
+                                            .saturating_add(attachment.bytes_b64.as_ref().map_or(0, String::len))
+                                            .saturating_add(attachment.url.as_ref().map_or(0, String::len))
+                                            .saturating_add(attachment.name.as_ref().map_or(0, String::len))
+                                        },
+                                    );
+                                    let queue_has_capacity = pending_interjection_fits(
+                                        pending.len(),
+                                        pending_bytes,
+                                        message_bytes,
+                                    );
+                                    if !queue_has_capacity {
+                                        let _ = emit(out, &ServerMsg::InterjectionAcknowledged {
+                                            conversation_id: conversation.to_string(),
+                                            message_id,
+                                            disposition: InterjectionDisposition::Rejected,
+                                            message: "the interjection queue is full — resend after the current task".to_string(),
+                                        });
+                                        continue;
+                                    }
                                     let summary = goal_state.lock().await.nudge_text();
                                     let action = crate::triage::triage(&t2, &summary, provider).await;
                                     let atts: Vec<agent_core::Attachment> = a2
@@ -1131,25 +1324,20 @@ async fn serve(
                                             name: a.name,
                                         })
                                         .collect();
-                                    let (ack, store) = match action {
-                                        crate::triage::TriageAction::InterruptNow => {
-                                            cancel.request_triage();
-                                            ("interrupting the current task to handle your new message", true)
-                                        }
-                                        crate::triage::TriageAction::QueueAfter => {
-                                            ("got it — I'll handle that right after the current task", true)
-                                        }
-                                        crate::triage::TriageAction::Ignore => ("noted", false),
-                                    };
-                                    let _ = emit(out, &ServerMsg::Assistant {
+                                    let (disposition, ack, store) =
+                                        interjection_decision(action);
+                                    if disposition == InterjectionDisposition::Interrupting {
+                                        cancel.request_triage();
+                                    }
+                                    let _ = emit(out, &ServerMsg::InterjectionAcknowledged {
                                         conversation_id: conversation.to_string(),
-                                        text: ack.to_string(),
-                                        seq: 0,
-                                        speech: None,
-                                        attention: None,
+                                        message_id: message_id.clone(),
+                                        disposition,
+                                        message: ack.to_string(),
                                     });
                                     if store {
-                                        pending = Some((t2, atts));
+                                        pending_bytes = pending_bytes.saturating_add(message_bytes);
+                                        pending.push_back((message_id, t2, atts));
                                     }
                                 }
                                 Ok(Some(ClientMsg::CancelTurn { .. })) => {
@@ -1177,7 +1365,26 @@ async fn serve(
                     };
                     // Handle a queued/interrupting message as a follow-up turn
                     // (not itself interruptible in this MVP).
-                    if let Some((t, atts)) = pending {
+                    let first_steps = match first_steps {
+                        Ok(first_steps) => first_steps,
+                        Err(error @ CoreError::Provider(_)) => {
+                            finish_provider_turn_failure(
+                                out,
+                                storage,
+                                device_id,
+                                &conversation,
+                                &error,
+                                &pending
+                                    .iter()
+                                    .map(|(id, _, _)| id.clone())
+                                    .collect::<Vec<_>>(),
+                            )?;
+                            0
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    let mut completed_steps = first_steps;
+                    while let Some((_message_id, t, atts)) = pending.pop_front() {
                         let um = if atts.is_empty() {
                             Message::user(t)
                         } else {
@@ -1185,7 +1392,7 @@ async fn serve(
                         };
                         let cancel2 = CancelFlag::new();
                         let mut gate2 = agent_core::AutoApprove;
-                        let s2 = drive_to_goal(
+                        match drive_to_goal(
                             out,
                             storage,
                             provider,
@@ -1206,19 +1413,37 @@ async fn serve(
                             // the slot re-read inside drive_to_goal.
                             None,
                         )
-                        .await?;
-                        first_steps + s2
-                    } else {
-                        first_steps
+                        .await
+                        {
+                            Ok(second_steps) => completed_steps += second_steps,
+                            Err(error @ CoreError::Provider(_)) => {
+                                finish_provider_turn_failure(
+                                    out,
+                                    storage,
+                                    device_id,
+                                    &conversation,
+                                    &error,
+                                    &pending
+                                        .iter()
+                                        .map(|(id, _, _)| id.clone())
+                                        .collect::<Vec<_>>(),
+                                )?;
+                            }
+                            Err(error) => return Err(error),
+                        }
                     }
+                    Ok(completed_steps)
                 } else {
-                    // Require-approval: the gate reads inbound for Approve/Deny, so
-                    // we keep the sequential path (no mid-turn interjection yet,
-                    // hence CancelTurn has no effect here — documented in env.md).
+                    // Require-approval stays sequential because the gate owns
+                    // inbound while awaiting a decision. Non-approval frames are
+                    // deferred in FIFO order instead of being discarded.
                     let cancel = CancelFlag::new();
                     let mut gate = ConnGate {
                         out: out.clone(),
                         inbound,
+                        deferred: &mut deferred_inbound,
+                        deferred_bytes: &mut deferred_inbound_bytes,
+                        conversation: &conversation,
                     };
                     drive_to_goal(
                         out,
@@ -1238,7 +1463,22 @@ async fn serve(
                         &session_effort,
                         turn_baseline,
                     )
-                    .await?
+                    .await
+                };
+                let steps = match steps {
+                    Ok(steps) => steps,
+                    Err(error @ CoreError::Provider(_)) => {
+                        finish_provider_turn_failure(
+                            out,
+                            storage,
+                            device_id,
+                            &conversation,
+                            &error,
+                            &[],
+                        )?;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
                 };
                 // Apply an explicit rollover the agent requested during the turn
                 // (fast, storage-only): set the old aside, switch active, tell the
@@ -1345,6 +1585,9 @@ async fn serve(
                     policy,
                     device_id,
                     &conversation_id,
+                    RecoveryEmission::ResumeReplay,
+                    &mut deferred_inbound,
+                    &mut deferred_inbound_bytes,
                 )
                 .await
                 {
@@ -3662,6 +3905,78 @@ fn emit(out: &Out, msg: &ServerMsg) -> Result<()> {
         .map_err(|_| CoreError::Provider("connection writer closed".to_string()))
 }
 
+fn finish_provider_turn_failure(
+    out: &Out,
+    storage: &Arc<Storage>,
+    device_id: &str,
+    conversation: &str,
+    error: &CoreError,
+    queued_message_ids: &[String],
+) -> Result<()> {
+    let report = error.report();
+    tracing::warn!(
+        %device_id,
+        %conversation,
+        report = ?report,
+        "model provider failed during user turn"
+    );
+    let cleanup = storage.journal_end(device_id, conversation);
+    if let Err(cleanup_error) = cleanup {
+        tracing::warn!(
+            %device_id,
+            %conversation,
+            report = ?cleanup_error.report(),
+            "could not close failed turn journal"
+        );
+        let cleanup_report = cleanup_error.report();
+        for message_id in queued_message_ids {
+            emit(
+                out,
+                &ServerMsg::InterjectionAcknowledged {
+                    conversation_id: conversation.to_string(),
+                    message_id: message_id.clone(),
+                    disposition: InterjectionDisposition::Rejected,
+                    message: "the earlier queue acknowledgement was revoked because the failed turn could not be closed safely — reconnect and resend this message"
+                        .to_string(),
+                },
+            )?;
+        }
+        emit(
+            out,
+            &ServerMsg::Error {
+                error: WireError {
+                    kind: "turn_cleanup_failed".to_string(),
+                    message: format!(
+                        "{} Fleety also could not close the failed turn journal: {}",
+                        report.message, cleanup_report.message
+                    ),
+                    remediation: Some(
+                        "Reconnect, then resend any queued messages before retrying the failed turn."
+                            .to_string(),
+                    ),
+                },
+            },
+        )?;
+        return Err(cleanup_error);
+    }
+    emit(
+        out,
+        &ServerMsg::Error {
+            error: WireError {
+                kind: report.kind,
+                message: report.message,
+                remediation: report.remediation,
+            },
+        },
+    )?;
+    emit(
+        out,
+        &ServerMsg::Done {
+            conversation_id: conversation.to_string(),
+        },
+    )
+}
+
 /// On connect, proactively deliver each schedule outcome that has completed
 /// since the owner was last notified — one `ServerMsg::Assistant` per outcome,
 /// addressed to its `schedule-<id>` conversation, with failures prominently
@@ -3924,7 +4239,15 @@ async fn recover_one_interactive(
 /// from the journal (the in-flight tool is flagged interrupted, never re-run),
 /// continue the loop to a final answer, persist it, and clear the journal. A
 /// no-op when there is no journal. The continuation is itself journaled, so a
-/// second crash is still recoverable.
+/// second crash is still recoverable. Resume persists the result silently and
+/// lets the following Replay stream deliver it; a live UserMessage emits the
+/// recovered turn immediately before continuing with the new turn.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecoveryEmission {
+    LiveTurn,
+    ResumeReplay,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn recover_incomplete_turn(
     inbound: &mut dyn ClientInbound,
@@ -3935,6 +4258,9 @@ async fn recover_incomplete_turn(
     policy: Policy,
     device_id: &str,
     conversation: &str,
+    emission: RecoveryEmission,
+    deferred: &mut std::collections::VecDeque<ClientMsg>,
+    deferred_bytes: &mut usize,
 ) -> Result<()> {
     let events = storage.journal_events(device_id, conversation)?;
     if events.is_empty() {
@@ -3951,23 +4277,31 @@ async fn recover_incomplete_turn(
     messages.extend(storage.load(device_id, conversation)?);
     messages.extend(reconstruct_messages(&events, config.max_tool_result_chars));
 
-    let delta_out = out.clone();
-    let delta_conv = conversation.to_string();
-    let mut on_delta: Box<dyn FnMut(&str) + Send> = Box::new(move |chunk: &str| {
-        let frame = ServerMsg::AssistantDelta {
-            conversation_id: delta_conv.clone(),
-            chunk: chunk.to_string(),
-        };
-        if let Ok(json) = serde_json::to_string(&frame) {
-            let _ = delta_out.send(WsMessage::Text(json));
+    let mut on_delta: Box<dyn FnMut(&str) + Send> = match emission {
+        RecoveryEmission::LiveTurn => {
+            let delta_out = out.clone();
+            let delta_conv = conversation.to_string();
+            Box::new(move |chunk: &str| {
+                let frame = ServerMsg::AssistantDelta {
+                    conversation_id: delta_conv.clone(),
+                    chunk: chunk.to_string(),
+                };
+                if let Ok(json) = serde_json::to_string(&frame) {
+                    let _ = delta_out.send(WsMessage::Text(json));
+                }
+            })
         }
-    });
+        RecoveryEmission::ResumeReplay => Box::new(|_| {}),
+    };
 
     let mut log = storage.journaling_log(device_id, conversation);
     let outcome = {
         let mut gate = ConnGate {
             out: out.clone(),
             inbound,
+            deferred,
+            deferred_bytes,
+            conversation,
         };
         run_turn_streaming(
             provider,
@@ -3988,23 +4322,25 @@ async fn recover_incomplete_turn(
     let reply = outcome.output;
     let seq = storage.append(device_id, conversation, &Message::assistant(reply.clone()))?;
     storage.journal_end(device_id, conversation)?;
-    emit(
-        out,
-        &ServerMsg::Assistant {
-            conversation_id: conversation.to_string(),
-            text: reply,
-            seq,
-            // Recovery turns are non-voice: no spoken channel, no attention hint.
-            speech: None,
-            attention: None,
-        },
-    )?;
-    emit(
-        out,
-        &ServerMsg::Done {
-            conversation_id: conversation.to_string(),
-        },
-    )?;
+    if emission == RecoveryEmission::LiveTurn {
+        emit(
+            out,
+            &ServerMsg::Assistant {
+                conversation_id: conversation.to_string(),
+                text: reply,
+                seq,
+                // Recovery turns are non-voice: no spoken channel, no attention hint.
+                speech: None,
+                attention: None,
+            },
+        )?;
+        emit(
+            out,
+            &ServerMsg::Done {
+                conversation_id: conversation.to_string(),
+            },
+        )?;
+    }
     Ok(())
 }
 
@@ -4014,6 +4350,9 @@ async fn recover_incomplete_turn(
 struct ConnGate<'a> {
     out: Out,
     inbound: &'a mut dyn ClientInbound,
+    deferred: &'a mut std::collections::VecDeque<ClientMsg>,
+    deferred_bytes: &'a mut usize,
+    conversation: &'a str,
 }
 
 #[async_trait::async_trait]
@@ -4043,7 +4382,43 @@ impl ApprovalGate for ConnGate<'_> {
                 Some(ClientMsg::Deny { approval_id: id }) if id == approval_id => {
                     return Ok(ApprovalDecision::Deny)
                 }
-                Some(_) => continue,
+                Some(other) => {
+                    let incoming_bytes = client_message_wire_bytes(&other);
+                    if pending_interjection_fits(
+                        self.deferred.len(),
+                        *self.deferred_bytes,
+                        incoming_bytes,
+                    ) {
+                        *self.deferred_bytes = self.deferred_bytes.saturating_add(incoming_bytes);
+                        self.deferred.push_back(other);
+                    } else {
+                        match other {
+                            ClientMsg::UserMessage { message_id, .. } => emit(
+                                &self.out,
+                                &ServerMsg::InterjectionAcknowledged {
+                                    conversation_id: self.conversation.to_string(),
+                                    message_id,
+                                    disposition: InterjectionDisposition::Rejected,
+                                    message: "the interjection queue is full — resend after the current task"
+                                        .to_string(),
+                                },
+                            )?,
+                            _ => emit(
+                                &self.out,
+                                &ServerMsg::Error {
+                                    error: WireError {
+                                        kind: "approval_deferred_queue_full".to_string(),
+                                        message: "the approval wait queue is full".to_string(),
+                                        remediation: Some(
+                                            "retry the request after the current approval is resolved"
+                                                .to_string(),
+                                        ),
+                                    },
+                                },
+                            )?,
+                        }
+                    }
+                }
                 None => return Ok(ApprovalDecision::Deny),
             }
         }
@@ -5110,6 +5485,44 @@ mod tests {
     }
 
     #[test]
+    fn pending_interjection_limits_cover_count_and_total_payload_bytes() {
+        assert!(pending_interjection_fits(
+            MAX_PENDING_INTERJECTIONS - 1,
+            MAX_PENDING_INTERJECTION_BYTES - 1,
+            1,
+        ));
+        assert!(!pending_interjection_fits(MAX_PENDING_INTERJECTIONS, 0, 1,));
+        assert!(!pending_interjection_fits(
+            0,
+            MAX_PENDING_INTERJECTION_BYTES,
+            1,
+        ));
+        assert!(!pending_interjection_fits(0, usize::MAX, usize::MAX));
+    }
+
+    #[test]
+    fn interjection_decisions_distinguish_accepted_and_ignored() {
+        assert_eq!(
+            interjection_decision(crate::triage::TriageAction::QueueAfter).0,
+            InterjectionDisposition::Queued
+        );
+        assert_eq!(
+            interjection_decision(crate::triage::TriageAction::Ignore),
+            (
+                InterjectionDisposition::Ignored,
+                "noted — this message won't start another turn",
+                false,
+            )
+        );
+    }
+
+    #[test]
+    fn same_host_origin_requires_explicit_loopback_trust() {
+        assert!(trusted_same_host_origin(true));
+        assert!(!trusted_same_host_origin(false));
+    }
+
+    #[test]
     #[serial_test::serial]
     fn loopback_peer_is_trusted_only_when_enabled() {
         assert!(peer_is_loopback(Some("127.0.0.1:5".parse().unwrap())));
@@ -5490,6 +5903,135 @@ mod tests {
             Some(ClientMsg::Deny { approval_id }) if approval_id == "a2"
         ));
         assert!(inbound.next_client().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn approval_gate_defers_non_approval_frames_in_bounded_fifo_order() {
+        struct QueueInbound(std::collections::VecDeque<ClientMsg>);
+        #[async_trait::async_trait]
+        impl ClientInbound for QueueInbound {
+            async fn next_client(&mut self) -> Result<Option<ClientMsg>> {
+                Ok(self.0.pop_front())
+            }
+        }
+        let message = |id: String| ClientMsg::UserMessage {
+            message_id: id.clone(),
+            conversation_id: None,
+            text: id,
+            origin: Default::default(),
+            attachments: Vec::new(),
+            voice: false,
+            acting_user: None,
+        };
+        let submitted: Vec<ClientMsg> = (0..=MAX_PENDING_INTERJECTIONS)
+            .map(|index| message(format!("message-{index:02}")))
+            .collect();
+        let mut inbound = QueueInbound(submitted.into());
+        let (out, mut rx) = mpsc::unbounded_channel();
+        let mut deferred = std::collections::VecDeque::new();
+        let mut deferred_bytes = 0usize;
+        let decision = ConnGate {
+            out,
+            inbound: &mut inbound,
+            deferred: &mut deferred,
+            deferred_bytes: &mut deferred_bytes,
+            conversation: "c1",
+        }
+        .request(
+            "write_file",
+            &serde_json::json!({"path": "note.txt"}),
+            RiskLevel::Mutate,
+        )
+        .await
+        .expect("closed approval stream denies without dropping frames");
+
+        assert_eq!(decision, ApprovalDecision::Deny);
+        assert_eq!(deferred.len(), MAX_PENDING_INTERJECTIONS);
+        assert!(deferred_bytes <= MAX_PENDING_INTERJECTION_BYTES);
+        let ids: Vec<String> = deferred
+            .iter()
+            .filter_map(|message| match message {
+                ClientMsg::UserMessage { message_id, .. } => Some(message_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids.first().map(String::as_str), Some("message-00"));
+        assert_eq!(ids.last().map(String::as_str), Some("message-15"));
+        assert!(drain(&mut rx).iter().any(|frame| matches!(
+            frame,
+            ServerMsg::InterjectionAcknowledged {
+                message_id,
+                disposition: InterjectionDisposition::Rejected,
+                ..
+            } if message_id == "message-16"
+        )));
+    }
+
+    #[tokio::test]
+    async fn incompatible_protocol_is_rejected_before_device_registration() {
+        struct QueueInbound(std::collections::VecDeque<ClientMsg>);
+        #[async_trait::async_trait]
+        impl ClientInbound for QueueInbound {
+            async fn next_client(&mut self) -> Result<Option<ClientMsg>> {
+                Ok(self.0.pop_front())
+            }
+        }
+        struct CollectWriter(Arc<std::sync::Mutex<Vec<String>>>);
+        #[async_trait::async_trait]
+        impl FrameWriter for CollectWriter {
+            async fn send_text(&mut self, text: String) -> bool {
+                self.0.lock().expect("writer lock").push(text);
+                true
+            }
+        }
+
+        let home =
+            std::env::temp_dir().join(format!("fleety-protocol-mismatch-{}", uuid::Uuid::new_v4()));
+        let storage = Arc::new(Storage::new(home.clone()));
+        let frames = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let inbound = QueueInbound(
+            vec![ClientMsg::Hello {
+                device_id: "old-client".into(),
+                protocol: PROTOCOL_VERSION - 1,
+                token: None,
+                pairing_code: None,
+                local_tools_json: None,
+                hostname: None,
+            }]
+            .into(),
+        );
+        let provider: Arc<dyn ModelProvider> = Arc::new(MockProvider::new(vec![]));
+
+        run_connection(
+            Box::new(inbound),
+            Box::new(CollectWriter(Arc::clone(&frames))),
+            Arc::clone(&storage),
+            provider,
+            Arc::new(home.join("workspace")),
+            Policy::FullAccess,
+            bridge::new_hub(),
+            bridge::new_pending(),
+            bridge::new_handles(),
+            open_auth(),
+            bridge::new_device_tools(),
+            true,
+        )
+        .await
+        .expect("protocol rejection is handled in band");
+
+        let frames = frames.lock().expect("frames lock");
+        assert_eq!(frames.len(), 1);
+        let reply: ServerMsg = serde_json::from_str(&frames[0]).expect("error frame");
+        assert!(matches!(
+            reply,
+            ServerMsg::Error { error } if error.kind == "protocol_mismatch"
+        ));
+        assert!(
+            !storage.devices_dir().join("old-client").exists(),
+            "an incompatible Hello must not register the asserted device"
+        );
+
+        let _ = std::fs::remove_dir_all(home);
     }
 
     // ---- proactive schedule-notification delivery ----------------------------
@@ -6652,6 +7194,138 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    #[tokio::test]
+    async fn resume_recovery_emits_exactly_one_done_for_the_whole_stream() {
+        use crate::echo::EchoProvider;
+
+        let home =
+            std::env::temp_dir().join(format!("fleety-resume-recovery-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&home).expect("mk home");
+        let storage = Arc::new(Storage::new(home.clone()));
+        let user = Message::user("status");
+        storage.append("dev", "c1", &user).expect("append user");
+        storage
+            .journal_begin("dev", "c1", &user)
+            .expect("begin journal");
+        storage
+            .journal_event(
+                "dev",
+                "c1",
+                &Event::Assistant(Message::assistant("partial")),
+            )
+            .expect("seed interrupted event");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        {
+            let storage = Arc::clone(&storage);
+            let workspace = Arc::new(home.clone());
+            tokio::spawn(async move {
+                if let Ok((stream, _)) = listener.accept().await {
+                    let _ = handle_conn(
+                        stream,
+                        storage,
+                        Arc::new(EchoProvider),
+                        workspace,
+                        Policy::FullAccess,
+                        bridge::new_hub(),
+                        bridge::new_pending(),
+                        bridge::new_handles(),
+                        open_auth(),
+                        bridge::new_device_tools(),
+                    )
+                    .await;
+                }
+            });
+        }
+
+        let (client, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .expect("connect");
+        let (mut tx, mut rx) = client.split();
+        send_client(&mut tx, &hello("dev")).await;
+        assert!(matches!(
+            recv_server(&mut rx).await,
+            Some(ServerMsg::Welcome { .. })
+        ));
+        send_client(
+            &mut tx,
+            &ClientMsg::Resume {
+                conversation_id: "c1".into(),
+                after_seq: 0,
+            },
+        )
+        .await;
+        send_client(&mut tx, &ClientMsg::ServerStatus).await;
+
+        let mut resume_frames = Vec::new();
+        loop {
+            let frame = recv_server(&mut rx).await.expect("resume/status frame");
+            if matches!(frame, ServerMsg::ServerStatusResult { .. }) {
+                break;
+            }
+            resume_frames.push(frame);
+        }
+        assert!(resume_frames
+            .iter()
+            .any(|frame| matches!(frame, ServerMsg::Replay { .. })));
+        assert!(
+            !resume_frames.iter().any(|frame| matches!(
+                frame,
+                ServerMsg::Assistant { .. } | ServerMsg::AssistantDelta { .. }
+            )),
+            "Resume recovery is delivered only through Replay"
+        );
+        assert_eq!(
+            resume_frames
+                .iter()
+                .filter(|frame| matches!(frame, ServerMsg::Done { .. }))
+                .count(),
+            1,
+            "Resume owns one terminal marker even when it recovers a turn"
+        );
+
+        send_client(
+            &mut tx,
+            &ClientMsg::UserMessage {
+                message_id: "follow-up-after-resume".into(),
+                conversation_id: Some("c1".into()),
+                text: "follow-up after resume".into(),
+                origin: Default::default(),
+                attachments: Vec::new(),
+                voice: false,
+                acting_user: None,
+            },
+        )
+        .await;
+        let mut saw_follow_up = false;
+        loop {
+            match recv_server(&mut rx).await.expect("follow-up frame") {
+                ServerMsg::Assistant {
+                    conversation_id, ..
+                } => {
+                    assert_eq!(conversation_id, "c1");
+                    saw_follow_up = true;
+                }
+                ServerMsg::Done { conversation_id } => {
+                    assert_eq!(conversation_id, "c1");
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_follow_up);
+        assert!(storage
+            .load("dev", "c1")
+            .expect("resumed history")
+            .iter()
+            .any(|message| message.content.as_deref() == Some("follow-up after resume")));
+
+        let _ = std::fs::remove_dir_all(home);
+    }
+
     async fn recv_server(rx: &mut futures::stream::SplitStream<ClientWs>) -> Option<ServerMsg> {
         while let Some(Ok(frame)) = rx.next().await {
             if frame.is_text() {
@@ -7629,6 +8303,7 @@ mod tests {
         send_client(
             &mut ctx,
             &ClientMsg::UserMessage {
+                message_id: "please-write".into(),
                 conversation_id: None,
                 text: "please write".into(),
                 origin: Default::default(),
@@ -7669,49 +8344,23 @@ mod tests {
     }
 
     #[tokio::test]
-    #[serial_test::serial]
-    async fn user_prompt_submit_hook_blocks_the_turn_end_to_end() {
-        // End-to-end through the serve loop: a same-host conversation whose origin
-        // cwd declares a UserPromptSubmit hook that exits non-zero must have its
-        // prompt blocked — the provider is never reached, and the client is told a
-        // hook blocked it. Exercises bind → collect_conversation_hooks →
-        // conv_hook_ctx → run_conversation_event_hooks → block/emit/continue with
-        // the real local shell runner.
-        let home = std::env::temp_dir().join(format!("fleety-upshook-{}", uuid::Uuid::new_v4()));
-        let ws_root = home.join("ws");
-        let project = home.join("proj");
-        std::fs::create_dir_all(&ws_root).expect("mk ws");
-        std::fs::create_dir_all(project.join(".claude")).expect("mk proj/.claude");
-        std::fs::write(
-            project.join(".claude").join("settings.json"),
-            r#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"exit 1"}]}]}}"#,
-        )
-        .expect("w settings");
-
-        // Isolate the user-scope home read so the serve loop can't touch the real
-        // ~/.claude, and make sure project hooks aren't disabled by a stray env.
-        let saved_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &home);
-        std::env::remove_var("FLEETY_DISABLE_PROJECT_HOOKS");
-
-        // If the block fails, the provider would answer "processed" — a clear
-        // failure signal versus the expected "blocked" notice.
-        let provider: Arc<dyn ModelProvider> =
-            Arc::new(MockProvider::new(vec![ModelResponse::new(
-                Message::assistant("PROVIDER_REACHED_SENTINEL"),
-            )]));
+    async fn provider_failure_ends_only_the_turn_and_keeps_the_connection_open() {
+        let home =
+            std::env::temp_dir().join(format!("fleety-provider-failure-{}", uuid::Uuid::new_v4()));
         let storage = Arc::new(Storage::new(home.clone()));
-        let workspace = Arc::new(ws_root.clone());
+        let workspace = Arc::new(home.clone());
+        let provider: Arc<dyn ModelProvider> = Arc::new(MockProvider::new(Vec::new()));
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
         let addr = listener.local_addr().expect("addr");
+        let server_storage = Arc::clone(&storage);
         tokio::spawn(async move {
             if let Ok((stream, _)) = listener.accept().await {
                 let _ = handle_conn(
                     stream,
-                    storage,
+                    server_storage,
                     provider,
                     workspace,
                     Policy::FullAccess,
@@ -7740,6 +8389,496 @@ mod tests {
         send_client(
             &mut ctx,
             &ClientMsg::UserMessage {
+                message_id: "provider-fail".into(),
+                conversation_id: None,
+                text: "make the provider fail".into(),
+                origin: Default::default(),
+                attachments: Vec::new(),
+                voice: false,
+                acting_user: None,
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            recv_server(&mut crx).await,
+            Some(ServerMsg::Error { error }) if error.kind == "provider"
+        ));
+        assert!(matches!(
+            recv_server(&mut crx).await,
+            Some(ServerMsg::Done { .. })
+        ));
+        assert!(
+            storage
+                .list_incomplete_turns()
+                .expect("list journals")
+                .is_empty(),
+            "a reported provider failure must not replay as an interrupted turn"
+        );
+
+        send_client(&mut ctx, &ClientMsg::ServerStatus).await;
+        assert!(matches!(
+            recv_server(&mut crx).await,
+            Some(ServerMsg::ServerStatusResult { .. })
+        ));
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn failed_journal_cleanup_never_reports_the_turn_done() {
+        let home = std::env::temp_dir().join(format!(
+            "fleety-provider-cleanup-failure-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let storage = Arc::new(Storage::new(home.clone()));
+        storage
+            .journal_begin("d", "c", &Message::user("failed turn"))
+            .expect("begin journal");
+        let journal = home
+            .join("fleet")
+            .join("devices")
+            .join("d")
+            .join("conversations")
+            .join("c.journal.jsonl");
+        std::fs::remove_file(&journal).expect("remove journal file");
+        std::fs::create_dir(&journal).expect("replace journal with a directory");
+        let (out, mut rx) = mpsc::unbounded_channel();
+
+        let result = finish_provider_turn_failure(
+            &out,
+            &storage,
+            "d",
+            "c",
+            &CoreError::Provider("model unavailable".to_string()),
+            &["queued-1".to_string(), "queued-2".to_string()],
+        );
+        let frames = drain(&mut rx);
+
+        assert!(result.is_err(), "cleanup failure must end the connection");
+        assert!(
+            frames
+                .iter()
+                .any(|frame| matches!(frame, ServerMsg::Error { .. })),
+            "the original provider failure is still surfaced"
+        );
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| matches!(frame, ServerMsg::Error { .. }))
+                .count(),
+            1,
+            "one provider failure must retire only the active turn"
+        );
+        let rejected_ids: Vec<&str> = frames
+            .iter()
+            .filter_map(|frame| match frame {
+                ServerMsg::InterjectionAcknowledged {
+                    message_id,
+                    disposition: InterjectionDisposition::Rejected,
+                    ..
+                } => Some(message_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rejected_ids, ["queued-1", "queued-2"]);
+        let error_index = frames
+            .iter()
+            .position(|frame| matches!(frame, ServerMsg::Error { .. }))
+            .expect("cleanup error");
+        assert!(
+            frames[..error_index].iter().all(|frame| matches!(
+                frame,
+                ServerMsg::InterjectionAcknowledged {
+                    disposition: InterjectionDisposition::Rejected,
+                    ..
+                }
+            )),
+            "seeing the terminal Error must prove every queued rejection was delivered first"
+        );
+        assert!(
+            !frames
+                .iter()
+                .any(|frame| matches!(frame, ServerMsg::Done { .. })),
+            "an incomplete journal must never be declared done"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn protocol_boundary_rejects_older_clients() {
+        assert!(protocol_is_supported(PROTOCOL_VERSION));
+        assert!(!protocol_is_supported(PROTOCOL_VERSION - 1));
+        assert!(!protocol_is_supported(PROTOCOL_VERSION + 1));
+    }
+
+    #[test]
+    fn client_message_id_boundary_is_nonempty_and_bounded() {
+        assert!(!client_message_id_is_valid(""));
+        assert!(client_message_id_is_valid(
+            &"x".repeat(MAX_CLIENT_MESSAGE_ID_BYTES)
+        ));
+        assert!(!client_message_id_is_valid(
+            &"x".repeat(MAX_CLIENT_MESSAGE_ID_BYTES + 1)
+        ));
+    }
+
+    struct FailFirstTurnAfterInterjection {
+        first_started: Arc<tokio::sync::Notify>,
+        release_first: Arc<tokio::sync::Notify>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    struct FailFirstTurnAfterTwoInterjections {
+        first_started: Arc<tokio::sync::Notify>,
+        release_first: Arc<tokio::sync::Notify>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for FailFirstTurnAfterTwoInterjections {
+        async fn complete(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+        ) -> agent_core::Result<ModelResponse> {
+            match self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                0 => {
+                    self.first_started.notify_one();
+                    self.release_first.notified().await;
+                    Err(CoreError::Provider("first turn failed".to_string()))
+                }
+                1 | 2 => Ok(ModelResponse::new(Message::assistant("queue_after"))),
+                3 => Ok(ModelResponse::new(Message::assistant("second answer"))),
+                _ => Ok(ModelResponse::new(Message::assistant("third answer"))),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for FailFirstTurnAfterInterjection {
+        async fn complete(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+        ) -> agent_core::Result<ModelResponse> {
+            match self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                0 => {
+                    self.first_started.notify_one();
+                    self.release_first.notified().await;
+                    Err(CoreError::Provider("first turn failed".to_string()))
+                }
+                1 => Ok(ModelResponse::new(Message::assistant("queue_after"))),
+                _ => Ok(ModelResponse::new(Message::assistant("second answer"))),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_interjection_survives_a_provider_failure_in_the_active_turn() {
+        let home = std::env::temp_dir().join(format!(
+            "fleety-provider-interjection-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let storage = Arc::new(Storage::new(home.clone()));
+        let workspace = Arc::new(home.clone());
+        let first_started = Arc::new(tokio::sync::Notify::new());
+        let release_first = Arc::new(tokio::sync::Notify::new());
+        let provider: Arc<dyn ModelProvider> = Arc::new(FailFirstTurnAfterInterjection {
+            first_started: Arc::clone(&first_started),
+            release_first: Arc::clone(&release_first),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server_storage = Arc::clone(&storage);
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let _ = handle_conn(
+                    stream,
+                    server_storage,
+                    provider,
+                    workspace,
+                    Policy::FullAccess,
+                    bridge::new_hub(),
+                    bridge::new_pending(),
+                    bridge::new_handles(),
+                    open_auth(),
+                    bridge::new_device_tools(),
+                )
+                .await;
+            }
+        });
+
+        let url = format!("ws://{addr}");
+        let (client, _) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("connect");
+        let (mut ctx, mut crx) = client.split();
+        send_client(&mut ctx, &hello("d")).await;
+        assert!(matches!(
+            recv_server(&mut crx).await,
+            Some(ServerMsg::Welcome { .. })
+        ));
+
+        let message = |text: &str| ClientMsg::UserMessage {
+            message_id: text.to_string(),
+            conversation_id: None,
+            text: text.to_string(),
+            origin: Default::default(),
+            attachments: Vec::new(),
+            voice: false,
+            acting_user: None,
+        };
+        send_client(&mut ctx, &message("first message")).await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), first_started.notified())
+            .await
+            .expect("first provider turn started");
+        send_client(&mut ctx, &message("second message")).await;
+
+        let ack = tokio::time::timeout(std::time::Duration::from_secs(2), recv_server(&mut crx))
+            .await
+            .expect("interjection acknowledgement");
+        let conversation = match ack {
+            Some(ServerMsg::InterjectionAcknowledged {
+                conversation_id,
+                disposition: InterjectionDisposition::Queued,
+                message,
+                ..
+            }) if message.contains("right after") => conversation_id,
+            other => panic!("expected queued-interjection acknowledgement, got {other:?}"),
+        };
+        release_first.notify_one();
+
+        let mut saw_first_error = false;
+        let mut saw_second_answer = false;
+        for _ in 0..6 {
+            let frame =
+                tokio::time::timeout(std::time::Duration::from_secs(2), recv_server(&mut crx))
+                    .await
+                    .expect("turn result before timeout");
+            match frame {
+                Some(ServerMsg::Error { error }) if error.message.contains("first turn") => {
+                    saw_first_error = true;
+                }
+                Some(ServerMsg::Assistant { text, .. }) if text == "second answer" => {
+                    saw_second_answer = true;
+                    break;
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+        assert!(saw_first_error, "the failed active turn is reported");
+        assert!(
+            saw_second_answer,
+            "the acknowledged queued interjection must still run"
+        );
+
+        let history = storage
+            .load("d", &conversation)
+            .expect("conversation history");
+        assert!(history.iter().any(|message| {
+            message.role == CoreRole::User && message.content.as_deref() == Some("second message")
+        }));
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn multiple_queued_interjections_survive_in_fifo_order() {
+        let home = std::env::temp_dir().join(format!(
+            "fleety-provider-interjection-fifo-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let storage = Arc::new(Storage::new(home.clone()));
+        let workspace = Arc::new(home.clone());
+        let first_started = Arc::new(tokio::sync::Notify::new());
+        let release_first = Arc::new(tokio::sync::Notify::new());
+        let provider: Arc<dyn ModelProvider> = Arc::new(FailFirstTurnAfterTwoInterjections {
+            first_started: Arc::clone(&first_started),
+            release_first: Arc::clone(&release_first),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server_storage = Arc::clone(&storage);
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let _ = handle_conn(
+                    stream,
+                    server_storage,
+                    provider,
+                    workspace,
+                    Policy::FullAccess,
+                    bridge::new_hub(),
+                    bridge::new_pending(),
+                    bridge::new_handles(),
+                    open_auth(),
+                    bridge::new_device_tools(),
+                )
+                .await;
+            }
+        });
+
+        let url = format!("ws://{addr}");
+        let (client, _) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("connect");
+        let (mut ctx, mut crx) = client.split();
+        send_client(&mut ctx, &hello("d")).await;
+        assert!(matches!(
+            recv_server(&mut crx).await,
+            Some(ServerMsg::Welcome { .. })
+        ));
+        let message = |text: &str| ClientMsg::UserMessage {
+            message_id: text.to_string(),
+            conversation_id: None,
+            text: text.to_string(),
+            origin: Default::default(),
+            attachments: Vec::new(),
+            voice: false,
+            acting_user: None,
+        };
+
+        send_client(&mut ctx, &message("first message")).await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), first_started.notified())
+            .await
+            .expect("first provider turn started");
+        let mut conversation = None;
+        for text in ["second message", "third message"] {
+            send_client(&mut ctx, &message(text)).await;
+            match tokio::time::timeout(std::time::Duration::from_secs(2), recv_server(&mut crx))
+                .await
+                .expect("interjection acknowledgement")
+            {
+                Some(ServerMsg::InterjectionAcknowledged {
+                    conversation_id,
+                    disposition: InterjectionDisposition::Queued,
+                    message,
+                    ..
+                }) if message.contains("right after") => conversation = Some(conversation_id),
+                other => panic!("expected queued-interjection acknowledgement, got {other:?}"),
+            }
+        }
+        release_first.notify_one();
+
+        let mut answers = Vec::new();
+        for _ in 0..10 {
+            match tokio::time::timeout(std::time::Duration::from_secs(2), recv_server(&mut crx))
+                .await
+                .expect("turn result before timeout")
+            {
+                Some(ServerMsg::Assistant { text, .. })
+                    if text == "second answer" || text == "third answer" =>
+                {
+                    answers.push(text);
+                    if answers.len() == 2 {
+                        break;
+                    }
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+        assert_eq!(answers, ["second answer", "third answer"]);
+
+        let conversation = conversation.expect("generated conversation");
+        let history = storage.load("d", &conversation).expect("history");
+        let users: Vec<&str> = history
+            .iter()
+            .filter(|message| message.role == CoreRole::User)
+            .filter_map(|message| message.content.as_deref())
+            .collect();
+        assert!(users.ends_with(&["second message", "third message"]));
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn user_prompt_submit_hook_blocks_the_turn_end_to_end() {
+        // End-to-end through the serve loop: a same-host conversation whose origin
+        // cwd declares a UserPromptSubmit hook that exits non-zero must have its
+        // prompt blocked — the provider is never reached, and the client is told a
+        // hook blocked it. Exercises bind → collect_conversation_hooks →
+        // conv_hook_ctx → run_conversation_event_hooks → block/emit/continue with
+        // the real local shell runner.
+        let home = std::env::temp_dir().join(format!("fleety-upshook-{}", uuid::Uuid::new_v4()));
+        let ws_root = home.join("ws");
+        let project = home.join("proj");
+        std::fs::create_dir_all(&ws_root).expect("mk ws");
+        std::fs::create_dir_all(project.join(".claude")).expect("mk proj/.claude");
+        std::fs::write(
+            project.join(".claude").join("settings.json"),
+            r#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"exit 1"}]}]}}"#,
+        )
+        .expect("w settings");
+
+        // Isolate the user-scope home read so the serve loop can't touch the real
+        // ~/.claude, and make sure project hooks aren't disabled by a stray env.
+        let saved_home = std::env::var("HOME").ok();
+        let saved_loopback_trust = std::env::var("FLEETY_TRUST_LOOPBACK").ok();
+        std::env::set_var("HOME", &home);
+        std::env::remove_var("FLEETY_DISABLE_PROJECT_HOOKS");
+        std::env::remove_var("FLEETY_TRUST_LOOPBACK");
+
+        // If the block fails, the provider would answer "processed" — a clear
+        // failure signal versus the expected "blocked" notice.
+        let provider: Arc<dyn ModelProvider> =
+            Arc::new(MockProvider::new(vec![ModelResponse::new(
+                Message::assistant("PROVIDER_REACHED_SENTINEL"),
+            )]));
+        let storage = Arc::new(Storage::new(home.clone()));
+        let workspace = Arc::new(ws_root.clone());
+        let auth = Arc::new(AuthStore::load(home.join("auth.json"), None, true));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let _ = handle_conn_with_peer(
+                    stream,
+                    storage,
+                    provider,
+                    workspace,
+                    Policy::FullAccess,
+                    bridge::new_hub(),
+                    bridge::new_pending(),
+                    bridge::new_handles(),
+                    auth,
+                    bridge::new_device_tools(),
+                    true,
+                )
+                .await;
+            }
+        });
+
+        let url = format!("ws://{addr}");
+        let (client, _) = tokio_tungstenite::connect_async(&url)
+            .await
+            .expect("connect");
+        let (mut ctx, mut crx) = client.split();
+
+        send_client(&mut ctx, &hello("d")).await;
+        assert!(matches!(
+            recv_server(&mut crx).await,
+            Some(ServerMsg::Welcome { .. })
+        ));
+
+        send_client(
+            &mut ctx,
+            &ClientMsg::UserMessage {
+                message_id: "hook-turn".into(),
                 conversation_id: None,
                 text: "please do the thing".into(),
                 // Same host (hostname == server) so hooks are collected locally,
@@ -7773,6 +8912,10 @@ mod tests {
         match saved_home {
             Some(v) => std::env::set_var("HOME", v),
             None => std::env::remove_var("HOME"),
+        }
+        match saved_loopback_trust {
+            Some(value) => std::env::set_var("FLEETY_TRUST_LOOPBACK", value),
+            None => std::env::remove_var("FLEETY_TRUST_LOOPBACK"),
         }
 
         let reply = reply.expect("server should reply");
@@ -7823,11 +8966,14 @@ mod tests {
         .expect("w settings");
 
         let saved_home = std::env::var("HOME").ok();
+        let saved_loopback_trust = std::env::var("FLEETY_TRUST_LOOPBACK").ok();
         std::env::set_var("HOME", &home);
         std::env::remove_var("FLEETY_DISABLE_PROJECT_HOOKS");
+        std::env::remove_var("FLEETY_TRUST_LOOPBACK");
 
         let storage = Arc::new(Storage::new(home.clone()));
         let workspace = Arc::new(ws_root.clone());
+        let auth = Arc::new(AuthStore::load(home.join("auth.json"), None, true));
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -7835,7 +8981,7 @@ mod tests {
         let addr = listener.local_addr().expect("addr");
         tokio::spawn(async move {
             if let Ok((stream, _)) = listener.accept().await {
-                let _ = handle_conn(
+                let _ = handle_conn_with_peer(
                     stream,
                     storage,
                     provider,
@@ -7844,8 +8990,9 @@ mod tests {
                     bridge::new_hub(),
                     bridge::new_pending(),
                     bridge::new_handles(),
-                    open_auth(),
+                    auth,
                     bridge::new_device_tools(),
+                    true,
                 )
                 .await;
             }
@@ -7866,6 +9013,7 @@ mod tests {
         send_client(
             &mut ctx,
             &ClientMsg::UserMessage {
+                message_id: "write-file".into(),
                 conversation_id: None,
                 text: "please write the file".into(),
                 origin: fleety_protocol::OriginContext {
@@ -7895,6 +9043,10 @@ mod tests {
         match saved_home {
             Some(v) => std::env::set_var("HOME", v),
             None => std::env::remove_var("HOME"),
+        }
+        match saved_loopback_trust {
+            Some(value) => std::env::set_var("FLEETY_TRUST_LOOPBACK", value),
+            None => std::env::remove_var("FLEETY_TRUST_LOOPBACK"),
         }
 
         assert!(saw_done, "turn should complete");
@@ -7990,6 +9142,7 @@ mod tests {
         send_client(
             &mut ctx,
             &ClientMsg::UserMessage {
+                message_id: "long-turn".into(),
                 conversation_id: None,
                 text: "do a long thing".into(),
                 origin: OriginContext::default(),
@@ -8109,6 +9262,7 @@ mod tests {
         send_client(
             &mut ctx,
             &ClientMsg::UserMessage {
+                message_id: "after-idle-cancel".into(),
                 conversation_id: None,
                 text: "hi".into(),
                 origin: OriginContext::default(),
@@ -8251,6 +9405,7 @@ mod tests {
         send_client(
             &mut utx,
             &ClientMsg::UserMessage {
+                message_id: "device-exec".into(),
                 conversation_id: None,
                 text: "run on pi".into(),
                 origin: Default::default(),

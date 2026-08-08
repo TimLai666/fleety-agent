@@ -8,12 +8,17 @@ TBD - created by archiving change 'session-workspace-cwd'. Update Purpose after 
 
 ### Requirement: Conversation works in the originating directory and device
 
-A conversation SHALL bind once, from its first message, to the originating directory (`origin.cwd`) and device (the `device_id` from `Hello`), and SHALL reuse that binding for subsequent turns and across resume. When the originating device is the server host and `origin.cwd` is a usable absolute path, the conversation's filesystem, command, and git tools SHALL be rooted at that cwd and run locally. When the originating device is not the server host, those tools SHALL remain rooted at the server workspace; the runtime SHALL NOT silently relocate tool execution to the origin device. Instead, the conversation SHALL rely on the injected origin context (see "Runtime injects origin context into each turn") so the agent routes work to the origin device via `device_exec`. A later message carrying a different cwd SHALL NOT move an already-bound conversation.
+A conversation SHALL bind once, from its first message, to the originating directory (`origin.cwd`) and device (the `device_id` from `Hello`), and SHALL reuse that binding for subsequent turns and across resume. The originating device SHALL count as the server host only when the connection was accepted through explicit auth-required loopback trust; a client-supplied hostname or a loopback socket alone SHALL NOT establish that authority. When that trusted same-host decision holds and `origin.cwd` is a usable absolute path, the conversation's filesystem, command, and git tools SHALL be rooted at that cwd and run locally. Auth-disabled, token-authenticated, non-loopback, and loopback-trust-disabled sessions SHALL remain rooted at the server workspace and record the origin device; the runtime SHALL NOT silently relocate tool execution to the origin device. Instead, the conversation SHALL rely on the injected origin context (see "Runtime injects origin context into each turn") so the agent routes work to the origin device via `device_exec`. A later message carrying a different cwd SHALL NOT move an already-bound conversation.
 
 #### Scenario: tools run in the CLI's directory on the CLI's device
 
-- **WHEN** a user opens the CLI in directory D on the server-host device and starts a conversation
+- **WHEN** a user opens an unpaired CLI in directory D through an auth-required Server's explicitly trusted loopback path and starts a conversation
 - **THEN** that conversation's file/command/git tools read, write, and run locally in D
+
+#### Scenario: loopback alone does not grant a client cwd local authority
+
+- **WHEN** an auth-disabled, token-authenticated, or loopback-trust-disabled connection supplies an absolute `origin.cwd`, even when its socket peer is loopback
+- **THEN** the conversation remains rooted at the server fallback workspace and records the origin device
 
 #### Scenario: two CLIs are independent
 
@@ -34,8 +39,8 @@ A conversation SHALL bind once, from its first message, to the originating direc
 
 | Origin cwd | Origin device vs server host | Resolved root | Where bare tools run |
 | ---------- | ---------------------------- | ------------- | -------------------- |
-| absolute path D | same host | D | server host, locally |
-| absolute path D | other device | server fallback root | server host; origin device injected so the agent uses `device_exec` to reach D on that device |
+| absolute path D | explicitly loopback-trusted | D | server host, locally |
+| absolute path D | any other session | server fallback root | server host; origin device injected so the agent uses `device_exec` to reach D on that device |
 | blank / relative / none | any | fallback root | server host |
 
 

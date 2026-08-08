@@ -11,7 +11,7 @@
 
 use std::collections::VecDeque;
 
-use fleety_protocol::WireAttachment;
+use fleety_protocol::{InterjectionDisposition, WireAttachment};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
@@ -59,6 +59,12 @@ pub fn parse_conversation_summaries(
 /// (or during reconnection) so the wait shows motion even with no new frames.
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingUserConfirmation {
+    message_id: String,
+    text: String,
+}
+
 /// TUI state.
 pub struct App {
     pub messages: Vec<(String, String)>,
@@ -100,6 +106,23 @@ pub struct App {
     /// Highest event `seq` observed. Sent as `after_seq` on `Resume`, and used
     /// to de-duplicate replayed events that were already shown.
     pub last_seq: u64,
+    /// Raw text of locally committed user messages whose authoritative storage
+    /// events have not yet been observed, oldest first. A reconnect can replay
+    /// those events after the optimistic `you:` lines are already in scrollback;
+    /// this lets replay confirm sends instead of printing them a second time.
+    pending_user_confirmations: VecDeque<PendingUserConfirmation>,
+    /// Number of leading confirmations whose turns ended with an in-band error.
+    /// An error has no event sequence, so replay may still confirm them; a later
+    /// successful reply retires this failed prefix before its own confirmation.
+    failed_user_confirmations: usize,
+    /// Whether an authoritative reply or error already ended the current turn.
+    /// `Done` follows those terminal frames, but also disambiguates a `seq = 0`
+    /// assistant notice that was itself the only terminal response.
+    terminal_outcome_seen: bool,
+    /// Whether the next `Done` terminates a reconnect/conversation Resume
+    /// stream rather than a user turn. Resume and UserMessage share the same
+    /// wire terminator, so this keeps fast post-reconnect sends correlated.
+    resume_in_flight: bool,
     /// Whether an idle Esc is awaiting a second, confirming Esc because there is
     /// unsent input or a pending attachment. Cleared by any editing keypress.
     pub confirm_quit: bool,
@@ -127,6 +150,10 @@ impl App {
             spinner_frame: 0,
             last_conversation_id: None,
             last_seq: 0,
+            pending_user_confirmations: VecDeque::new(),
+            failed_user_confirmations: 0,
+            terminal_outcome_seen: false,
+            resume_in_flight: false,
             confirm_quit: false,
             conversations: Vec::new(),
             conversation_selected: 0,
@@ -144,8 +171,8 @@ impl App {
     }
 
     /// Apply a replayed past event, de-duplicating any already shown. Returns
-    /// `true` when the event was newly appended, `false` when skipped as a
-    /// duplicate (`seq` at or below the highest already seen).
+    /// `true` when the event was newly consumed (appended or reconciled with a
+    /// local optimistic send), `false` when its sequence was already observed.
     pub fn apply_replay(
         &mut self,
         conversation_id: &str,
@@ -157,7 +184,29 @@ impl App {
         if seq <= self.last_seq {
             return false;
         }
-        self.push(role, content);
+        if role == "user"
+            && self
+                .pending_user_confirmations
+                .front()
+                .map(|confirmation| confirmation.text.as_str())
+                == Some(content)
+        {
+            self.pending_user_confirmations.pop_front();
+            self.failed_user_confirmations = self.failed_user_confirmations.saturating_sub(1);
+            self.last_seq = seq;
+            return true;
+        }
+        let display_role = match role {
+            "user" => "you",
+            "assistant" => "fleety",
+            other => other,
+        };
+        self.push(display_role, content);
+        if role == "assistant" {
+            self.terminal_outcome_seen = true;
+            self.turn_in_flight =
+                self.pending_user_confirmations.len() > self.failed_user_confirmations;
+        }
         self.last_seq = seq;
         true
     }
@@ -202,7 +251,108 @@ impl App {
         } else {
             self.push("fleety", text);
         }
+        self.terminal_outcome_seen = true;
+        while self.failed_user_confirmations > 0 {
+            self.pending_user_confirmations.pop_front();
+            self.failed_user_confirmations -= 1;
+        }
+        self.pending_user_confirmations.pop_front();
+        self.turn_in_flight = !self.pending_user_confirmations.is_empty();
+    }
+
+    /// Display a non-persisted assistant notice without treating it as the
+    /// final reply. Mid-turn interjection acknowledgements use `seq = 0` and
+    /// must not retire the user event needed for reconnect de-duplication.
+    pub fn push_assistant_notice(&mut self, text: String) {
+        self.push("fleety", text);
+    }
+
+    /// Apply the Server's structured response to a message sent while another
+    /// turn is active. Accepted messages remain pending for replay and their
+    /// eventual reply; ignored or capacity-rejected messages never become a
+    /// turn, so retire only the optimistic confirmation carrying the matching
+    /// client message id.
+    pub fn acknowledge_interjection(
+        &mut self,
+        message_id: &str,
+        disposition: InterjectionDisposition,
+        message: String,
+    ) {
+        self.push("fleety", message);
+        if matches!(
+            disposition,
+            InterjectionDisposition::Ignored | InterjectionDisposition::Rejected
+        ) {
+            if let Some(index) = self
+                .pending_user_confirmations
+                .iter()
+                .position(|confirmation| confirmation.message_id == message_id)
+            {
+                self.pending_user_confirmations.remove(index);
+                if index < self.failed_user_confirmations {
+                    self.failed_user_confirmations -= 1;
+                }
+            }
+        }
+        self.turn_in_flight =
+            self.pending_user_confirmations.len() > self.failed_user_confirmations;
+    }
+
+    /// Finish a user turn that produced an in-band error instead of an
+    /// assistant reply. Keep its pending confirmation: the Server stored the
+    /// user event before calling the provider, but the error carries no event
+    /// sequence, so only a later replay can authoritatively confirm it.
+    pub fn finish_error(&mut self) {
+        if self.terminal_outcome_seen {
+            return;
+        }
+        self.terminal_outcome_seen = true;
+        if self.failed_user_confirmations < self.pending_user_confirmations.len() {
+            self.failed_user_confirmations += 1;
+        }
+        self.turn_in_flight =
+            self.pending_user_confirmations.len() > self.failed_user_confirmations;
+    }
+
+    /// Clear transport-scoped terminal bookkeeping before reconnecting. Failed
+    /// confirmations stay queued for replay de-duplication, but their Error
+    /// must not consume the first terminal frame from the replacement link.
+    pub fn prepare_for_reconnect(&mut self) {
         self.turn_in_flight = false;
+        self.terminal_outcome_seen = false;
+        self.resume_in_flight = false;
+    }
+
+    /// Mark a successfully submitted Resume. Its Done only closes replay; it
+    /// must never retire a user confirmation submitted on the new transport.
+    pub fn begin_resume(&mut self) {
+        self.resume_in_flight = true;
+    }
+
+    /// Consume the wire-level turn terminator. Usually an authoritative
+    /// Assistant/Error already updated state; when the only reply had `seq = 0`
+    /// (for example an access denial), `Done` is what makes it terminal.
+    pub fn finish_done(&mut self) {
+        if self.resume_in_flight {
+            self.resume_in_flight = false;
+            self.terminal_outcome_seen = false;
+            self.turn_in_flight =
+                self.pending_user_confirmations.len() > self.failed_user_confirmations;
+            return;
+        }
+        if self.terminal_outcome_seen {
+            self.terminal_outcome_seen = false;
+            return;
+        }
+        while self.failed_user_confirmations > 0 {
+            self.pending_user_confirmations.pop_front();
+            self.failed_user_confirmations -= 1;
+        }
+        // The current seq-zero terminal response did not carry an event
+        // sequence, so Done is the only authoritative retirement signal.
+        self.pending_user_confirmations.pop_front();
+        self.turn_in_flight =
+            self.pending_user_confirmations.len() > self.failed_user_confirmations;
     }
 
     /// Stage one attachment for the next send. The outer loop calls this after
@@ -367,7 +517,16 @@ impl App {
     /// this point the composer, attachments, transcript, and turn state stay
     /// untouched so a failed write cannot destroy unsent work.
     pub fn commit_send(&mut self) {
+        self.commit_send_with_id(uuid::Uuid::new_v4().to_string());
+    }
+
+    pub fn commit_send_with_id(&mut self, message_id: String) {
         let text = take_input(&mut self.input);
+        self.pending_user_confirmations
+            .push_back(PendingUserConfirmation {
+                message_id,
+                text: text.clone(),
+            });
         let attachments = std::mem::take(&mut self.pending_attachments);
         let display = if attachments.is_empty() {
             text
@@ -794,6 +953,13 @@ mod tests {
     }
 
     #[test]
+    fn question_mark_is_plain_composer_text() {
+        let mut app = App::new("ready");
+        assert_eq!(on_key(&mut app, key(KeyCode::Char('?'))), Action::None);
+        assert_eq!(app.input.text(), "?");
+    }
+
+    #[test]
     fn ctrl_v_routes_to_paste_action() {
         let mut app = App::new("ready");
         assert_eq!(on_key(&mut app, ctrl('v')), Action::PasteFromClipboard);
@@ -1170,12 +1336,318 @@ mod tests {
         assert!(!app.apply_replay("c1", 3, "assistant", "old"));
         assert_eq!(app.messages.len(), before, "duplicate not inserted");
         // A replay beyond the last seq is applied and advances the seq.
-        assert!(app.apply_replay("c1", 6, "you", "new line"));
+        assert!(app.apply_replay("c1", 6, "user", "new line"));
         assert_eq!(app.messages.len(), before + 1);
+        assert_eq!(
+            app.messages.last().map(|(role, _)| role.as_str()),
+            Some("you")
+        );
         assert_eq!(app.last_seq, 6);
         // Replaying that same seq again is now a duplicate.
-        assert!(!app.apply_replay("c1", 6, "you", "new line"));
+        assert!(!app.apply_replay("c1", 6, "user", "new line"));
         assert_eq!(app.messages.len(), before + 1);
+    }
+
+    #[test]
+    fn replayed_user_event_reconciles_the_locally_committed_send() {
+        let mut app = App::new("ready");
+        app.note_seq("c1", 5);
+        prefill(&mut app.input, "same message");
+        app.commit_send();
+        let before = app.messages.len();
+
+        assert!(app.apply_replay("c1", 6, "user", "same message"));
+        assert_eq!(
+            app.messages.len(),
+            before,
+            "the authoritative replay must confirm, not duplicate, the local send"
+        );
+        assert_eq!(app.last_seq, 6);
+        assert!(
+            app.turn_in_flight,
+            "the user replay does not finish the turn"
+        );
+
+        assert!(app.apply_replay("c1", 7, "assistant", "the answer"));
+        assert_eq!(
+            app.messages.last(),
+            Some(&("fleety".to_string(), "the answer".to_string()))
+        );
+        assert!(
+            !app.turn_in_flight,
+            "a replayed assistant reply finishes the turn"
+        );
+    }
+
+    #[test]
+    fn replay_reconciles_multiple_locally_committed_interjections_in_order() {
+        let mut app = App::new("ready");
+        prefill(&mut app.input, "first message");
+        app.commit_send();
+        prefill(&mut app.input, "second message");
+        app.commit_send();
+        let local_messages = app.messages.len();
+
+        assert!(app.apply_replay("c1", 1, "user", "first message"));
+        assert!(app.apply_replay("c1", 2, "assistant", "first answer"));
+        assert!(app.apply_replay("c1", 3, "user", "second message"));
+
+        assert_eq!(
+            app.messages.len(),
+            local_messages + 1,
+            "both local user messages are confirmed without duplicate transcript lines"
+        );
+        assert_eq!(
+            app.messages.last(),
+            Some(&("fleety".to_string(), "first answer".to_string()))
+        );
+    }
+
+    #[test]
+    fn failed_turn_keeps_its_user_confirmation_until_replay() {
+        let mut app = App::new("ready");
+        prefill(&mut app.input, "stored before provider failure");
+        app.commit_send();
+        app.finish_error();
+        let local_messages = app.messages.len();
+
+        assert!(app.apply_replay("c1", 1, "user", "stored before provider failure"));
+        assert_eq!(
+            app.messages.len(),
+            local_messages,
+            "a later reconnect confirms the failed turn without duplicating it"
+        );
+    }
+
+    #[test]
+    fn successful_queued_turn_retires_the_failed_and_successful_confirmations() {
+        let mut app = App::new("ready");
+        prefill(&mut app.input, "first message");
+        app.commit_send();
+        prefill(&mut app.input, "queued message");
+        app.commit_send();
+
+        app.finish_error();
+        app.finish_assistant("queued answer".to_string());
+
+        assert!(
+            app.pending_user_confirmations.is_empty(),
+            "the later authoritative assistant reply covers the failed prefix and queued turn"
+        );
+    }
+
+    #[test]
+    fn duplicate_error_frame_does_not_fail_the_next_confirmation() {
+        let mut app = App::new("ready");
+        prefill(&mut app.input, "active message");
+        app.commit_send();
+        prefill(&mut app.input, "queued message");
+        app.commit_send();
+
+        app.finish_error();
+        app.finish_error();
+
+        assert_eq!(app.failed_user_confirmations, 1);
+        assert!(app.turn_in_flight);
+    }
+
+    #[test]
+    fn interjection_notice_keeps_replay_confirmation_and_turn_active() {
+        let mut app = App::new("ready");
+        prefill(&mut app.input, "active message");
+        app.commit_send();
+        prefill(&mut app.input, "queued interjection");
+        app.commit_send();
+
+        app.push_assistant_notice("got it — right after this".to_string());
+
+        assert_eq!(app.pending_user_confirmations.len(), 2);
+        assert!(app.turn_in_flight);
+        let displayed = app.messages.len();
+        assert!(app.apply_replay("c1", 1, "user", "active message"));
+        assert_eq!(
+            app.messages.len(),
+            displayed,
+            "a reconnect after the acknowledgement must not duplicate the active message"
+        );
+    }
+
+    #[test]
+    fn queued_interjection_ack_keeps_both_confirmations_active() {
+        let mut app = App::new("ready");
+        prefill(&mut app.input, "active message");
+        app.commit_send();
+        prefill(&mut app.input, "queued interjection");
+        app.commit_send();
+
+        app.acknowledge_interjection(
+            "unknown-but-accepted",
+            InterjectionDisposition::Queued,
+            "got it — right after this".to_string(),
+        );
+
+        assert_eq!(app.pending_user_confirmations.len(), 2);
+        assert!(app.turn_in_flight);
+    }
+
+    #[test]
+    fn ignored_interjection_ack_retires_only_the_ignored_confirmation() {
+        let mut app = App::new("ready");
+        prefill(&mut app.input, "active message");
+        app.commit_send();
+        prefill(&mut app.input, "ignore this interjection");
+        app.commit_send_with_id("ignored".to_string());
+
+        app.acknowledge_interjection(
+            "ignored",
+            InterjectionDisposition::Ignored,
+            "noted — this message won't start another turn".to_string(),
+        );
+
+        assert_eq!(
+            app.pending_user_confirmations
+                .iter()
+                .map(|confirmation| confirmation.text.as_str())
+                .collect::<Vec<_>>(),
+            ["active message"]
+        );
+        assert!(app.turn_in_flight);
+    }
+
+    #[test]
+    fn rejected_interjection_ack_retires_only_the_rejected_confirmation() {
+        let mut app = App::new("ready");
+        prefill(&mut app.input, "active message");
+        app.commit_send();
+        prefill(&mut app.input, "overflow message");
+        app.commit_send_with_id("rejected".to_string());
+
+        app.acknowledge_interjection(
+            "rejected",
+            InterjectionDisposition::Rejected,
+            "the interjection queue is full".to_string(),
+        );
+
+        assert_eq!(
+            app.pending_user_confirmations
+                .iter()
+                .map(|confirmation| confirmation.text.as_str())
+                .collect::<Vec<_>>(),
+            ["active message"]
+        );
+        assert!(app.turn_in_flight);
+    }
+
+    #[test]
+    fn interjection_ack_retires_the_matching_confirmation_not_the_newest() {
+        let mut app = App::new("ready");
+        prefill(&mut app.input, "active message");
+        app.commit_send_with_id("active".to_string());
+        prefill(&mut app.input, "first interjection");
+        app.commit_send_with_id("first".to_string());
+        prefill(&mut app.input, "second interjection");
+        app.commit_send_with_id("second".to_string());
+
+        app.acknowledge_interjection(
+            "first",
+            InterjectionDisposition::Ignored,
+            "noted — this message won't start another turn".to_string(),
+        );
+
+        let pending: Vec<&str> = app
+            .pending_user_confirmations
+            .iter()
+            .map(|confirmation| confirmation.text.as_str())
+            .collect();
+        assert_eq!(pending, ["active message", "second interjection"]);
+        assert!(app.turn_in_flight);
+    }
+
+    #[test]
+    fn done_makes_a_seq_zero_terminal_reply_finish_the_turn() {
+        let mut app = App::new("ready");
+        prefill(&mut app.input, "forbidden conversation");
+        app.commit_send();
+
+        app.push_assistant_notice("That conversation isn't available to you.".to_string());
+        app.finish_done();
+
+        assert!(!app.turn_in_flight);
+        assert!(app.pending_user_confirmations.is_empty());
+    }
+
+    #[test]
+    fn reconnect_clears_prior_error_before_a_seq_zero_terminal_turn() {
+        let mut app = App::new("ready");
+        prefill(&mut app.input, "failed before cleanup");
+        app.commit_send();
+        app.finish_error();
+
+        app.prepare_for_reconnect();
+        prefill(&mut app.input, "blocked after reconnect");
+        app.commit_send();
+        app.push_assistant_notice("That request is not available.".to_string());
+        app.finish_done();
+
+        assert!(!app.turn_in_flight);
+        assert!(app.pending_user_confirmations.is_empty());
+        assert_eq!(app.failed_user_confirmations, 0);
+    }
+
+    #[test]
+    fn resume_done_does_not_retire_a_fast_post_reconnect_send() {
+        let mut app = App::new("ready");
+        prefill(&mut app.input, "active when transport dropped");
+        app.commit_send();
+        app.prepare_for_reconnect();
+        app.begin_resume();
+
+        prefill(&mut app.input, "sent before resume done");
+        app.commit_send();
+        assert!(app.apply_replay("c1", 1, "user", "active when transport dropped"));
+        assert!(app.apply_replay("c1", 2, "assistant", "recovered prior turn"));
+        app.finish_done();
+
+        assert!(app.turn_in_flight);
+        assert_eq!(app.pending_user_confirmations.len(), 1);
+        assert_eq!(app.failed_user_confirmations, 0);
+
+        app.finish_assistant("new turn answer".to_string());
+        app.finish_done();
+        assert!(!app.turn_in_flight);
+        assert!(app.pending_user_confirmations.is_empty());
+    }
+
+    #[test]
+    fn queued_confirmation_stays_in_flight_between_turn_done_frames() {
+        let mut app = App::new("ready");
+        prefill(&mut app.input, "active message");
+        app.commit_send();
+        prefill(&mut app.input, "queued interjection");
+        app.commit_send();
+
+        app.finish_assistant("first answer".to_string());
+        app.finish_done();
+        assert!(app.turn_in_flight);
+        assert_eq!(app.pending_user_confirmations.len(), 1);
+
+        app.finish_assistant("queued answer".to_string());
+        app.finish_done();
+        assert!(!app.turn_in_flight);
+        assert!(app.pending_user_confirmations.is_empty());
+    }
+
+    #[test]
+    fn a_different_replayed_user_event_is_preserved() {
+        let mut app = App::new("ready");
+        prefill(&mut app.input, "local message");
+        app.commit_send();
+
+        assert!(app.apply_replay("c1", 1, "user", "message from elsewhere"));
+        assert_eq!(
+            app.messages.last(),
+            Some(&("you".to_string(), "message from elsewhere".to_string()))
+        );
     }
 
     #[test]

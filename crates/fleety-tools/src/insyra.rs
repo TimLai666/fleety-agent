@@ -44,14 +44,14 @@ struct InsyraExec {
     seq: Arc<AtomicU64>,
 }
 
-/// Resolve the sidecar binary: env override, then beside the current exe, then
-/// the bare name for a `PATH` lookup at spawn time.
+/// Resolve the sidecar binary: an authoritative env override, otherwise beside
+/// the current exe, then the bare name for a `PATH` lookup at spawn time.
 fn locate_binary() -> PathBuf {
-    if let Ok(p) = std::env::var("FLEETY_INSYRA_BIN") {
-        let pb = PathBuf::from(p);
-        if pb.is_file() {
-            return pb;
-        }
+    if let Some(path) = std::env::var_os("FLEETY_INSYRA_BIN") {
+        // An explicit override is authoritative. Silently falling through when
+        // it is stale makes the same configuration succeed or fail depending
+        // on whether another sidecar happens to be beside this executable.
+        return PathBuf::from(path);
     }
     let names: &[&str] = if cfg!(windows) {
         &["fleety-insyra.exe"]

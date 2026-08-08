@@ -3,7 +3,7 @@
 //!
 //! The CLI already sends `OriginContext { hostname, os, cwd }`. A conversation
 //! binds once (from its first message) to a [`WorkspaceBinding`]: when the
-//! originating device is the same host as the server, tools are rooted at the
+//! originating connection is verified as same-host, tools are rooted at the
 //! CLI's `cwd` locally (the "coding agent in my project dir" case); otherwise it
 //! falls back to the server workspace and records the originating device (remote
 //! tool routing is a follow-up). Resolution is pure and unit-tested.
@@ -45,11 +45,11 @@ pub struct WorkspaceBinding {
 
 /// Resolve a conversation's workspace binding (pure). `cwd`/`origin_hostname`/
 /// `origin_os` come from the originating CLI's `OriginContext`; `conn_device` is
-/// the device that opened the connection; `server_hostname` identifies the
-/// server's own host; `fallback_root` is the server's default workspace. The
-/// origin fields are retained on the binding so each turn can re-inject the
-/// origin context (see the "Runtime injects origin context into each turn"
-/// requirement).
+/// the device that opened the connection; `same_host` is true only when the
+/// transport proves the client is local; `fallback_root` is the server's
+/// default workspace. The origin fields are retained on the binding so each
+/// turn can re-inject the origin context (see the "Runtime injects origin
+/// context into each turn" requirement).
 ///
 /// - absolute `cwd` on the **same host** as the server → root = `cwd`, local.
 /// - absolute `cwd` on a **different** device → fall back to the server root,
@@ -61,7 +61,7 @@ pub fn resolve_binding(
     origin_hostname: Option<&str>,
     origin_os: Option<&str>,
     conn_device: &str,
-    server_hostname: &str,
+    same_host: bool,
     fallback_root: &Path,
 ) -> WorkspaceBinding {
     let usable_cwd = cwd
@@ -70,7 +70,7 @@ pub fn resolve_binding(
     let host = origin_hostname.map(str::to_string);
     let os = origin_os.map(str::to_string);
     match usable_cwd {
-        Some(c) if origin_hostname == Some(server_hostname) => WorkspaceBinding {
+        Some(c) if same_host => WorkspaceBinding {
             root: PathBuf::from(c),
             device: None,
             origin_cwd: Some(c.to_string()),
@@ -137,7 +137,7 @@ mod tests {
             Some("alice-box"),
             None,
             "dev1",
-            "alice-box",
+            true,
             &fb(),
         );
         assert_eq!(b.root, PathBuf::from("/home/alice/proj"));
@@ -151,7 +151,7 @@ mod tests {
             Some("bob-laptop"),
             None,
             "dev2",
-            "alice-box",
+            false,
             &fb(),
         );
         assert_eq!(b.root, fb());
@@ -165,7 +165,7 @@ mod tests {
             Some("win-box"),
             None,
             "dev1",
-            "win-box",
+            true,
             &fb(),
         );
         assert_eq!(b.root, PathBuf::from("C:\\Users\\alice\\proj"));
@@ -175,7 +175,7 @@ mod tests {
     #[test]
     fn no_or_relative_cwd_uses_fallback_locally() {
         assert_eq!(
-            resolve_binding(None, Some("alice-box"), None, "dev1", "alice-box", &fb()),
+            resolve_binding(None, Some("alice-box"), None, "dev1", true, &fb()),
             WorkspaceBinding {
                 root: fb(),
                 device: None,
@@ -190,7 +190,7 @@ mod tests {
                 Some("alice-box"),
                 None,
                 "dev1",
-                "alice-box",
+                true,
                 &fb()
             ),
             WorkspaceBinding {
@@ -202,14 +202,7 @@ mod tests {
             }
         );
         assert_eq!(
-            resolve_binding(
-                Some("   "),
-                Some("alice-box"),
-                None,
-                "dev1",
-                "alice-box",
-                &fb()
-            ),
+            resolve_binding(Some("   "), Some("alice-box"), None, "dev1", true, &fb()),
             WorkspaceBinding {
                 root: fb(),
                 device: None,
@@ -254,7 +247,7 @@ mod tests {
             Some("alice-box"),
             Some("linux"),
             "dev1",
-            "alice-box",
+            true,
             &fb(),
         );
         assert_eq!(b.origin_cwd.as_deref(), Some("/home/alice/proj"));
@@ -266,7 +259,7 @@ mod tests {
             Some("bob-laptop"),
             Some("macos"),
             "dev2",
-            "alice-box",
+            false,
             &fb(),
         );
         assert_eq!(c.origin_cwd.as_deref(), Some("/home/bob/proj"));
@@ -330,7 +323,7 @@ mod tests {
             Some("bob-laptop"),
             Some("macos"),
             "dev2",
-            "alice-box",
+            false,
             &fallback,
         );
         assert_eq!(
@@ -342,5 +335,20 @@ mod tests {
             Some("dev2"),
             "the origin device is recorded for device_exec, not auto-routed"
         );
+    }
+
+    #[test]
+    fn matching_hostname_does_not_override_cross_device_transport_identity() {
+        let b = resolve_binding(
+            Some("/Users/alice/project"),
+            Some("shared-hostname"),
+            Some("macos"),
+            "remote-device",
+            false,
+            &fb(),
+        );
+
+        assert_eq!(b.root, fb());
+        assert_eq!(b.device.as_deref(), Some("remote-device"));
     }
 }

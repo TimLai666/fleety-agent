@@ -55,6 +55,11 @@ The runtime SHALL read `FLEETY_INSYRA_BIN` for the path to the `fleety-insyra` G
 - **WHEN** `FLEETY_INSYRA_BIN` is unset
 - **THEN** the `insyra_exec` tool spawns the `fleety-insyra` binary located beside the running executable
 
+#### Scenario: an explicit sidecar path is authoritative
+
+- **WHEN** `FLEETY_INSYRA_BIN` is set to a path that cannot be started
+- **THEN** the `insyra_exec` tool reports that path with actionable remediation and SHALL NOT silently fall back to another binary beside the executable or on `PATH`
+
 #### Scenario: install falls back when /usr/local/bin is not truly writable
 
 - **WHEN** the install script runs without `FLEETY_INSTALL_DIR` and `/usr/local/bin` cannot actually be written (it is root-owned or absent)

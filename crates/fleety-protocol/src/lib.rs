@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Bumped when the wire format changes incompatibly.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// The structured-config protocol version the server advertises in `Welcome`
 /// (`0` = only the legacy `ConfigExec`). A client compares this to decide
@@ -191,6 +191,10 @@ pub enum ClientMsg {
     /// `None` starts a new one. `attachments` carries multimodal media handed
     /// straight to the model (images, audio, etc.) — see [`WireAttachment`].
     UserMessage {
+        /// Client-generated id used to correlate mid-turn acknowledgements and
+        /// later rejection of queued work. Required in protocol v2; payloads
+        /// without it fail deserialization.
+        message_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         conversation_id: Option<String>,
         text: String,
@@ -426,6 +430,15 @@ pub enum ServerMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attention: Option<AttentionHint>,
     },
+    /// Immediate acknowledgement for a message submitted while another turn is
+    /// active. This is deliberately distinct from `Assistant`: it does not end
+    /// the active turn or carry a persisted conversation sequence.
+    InterjectionAcknowledged {
+        conversation_id: String,
+        message_id: String,
+        disposition: InterjectionDisposition,
+        message: String,
+    },
     /// A replayed past event (sent in response to `Resume`).
     Replay {
         conversation_id: String,
@@ -556,6 +569,15 @@ pub enum ServerMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<WireError>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InterjectionDisposition {
+    Interrupting,
+    Queued,
+    Ignored,
+    Rejected,
 }
 
 #[cfg(test)]
@@ -1019,6 +1041,22 @@ mod tests {
     }
 
     #[test]
+    fn interjection_acknowledgement_roundtrips_with_disposition() {
+        let acknowledgement = ServerMsg::InterjectionAcknowledged {
+            conversation_id: "c1".to_string(),
+            message_id: "m1".to_string(),
+            disposition: InterjectionDisposition::Ignored,
+            message: "noted".to_string(),
+        };
+        let json = serde_json::to_string(&acknowledgement).expect("serialize");
+        assert!(json.contains(r#""disposition":"ignored""#));
+        assert_eq!(
+            serde_json::from_str::<ServerMsg>(&json).expect("deserialize"),
+            acknowledgement
+        );
+    }
+
+    #[test]
     fn assistant_delta_roundtrips() {
         let msg = ServerMsg::AssistantDelta {
             conversation_id: "c1".into(),
@@ -1182,12 +1220,13 @@ mod tests {
         assert_eq!(reply, serde_json::from_str(&json).expect("de"));
 
         // Additive: the new variant doesn't disturb an existing frame's shape.
-        assert_eq!(PROTOCOL_VERSION, 1);
+        assert_eq!(PROTOCOL_VERSION, 2);
     }
 
     #[test]
     fn user_message_voice_roundtrips() {
         let msg = ClientMsg::UserMessage {
+            message_id: "m1".into(),
             conversation_id: None,
             text: "hi".into(),
             origin: Default::default(),
@@ -1199,6 +1238,7 @@ mod tests {
         assert_eq!(msg, serde_json::from_str(&json).expect("deserialize"));
 
         let no_voice = ClientMsg::UserMessage {
+            message_id: "m2".into(),
             conversation_id: None,
             text: "hi".into(),
             origin: Default::default(),
@@ -1220,13 +1260,14 @@ mod tests {
         assert_eq!(msg, serde_json::from_str(&json).expect("deserialize"));
         // Additive: an older stream without this variant still parses other
         // ServerMsg variants, and the version is unchanged.
-        assert_eq!(PROTOCOL_VERSION, 1);
+        assert_eq!(PROTOCOL_VERSION, 2);
     }
 
     #[test]
-    fn user_message_acting_user_roundtrips_and_is_backward_compatible() {
+    fn user_message_acting_user_roundtrips_and_defaults_when_absent() {
         // With an asserted acting user → round-trips.
         let asserted = ClientMsg::UserMessage {
+            message_id: "m1".into(),
             conversation_id: None,
             text: "hi".into(),
             origin: Default::default(),
@@ -1238,9 +1279,10 @@ mod tests {
         assert!(json.contains("acting_user"));
         assert_eq!(asserted, serde_json::from_str(&json).expect("deserialize"));
 
-        // When absent, the field is omitted from the wire (skip_serializing_if),
-        // so the on-wire shape matches an older client; it parses back to None.
+        // When absent, the field is omitted from the wire and parses back to
+        // None without affecting protocol-v2 message-id correlation.
         let absent = ClientMsg::UserMessage {
+            message_id: "m2".into(),
             conversation_id: None,
             text: "hi".into(),
             origin: Default::default(),
@@ -1254,8 +1296,8 @@ mod tests {
             ClientMsg::UserMessage { acting_user, .. } => assert_eq!(acting_user, None),
             _ => panic!("expected UserMessage"),
         }
-        // Protocol version unchanged (additive field).
-        assert_eq!(PROTOCOL_VERSION, 1);
+        // `acting_user` remains additive within protocol v2.
+        assert_eq!(PROTOCOL_VERSION, 2);
     }
 
     #[test]
@@ -1283,12 +1325,18 @@ mod tests {
 
     #[test]
     fn user_message_without_voice_field_defaults_false() {
-        let json = r#"{"type":"user_message","text":"hi"}"#;
+        let json = r#"{"type":"user_message","message_id":"m1","text":"hi"}"#;
         let msg: ClientMsg = serde_json::from_str(json).expect("deserialize");
         match msg {
             ClientMsg::UserMessage { voice, .. } => assert!(!voice),
             other => panic!("expected UserMessage, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn user_message_requires_a_correlation_id_in_protocol_v2() {
+        let json = r#"{"type":"user_message","text":"hi"}"#;
+        assert!(serde_json::from_str::<ClientMsg>(json).is_err());
     }
 
     #[test]

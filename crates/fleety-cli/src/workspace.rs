@@ -733,7 +733,7 @@ pub fn on_key(state: &mut WorkspaceState, key: KeyEvent, context: KeyContext) ->
         }
         return KeyOutcome::ExitRequested;
     }
-    if key.code == KeyCode::Char('?') && !context.text_input_focused {
+    if key.code == KeyCode::F(1) {
         return KeyOutcome::Consumed(state.reduce(Action::OpenHelp));
     }
     if key.modifiers.contains(KeyModifiers::ALT)
@@ -883,7 +883,7 @@ pub fn render(
     if frame.area().width < MIN_WIDTH || frame.area().height < MIN_HEIGHT {
         frame.render_widget(
             Paragraph::new(format!(
-                "Terminal too small\n{}x{}; need {MIN_WIDTH}x{MIN_HEIGHT}\n? help · Esc/Ctrl+C exit",
+                "Terminal too small\n{}x{}; need {MIN_WIDTH}x{MIN_HEIGHT}\nF1 help · Esc/Ctrl+C exit",
                 frame.area().width,
                 frame.area().height
             )),
@@ -1106,7 +1106,7 @@ fn footer_line(state: &WorkspaceState) -> Line<'static> {
         " · Alt+R retry · Alt+D dismiss"
     };
     Line::from(format!(
-        "{route_keys} · ?: help · Ctrl+K: commands{notice_keys}"
+        "{route_keys} · F1: help · Ctrl+K: commands{notice_keys}"
     ))
 }
 
@@ -1674,7 +1674,7 @@ mod tests {
             "Chat",
             "Enter",
             "Esc",
-            "?",
+            "F1",
             "Ctrl+K",
             "Alt+R",
             "Alt+D",
@@ -1811,7 +1811,7 @@ mod tests {
                     "{width}x{height}: {content}"
                 );
                 assert!(content.contains("50x16"), "{width}x{height}: {content}");
-                assert!(content.contains('?'), "{width}x{height}: {content}");
+                assert!(content.contains("F1"), "{width}x{height}: {content}");
                 assert!(content.contains("Esc"), "{width}x{height}: {content}");
             }
             assert!(!content.contains('�'), "{width}x{height}: {content}");
@@ -1825,6 +1825,16 @@ mod tests {
             on_key(
                 &mut state,
                 KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+                KeyContext::default(),
+            ),
+            KeyOutcome::Forward,
+            "a printable question mark belongs to the chat composer"
+        );
+        assert_eq!(state.route, Route::Chat);
+        assert_eq!(
+            on_key(
+                &mut state,
+                KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE),
                 KeyContext::default(),
             ),
             KeyOutcome::Consumed(vec![])
