@@ -189,5 +189,5 @@ This list is generated from `insyra help` in this repository state.
 - `accel cache` — show session-local resident buffers.
 - `accel plan` — planning report only; runs nothing.
 - The GPU backend is builtin, so nothing extra needs installing. `INSYRA_ACCEL_DISABLE_WGPU=1` turns it off.
-- There is no `accel run`. It was removed along with the operations it invoked, once each was measured to be slower than the CPU using all its cores. These commands inspect the runtime; none of them executes anything.
+- The v0.3.1 upstream help text still lists `accel run`, but that action is not implemented and returns `unknown accel action`; use `devices`, `cache`, or `plan` instead. These commands inspect the runtime; none of them executes anything.
 - `config accel.mode <auto|cpu|gpu|strict-gpu>`, `show accel.devices`, `show accel.cache`.
