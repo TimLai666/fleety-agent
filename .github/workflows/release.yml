@@ -373,7 +373,11 @@ jobs:
             cd "$riscv_tmp"
             go mod edit -require=github.com/HazelnutParadise/insyra@v0.3.0
             go mod tidy
-            go test ./...
+            # The wrapper's latest-version tests include the accel command that
+            # was introduced after this compatibility release. Keep a
+            # version-independent normalization check, then compile the
+            # fallback binary.
+            go test ./... -run '^TestNormalizeInsyraTextRemovesStaleAccelRunFromHelp$'
             GOOS=linux GOARCH=riscv64 go build -trimpath -ldflags "-s -w" -o "$GITHUB_WORKSPACE/fleety-insyra-riscv64gc-unknown-linux-gnu" .
           )
       - name: Attach to release

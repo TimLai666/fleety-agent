@@ -45,7 +45,7 @@ dependencies = [
 
 [[package]]
 name = "agent-core"
-version = "0.1.30"
+version = "0.1.31"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -68,7 +68,7 @@ dependencies = [
 
 [[package]]
 name = "agent-workflow"
-version = "0.1.30"
+version = "0.1.31"
 dependencies = [
  "agent-core",
  "async-trait",
@@ -1948,7 +1948,7 @@ dependencies = [
 
 [[package]]
 name = "fleety-cli"
-version = "0.1.30"
+version = "0.1.31"
 dependencies = [
  "agent-core",
  "anstyle",
@@ -1980,7 +1980,7 @@ dependencies = [
 
 [[package]]
 name = "fleety-daemon"
-version = "0.1.30"
+version = "0.1.31"
 dependencies = [
  "agent-core",
  "clap",
@@ -2000,7 +2000,7 @@ dependencies = [
 
 [[package]]
 name = "fleety-eval"
-version = "0.1.30"
+version = "0.1.31"
 dependencies = [
  "agent-core",
  "async-trait",
@@ -2015,7 +2015,7 @@ dependencies = [
 
 [[package]]
 name = "fleety-inline"
-version = "0.1.30"
+version = "0.1.31"
 dependencies = [
  "anstyle-parse",
  "crossterm",
@@ -2025,7 +2025,7 @@ dependencies = [
 
 [[package]]
 name = "fleety-markdown"
-version = "0.1.30"
+version = "0.1.31"
 dependencies = [
  "anstyle",
  "anstyle-lossy",
@@ -2046,14 +2046,14 @@ dependencies = [
 
 [[package]]
 name = "fleety-markdown-core"
-version = "0.1.30"
+version = "0.1.31"
 dependencies = [
  "pulldown-cmark",
 ]
 
 [[package]]
 name = "fleety-protocol"
-version = "0.1.30"
+version = "0.1.31"
 dependencies = [
  "serde",
  "serde_json",
@@ -2061,7 +2061,7 @@ dependencies = [
 
 [[package]]
 name = "fleety-server"
-version = "0.1.30"
+version = "0.1.31"
 dependencies = [
  "agent-core",
  "agent-workflow",
@@ -2100,7 +2100,7 @@ dependencies = [
 
 [[package]]
 name = "fleety-textarea"
-version = "0.1.30"
+version = "0.1.31"
 dependencies = [
  "arboard",
  "chrono",
@@ -2121,7 +2121,7 @@ dependencies = [
 
 [[package]]
 name = "fleety-tools"
-version = "0.1.30"
+version = "0.1.31"
 dependencies = [
  "agent-core",
  "async-trait",
@@ -2157,7 +2157,7 @@ dependencies = [
 
 [[package]]
 name = "fleety-vec"
-version = "0.1.30"
+version = "0.1.31"
 dependencies = [
  "rusqlite",
  "sqlite-vec",
