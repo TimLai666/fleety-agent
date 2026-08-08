@@ -465,6 +465,7 @@ mod tests {
     use crate::storage::Storage;
     use fleety_protocol::{ClientMsg, ServerMsg, PROTOCOL_VERSION};
     use futures::SinkExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::time::timeout;
 
@@ -487,6 +488,23 @@ mod tests {
     fn test_state(home: &std::path::Path) -> AppState {
         let auth = Arc::new(AuthStore::load(home.join("auth.json"), None, false));
         state_with(home, auth)
+    }
+
+    #[test]
+    fn provider_factory_resolves_a_fresh_provider_for_each_connection() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let factory: ProviderFactory = {
+            let calls = Arc::clone(&calls);
+            Arc::new(move || {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Arc::new(EchoProvider) as Arc<dyn ModelProvider>
+            })
+        };
+
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        let _first = factory();
+        let _second = factory();
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 
     /// Serve `state` on a fresh port; returns the `http://addr` base.
