@@ -298,6 +298,12 @@ pub const CODEX_AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
 pub const CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 pub const CODEX_BACKEND_URL: &str = "https://chatgpt.com/backend-api/codex";
 
+/// Codex model-catalog compatibility version. This is intentionally separate
+/// from Fleety's package version: the backend uses it to filter models by the
+/// Codex client capabilities they require. Keep it aligned with the Codex
+/// release used to verify the catalog contract.
+const CODEX_CATALOG_CLIENT_VERSION: &str = "0.147.0";
+
 /// The fixed OAuth configuration. No env/config override — these are constants.
 pub fn oauth_config() -> OAuthConfig {
     OAuthConfig {
@@ -321,8 +327,9 @@ pub fn parse_codex_model_ids(body: &Value) -> Vec<String> {
     for model in models {
         let value = model
             .get("slug")
-            .or_else(|| model.get("id"))
             .and_then(Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+            .or_else(|| model.get("id").and_then(Value::as_str))
             .or_else(|| model.as_str());
         let Some(id) = value.map(str::trim).filter(|id| !id.is_empty()) else {
             continue;
@@ -357,13 +364,13 @@ async fn fetch_codex_models_at(
     let endpoint = format!("{}/models", backend_base_url.trim_end_matches('/'));
     let mut request = client
         .get(&endpoint)
-        .query(&[("client_version", agent_core::VERSION)])
+        .query(&[("client_version", CODEX_CATALOG_CLIENT_VERSION)])
         .bearer_auth(&creds.bearer)
         .header("originator", backend_originator())
-        .header("version", agent_core::VERSION)
+        .header("version", CODEX_CATALOG_CLIENT_VERSION)
         .header(
             "User-Agent",
-            format!("codex_cli_rs/{}", agent_core::VERSION),
+            format!("codex_cli_rs/{CODEX_CATALOG_CLIENT_VERSION}"),
         );
     if let Some(account_id) = &creds.account_id {
         request = request.header("chatgpt-account-id", account_id);
@@ -397,10 +404,25 @@ async fn fetch_codex_models_at(
         .json()
         .await
         .map_err(|e| CoreError::Provider(format!("Codex model catalog returned non-JSON: {e}")))?;
+    let Some(models) = body.get("models") else {
+        return Err(CoreError::Provider(
+            "Codex model catalog response is missing or non-array models".into(),
+        ));
+    };
+    let Some(models) = models.as_array() else {
+        return Err(CoreError::Provider(
+            "Codex model catalog response is missing or non-array models".into(),
+        ));
+    };
+    if models.is_empty() {
+        return Err(CoreError::Provider(
+            "Codex model catalog returned an empty model catalog".into(),
+        ));
+    }
     let ids = parse_codex_model_ids(&body);
     if ids.is_empty() {
         return Err(CoreError::Provider(
-            "Codex model catalog returned no model IDs".into(),
+            "Codex model catalog entries contained no usable model IDs".into(),
         ));
     }
     Ok(ids)
@@ -763,6 +785,75 @@ mod tests {
         assert!(parse_codex_model_ids(&json!({"models": [{"slug": "  "}]})).is_empty());
     }
 
+    #[tokio::test]
+    async fn codex_catalog_missing_models_reports_structural_error() {
+        let (base, _rx) = serve_once_json("200 OK", r#"{}"#.to_string());
+        let creds = agent_core::CodexCreds {
+            bearer: "catalog-bearer-secret".into(),
+            account_id: Some("catalog-account-secret".into()),
+        };
+        let error = fetch_codex_models_at(&reqwest::Client::new(), &base, &creds)
+            .await
+            .expect_err("missing models should be diagnosed");
+        let message = error.report().message;
+        assert!(message.contains("missing or non-array models"), "{message}");
+        assert!(!message.contains(&creds.bearer), "{message}");
+        assert!(
+            !message.contains(creds.account_id.as_deref().unwrap()),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_catalog_non_array_models_reports_structural_error() {
+        let (base, _rx) = serve_once_json("200 OK", r#"{"models": {}}"#.to_string());
+        let creds = agent_core::CodexCreds {
+            bearer: "catalog-bearer-secret".into(),
+            account_id: Some("catalog-account-secret".into()),
+        };
+        let error = fetch_codex_models_at(&reqwest::Client::new(), &base, &creds)
+            .await
+            .expect_err("non-array models should be diagnosed");
+        let message = error.report().message;
+        assert!(message.contains("missing or non-array models"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn codex_catalog_empty_models_reports_empty_catalog_error() {
+        let (base, _rx) = serve_once_json("200 OK", r#"{"models": []}"#.to_string());
+        let creds = agent_core::CodexCreds {
+            bearer: "catalog-bearer-secret".into(),
+            account_id: Some("catalog-account-secret".into()),
+        };
+        let error = fetch_codex_models_at(&reqwest::Client::new(), &base, &creds)
+            .await
+            .expect_err("empty models should be diagnosed");
+        let message = error.report().message;
+        assert!(message.contains("empty model catalog"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn codex_catalog_unusable_entries_reports_safe_diagnostic() {
+        let (base, _rx) = serve_once_json(
+            "200 OK",
+            r#"{"models":[{"slug":"  "},{"id":null}],"message":"Bearer catalog-bearer-secret account catalog-account-secret"}"#.to_string(),
+        );
+        let creds = agent_core::CodexCreds {
+            bearer: "catalog-bearer-secret".into(),
+            account_id: Some("catalog-account-secret".into()),
+        };
+        let error = fetch_codex_models_at(&reqwest::Client::new(), &base, &creds)
+            .await
+            .expect_err("unusable entries should be diagnosed");
+        let message = error.report().message;
+        assert!(message.contains("no usable model IDs"), "{message}");
+        assert!(!message.contains(&creds.bearer), "{message}");
+        assert!(
+            !message.contains(creds.account_id.as_deref().unwrap()),
+            "{message}"
+        );
+    }
+
     #[test]
     fn pkce_matches_rfc7636_test_vector() {
         // RFC 7636 Appendix B.
@@ -1003,8 +1094,14 @@ mod tests {
         assert!(request.contains("authorization: Bearer secret-access-token"));
         assert!(request.contains("chatgpt-account-id: account-1"));
         assert!(request.contains("originator: codex_cli_rs"));
-        assert!(request.contains(&format!("version: {}", agent_core::VERSION)));
-        assert!(request.contains(&format!("user-agent: codex_cli_rs/{}", agent_core::VERSION)));
+        assert!(request.contains(&format!(
+            "GET /models?client_version={CODEX_CATALOG_CLIENT_VERSION}"
+        )));
+        assert_ne!(CODEX_CATALOG_CLIENT_VERSION, agent_core::VERSION);
+        assert!(request.contains(&format!("version: {CODEX_CATALOG_CLIENT_VERSION}")));
+        assert!(request.contains(&format!(
+            "user-agent: codex_cli_rs/{CODEX_CATALOG_CLIENT_VERSION}"
+        )));
         assert!(!request.contains("refresh_token"));
     }
 

@@ -280,8 +280,10 @@ pub fn spawn_auto_upgrade_loop() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
+    #[serial]
     fn seed_writes_ddgs_entry() {
         let dir = std::env::temp_dir().join(format!("fleety-bmcp-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("mk");
@@ -299,6 +301,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn env_overrides_args() {
         std::env::set_var(DDGS_ARGS_ENV, r#"["mcp","-pr","socks5h://127.0.0.1:9150"]"#);
         let args = ddgs_args();

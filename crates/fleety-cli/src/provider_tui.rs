@@ -837,11 +837,11 @@ fn on_key_add_wizard(app: &mut App, code: KeyCode) {
         };
         match wiz.step {
             AddStep::PickType => match code {
-                KeyCode::Up => {
+                KeyCode::Left | KeyCode::Up => {
                     wiz.type_sel = wiz.type_sel.saturating_sub(1);
                     WizAction::Stay
                 }
-                KeyCode::Down => {
+                KeyCode::Right | KeyCode::Down => {
                     let max = pc::provider_types().len().saturating_sub(1);
                     wiz.type_sel = (wiz.type_sel + 1).min(max);
                     WizAction::Stay
@@ -950,11 +950,11 @@ fn on_key_model_wizard(app: &mut App, code: KeyCode) {
         };
         match w.step {
             ModelStep::PickRole => match code {
-                KeyCode::Up => {
+                KeyCode::Left | KeyCode::Up => {
                     w.role_sel = w.role_sel.saturating_sub(1);
                     MdAction::Stay
                 }
-                KeyCode::Down => {
+                KeyCode::Right | KeyCode::Down => {
                     w.role_sel = (w.role_sel + 1).min(MODEL_ROLES.len() - 1);
                     MdAction::Stay
                 }
@@ -1271,8 +1271,8 @@ fn on_key_oauth_menu(app: &mut App, code: KeyCode) {
         return;
     };
     match code {
-        KeyCode::Up => m.sel = m.sel.saturating_sub(1),
-        KeyCode::Down => m.sel = (m.sel + 1).min(AUTH_ACTIONS.len() - 1),
+        KeyCode::Left | KeyCode::Up => m.sel = m.sel.saturating_sub(1),
+        KeyCode::Right | KeyCode::Down => m.sel = (m.sel + 1).min(AUTH_ACTIONS.len() - 1),
         KeyCode::Esc => {
             app.mode = Mode::Browse;
             app.status = "cancelled".to_string();
@@ -1293,11 +1293,11 @@ fn on_key_exit_confirm(app: &mut App, code: KeyCode) {
         return;
     };
     let choice = match code {
-        KeyCode::Up => {
+        KeyCode::Left | KeyCode::Up => {
             confirm.sel = confirm.sel.saturating_sub(1);
             return;
         }
-        KeyCode::Down => {
+        KeyCode::Right | KeyCode::Down => {
             confirm.sel = (confirm.sel + 1).min(EXIT_CHOICES.len() - 1);
             return;
         }
@@ -1785,17 +1785,17 @@ fn hints_for(mode: &Mode) -> &'static str {
             "a: add · e: edit · k: clear-key · d: del · m: set-model · u: unset · s: save · q: quit"
         }
         Mode::ConfirmExit(_) => {
-            "↑↓: choose · Enter: confirm · s: save · d: discard · c/Esc: cancel"
+            "←→: choose · Enter: confirm · s: save · d: discard · c/Esc: cancel"
         }
         Mode::ConfirmSensitiveSave { .. } => {
             "Enter: confirm endpoint/key changes · Esc: keep staged without saving"
         }
         Mode::AddProvider(w) => match w.step {
-            AddStep::PickType => "↑↓: pick type · Enter: next · Esc: cancel",
+            AddStep::PickType => "←→: pick type · Enter: next · Esc: cancel",
             _ => "type the value · Enter: next · Esc: cancel",
         },
         Mode::SetModel(w) => match w.step {
-            ModelStep::PickRole => "↑↓: pick role · Enter: next · Esc: cancel",
+            ModelStep::PickRole => "←→: pick role · Enter: next · Esc: cancel",
             ModelStep::PickProvider => "↑↓: provider · Enter: fetch models · Esc: back",
             ModelStep::Fetching => "fetching the provider's models… · Esc: cancel",
             ModelStep::CatalogFailed => {
@@ -1804,7 +1804,7 @@ fn hints_for(mode: &Mode) -> &'static str {
             ModelStep::PickModel => "↑↓: pick · type: filter · Enter: set · Esc: back",
         },
         Mode::EditProvider(_) => "type the value · Enter: next · Esc: cancel",
-        Mode::OauthActions(_) => "↑↓: action · Enter: run · Esc: back",
+        Mode::OauthActions(_) => "←→: action · Enter: run · Esc: back",
         Mode::Input { .. } => "Enter: save · Esc: cancel",
     }
 }
@@ -2071,6 +2071,121 @@ mod tests {
         assert!(content.contains("Signed in"));
         assert!(content.contains("Not signed in"));
         assert!(content.contains("auth=Unavailable"));
+    }
+
+    #[test]
+    fn signed_in_codex_catalog_is_queryable_before_fetch_not_ready() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut cfg = ProvidersConfig::default();
+        cfg.providers.insert(
+            "codex".into(),
+            pc::Provider {
+                kind: "oauth:codex".into(),
+                base_url: None,
+                key: None,
+            },
+        );
+        let states = ProviderAuthStates::from([("codex".into(), ProviderAuthState::SignedIn)]);
+        let app = App::with_auth_states(cfg, BTreeSet::new(), states, "test-server".into(), 4);
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).expect("term");
+        terminal.draw(|frame| render(frame, &app)).expect("draw");
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        assert!(content.contains("catalog=Queryable"), "{content}");
+        assert!(!content.contains("catalog=Ready"), "{content}");
+    }
+
+    #[test]
+    fn loaded_catalog_is_rendered_with_models_after_non_empty_fetch() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut wizard = ModelWizard::new(vec!["codex".into()]);
+        wizard.provider = "codex".into();
+        wizard.role = "main".into();
+        wizard.selection = Some(ModelSelection::loading("test-server", "codex", "main"));
+        wizard.apply_fetch(Ok(vec!["gpt-5-codex".into()]));
+        assert!(matches!(
+            wizard.selection.as_ref().map(|selection| &selection.catalog),
+            Some(CatalogState::Available(models)) if models == &vec!["gpt-5-codex".to_string()]
+        ));
+        let mut app = App::new(ProvidersConfig::default());
+        app.mode = Mode::SetModel(wizard);
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).expect("term");
+        terminal.draw(|frame| render(frame, &app)).expect("draw");
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        assert!(content.contains("gpt-5-codex"), "{content}");
+    }
+
+    #[test]
+    fn failed_catalog_render_preserves_reason_and_manual_fallback() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let mut wizard = ModelWizard::new(vec!["codex".into()]);
+        wizard.provider = "codex".into();
+        wizard.role = "main".into();
+        wizard.selection = Some(ModelSelection::loading("test-server", "codex", "main"));
+        wizard.apply_fetch(Err(ProviderIssue::new(
+            "empty_catalog",
+            "Server returned no model IDs",
+            Some("Retry or enter a model ID"),
+        )));
+        let mut app = App::new(ProvidersConfig::default());
+        app.mode = Mode::SetModel(wizard);
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).expect("term");
+        terminal.draw(|frame| render(frame, &app)).expect("draw");
+        let failed: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(failed.contains("catalog failed"), "{failed}");
+        assert!(failed.contains("Server returned no model IDs"), "{failed}");
+        assert!(!failed.contains("catalog=Ready"), "{failed}");
+
+        on_key(&mut app, KeyCode::Char('m'));
+        let Mode::SetModel(wizard) = &app.mode else {
+            panic!("manual fallback leaves model wizard active");
+        };
+        assert!(wizard.manual);
+        assert!(matches!(
+            wizard
+                .selection
+                .as_ref()
+                .map(|selection| &selection.catalog),
+            Some(CatalogState::Manual { .. })
+        ));
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).expect("term");
+        terminal.draw(|frame| render(frame, &app)).expect("draw");
+        let manual: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(manual.contains("Server returned no model IDs"), "{manual}");
     }
 
     #[test]
@@ -2456,6 +2571,107 @@ mod tests {
         on_key(&mut app, KeyCode::Char('m'));
         assert!(matches!(app.mode, Mode::Browse));
         assert!(app.status.contains("add a provider"));
+    }
+
+    #[test]
+    fn horizontal_choices_use_left_right_with_vertical_aliases_and_bounded_edges() {
+        let mut add = App::new(ProvidersConfig::default());
+        on_key(&mut add, KeyCode::Char('a'));
+        assert!(matches!(add.mode, Mode::AddProvider(_)));
+        on_key(&mut add, KeyCode::Left);
+        assert!(matches!(&add.mode, Mode::AddProvider(w) if w.type_sel == 0));
+        on_key(&mut add, KeyCode::Right);
+        assert!(matches!(&add.mode, Mode::AddProvider(w) if w.type_sel == 1));
+        on_key(&mut add, KeyCode::Up);
+        assert!(matches!(&add.mode, Mode::AddProvider(w) if w.type_sel == 0));
+        on_key(&mut add, KeyCode::Down);
+        assert!(matches!(&add.mode, Mode::AddProvider(w) if w.type_sel == 1));
+
+        let mut role = App::new(ProvidersConfig::default());
+        role.ed
+            .add_provider("p1".into(), "api".into(), Some("https://u/v1".into()), None)
+            .expect("provider");
+        on_key(&mut role, KeyCode::Char('m'));
+        on_key(&mut role, KeyCode::Left);
+        assert!(matches!(&role.mode, Mode::SetModel(w) if w.role_sel == 0));
+        on_key(&mut role, KeyCode::Right);
+        assert!(matches!(&role.mode, Mode::SetModel(w) if w.role_sel == 1));
+        on_key(&mut role, KeyCode::Up);
+        assert!(matches!(&role.mode, Mode::SetModel(w) if w.role_sel == 0));
+        on_key(&mut role, KeyCode::Down);
+        assert!(matches!(&role.mode, Mode::SetModel(w) if w.role_sel == 1));
+
+        let mut vertical = App::new(ProvidersConfig::default());
+        vertical
+            .ed
+            .add_provider("p1".into(), "api".into(), Some("https://u/v1".into()), None)
+            .expect("provider 1");
+        vertical
+            .ed
+            .add_provider(
+                "p2".into(),
+                "api".into(),
+                Some("https://u2/v1".into()),
+                None,
+            )
+            .expect("provider 2");
+        on_key(&mut vertical, KeyCode::Char('m'));
+        on_key(&mut vertical, KeyCode::Enter);
+        on_key(&mut vertical, KeyCode::Right);
+        assert!(matches!(&vertical.mode, Mode::SetModel(w) if w.prov_sel == 0));
+        on_key(&mut vertical, KeyCode::Down);
+        assert!(matches!(&vertical.mode, Mode::SetModel(w) if w.prov_sel == 1));
+        on_key(&mut vertical, KeyCode::Up);
+        assert!(matches!(&vertical.mode, Mode::SetModel(w) if w.prov_sel == 0));
+
+        let mut oauth = ProvidersConfig::default();
+        oauth.providers.insert(
+            "codex".into(),
+            pc::Provider {
+                kind: "oauth:codex".into(),
+                base_url: None,
+                key: None,
+            },
+        );
+        let mut oauth_app = App::new(oauth);
+        on_key(&mut oauth_app, KeyCode::Char('e'));
+        on_key(&mut oauth_app, KeyCode::Right);
+        assert!(matches!(&oauth_app.mode, Mode::OauthActions(menu) if menu.sel == 1));
+        on_key(&mut oauth_app, KeyCode::Left);
+        assert!(matches!(&oauth_app.mode, Mode::OauthActions(menu) if menu.sel == 0));
+        on_key(&mut oauth_app, KeyCode::Down);
+        assert!(matches!(&oauth_app.mode, Mode::OauthActions(menu) if menu.sel == 1));
+        on_key(&mut oauth_app, KeyCode::Up);
+        assert!(matches!(&oauth_app.mode, Mode::OauthActions(menu) if menu.sel == 0));
+
+        let mut exit = App::new(ProvidersConfig::default());
+        exit.dirty = true;
+        on_key(&mut exit, KeyCode::Char('q'));
+        on_key(&mut exit, KeyCode::Right);
+        assert!(matches!(&exit.mode, Mode::ConfirmExit(confirm) if confirm.sel == 1));
+        on_key(&mut exit, KeyCode::Left);
+        assert!(matches!(&exit.mode, Mode::ConfirmExit(confirm) if confirm.sel == 0));
+        on_key(&mut exit, KeyCode::Down);
+        assert!(matches!(&exit.mode, Mode::ConfirmExit(confirm) if confirm.sel == 1));
+        on_key(&mut exit, KeyCode::Up);
+        assert!(matches!(&exit.mode, Mode::ConfirmExit(confirm) if confirm.sel == 0));
+    }
+
+    #[test]
+    fn horizontal_choice_hints_show_left_right_and_vertical_lists_keep_up_down() {
+        assert!(hints_for(&Mode::ConfirmExit(ExitConfirm { sel: 0 })).contains("←→"));
+        assert!(hints_for(&Mode::AddProvider(AddWizard::new())).contains("←→"));
+        assert!(hints_for(&Mode::SetModel(ModelWizard::new(vec!["p1".into()]))).contains("←→"));
+        assert!(hints_for(&Mode::OauthActions(OauthMenu {
+            provider: "codex".into(),
+            sel: 0,
+        }))
+        .contains("←→"));
+        assert!(hints_for(&Mode::SetModel(ModelWizard {
+            step: ModelStep::PickProvider,
+            ..ModelWizard::new(vec!["p1".into()])
+        }))
+        .contains("↑↓"));
     }
 
     #[test]
