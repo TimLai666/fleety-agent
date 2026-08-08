@@ -268,6 +268,7 @@ async fn provider_edit_remote_loop(
         // async apply on the runtime from inside it.
         let handle = tokio::runtime::Handle::current();
         let io = std::rc::Rc::new(tokio::sync::Mutex::new((&mut tx, &mut rx)));
+        let save_io = io.clone();
         let catalog_handle = handle.clone();
         let catalog_target = target.clone();
         let catalog_connection_id = connection_id.clone();
@@ -275,7 +276,7 @@ async fn provider_edit_remote_loop(
         let save = |edited: &fleety_tools::providers_config::ProvidersConfig,
                     clear_keys: &std::collections::BTreeSet<String>| {
             handle.block_on(async {
-                let mut io = io.lock().await;
+                let mut io = save_io.lock().await;
                 let (apply_tx, apply_rx) = &mut *io;
                 match crate::provider_service::apply_snapshot(
                     apply_tx,
@@ -300,6 +301,15 @@ async fn provider_edit_remote_loop(
                     }
                     Err(issue) => Err(crate::provider_service::issue_as_error(issue)),
                 }
+            })
+        };
+        let keepalive_io = io.clone();
+        let keepalive_handle = handle.clone();
+        let keepalive = move || {
+            keepalive_handle.block_on(async {
+                let mut io = keepalive_io.lock().await;
+                let (keepalive_tx, keepalive_rx) = &mut *io;
+                crate::provider_service::keepalive(keepalive_tx, keepalive_rx).await
             })
         };
         let fetch =
@@ -358,6 +368,7 @@ async fn provider_edit_remote_loop(
                     terminal,
                     editor_input,
                     save,
+                    keepalive,
                     fetch,
                     crate::provider_tui::ProviderEditorContext {
                         auth_states,
@@ -370,6 +381,7 @@ async fn provider_edit_remote_loop(
                 crate::provider_tui::run_with_saver_and_fetcher(
                     editor_input,
                     save,
+                    keepalive,
                     fetch,
                     auth_states,
                     connection_id.clone(),

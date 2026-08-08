@@ -1861,9 +1861,11 @@ fn cancel_hidden_catalog_fetch(app: &App, active_fetch: &mut Option<ActiveCatalo
 /// Open the editor with caller-owned model discovery and credential-status
 /// providers. The remote config editor uses this to keep every operation bound
 /// to its existing authenticated Server target.
+#[allow(clippy::too_many_arguments)]
 pub fn run_with_saver_and_fetcher(
     initial: ProviderEditorInput,
     save: impl FnMut(&ProvidersConfig, &BTreeSet<String>) -> Result<SaveOutcome>,
+    keepalive: impl FnMut() -> Result<()>,
     fetch_models: impl Fn(&CatalogRequest, std::sync::Arc<std::sync::atomic::AtomicBool>) -> CatalogFetchResult
         + Send
         + Sync
@@ -1878,6 +1880,7 @@ pub fn run_with_saver_and_fetcher(
         &mut terminal,
         initial,
         save,
+        keepalive,
         fetch_models,
         ProviderEditorContext {
             auth_states,
@@ -1897,6 +1900,7 @@ pub fn run_with_terminal<B: ratatui::backend::Backend>(
     terminal: &mut ratatui::Terminal<B>,
     initial: ProviderEditorInput,
     mut save: impl FnMut(&ProvidersConfig, &BTreeSet<String>) -> Result<SaveOutcome>,
+    mut keepalive: impl FnMut() -> Result<()>,
     fetch_models: impl Fn(&CatalogRequest, std::sync::Arc<std::sync::atomic::AtomicBool>) -> CatalogFetchResult
         + Send
         + Sync
@@ -1906,7 +1910,9 @@ pub fn run_with_terminal<B: ratatui::backend::Backend>(
 ) -> Result<EditorOutcome> {
     use std::sync::atomic::AtomicBool;
     use std::sync::{mpsc, Arc};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
+
+    const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
     let mut app = App::with_auth_states(
         initial.config,
@@ -1917,8 +1923,25 @@ pub fn run_with_terminal<B: ratatui::backend::Backend>(
     );
     let fetch_models = Arc::new(fetch_models);
     let mut active_fetch: Option<ActiveCatalogFetch> = None;
+    let mut last_keepalive = Instant::now();
+    let mut keepalive_failed = false;
     let result = (|| -> Result<()> {
         loop {
+            if !keepalive_failed
+                && keepalive_due(last_keepalive, Instant::now(), KEEPALIVE_INTERVAL)
+            {
+                if let Err(error) = keepalive() {
+                    keepalive_failed = true;
+                    app.refresh_required = true;
+                    app.mode = Mode::Browse;
+                    app.status = format!(
+                        "connection lost: {} — exit and reopen before saving",
+                        app.ed.redact_secrets(&error.report().message)
+                    );
+                } else {
+                    last_keepalive = Instant::now();
+                }
+            }
             cancel_hidden_catalog_fetch(&app, &mut active_fetch);
             if let Some((request, receiver, _)) = &active_fetch {
                 match receiver.try_recv() {
@@ -2006,9 +2029,29 @@ pub fn run_with_terminal<B: ratatui::backend::Backend>(
     })
 }
 
+fn keepalive_due(
+    last: std::time::Instant,
+    now: std::time::Instant,
+    interval: std::time::Duration,
+) -> bool {
+    now.duration_since(last) >= interval
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_editor_keepalive_runs_only_after_the_idle_interval() {
+        let start = std::time::Instant::now();
+        let interval = std::time::Duration::from_secs(15);
+        assert!(!keepalive_due(
+            start,
+            start + interval - std::time::Duration::from_millis(1),
+            interval
+        ));
+        assert!(keepalive_due(start, start + interval, interval));
+    }
 
     #[test]
     fn oauth_model_target_uses_remote_discovery_without_base_url() {

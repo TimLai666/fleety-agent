@@ -388,6 +388,20 @@ pub async fn apply_snapshot(
     }
 }
 
+/// Keep a long-lived Provider editor connection active while the user is
+/// thinking.  Reading the reply also lets the transport process WebSocket
+/// Ping/Pong frames instead of leaving the Server's liveness deadline idle.
+pub async fn keepalive(tx: &mut Tx, rx: &mut Rx) -> Result<()> {
+    crate::send(tx, &ClientMsg::ServerStatus).await?;
+    match crate::recv(rx).await? {
+        Some(ServerMsg::ServerStatusResult { .. }) => Ok(()),
+        reply => Err(issue_as_error(unexpected(
+            "a Server status reply",
+            reply.as_ref(),
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
