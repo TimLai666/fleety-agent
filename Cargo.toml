@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.31"
+version = "0.1.32"
 edition = "2021"
 # 1.85 is the edition-2024 floor, required by the vendored `fleety-textarea`
 # (see AGENTS.md, "Vendored Rust source") and by `snow`. CI builds on `stable`,
