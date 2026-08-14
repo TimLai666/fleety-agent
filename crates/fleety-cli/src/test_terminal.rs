@@ -27,6 +27,8 @@ pub(crate) struct Capture {
     pub(crate) frames: Vec<String>,
     buffer: Vec<Vec<String>>,
     size: Size,
+    fail_writes: usize,
+    fail_clear_regions: usize,
 }
 
 impl Capture {
@@ -37,12 +39,31 @@ impl Capture {
             frames: Vec::new(),
             buffer: vec![vec![" ".to_string(); width as usize]; height as usize],
             size: Size { width, height },
+            fail_writes: 0,
+            fail_clear_regions: 0,
         }
+    }
+
+    pub(crate) fn fail_write_after(&mut self, writes_before_failure: usize) {
+        self.fail_writes = writes_before_failure.saturating_add(1);
+    }
+
+    pub(crate) fn fail_clear_region_after(&mut self, clears_before_failure: usize) {
+        self.fail_clear_regions = clears_before_failure.saturating_add(1);
     }
 }
 
 impl Write for Capture {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.fail_writes > 0 {
+            self.fail_writes -= 1;
+            if self.fail_writes == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "injected terminal write failure",
+                ));
+            }
+        }
         self.written.extend_from_slice(buf);
         self.inner.write(buf)
     }
@@ -95,6 +116,15 @@ impl Backend for Capture {
         self.inner.clear()
     }
     fn clear_region(&mut self, clear_type: ratatui::backend::ClearType) -> std::io::Result<()> {
+        if self.fail_clear_regions > 0 {
+            self.fail_clear_regions -= 1;
+            if self.fail_clear_regions == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "injected terminal clear failure",
+                ));
+            }
+        }
         self.inner.clear_region(clear_type)
     }
     fn append_lines(&mut self, n: u16) -> std::io::Result<()> {
@@ -125,6 +155,12 @@ pub(crate) fn terminal(width: u16, height: u16) -> fleety_inline::Terminal<Captu
         },
     )
     .expect("inline terminal")
+}
+
+pub(crate) fn failing_terminal(width: u16, height: u16) -> fleety_inline::Terminal<Capture> {
+    let mut terminal = terminal(width, height);
+    terminal.backend_mut().fail_write_after(0);
+    terminal
 }
 
 /// Everything written so far, with escape sequences stripped.
@@ -215,7 +251,7 @@ fn the_viewport_can_grow_and_shrink_without_losing_history() {
 /// The seam itself: App state in, terminal bytes out.
 #[cfg(test)]
 mod sync {
-    use super::{terminal, visible};
+    use super::{failing_terminal, terminal, visible};
     use crate::tui::App;
     use crate::{sync_terminal, ViewportState};
 
@@ -253,6 +289,127 @@ mod sync {
         assert_eq!(
             after_first, after_second,
             "a second frame must not re-emit what the terminal already has"
+        );
+    }
+
+    #[test]
+    fn a_transient_scrollback_write_failure_replays_the_history() {
+        let mut term = failing_terminal(60, 24);
+        let mut state = ViewportState::new(&term);
+        let mut app = App::new("ready");
+        app.push("you", "recover me");
+
+        sync_terminal(&mut app, &mut term, true, &mut state);
+
+        let seen = visible(&term);
+        assert!(
+            seen.contains("you: recover me"),
+            "recovered output: {seen:?}"
+        );
+        assert_eq!(
+            seen.matches("recover me").count(),
+            1,
+            "the recovery redraw must not duplicate the transcript: {seen:?}"
+        );
+        assert_eq!(app.status, "ready", "recovery must not leave a stale error");
+    }
+
+    #[test]
+    fn a_partially_emitted_scrollback_block_is_replayed_from_history() {
+        let mut term = terminal(60, 24);
+        term.backend_mut().fail_write_after(2);
+        let mut state = ViewportState::new(&term);
+        let mut app = App::new("ready");
+        app.push("you", "recover after partial output");
+
+        sync_terminal(&mut app, &mut term, true, &mut state);
+
+        let seen = visible(&term);
+        assert!(
+            seen.contains("you: recover after partial output"),
+            "recovered output: {seen:?}"
+        );
+        assert_eq!(
+            seen.matches("recover after partial output").count(),
+            1,
+            "the recovery redraw must replace partial output: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_viewport_resize_is_reported_and_retried() {
+        let mut term = terminal(60, 24);
+        term.backend_mut().fail_clear_region_after(0);
+        let mut state = ViewportState::new(&term);
+        let mut app = App::new("ready");
+
+        sync_terminal(&mut app, &mut term, true, &mut state);
+
+        assert_eq!(state.rows, 0, "a failed resize must not be marked complete");
+        assert!(
+            app.status
+                .contains("could not resize the terminal viewport"),
+            "resize failure must be visible: {:?}",
+            app.status
+        );
+
+        sync_terminal(&mut app, &mut term, true, &mut state);
+
+        assert!(state.rows > 0, "the next sync must retry the resize");
+        assert_eq!(
+            app.status, "ready",
+            "a recovered resize must restore status"
+        );
+    }
+
+    #[test]
+    fn a_final_viewport_clear_failure_is_retried() {
+        let mut term = terminal(60, 24);
+        term.backend_mut().fail_clear_region_after(1);
+        let mut state = ViewportState::new(&term);
+        let mut app = App::new("ready");
+
+        sync_terminal(&mut app, &mut term, true, &mut state);
+
+        assert_eq!(
+            state.rows, 0,
+            "a failed final clear must not be marked complete"
+        );
+        assert!(
+            state.viewport_clear_needed,
+            "the final clear must be retried"
+        );
+
+        sync_terminal(&mut app, &mut term, true, &mut state);
+
+        assert!(
+            state.rows > 0,
+            "the final clear must recover on the next sync"
+        );
+        assert!(
+            !state.viewport_clear_needed,
+            "a successful clear must settle the retry"
+        );
+        assert_eq!(app.status, "ready", "a recovered clear must restore status");
+    }
+
+    #[test]
+    fn terminal_retries_preserve_the_latest_application_status() {
+        let mut term = terminal(60, 24);
+        term.backend_mut().fail_clear_region_after(0);
+        let mut state = ViewportState::new(&term);
+        let mut app = App::new("ready");
+
+        sync_terminal(&mut app, &mut term, true, &mut state);
+        app.status = "streaming…".into();
+        term.backend_mut().fail_clear_region_after(0);
+
+        sync_terminal(&mut app, &mut term, true, &mut state);
+        sync_terminal(&mut app, &mut term, true, &mut state);
+
+        assert_eq!(
+            app.status, "streaming…",
+            "terminal recovery must not discard a newer application status"
         );
     }
 

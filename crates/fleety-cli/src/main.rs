@@ -1256,34 +1256,38 @@ async fn run_tui(session: workspace::WorkspaceSession) -> Result<workspace::Sess
                     break Err(CoreError::Message(format!("draw failed: {e}")));
                 }
                 dirty = false;
-                continue;
+                if !viewport.retry_needed {
+                    continue;
+                }
             }
-            if let Err(e) = terminal.draw(|frame| {
-                workspace::render(frame, &workspace, |frame, area| match &workspace.route {
-                    workspace::Route::Chat => tui::render_in_area(frame, &app, area),
-                    workspace::Route::Conversations => {
-                        tui::render_conversations_in_area(frame, &app, area)
-                    }
-                    workspace::Route::Settings(page) => frame.render_widget(
-                        ratatui::widgets::Paragraph::new(format!(
-                            "{page:?} settings are loading into the shared workspace."
-                        ))
-                        .block(ratatui::widgets::Block::bordered().title("Settings")),
-                        area,
-                    ),
-                    workspace::Route::ConnectionPicker => frame.render_widget(
-                        ratatui::widgets::Paragraph::new(
-                            "Select a saved profile. Esc keeps the current connection.",
-                        )
-                        .block(ratatui::widgets::Block::bordered().title("Profiles")),
-                        area,
-                    ),
-                    workspace::Route::CommandPalette | workspace::Route::Modal(_) => {}
-                });
-            }) {
-                break Err(CoreError::Message(format!("draw failed: {e}")));
+            if !chat {
+                if let Err(e) = terminal.draw(|frame| {
+                    workspace::render(frame, &workspace, |frame, area| match &workspace.route {
+                        workspace::Route::Chat => tui::render_in_area(frame, &app, area),
+                        workspace::Route::Conversations => {
+                            tui::render_conversations_in_area(frame, &app, area)
+                        }
+                        workspace::Route::Settings(page) => frame.render_widget(
+                            ratatui::widgets::Paragraph::new(format!(
+                                "{page:?} settings are loading into the shared workspace."
+                            ))
+                            .block(ratatui::widgets::Block::bordered().title("Settings")),
+                            area,
+                        ),
+                        workspace::Route::ConnectionPicker => frame.render_widget(
+                            ratatui::widgets::Paragraph::new(
+                                "Select a saved profile. Esc keeps the current connection.",
+                            )
+                            .block(ratatui::widgets::Block::bordered().title("Profiles")),
+                            area,
+                        ),
+                        workspace::Route::CommandPalette | workspace::Route::Modal(_) => {}
+                    });
+                }) {
+                    break Err(CoreError::Message(format!("draw failed: {e}")));
+                }
+                dirty = false;
             }
-            dirty = false;
         }
         if app.should_quit {
             break Ok(workspace::SessionResult::Exit);
@@ -1656,6 +1660,9 @@ async fn run_tui(session: workspace::WorkspaceSession) -> Result<workspace::Sess
                 // Only the waiting state animates; idle ticks cause no redraw.
                 if app.turn_in_flight {
                     app.advance_spinner();
+                    dirty = true;
+                }
+                if viewport.retry_needed {
                     dirty = true;
                 }
             }
@@ -2348,6 +2355,11 @@ use fleety_tools::connection::{discover_all_via_mdns, DiscoveredServer};
 struct ViewportState {
     last_size: ratatui::layout::Size,
     rows: u16,
+    replay_needed: bool,
+    viewport_clear_needed: bool,
+    retry_needed: bool,
+    terminal_error: Option<String>,
+    status_before_terminal_error: Option<String>,
 }
 
 impl ViewportState {
@@ -2357,6 +2369,30 @@ impl ViewportState {
         Self {
             last_size: terminal.backend().size().unwrap_or_default(),
             rows: 0,
+            replay_needed: false,
+            viewport_clear_needed: false,
+            retry_needed: false,
+            terminal_error: None,
+            status_before_terminal_error: None,
+        }
+    }
+
+    fn report_terminal_error(&mut self, app: &mut tui::App, message: String) {
+        if self.terminal_error.as_deref() != Some(app.status.as_str()) {
+            self.status_before_terminal_error = Some(app.status.clone());
+        }
+        self.terminal_error = Some(message.clone());
+        app.status = message;
+    }
+
+    fn clear_terminal_error(&mut self, app: &mut tui::App) {
+        let Some(error) = self.terminal_error.take() else {
+            return;
+        };
+        if app.status == error {
+            app.status = self.status_before_terminal_error.take().unwrap_or_default();
+        } else {
+            self.status_before_terminal_error = None;
         }
     }
 }
@@ -2373,21 +2409,33 @@ fn sync_terminal<B: ratatui::backend::Backend + std::io::Write>(
     chat: bool,
     state: &mut ViewportState,
 ) {
+    state.retry_needed = false;
     // Settled content leaves before the frame is drawn, so the viewport never
     // shows what the terminal is already showing.
     for block in app.take_emissions() {
-        if let Err(e) = fleety_inline::emit_to_scrollback(terminal, &block) {
-            app.status = format!("could not write to the terminal: {e}");
+        if fleety_inline::emit_to_scrollback(terminal, &block).is_err() {
+            state.replay_needed = true;
+            break;
         }
     }
     let size = terminal.backend().size().unwrap_or_default();
-    if size != state.last_size {
+    if state.replay_needed || size != state.last_size {
         // The terminal reflows already-printed rows before we hear about the
-        // resize, which mangles styled output. Reset and replay the whole
-        // conversation at the new width instead.
-        let _ = fleety_inline::resize_purge_rerender(terminal, app.history());
-        state.last_size = size;
-        state.rows = 0;
+        // resize, which mangles styled output. A failed emission has the same
+        // recovery: clear and replay the authoritative history instead of
+        // silently leaving an already-consumed block off screen.
+        match fleety_inline::resize_purge_rerender(terminal, app.history()) {
+            Ok(()) => {
+                state.last_size = size;
+                state.rows = 0;
+                state.replay_needed = false;
+            }
+            Err(e) => {
+                state.retry_needed = true;
+                state.report_terminal_error(app, format!("could not restore the terminal: {e}"));
+                return;
+            }
+        }
     }
     // Chat lives in a few rows; every other route needs the screen.
     let want = if chat {
@@ -2398,10 +2446,29 @@ fn sync_terminal<B: ratatui::backend::Backend + std::io::Write>(
     } else {
         size.height
     };
-    if want != state.rows {
-        let _ = terminal.set_viewport_height(want);
-        state.rows = want;
+    if want != state.rows || state.viewport_clear_needed {
+        let result = if terminal.viewport_area().height == want {
+            terminal.clear()
+        } else {
+            terminal.set_viewport_height(want)
+        };
+        match result {
+            Ok(()) => {
+                state.rows = want;
+                state.viewport_clear_needed = false;
+            }
+            Err(e) => {
+                state.retry_needed = true;
+                state.viewport_clear_needed = true;
+                state.report_terminal_error(
+                    app,
+                    format!("could not resize the terminal viewport: {e}"),
+                );
+                return;
+            }
+        }
     }
+    state.clear_terminal_error(app);
 }
 
 /// Terminal for Chat: raw mode, no alternate screen, a viewport at the bottom.

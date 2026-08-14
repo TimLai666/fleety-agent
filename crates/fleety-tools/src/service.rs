@@ -931,6 +931,7 @@ pub fn claim_process_identity_at(path: &Path, identity: &str) -> Result<ProcessI
             CoreError::Message(format!("cannot create {}: {error}", parent.display()))
         })?;
     }
+    #[cfg(unix)]
     let created = !path.exists();
     let mut file = std::fs::OpenOptions::new()
         .read(true)

@@ -367,7 +367,7 @@ pub fn load() -> Result<Connections> {
     load_at(&connections_path())
 }
 
-fn sync_published_connections(_path: &Path, dir: Option<&Path>) -> std::io::Result<()> {
+fn sync_published_connections(_path: &Path, _dir: Option<&Path>) -> std::io::Result<()> {
     #[cfg(windows)]
     std::fs::OpenOptions::new()
         .read(true)
@@ -375,7 +375,7 @@ fn sync_published_connections(_path: &Path, dir: Option<&Path>) -> std::io::Resu
         .open(_path)?
         .sync_all()?;
     #[cfg(unix)]
-    std::fs::File::open(dir.unwrap_or_else(|| Path::new(".")))?.sync_all()?;
+    std::fs::File::open(_dir.unwrap_or_else(|| Path::new(".")))?.sync_all()?;
     Ok(())
 }
 
