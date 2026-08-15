@@ -9,6 +9,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod auth;
+mod auto_review;
 mod backup;
 mod bridge;
 mod builtin_mcp;
@@ -105,11 +106,11 @@ fn require_auth_from_env() -> bool {
     std::env::var("FLEETY_REQUIRE_AUTH").as_deref() != Ok("0")
 }
 
-/// Approval policy from `FLEETY_POLICY` (`require_approval` → gate non-read
-/// tools; default full access).
+/// Approval policy from `FLEETY_POLICY` (default full access).
 fn policy_from_env() -> agent_core::Policy {
     match std::env::var("FLEETY_POLICY").as_deref() {
         Ok("require_approval") => agent_core::Policy::RequireApproval,
+        Ok("auto_review") => agent_core::Policy::AutoReview,
         _ => agent_core::Policy::FullAccess,
     }
 }
@@ -1085,6 +1086,8 @@ mod tests {
         assert_eq!(policy_from_env(), agent_core::Policy::FullAccess);
         std::env::set_var("FLEETY_POLICY", "require_approval");
         assert_eq!(policy_from_env(), agent_core::Policy::RequireApproval);
+        std::env::set_var("FLEETY_POLICY", "auto_review");
+        assert_eq!(policy_from_env(), agent_core::Policy::AutoReview);
     }
 
     #[test]

@@ -35,8 +35,10 @@ Last reviewed against `crates/` on 2026-06-28.
   - `mutate` — changes state. Under `full_access` executes directly but is
     **audited + rollback-backed**. Under stricter policy returns
     `approval_required`.
-  - `critical` — irreversible / no rollback path. **Always requires explicit
-    user confirmation**, even under `full_access`.
+  - `critical` — irreversible / no rollback path. Under `full_access` and
+    `require_approval`, the deterministic command/path guards refuse it. Under
+    `auto_review`, the guard emits a trusted warning to the cheap reviewer and
+    the candidate runs only after an exact reviewer approval.
 - **Return envelope.** Tool results are JSON objects whose shape is described
   per-tool. Errors come back as actionable messages with hints to retry / fix
   arguments / acquire permissions, not as bare strings.
@@ -46,6 +48,9 @@ Last reviewed against `crates/` on 2026-06-28.
 - **Approvals.** Under `FLEETY_POLICY=require_approval`, mutating/critical
   tools surface an `ApprovalRequested` over the WebSocket before running;
   on `Deny` the agent gets a synthetic `tool_denied` result and continues.
+  Under `FLEETY_POLICY=auto_review`, no approval frame is sent: the server
+  reviews with the cheap tier, records an `auto_review` audit event, and fails
+  closed on reviewer errors or non-conforming output.
   See `prompts/policy.md` and `crates/agent-core/src/approval.rs`.
 
 ---
@@ -563,16 +568,19 @@ it settles; the part still being written stays in the viewport until it does.
 
 ## Risk class → policy (summary)
 
-| Class | `full_access` (default) | `require_approval` |
-|---|---|---|
-| `read` | direct | direct |
-| `mutate` | direct, audited + rollback-backed | `ApprovalRequested` → re-call after `Approve` |
-| `critical` | **blocked pending explicit user confirmation** | blocked pending explicit user confirmation |
+| Class | `full_access` (default) | `require_approval` | `auto_review` |
+|---|---|---|---|
+| `read` | direct | direct | direct |
+| `mutate` | direct, audited + rollback-backed | `ApprovalRequested` → re-call after `Approve` | cheap reviewer → execute only on exact `approve` |
+| `critical` | blocked by deterministic guard | `ApprovalRequested` then guard still blocks | trusted warning → cheap reviewer → execute only on exact `approve` |
 
-The same gate fires for scheduled (unattended) turns via `MandateGate`: only
-`allowed_tools` named at schedule creation can run; everything else is denied.
-Denials are recorded in the audit as `tool_denied` with the real tool name —
-see `fleety audit list`.
+The same gate fires for scheduled (unattended) turns via `MandateGate` when
+`require_approval` is active: only `allowed_tools` named at schedule
+creation can run; everything else is denied. With `auto_review`, scheduled,
+subagent, recovery, WebSocket, and SSE turns use the cheap reviewer and record
+`auto_review` metadata. Denials are recorded in the audit as
+`tool_denied` plus the review metadata with the real tool name — see
+`fleety audit list`.
 
 ## Planned (not yet shipped)
 

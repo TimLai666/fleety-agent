@@ -127,9 +127,17 @@ pub fn registry() -> &'static [Setting] {
             key: "FLEETY_POLICY",
             scope: Server,
             default: "full_access",
-            description: "full_access or require_approval.",
+            description: "full_access, require_approval, or auto_review.",
             secret: false,
             validator: Some(v_policy),
+        },
+        Setting {
+            key: "FLEETY_AUTO_REVIEW_TIMEOUT_SECS",
+            scope: Server,
+            default: "30",
+            description: "Maximum seconds for the unattended cheap-model review.",
+            secret: false,
+            validator: Some(v_pos_uint),
         },
         Setting {
             key: "FLEETY_REQUIRE_AUTH",
@@ -446,7 +454,7 @@ fn check_enum(value: &str, allowed: &[&str]) -> std::result::Result<(), String> 
 }
 
 fn v_policy(value: &str) -> std::result::Result<(), String> {
-    check_enum(value, &["full_access", "require_approval"])
+    check_enum(value, &["full_access", "require_approval", "auto_review"])
 }
 
 fn v_fs_scope(value: &str) -> std::result::Result<(), String> {
@@ -782,7 +790,7 @@ pub struct SnapshotEntry {
 /// free-form keys.
 pub fn setting_choices(key: &str) -> Vec<&'static str> {
     match key {
-        "FLEETY_POLICY" => vec!["full_access", "require_approval"],
+        "FLEETY_POLICY" => vec!["full_access", "require_approval", "auto_review"],
         "FLEETY_FS_SCOPE" => vec!["full", "workspace"],
         "FLEETY_VOICE_AUDIO" => vec!["auto", "on", "off"],
         "FLEETY_PRESENCE" => vec!["on", "off"],
@@ -2128,6 +2136,36 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn auto_review_settings_register_defaults_scope_and_validation() {
+        std::env::remove_var("FLEETY_POLICY");
+        std::env::remove_var("FLEETY_AUTO_REVIEW_TIMEOUT_SECS");
+
+        let policy = find("FLEETY_POLICY").expect("FLEETY_POLICY registered");
+        assert_eq!(policy.scope, Scope::Server);
+        assert_eq!(policy.default, "full_access");
+        assert!(validate(policy, "full_access").is_ok());
+        assert!(validate(policy, "require_approval").is_ok());
+        assert!(validate(policy, "auto_review").is_ok());
+        assert!(validate(policy, "unknown").is_err());
+
+        let timeout = find("FLEETY_AUTO_REVIEW_TIMEOUT_SECS")
+            .expect("FLEETY_AUTO_REVIEW_TIMEOUT_SECS registered");
+        assert_eq!(timeout.scope, Scope::Server);
+        assert_eq!(timeout.default, "30");
+        assert!(validate(timeout, "1").is_ok());
+        for bad in ["0", "-1", "not-a-number"] {
+            let err = validate(timeout, bad).unwrap_err().to_string();
+            assert!(err.contains("FLEETY_AUTO_REVIEW_TIMEOUT_SECS"), "{err}");
+        }
+
+        let resolved = resolve("FLEETY_AUTO_REVIEW_TIMEOUT_SECS", &ConfigMap::new())
+            .expect("resolve auto-review timeout");
+        assert_eq!(resolved.value, "30");
+        assert_eq!(resolved.source, Source::Default);
+    }
+
+    #[test]
     fn ws_liveness_settings_registered_and_validated() {
         // WS keepalive timing: the server's ping period, and the shared
         // liveness deadline (server reclaim + client read deadline).
@@ -2303,7 +2341,10 @@ mod tests {
             .iter()
             .find(|e| e.key == "FLEETY_POLICY")
             .expect("policy entry");
-        assert_eq!(policy.choices, vec!["full_access", "require_approval"]);
+        assert_eq!(
+            policy.choices,
+            vec!["full_access", "require_approval", "auto_review"]
+        );
         assert_eq!(policy.effect, Some(ConfigEffect::Restart));
 
         // Revision: stable for identical content, changes when content changes.

@@ -26,13 +26,14 @@ use tokio::sync::mpsc;
 use agent_core::{
     reconstruct_messages, run_turn, run_turn_streaming, run_turn_streaming_cached,
     ApprovalDecision, ApprovalGate, AutoDeny, CoreError, GoalState, LoopConfig, Message,
-    ModelProvider, Policy, Result, RiskLevel, Role, Terminal, ToolRegistry,
+    ModelProvider, Policy, Result, Role, Terminal, ToolRegistry,
 };
 use fleety_protocol::{
     AttentionHint, ClientMsg, InterjectionDisposition, ServerMsg, WireError, PROTOCOL_VERSION,
 };
 
 use crate::auth::{self, AuthStore};
+use crate::auto_review::{timeout_from_env, AutoReviewGate};
 use crate::bridge::{self, DeviceTools, Handles, Hub, Pending};
 use crate::storage::Storage;
 
@@ -43,6 +44,11 @@ const MAX_PENDING_INTERJECTIONS: usize = 16;
 const MAX_PENDING_INTERJECTION_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CLIENT_MESSAGE_ID_BYTES: usize = 128;
 const WRITER_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+pub(crate) fn auto_review_gate() -> AutoReviewGate {
+    let tiers = crate::providers::ProviderTiers::from_env();
+    AutoReviewGate::from_tiers(&tiers, timeout_from_env())
+}
 
 fn pending_interjection_fits(count: usize, bytes: usize, incoming_bytes: usize) -> bool {
     count < MAX_PENDING_INTERJECTIONS
@@ -1433,6 +1439,30 @@ async fn serve(
                         }
                     }
                     Ok(completed_steps)
+                } else if matches!(policy, Policy::AutoReview) {
+                    // Auto-review is sequential so the one unattended gate is
+                    // the only decision point and no interactive frame is sent.
+                    let cancel = CancelFlag::new();
+                    let mut gate = auto_review_gate();
+                    drive_to_goal(
+                        out,
+                        storage,
+                        provider,
+                        &tools,
+                        policy,
+                        device_id,
+                        &conversation,
+                        user_msg,
+                        &mut gate,
+                        &goal_state,
+                        goal_max_continues,
+                        voice,
+                        &acting,
+                        &cancel,
+                        &session_effort,
+                        turn_baseline,
+                    )
+                    .await
                 } else {
                     // Require-approval stays sequential because the gate owns
                     // inbound while awaiting a decision. Non-approval frames are
@@ -1546,7 +1576,12 @@ async fn serve(
                             &mut tools,
                             Arc::clone(&rollover_bg),
                         );
-                        let mut bg_gate = agent_core::AutoApprove;
+                        let mut bg_gate: Box<dyn agent_core::ApprovalGate + Send> =
+                            if matches!(policy, Policy::AutoReview) {
+                                Box::new(auto_review_gate())
+                            } else {
+                                Box::new(agent_core::AutoApprove)
+                            };
                         if let Err(e) = maybe_reflect(
                             &out_bg,
                             &storage_bg,
@@ -1555,7 +1590,7 @@ async fn serve(
                             policy,
                             &device_bg,
                             &conv_bg,
-                            &mut bg_gate,
+                            bg_gate.as_mut(),
                             steps,
                             min_steps,
                         )
@@ -4295,7 +4330,20 @@ async fn recover_incomplete_turn(
     };
 
     let mut log = storage.journaling_log(device_id, conversation);
-    let outcome = {
+    let outcome = if matches!(policy, Policy::AutoReview) {
+        let mut gate = auto_review_gate();
+        run_turn_streaming(
+            provider,
+            tools,
+            &mut messages,
+            &mut log,
+            &config,
+            policy,
+            &mut gate,
+            on_delta.as_mut(),
+        )
+        .await?
+    } else {
         let mut gate = ConnGate {
             out: out.clone(),
             inbound,
@@ -4357,12 +4405,10 @@ struct ConnGate<'a> {
 
 #[async_trait::async_trait]
 impl ApprovalGate for ConnGate<'_> {
-    async fn request(
-        &mut self,
-        tool: &str,
-        args: &serde_json::Value,
-        risk: RiskLevel,
-    ) -> Result<ApprovalDecision> {
+    async fn request(&mut self, context: &agent_core::ReviewContext) -> Result<ApprovalDecision> {
+        let tool = &context.tool;
+        let args = &context.arguments;
+        let risk = context.risk;
         let approval_id = uuid::Uuid::new_v4().to_string();
         let summary: String = args.to_string().chars().take(300).collect();
         emit(
@@ -5937,11 +5983,14 @@ mod tests {
             deferred_bytes: &mut deferred_bytes,
             conversation: "c1",
         }
-        .request(
-            "write_file",
-            &serde_json::json!({"path": "note.txt"}),
-            RiskLevel::Mutate,
-        )
+        .request(&agent_core::ReviewContext {
+            objective: String::new(),
+            conversation_context: String::new(),
+            tool: "write_file".to_string(),
+            arguments: serde_json::json!({"path": "note.txt"}),
+            risk: agent_core::RiskLevel::Mutate,
+            danger_signals: Vec::new(),
+        })
         .await
         .expect("closed approval stream denies without dropping frames");
 

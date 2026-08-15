@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-use agent_core::{CoreError, Result, RiskLevel, Tool, ToolRegistry, ToolSpec};
+use agent_core::{CoreError, DangerSignal, Result, RiskLevel, Tool, ToolRegistry, ToolSpec};
 use fleety_protocol::ServerMsg;
 
 /// Active device connections: `device_id -> outbound frame sender`.
@@ -222,6 +222,27 @@ impl Tool for DeviceExec {
             }),
             risk: RiskLevel::Mutate,
         }
+    }
+
+    fn danger_signals(&self, args: &Value) -> Vec<DangerSignal> {
+        let tool = args.get("tool").and_then(Value::as_str);
+        let tool_args = args.get("args").unwrap_or(&Value::Null);
+        let mut signals = Vec::new();
+        if tool == Some("run_command") {
+            if let Some(command) = tool_args.get("command").and_then(Value::as_str) {
+                if let Some(signal) = fleety_tools::critical_command_danger_signal(command) {
+                    signals.push(signal);
+                }
+            }
+        }
+        for key in ["path", "from", "to", "cwd", "identity"] {
+            if let Some(path) = tool_args.get(key).and_then(Value::as_str) {
+                if let Some(signal) = fleety_tools::sensitive_path_danger_signal(path) {
+                    signals.push(signal);
+                }
+            }
+        }
+        signals
     }
 
     async fn call(&self, args: Value) -> Result<Value> {

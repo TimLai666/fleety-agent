@@ -27,7 +27,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use agent_core::{CoreError, Result, RiskLevel, Tool, ToolRegistry, ToolSpec};
+use agent_core::{CoreError, DangerSignal, Result, RiskLevel, Tool, ToolRegistry, ToolSpec};
 
 mod browser;
 mod chrome;
@@ -108,6 +108,10 @@ fn fs_confined() -> bool {
     std::env::var("FLEETY_FS_SCOPE").as_deref() == Ok("workspace")
 }
 
+fn auto_review_enabled() -> bool {
+    std::env::var("FLEETY_POLICY").as_deref() == Ok("auto_review")
+}
+
 fn is_absolute_path(rel: &str) -> bool {
     Path::new(rel).is_absolute() || rel.starts_with('/') || rel.starts_with('\\')
 }
@@ -144,14 +148,103 @@ fn sensitive_write_reason(resolved: &Path) -> Option<&'static str> {
         .map(|(_, why)| *why)
 }
 
+fn sensitive_danger_signal(resolved: &Path) -> Option<DangerSignal> {
+    sensitive_write_reason(resolved).map(|reason| DangerSignal {
+        code: "sensitive_path".to_string(),
+        message: format!(
+            "deterministic sensitive-path warning: {}",
+            match reason {
+                "SSH keys / authorized_keys" | "SSH authorized_keys" => {
+                    "SSH keys or authorization material"
+                }
+                "SSH server config / host keys" | "SSH server config" => {
+                    "SSH server configuration or host keys"
+                }
+                "the shadow password file" | "the passwd file" => {
+                    "system account database"
+                }
+                "the sudoers policy" | "PAM auth config" => {
+                    "system authentication policy"
+                }
+                "a device node" => "a device node",
+                "the proc filesystem" => "the proc filesystem",
+                "the sys filesystem" => "the sys filesystem",
+                "boot files" => "boot files",
+                "Windows system files" | "the Windows directory" => {
+                    "Windows system files"
+                }
+                "a Windows registry hive" => "a Windows registry hive",
+                _ => "a sensitive system path",
+            }
+        ),
+    })
+}
+
+/// Return the non-secret warning used by an auto-review gate for a path that
+/// may be mutated. The textual form is also used by remote routing before the
+/// target device resolves its workspace root.
+pub fn sensitive_path_danger_signal(path: &str) -> Option<DangerSignal> {
+    sensitive_danger_signal(Path::new(path)).or_else(|| {
+        let normalized = path.replace('\\', "/");
+        let rooted = format!("/{}", normalized.trim_start_matches('/'));
+        sensitive_danger_signal(Path::new(&rooted))
+    })
+}
+
+fn critical_danger_signal(command: &str) -> Option<DangerSignal> {
+    let reason = critical_reason(command)?;
+    let code = if reason.contains("disk")
+        || reason.contains("block device")
+        || reason.contains("filesystem signatures")
+    {
+        "disk_destruction"
+    } else if reason.contains("shutdown")
+        || reason.contains("rebooting")
+        || reason.contains("powering off")
+    {
+        "host_power"
+    } else if reason.contains("fork bomb") {
+        "fork_bomb"
+    } else if reason.contains("delet") {
+        "mass_deletion"
+    } else {
+        "critical_command"
+    };
+    Some(DangerSignal {
+        code: code.to_string(),
+        message: format!("deterministic critical-command warning: {reason}"),
+    })
+}
+
+/// Return the non-secret warning used by an auto-review gate for a critical
+/// command. The command itself is intentionally not included in the signal.
+pub fn critical_command_danger_signal(command: &str) -> Option<DangerSignal> {
+    critical_danger_signal(command)
+}
+
 /// Refuse a mutation of a critical path with an actionable error.
 fn guard_sensitive(resolved: &Path) -> Result<()> {
     if let Some(why) = sensitive_write_reason(resolved) {
+        if auto_review_enabled() {
+            return Ok(());
+        }
         return Err(CoreError::Message(format!(
             "refusing to modify {} ({}) — this is a critical, hard-to-reverse path. Confirm with \
              the user and do it deliberately (e.g. via run_command), not as a routine file edit.",
             resolved.display(),
             why
+        )));
+    }
+    Ok(())
+}
+
+fn guard_critical(command: &str) -> Result<()> {
+    if let Some(reason) = critical_reason(command) {
+        if auto_review_enabled() {
+            return Ok(());
+        }
+        return Err(CoreError::Message(format!(
+            "refused critical command ({reason}): '{command}'. Irreversible actions need explicit user confirmation, which is not available here; do not retry this command."
         )));
     }
     Ok(())
@@ -833,6 +926,15 @@ impl Tool for WriteFileBytes {
         }
     }
 
+    fn danger_signals(&self, args: &Value) -> Vec<DangerSignal> {
+        args.get("path")
+            .and_then(Value::as_str)
+            .and_then(|path| resolve_lenient(&self.root, path).ok())
+            .and_then(|path| sensitive_danger_signal(&path))
+            .into_iter()
+            .collect()
+    }
+
     async fn call(&self, args: Value) -> Result<Value> {
         let path = args
             .get("path")
@@ -1007,6 +1109,15 @@ impl Tool for WriteFile {
         }
     }
 
+    fn danger_signals(&self, args: &Value) -> Vec<DangerSignal> {
+        args.get("path")
+            .and_then(Value::as_str)
+            .and_then(|path| resolve_lenient(&self.root, path).ok())
+            .and_then(|path| sensitive_danger_signal(&path))
+            .into_iter()
+            .collect()
+    }
+
     async fn call(&self, args: Value) -> Result<Value> {
         let path = require_str(&args, "path")?;
         let content = require_str(&args, "content")?;
@@ -1058,6 +1169,15 @@ impl Tool for EditFile {
             }),
             risk: RiskLevel::Mutate,
         }
+    }
+
+    fn danger_signals(&self, args: &Value) -> Vec<DangerSignal> {
+        args.get("path")
+            .and_then(Value::as_str)
+            .and_then(|path| resolve_lenient(&self.root, path).ok())
+            .and_then(|path| sensitive_danger_signal(&path))
+            .into_iter()
+            .collect()
     }
 
     async fn call(&self, args: Value) -> Result<Value> {
@@ -1147,13 +1267,17 @@ impl Tool for RunCommand {
         }
     }
 
+    fn danger_signals(&self, args: &Value) -> Vec<DangerSignal> {
+        args.get("command")
+            .and_then(Value::as_str)
+            .and_then(critical_danger_signal)
+            .into_iter()
+            .collect()
+    }
+
     async fn call(&self, args: Value) -> Result<Value> {
         let command = require_str(&args, "command")?;
-        if let Some(reason) = critical_reason(command) {
-            return Err(CoreError::Message(format!(
-                "refused critical command ({reason}): '{command}'. Irreversible actions need explicit user confirmation, which is not available here; do not retry this command."
-            )));
-        }
+        guard_critical(command)?;
         let cwd = match args.get("cwd").and_then(Value::as_str) {
             Some(rel) => resolve_in_root(&self.root, rel)?,
             None => self.root.clone(),
@@ -1357,6 +1481,15 @@ impl Tool for DeleteFile {
         }
     }
 
+    fn danger_signals(&self, args: &Value) -> Vec<DangerSignal> {
+        args.get("path")
+            .and_then(Value::as_str)
+            .and_then(|path| resolve_lenient(&self.root, path).ok())
+            .and_then(|path| sensitive_danger_signal(&path))
+            .into_iter()
+            .collect()
+    }
+
     async fn call(&self, args: Value) -> Result<Value> {
         let path = require_str(&args, "path")?;
         let resolved = resolve_in_root(&self.root, path)?;
@@ -1394,6 +1527,15 @@ impl Tool for MoveFile {
             }),
             risk: RiskLevel::Mutate,
         }
+    }
+
+    fn danger_signals(&self, args: &Value) -> Vec<DangerSignal> {
+        ["from", "to"]
+            .into_iter()
+            .filter_map(|key| args.get(key).and_then(Value::as_str))
+            .filter_map(|path| resolve_lenient(&self.root, path).ok())
+            .filter_map(|path| sensitive_danger_signal(&path))
+            .collect()
     }
 
     async fn call(&self, args: Value) -> Result<Value> {
@@ -1437,6 +1579,15 @@ impl Tool for MakeDir {
         }
     }
 
+    fn danger_signals(&self, args: &Value) -> Vec<DangerSignal> {
+        args.get("path")
+            .and_then(Value::as_str)
+            .and_then(|path| resolve_lenient(&self.root, path).ok())
+            .and_then(|path| sensitive_danger_signal(&path))
+            .into_iter()
+            .collect()
+    }
+
     async fn call(&self, args: Value) -> Result<Value> {
         let path = require_str(&args, "path")?;
         let resolved = resolve_lenient(&self.root, path)?;
@@ -1478,6 +1629,17 @@ impl Tool for Rollback {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn guard_sensitive_for_policy(
+        policy: agent_core::Policy,
+        path: &Path,
+    ) -> Result<Option<DangerSignal>> {
+        if matches!(policy, agent_core::Policy::AutoReview) {
+            Ok(sensitive_danger_signal(path))
+        } else {
+            guard_sensitive(path).map(|_| None)
+        }
+    }
 
     fn temp() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("fleety-tools-{}", uuid::Uuid::new_v4()));
@@ -1927,6 +2089,68 @@ mod tests {
         assert!(sensitive_write_reason(Path::new("/etc/shadow")).is_some());
         assert!(sensitive_write_reason(Path::new("C:\\Windows\\System32\\drivers\\x")).is_some());
         assert!(sensitive_write_reason(Path::new("/home/u/project/src/main.rs")).is_none());
+        assert!(sensitive_path_danger_signal(".ssh/authorized_keys").is_some());
+        assert!(sensitive_path_danger_signal("etc/shadow").is_some());
+    }
+
+    #[test]
+    fn auto_review_sensitive_path_is_a_trusted_signal_not_a_refusal() {
+        let path = Path::new("/home/u/.ssh/authorized_keys");
+        let signal = guard_sensitive_for_policy(agent_core::Policy::AutoReview, path)
+            .expect("auto review should defer the mutation");
+        let signal = signal.expect("sensitive path signal");
+        assert_eq!(signal.code, "sensitive_path");
+        assert!(signal.message.contains("SSH keys"));
+        assert!(!signal.message.contains("authorized_keys"));
+        assert!(!signal.message.contains("/home/u"));
+    }
+
+    #[test]
+    fn legacy_sensitive_path_policies_still_refuse() {
+        let path = Path::new("/etc/shadow");
+        for policy in [
+            agent_core::Policy::FullAccess,
+            agent_core::Policy::RequireApproval,
+        ] {
+            let error = guard_sensitive_for_policy(policy, path)
+                .expect_err("legacy policies must keep hard refusal");
+            assert!(error.to_string().contains("critical, hard-to-reverse path"));
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn read_sensitive_path_is_not_guarded() {
+        let root = temp();
+        let backups = root.join(".bak");
+        std::fs::create_dir_all(root.join(".ssh")).expect("ssh dir");
+        std::fs::write(root.join(".ssh/config"), "Host example\n").expect("ssh config");
+        std::env::set_var("FLEETY_FS_SCOPE", "workspace");
+
+        let mut reg = ToolRegistry::new();
+        register_workspace(&mut reg, &root, &backups);
+        let result = reg
+            .call("read_file", json!({ "path": ".ssh/config" }))
+            .await
+            .expect("sensitive reads remain allowed");
+
+        std::env::remove_var("FLEETY_FS_SCOPE");
+        assert!(result["numbered"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Host example"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[serial]
+    fn workspace_scope_rejects_escape_before_sensitive_policy() {
+        let root = temp();
+        std::env::set_var("FLEETY_FS_SCOPE", "workspace");
+        assert!(resolve_for_write(&root, "../outside/.ssh/key").is_err());
+        assert!(resolve_for_write(&root, "/etc/shadow").is_err());
+        std::env::remove_var("FLEETY_FS_SCOPE");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1948,6 +2172,19 @@ mod tests {
         ] {
             assert!(critical_reason(c).is_none(), "should allow: {c}");
         }
+    }
+
+    #[test]
+    #[serial]
+    fn auto_review_critical_commands_are_warnings_and_legacy_policies_refuse() {
+        std::env::set_var("FLEETY_POLICY", "auto_review");
+        assert!(guard_critical("rm -rf /").is_ok());
+        let signal = critical_danger_signal("rm -rf /").expect("critical signal");
+        assert_eq!(signal.code, "mass_deletion");
+        assert!(!signal.message.contains("rm -rf"));
+        std::env::set_var("FLEETY_POLICY", "full_access");
+        assert!(guard_critical("rm -rf /").is_err());
+        std::env::remove_var("FLEETY_POLICY");
     }
 
     #[test]

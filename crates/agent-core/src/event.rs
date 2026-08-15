@@ -23,6 +23,9 @@ pub enum Event {
     ToolCall(ToolCall),
     /// The result fed back for a tool call (success value or an error report).
     ToolResult { id: String, result: Value },
+    /// Sanitized policy-gate metadata for one candidate tool call. Audit-only;
+    /// this is never reconstructed into model messages.
+    AutoReview { id: String, result: Value },
 }
 
 /// A per-event persistence callback (e.g. append to a turn journal).
@@ -111,7 +114,7 @@ pub fn reconstruct_messages(events: &[Event], max_tool_result_chars: usize) -> V
                 let fed = crate::compress::compress_tool_result(result, max_tool_result_chars, id);
                 messages.push(Message::tool_result(id.clone(), fed));
             }
-            Event::ToolCall(_) => {} // carried inside the assistant message
+            Event::ToolCall(_) | Event::AutoReview { .. } => {} // audit-only / carried in assistant message
         }
     }
     // Tool calls with no recorded result were interrupted: tell the model so it

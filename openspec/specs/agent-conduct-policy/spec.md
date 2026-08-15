@@ -8,12 +8,57 @@ TBD - created by archiving change 'baseline-prompt-specs'. Update Purpose after 
 
 ### Requirement: Full access by default
 
-The agent SHALL operate with full access by default: mutating tools run without per-call approval. Per-call approval gating SHALL apply only when the runtime policy is `require_approval`.
+The agent SHALL operate with full access by default: mutate tools run without per-call approval. Per-call interactive approval SHALL apply only when the runtime policy is `require_approval`. When the runtime policy is `auto_review`, every mutate and critical tool SHALL be reviewed by the unattended cheap-model gate before execution, while read tools SHALL remain direct.
 
 #### Scenario: default posture runs mutations directly
 
-- **WHEN** the runtime policy is the default and a mutating tool is invoked
-- **THEN** the action runs without a per-call approval prompt, recorded in the audit log
+- **WHEN** the runtime policy is the default and a mutate tool is invoked
+- **THEN** the action runs without a per-call approval prompt and is recorded in the audit log
+
+#### Scenario: auto posture reviews a mutation
+
+- **WHEN** the runtime policy is `auto_review` and a mutate tool is invoked
+- **THEN** the action waits for a cheap-model decision and no human prompt is required
+
+#### Scenario: auto posture reviews a critical action
+
+- **WHEN** the runtime policy is `auto_review` and a critical tool is invoked
+- **THEN** the action is submitted to the cheap-model decision instead of being rejected solely for its risk class
+
+
+<!-- @trace
+source: auto-review
+updated: 2026-08-15
+code:
+  - crates/fleety-server/src/storage.rs
+  - prompts/policy.md
+  - crates/agent-core/src/approval.rs
+  - crates/fleety-server/src/conn.rs
+  - README.md
+  - crates/agent-core/src/agent.rs
+  - docs/tools.md
+  - crates/agent-core/src/subagent.rs
+  - crates/fleety-tools/src/config.rs
+  - crates/fleety-server/src/subagent.rs
+  - crates/fleety-tools/src/lib.rs
+  - crates/agent-core/src/tools.rs
+  - crates/fleety-server/src/main.rs
+  - docs/env.md
+  - crates/agent-core/src/lib.rs
+  - crates/agent-core/src/event.rs
+  - crates/fleety-server/src/auto_review.rs
+  - crates/fleety-server/src/bridge.rs
+  - crates/fleety-server/src/scheduler.rs
+-->
+
+---
+### Requirement: Auto review is unattended and fail-closed
+
+When `auto_review` is active, the agent SHALL send the objective, bounded
+context, sanitized candidate, risk class, and trusted danger signals to the cheap
+reviewer. The candidate tool SHALL execute only after a valid exact approval. A
+timeout, provider failure, invalid response, redaction failure, or protocol
+violation SHALL deny the candidate and record a sanitized audit outcome.
 
 
 <!-- @trace

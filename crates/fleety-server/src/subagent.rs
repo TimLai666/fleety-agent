@@ -7,6 +7,7 @@
 //! `build_full_registry`, messages/audit via [`Storage`], git worktrees for
 //! isolation, and a proactive wake turn via `conn::drive_turn`.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, Weak};
 
@@ -14,11 +15,13 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use agent_core::{
-    register_orchestration, AutoApprove, CoreError, Message, ModelProvider, Policy, Result,
-    SubagentHost, SubagentManager, SubagentMode, SubagentState, ToolRegistry,
+    register_orchestration, ApprovalDecision, ApprovalGate, AutoApprove, CoreError, Message,
+    ModelProvider, Policy, Result, ReviewContext, SubagentHost, SubagentManager, SubagentMode,
+    SubagentState, ToolRegistry,
 };
 
 use crate::auth::AuthStore;
+use crate::auto_review::{timeout_from_env, AutoReviewGate};
 use crate::bridge::{DeviceTools, Handles, Hub, Pending};
 use crate::conn::{drive_turn, Out};
 use crate::providers::ProviderTiers;
@@ -148,6 +151,31 @@ impl FleetyHost {
 impl SubagentHost for FleetyHost {
     fn resolve_provider(&self, tier: &str) -> Arc<dyn ModelProvider> {
         self.providers.resolve(tier)
+    }
+
+    fn make_gate(
+        &self,
+        policy: Policy,
+        _provider: Arc<dyn ModelProvider>,
+        allowed_tools: &[String],
+    ) -> Box<dyn ApprovalGate + Send> {
+        if policy != Policy::AutoReview {
+            return match policy {
+                Policy::FullAccess => Box::new(AutoApprove),
+                Policy::RequireApproval => {
+                    if allowed_tools.is_empty() {
+                        Box::new(agent_core::AutoDeny)
+                    } else {
+                        Box::new(agent_core::MandateGate::new(allowed_tools.iter().cloned()))
+                    }
+                }
+                Policy::AutoReview => unreachable!(),
+            };
+        }
+        Box::new(SubagentAutoReviewGate {
+            allowed: allowed_tools.iter().cloned().collect(),
+            reviewer: AutoReviewGate::from_tiers(&self.providers, timeout_from_env()),
+        })
     }
 
     async fn capture_context(&self) -> String {
@@ -301,7 +329,14 @@ impl SubagentHost for FleetyHost {
             );
         }
         let provider = self.providers.main();
-        let mut gate = AutoApprove;
+        let mut gate: Box<dyn ApprovalGate + Send> = if self.policy == Policy::AutoReview {
+            Box::new(AutoReviewGate::from_tiers(
+                &self.providers,
+                timeout_from_env(),
+            ))
+        } else {
+            Box::new(AutoApprove)
+        };
         if let Err(e) = drive_turn(
             &self.out,
             &self.storage,
@@ -311,7 +346,7 @@ impl SubagentHost for FleetyHost {
             &self.device_id,
             &context,
             Message::user(seed),
-            &mut gate,
+            gate.as_mut(),
             // A wake turn is single-shot: emit its reply normally.
             true,
             // Background wake turns are non-voice.
@@ -326,6 +361,21 @@ impl SubagentHost for FleetyHost {
         {
             tracing::warn!(task_id, error = %format!("{e}"), "subagent wake turn failed");
         }
+    }
+}
+
+struct SubagentAutoReviewGate {
+    allowed: HashSet<String>,
+    reviewer: AutoReviewGate,
+}
+
+#[async_trait]
+impl ApprovalGate for SubagentAutoReviewGate {
+    async fn request(&mut self, context: &ReviewContext) -> Result<ApprovalDecision> {
+        if !self.allowed.contains(&context.tool) {
+            return Ok(ApprovalDecision::Deny);
+        }
+        self.reviewer.request(context).await
     }
 }
 

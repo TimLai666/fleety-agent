@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 
+use crate::approval::DangerSignal;
 use crate::model::ToolSpec;
 use crate::{CoreError, Result};
 
@@ -73,6 +74,9 @@ impl ActiveTools {
 #[async_trait::async_trait]
 pub trait Tool: Send + Sync {
     fn spec(&self) -> ToolSpec;
+    fn danger_signals(&self, _args: &Value) -> Vec<DangerSignal> {
+        Vec::new()
+    }
     async fn call(&self, args: Value) -> Result<Value>;
 }
 
@@ -140,6 +144,13 @@ impl ToolRegistry {
             Some(tool) => tool.call(args).await,
             None => Err(CoreError::ToolNotFound(name.to_string())),
         }
+    }
+
+    pub fn danger_signals(&self, name: &str, args: &Value) -> Vec<DangerSignal> {
+        self.tools
+            .get(name)
+            .map(|tool| tool.danger_signals(args))
+            .unwrap_or_default()
     }
 }
 

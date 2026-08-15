@@ -72,6 +72,11 @@ fn summarise_event(value: &Value) -> (String, Option<String>) {
     let tool = match kind.as_str() {
         "tool_call" => value.get("name").and_then(Value::as_str).map(String::from),
         "tool_result" => value.get("id").and_then(Value::as_str).map(String::from),
+        "auto_review" => value
+            .get("result")
+            .and_then(|result| result.get("tool"))
+            .and_then(Value::as_str)
+            .map(String::from),
         _ => None,
     };
     (kind, tool)
@@ -2576,6 +2581,42 @@ mod tests {
         let entries = storage.list_audit("dev", None, None).expect("list");
         assert_eq!(entries[1]["kind"], serde_json::json!("tool_denied"));
         assert_eq!(entries[1]["tool"], serde_json::json!("write_file"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn audit_list_surfaces_auto_review_metadata_without_candidate_arguments() {
+        use agent_core::Event;
+        let home = temp_home();
+        let storage = Storage::new(home.clone());
+        storage
+            .append_history(
+                "dev",
+                &Event::AutoReview {
+                    id: "1".into(),
+                    result: serde_json::json!({
+                        "policy": "auto_review",
+                        "decision": "deny",
+                        "executed": false,
+                        "risk": "critical",
+                        "tool": "run_command",
+                        "provider_model": "cheap",
+                        "danger_codes": ["disk_destruction"],
+                        "latency_ms": 12,
+                        "reason": "danger not justified",
+                        "failure_category": "review_denied"
+                    }),
+                },
+            )
+            .expect("auto review");
+
+        let entries = storage.list_audit("dev", None, None).expect("list");
+        assert_eq!(entries[0]["kind"], "auto_review");
+        assert_eq!(entries[0]["tool"], "run_command");
+        let full = storage.read_audit("dev", 0).expect("show");
+        assert_eq!(full["result"]["executed"], false);
+        assert!(full["result"].get("arguments").is_none());
+        assert!(full["result"].get("prompt").is_none());
         let _ = std::fs::remove_dir_all(&home);
     }
 

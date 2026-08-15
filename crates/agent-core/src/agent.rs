@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde_json::json;
 
-use crate::approval::{ApprovalDecision, ApprovalGate, Policy};
+use crate::approval::{ApprovalDecision, ApprovalGate, Policy, ReviewContext};
 use crate::event::{Event, EventLog};
 use crate::model::{Message, ModelProvider, RiskLevel, Role, TokenUsage, ToolSpec};
 use crate::tools::ToolRegistry;
@@ -355,14 +355,33 @@ pub async fn run_turn_streaming_cached(
             // Gate the call by policy/risk; a denial is fed back, not executed.
             let risk = risk_of(&specs, &call.name);
             if policy.needs_approval(risk) {
-                if let ApprovalDecision::Deny =
-                    gate.request(&call.name, &call.arguments, risk).await?
-                {
-                    let denied = json!({
-                        "denied": true,
-                        "tool": call.name,
-                        "reason": "the user denied this action; do not retry it"
+                let context = build_review_context(messages, tools, call, risk);
+                let decision = gate.request(&context).await?;
+                let audit = gate.take_audit();
+                if let Some(audit) = &audit {
+                    events.push(Event::AutoReview {
+                        id: call.id.clone(),
+                        result: audit.details.clone(),
                     });
+                }
+                if let ApprovalDecision::Deny = decision {
+                    let denied = if let Some(audit) = audit {
+                        let reason = audit.details["reason"]
+                            .as_str()
+                            .unwrap_or("automatic review denied this action");
+                        json!({
+                            "denied": true,
+                            "tool": call.name,
+                            "reason": reason,
+                            "auto_review": audit.details,
+                        })
+                    } else {
+                        json!({
+                            "denied": true,
+                            "tool": call.name,
+                            "reason": "the user denied this action; do not retry it"
+                        })
+                    };
                     events.push(Event::ToolResult {
                         id: call.id.clone(),
                         result: denied.clone(),
@@ -394,6 +413,36 @@ pub async fn run_turn_streaming_cached(
         "reached max steps ({}) without a final answer; raise max_steps or simplify the task",
         config.max_steps
     )))
+}
+
+fn build_review_context(
+    messages: &[Message],
+    tools: &ToolRegistry,
+    call: &crate::model::ToolCall,
+    risk: RiskLevel,
+) -> ReviewContext {
+    let objective = messages
+        .iter()
+        .find(|message| matches!(message.role, Role::User))
+        .and_then(|message| message.content.as_deref())
+        .unwrap_or_default()
+        .to_string();
+    let conversation_context = messages
+        .iter()
+        .rev()
+        .take(6)
+        .rev()
+        .filter_map(|message| message.content.as_deref())
+        .collect::<Vec<_>>()
+        .join("\n");
+    ReviewContext {
+        objective,
+        conversation_context,
+        tool: call.name.clone(),
+        arguments: call.arguments.clone(),
+        risk,
+        danger_signals: tools.danger_signals(&call.name, &call.arguments),
+    }
 }
 
 /// Whether the caller's cooperative cancel flag is present and set. `Relaxed`
@@ -1478,13 +1527,20 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ApprovalGate for DenyGate {
-        async fn request(
-            &mut self,
-            _tool: &str,
-            _args: &Value,
-            _risk: RiskLevel,
-        ) -> Result<ApprovalDecision> {
+        async fn request(&mut self, _context: &ReviewContext) -> Result<ApprovalDecision> {
             Ok(ApprovalDecision::Deny)
+        }
+    }
+
+    struct RecordingGate {
+        contexts: Vec<ReviewContext>,
+    }
+
+    #[async_trait::async_trait]
+    impl ApprovalGate for RecordingGate {
+        async fn request(&mut self, context: &ReviewContext) -> Result<ApprovalDecision> {
+            self.contexts.push(context.clone());
+            Ok(ApprovalDecision::Approve)
         }
     }
 
@@ -1539,6 +1595,39 @@ mod tests {
             .as_deref()
             .map(|c| c.contains("\"executed\""))
             .unwrap_or(false)));
+    }
+
+    #[tokio::test]
+    async fn auto_review_passes_objective_and_candidate_context_to_gate() {
+        let provider = MockProvider::new(vec![tool_call_response("danger"), final_response()]);
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(MutateTool));
+        let mut messages = vec![Message::user("do danger")];
+        let mut events = EventLog::new();
+        let mut gate = RecordingGate {
+            contexts: Vec::new(),
+        };
+
+        run_turn(
+            &provider,
+            &tools,
+            &mut messages,
+            &mut events,
+            &LoopConfig::default(),
+            Policy::AutoReview,
+            &mut gate,
+        )
+        .await
+        .expect("turn ok");
+
+        assert_eq!(gate.contexts.len(), 1);
+        let context = &gate.contexts[0];
+        assert_eq!(context.objective, "do danger");
+        assert_eq!(context.conversation_context, "do danger");
+        assert_eq!(context.tool, "danger");
+        assert_eq!(context.risk, RiskLevel::Mutate);
+        assert_eq!(context.arguments, serde_json::json!({"text": "hi"}));
+        assert!(context.danger_signals.is_empty());
     }
 
     #[tokio::test]

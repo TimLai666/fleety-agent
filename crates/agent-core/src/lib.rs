@@ -29,7 +29,10 @@ pub use agent::{
     is_cache_usable, run_turn, run_turn_streaming, run_turn_streaming_cached, AttentionHint,
     CompactionCache, LoopConfig, TurnOutcome, ATTENTION_SENTINEL, SPEECH_SENTINEL,
 };
-pub use approval::{ApprovalDecision, ApprovalGate, AutoApprove, AutoDeny, MandateGate, Policy};
+pub use approval::{
+    ApprovalAudit, ApprovalDecision, ApprovalGate, AutoApprove, AutoDeny, DangerSignal,
+    MandateGate, Policy, ReviewContext,
+};
 pub use codex_responses::{CodexAuth, CodexCreds, CodexResponses};
 pub use compress::{CacheAligner, CodeCompressor, ContextCompressor, Lang, SmartCrusher};
 pub use error::{CoreError, ErrorReport, Result};

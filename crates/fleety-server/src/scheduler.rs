@@ -10,14 +10,33 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use agent_core::{
-    reconstruct_messages, run_turn, LoopConfig, MandateGate, Message, ModelProvider, Policy,
-    Result, ToolRegistry,
+    reconstruct_messages, run_turn, ApprovalGate, LoopConfig, MandateGate, Message, ModelProvider,
+    Policy, Result, ToolRegistry,
 };
 
+use crate::auto_review::{timeout_from_env, AutoReviewGate};
 use crate::schedules;
 use crate::storage::Storage;
 
 pub(crate) const SCHED_DEVICE: &str = "scheduler";
+
+fn schedule_gate(allowed_tools: Vec<String>) -> (Policy, Box<dyn ApprovalGate + Send>) {
+    if std::env::var("FLEETY_POLICY").as_deref() == Ok("auto_review") {
+        let tiers = crate::providers::ProviderTiers::from_env();
+        return (
+            Policy::AutoReview,
+            Box::new(AutoReviewGate::with_allowed_tools(
+                tiers.resolve("cheap"),
+                timeout_from_env(),
+                allowed_tools,
+            )),
+        );
+    }
+    (
+        Policy::RequireApproval,
+        Box::new(MandateGate::new(allowed_tools)),
+    )
+}
 
 /// Current unix time in seconds.
 pub fn now_secs() -> u64 {
@@ -143,15 +162,15 @@ async fn fire_one(
     // Journal each event so a crash mid-run is recoverable on the next tick.
     let mut events = storage.journaling_log(SCHED_DEVICE, &conversation);
     // Mandate enforcement: only the schedule's allowed_tools may mutate.
-    let mut gate = MandateGate::new(allowed_tools);
+    let (policy, mut gate) = schedule_gate(allowed_tools);
     let run = run_turn(
         provider,
         tools,
         &mut messages,
         &mut events,
         &LoopConfig::default(),
-        Policy::RequireApproval,
-        &mut gate,
+        policy,
+        gate.as_mut(),
     )
     .await;
     // Persist whatever was journalled to history regardless of run outcome.
@@ -206,15 +225,15 @@ async fn recover_schedule_turn(
     messages.extend(storage.load(SCHED_DEVICE, conversation)?);
     messages.extend(reconstruct_messages(&events, config.max_tool_result_chars));
     let mut log = storage.journaling_log(SCHED_DEVICE, conversation);
-    let mut gate = MandateGate::new(schedule_allowed_tools(storage, conversation));
+    let (policy, mut gate) = schedule_gate(schedule_allowed_tools(storage, conversation));
     let outcome = run_turn(
         provider,
         tools,
         &mut messages,
         &mut log,
         &config,
-        Policy::RequireApproval,
-        &mut gate,
+        policy,
+        gate.as_mut(),
     )
     .await?;
     for event in log.events() {

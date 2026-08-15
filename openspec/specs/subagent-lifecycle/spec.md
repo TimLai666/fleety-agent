@@ -83,7 +83,7 @@ code:
 ---
 ### Requirement: Non-interactive gate and concurrency limit
 
-Background subagents SHALL run under a non-interactive approval gate: under `full_access` their mutating tools run; under `require_approval` they are limited to read tools unless `allowed_tools` pre-grants specific tools at spawn time. The number of concurrently running subagents SHALL be capped (configurable, floor 1); a spawn that would exceed the cap SHALL fail with an actionable error rather than queue silently. Every subagent action SHALL be recorded to the parent device's audit log, tagged with the subagent `task_id`.
+Background subagents SHALL run under a non-interactive approval gate: under `full_access` their mutating tools run; under `require_approval` they are limited to read tools unless `allowed_tools` pre-grants specific tools at spawn time; under `auto_review` every non-read tool is reviewed by the cheap tier and runs only after exact approval, with failures denied and no human fallback. The number of concurrently running subagents SHALL be capped (configurable, floor 1); a spawn that would exceed the cap SHALL fail with an actionable error rather than queue silently. Every subagent action SHALL be recorded to the parent device's audit log, tagged with the subagent `task_id`.
 
 #### Scenario: spawning past the concurrency cap is refused
 

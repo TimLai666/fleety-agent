@@ -43,7 +43,8 @@ trusted, the server keeps the fallback root and records the originating device o
 the binding (running tools on that remote device at its cwd is a planned follow-up).
 
 | `FLEETY_FS_SCOPE` | (unset → `full`) | `full` (default): the structured file tools may read/write anywhere on the device (absolute paths allowed; still audited + rollback-backed; a sensitive-path guard refuses SSH keys/`/etc/shadow`/`/dev`/Windows system dirs/etc.). `workspace`: re-confine every path to the workspace/device root (`..`/absolute/symlink-tight sandbox). Set on `fleetyd` too for its `FLEETY_DEVICE_ROOT`. |
-| `FLEETY_POLICY` | `full_access` | `require_approval` gates every non-read tool through the approval flow. While the approval gate owns the inbound stream, ordinary messages are retained in arrival order and processed after the gated turn; they are never discarded. A `CancelTurn` sent during a gated turn still has no effect because it is processed only after that turn ends — immediate cancel works under the default full-access policy. |
+| `FLEETY_POLICY` | `full_access` | `require_approval` gates every non-read tool through interactive approval. `auto_review` sends every non-read tool, including critical operations, to the server's `cheap` model tier and executes only an exact `approve` decision. It never asks a human; reviewer errors, missing context, redaction failures, timeouts, invalid output, and danger signals that the reviewer does not justify all deny. |
+| `FLEETY_AUTO_REVIEW_TIMEOUT_SECS` | `30` | Positive timeout in seconds for one `auto_review` call. `0`, negative, invalid, or unset values use 30 seconds. The reviewer receives bounded objective/context, sanitized arguments, risk, and trusted danger warnings, but no tools. |
 | `FLEETY_REQUIRE_AUTH` | `1` | Require a valid token / pairing code on every `Hello`. **On by default** — set `0` to disable. A fresh auth-required server (no `FLEETY_TOKEN`, no paired device) prints a short-lived first-run pairing code at startup. |
 | `FLEETY_TRUST_LOOPBACK` | `1` | Trust same-host connections: a client whose transport peer is a loopback address (`127.0.0.0/8` / `::1`, taken from the connection socket — never a header) is accepted without a token even when auth is required, because a same-host process can already read the server's token and config files. Set `0` to require auth even on loopback (multi-tenant hosts, or a reverse proxy that forwards remote connections over loopback — otherwise it would falsely trust them). LAN/remote connections are always authenticated regardless. |
 | `FLEETY_TOKEN` | (unset) | Server-owned bootstrap admin token. Use it once to pair the first device. A value saved under the Server scope in `config.toml` is loaded only by `fleety-server`; it is never seeded into `fleety` or `fleetyd` as a client credential. |
@@ -630,7 +631,9 @@ path to the editor's host.
 
 Tool approvals (under the require-approval policy) are surfaced to the editor via
 ACP `session/request_permission`, and the user's allow/deny is relayed back to the
-server; under the default full-access policy no prompts are raised.
+server; under the default full-access policy no prompts are raised. Under
+`auto_review`, no ACP permission request is emitted because the server-side
+cheap reviewer is the only decision-maker.
 
 Example editor config: run `fleety acp` as the agent command (a fleety-server
 must be reachable).

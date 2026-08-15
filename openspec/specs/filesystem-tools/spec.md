@@ -98,52 +98,47 @@ code:
 ---
 ### Requirement: Filesystem scope and sensitive-path guard
 
-By default the file tools SHALL resolve relative paths against the configured root and SHALL allow absolute paths and paths outside the root (audited and rollback-backed). When `FLEETY_FS_SCOPE=workspace` is set, the tools SHALL confine every path to the root and reject `..`, absolute, and symlink-escaping paths. Regardless of scope, the tools SHALL refuse **mutation** of critical paths (SSH keys/config, `/etc/shadow`, `/dev`, Windows system directories, and similar) with an actionable error; reads SHALL NOT be restricted by the sensitive-path guard.
+By default the file tools SHALL resolve relative paths against the configured root and SHALL allow absolute paths and paths outside the root (audited and rollback-backed). When `FLEETY_FS_SCOPE=workspace` is set, the tools SHALL confine every path to the root and reject `..`, absolute, and symlink-escaping paths. Under `full_access` or `require_approval`, the tools SHALL refuse mutation of critical paths such as SSH keys/config, `/etc/shadow`, `/dev`, Windows system directories, and similar targets. Under `auto_review`, the tools SHALL emit a trusted sensitive-path danger signal and SHALL defer the mutation decision to the auto reviewer. Reads SHALL NOT be restricted by the sensitive-path guard.
 
-#### Scenario: refuse a sensitive write but allow an outside-root write
+#### Scenario: default policy refuses a sensitive write
 
-- **WHEN** `write_file` targets an absolute path outside the root that is not sensitive
-- **THEN** the write succeeds and is backed up
-- **WHEN** `write_file` targets a sensitive path such as an SSH `authorized_keys`
+- **WHEN** `write_file` targets an SSH `authorized_keys` path under `full_access`
 - **THEN** the call is refused with an actionable critical-path error
 
+#### Scenario: auto review evaluates a sensitive write
+
+- **WHEN** `write_file` targets an SSH `authorized_keys` path under `auto_review`
+- **THEN** the reviewer receives a sensitive-path danger signal and the write executes only after reviewer approval
+
+#### Scenario: workspace scope still confines paths
+
+- **WHEN** `FLEETY_FS_SCOPE=workspace` and a candidate path escapes the workspace through an absolute path, `..`, or a symlink
+- **THEN** the path is rejected before auto review because it violates the filesystem scope boundary
+
+
 <!-- @trace
-source: baseline-tool-surface-specs
-updated: 2026-06-28
+source: auto-review
+updated: 2026-08-15
 code:
-  - .agents/skills/spectra-commit/SKILL.md
-  - .opencode/skills/spectra-commit/SKILL.md
-  - CLAUDE.md
-  - .agents/skills/spectra-ingest/SKILL.md
-  - .agents/skills/spectra-debug/SKILL.md
-  - .opencode/skills/spectra-audit/SKILL.md
-  - .spectra.yaml
-  - .opencode/skills/spectra-ask/SKILL.md
-  - .opencode/commands/spectra-drift.md
-  - .opencode/skills/spectra-propose/SKILL.md
-  - AGENTS.md
-  - .opencode/skills/spectra-discuss/SKILL.md
-  - .agents/skills/spectra-propose/SKILL.md
-  - .agents/skills/spectra-archive/SKILL.md
-  - .agents/skills/spectra-apply/SKILL.md
-  - .agents/skills/spectra-ask/SKILL.md
-  - .opencode/commands/spectra-discuss.md
-  - .opencode/commands/spectra-ingest.md
-  - .opencode/skills/spectra-apply/SKILL.md
-  - .opencode/skills/spectra-archive/SKILL.md
-  - .opencode/commands/spectra-propose.md
-  - .opencode/skills/spectra-drift/SKILL.md
-  - .opencode/commands/spectra-archive.md
-  - .agents/skills/spectra-audit/SKILL.md
-  - .opencode/commands/spectra-audit.md
-  - .opencode/commands/spectra-apply.md
-  - .opencode/skills/spectra-ingest/SKILL.md
-  - .opencode/commands/spectra-ask.md
-  - .opencode/commands/spectra-debug.md
-  - .agents/skills/spectra-discuss/SKILL.md
-  - .opencode/skills/spectra-debug/SKILL.md
-  - .opencode/commands/spectra-commit.md
-  - .agents/skills/spectra-drift/SKILL.md
+  - crates/fleety-server/src/storage.rs
+  - prompts/policy.md
+  - crates/agent-core/src/approval.rs
+  - crates/fleety-server/src/conn.rs
+  - README.md
+  - crates/agent-core/src/agent.rs
+  - docs/tools.md
+  - crates/agent-core/src/subagent.rs
+  - crates/fleety-tools/src/config.rs
+  - crates/fleety-server/src/subagent.rs
+  - crates/fleety-tools/src/lib.rs
+  - crates/agent-core/src/tools.rs
+  - crates/fleety-server/src/main.rs
+  - docs/env.md
+  - crates/agent-core/src/lib.rs
+  - crates/agent-core/src/event.rs
+  - crates/fleety-server/src/auto_review.rs
+  - crates/fleety-server/src/bridge.rs
+  - crates/fleety-server/src/scheduler.rs
 -->
 
 ---

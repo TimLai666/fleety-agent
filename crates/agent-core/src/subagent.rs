@@ -93,6 +93,25 @@ pub trait SubagentHost: Send + Sync + 'static {
     /// sensible default rather than error.
     fn resolve_provider(&self, tier: &str) -> Arc<dyn ModelProvider>;
 
+    fn make_gate(
+        &self,
+        policy: Policy,
+        _provider: Arc<dyn ModelProvider>,
+        allowed_tools: &[String],
+    ) -> Box<dyn ApprovalGate + Send> {
+        match policy {
+            Policy::FullAccess => Box::new(AutoApprove),
+            Policy::RequireApproval => {
+                if allowed_tools.is_empty() {
+                    Box::new(AutoDeny)
+                } else {
+                    Box::new(MandateGate::new(allowed_tools.iter().cloned()))
+                }
+            }
+            Policy::AutoReview => Box::new(AutoDeny),
+        }
+    }
+
     /// Snapshot an opaque context (e.g. the active conversation id) at spawn
     /// time, handed back to [`initial_messages`](Self::initial_messages) and
     /// [`on_complete`](Self::on_complete) so a background task reports to the
@@ -186,19 +205,6 @@ impl SubagentManager {
     /// The non-interactive gate for a subagent run (generic; the tier never
     /// affects it). Full access runs everything; require-approval limits to read
     /// tools unless `allowed_tools` pre-grants specific tools.
-    fn make_gate(&self, allowed_tools: &[String]) -> Box<dyn ApprovalGate + Send> {
-        match self.policy {
-            Policy::FullAccess => Box::new(AutoApprove),
-            Policy::RequireApproval => {
-                if allowed_tools.is_empty() {
-                    Box::new(AutoDeny)
-                } else {
-                    Box::new(MandateGate::new(allowed_tools.iter().cloned()))
-                }
-            }
-        }
-    }
-
     /// Run one nested agent loop and return the terminal state, output, and the
     /// (possibly extended) messages. Never panics: an error becomes `Failed`.
     async fn run_loop(
@@ -214,7 +220,9 @@ impl SubagentManager {
         let base = self.host.resolve_provider(tier);
         // Apply the parent-chosen effort for this subagent's whole run.
         let provider = provider_with_spawn_effort(base, effort);
-        let mut gate = self.make_gate(allowed_tools);
+        let mut gate = self
+            .host
+            .make_gate(self.policy, Arc::clone(&provider), allowed_tools);
         let mut events = EventLog::new();
         let cfg = LoopConfig::default();
         let outcome = run_turn(

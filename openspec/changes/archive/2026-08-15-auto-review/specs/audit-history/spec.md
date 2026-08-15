@@ -1,10 +1,4 @@
-# audit-history Specification
-
-## Purpose
-
-TBD - created by archiving change 'baseline-tool-surface-specs'. Update Purpose after archive.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: List recent audit entries
 
@@ -19,28 +13,3 @@ The system SHALL provide a `history_list` tool that returns recent audit-log ent
 
 - **WHEN** an auto-reviewed candidate is approved or denied
 - **THEN** `history_list` contains its sanitized decision metadata and contains no raw secret or candidate argument
-
-<!-- @trace
-source: auto-review
-updated: 2026-08-15
-code:
-  - crates/fleety-server/src/storage.rs
-  - prompts/policy.md
-  - crates/agent-core/src/approval.rs
-  - crates/fleety-server/src/conn.rs
-  - README.md
-  - crates/agent-core/src/agent.rs
-  - docs/tools.md
-  - crates/agent-core/src/subagent.rs
-  - crates/fleety-tools/src/config.rs
-  - crates/fleety-server/src/subagent.rs
-  - crates/fleety-tools/src/lib.rs
-  - crates/agent-core/src/tools.rs
-  - crates/fleety-server/src/main.rs
-  - docs/env.md
-  - crates/agent-core/src/lib.rs
-  - crates/agent-core/src/event.rs
-  - crates/fleety-server/src/auto_review.rs
-  - crates/fleety-server/src/bridge.rs
-  - crates/fleety-server/src/scheduler.rs
--->
