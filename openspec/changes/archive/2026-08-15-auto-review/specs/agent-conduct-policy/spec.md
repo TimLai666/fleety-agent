@@ -9,6 +9,12 @@ The agent SHALL operate with full access by default: mutate tools run without pe
 - **WHEN** the runtime policy is the default and a mutate tool is invoked
 - **THEN** the action runs without a per-call approval prompt and is recorded in the audit log
 
+##### Example: default mutation runs without a gate
+
+- **GIVEN** `FLEETY_POLICY` is unset and the agent calls `write_file` to update `notes.txt`
+- **WHEN** the call reaches the shared execution gate
+- **THEN** `write_file` runs without a human or model approval request and the mutation is recorded in the audit log
+
 #### Scenario: auto posture reviews a mutation
 
 - **WHEN** the runtime policy is `auto_review` and a mutate tool is invoked
