@@ -57,7 +57,7 @@ code:
 ---
 ### Requirement: Access policy and authentication
 
-The server SHALL read `FLEETY_POLICY` (default `full_access`); when set to `require_approval` it SHALL gate every non-read tool through the approval flow. It SHALL read `FLEETY_REQUIRE_AUTH` (default `0`); when set to `1` it SHALL require a valid token or pairing code on every `Hello`. `FLEETY_TOKEN` SHALL provide a bootstrap admin token usable to pair the first device.
+The server SHALL read `FLEETY_POLICY` (default `full_access`); when set to `require_approval` it SHALL gate every non-read tool through the approval flow. It SHALL read `FLEETY_REQUIRE_AUTH` (default `1`); any value other than an explicit `0` SHALL enable connection authentication, subject to the loopback trust behavior defined by `authentication-default-on`. `FLEETY_TOKEN` SHALL provide a bootstrap admin token usable to pair the first device.
 
 #### Scenario: approval gating toggles with policy
 
