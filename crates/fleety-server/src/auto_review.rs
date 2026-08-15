@@ -57,6 +57,7 @@ pub(crate) fn timeout_from_env() -> Duration {
 /// Unattended approval gate backed by the named cheap provider tier.
 pub(crate) struct AutoReviewGate {
     provider: Arc<dyn ModelProvider>,
+    provider_model: String,
     timeout: Duration,
     allowed_tools: Option<HashSet<String>>,
     last_audit: Option<ApprovalAudit>,
@@ -64,8 +65,17 @@ pub(crate) struct AutoReviewGate {
 
 impl AutoReviewGate {
     pub(crate) fn new(provider: Arc<dyn ModelProvider>, timeout: Duration) -> Self {
+        Self::new_with_provider_model(provider, timeout, "cheap")
+    }
+
+    fn new_with_provider_model(
+        provider: Arc<dyn ModelProvider>,
+        timeout: Duration,
+        provider_model: impl Into<String>,
+    ) -> Self {
         Self {
             provider,
+            provider_model: provider_model.into(),
             timeout,
             allowed_tools: None,
             last_audit: None,
@@ -81,8 +91,35 @@ impl AutoReviewGate {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
+        Self::with_allowed_tools_and_model(provider, timeout, allowed_tools, "cheap")
+    }
+
+    pub(crate) fn with_allowed_tools_from_tiers<I, S>(
+        tiers: &ProviderTiers,
+        timeout: Duration,
+        allowed_tools: I,
+    ) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let (provider, provider_model) = tiers.resolve_with_label("cheap");
+        Self::with_allowed_tools_and_model(provider, timeout, allowed_tools, provider_model)
+    }
+
+    fn with_allowed_tools_and_model<I, S>(
+        provider: Arc<dyn ModelProvider>,
+        timeout: Duration,
+        allowed_tools: I,
+        provider_model: impl Into<String>,
+    ) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
         Self {
             provider,
+            provider_model: provider_model.into(),
             timeout,
             allowed_tools: Some(allowed_tools.into_iter().map(Into::into).collect()),
             last_audit: None,
@@ -90,7 +127,8 @@ impl AutoReviewGate {
     }
 
     pub(crate) fn from_tiers(tiers: &ProviderTiers, timeout: Duration) -> Self {
-        Self::new(tiers.resolve("cheap"), timeout)
+        let (provider, provider_model) = tiers.resolve_with_label("cheap");
+        Self::new_with_provider_model(provider, timeout, provider_model)
     }
 
     fn record(
@@ -115,7 +153,7 @@ impl AutoReviewGate {
             "executed": matches!(decision, ApprovalDecision::Approve),
             "risk": format!("{:?}", context.risk).to_ascii_lowercase(),
             "tool": sanitize_audit_token(&context.tool, MAX_TOOL_CHARS),
-            "provider_model": "cheap",
+            "provider_model": sanitize_audit_token(&self.provider_model, MAX_TOOL_CHARS),
             "danger_codes": danger_codes,
             "latency_ms": started.elapsed().as_millis(),
             "reason": sanitize_audit_reason(reason),
@@ -614,6 +652,7 @@ mod tests {
     };
 
     use super::{build_review_prompt, timeout_from_env, AutoReviewGate};
+    use crate::providers::ProviderTiers;
 
     fn context() -> ReviewContext {
         ReviewContext {
@@ -778,6 +817,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn records_main_when_cheap_selector_aliases_main() {
+        let provider = MockProvider::new(vec![response(
+            r#"{"decision":"approve","reason":"objective requires it"}"#,
+        )]);
+        let tiers = ProviderTiers::new(Arc::new(provider), None);
+        let mut gate = AutoReviewGate::from_tiers(&tiers, Duration::from_secs(1));
+
+        assert_eq!(
+            gate.request(&context()).await.expect("gate result"),
+            ApprovalDecision::Approve
+        );
+        assert_eq!(
+            gate.take_audit().expect("audit").details["provider_model"],
+            "main"
+        );
+    }
+
+    #[tokio::test]
     async fn records_sanitized_decision_metadata_and_failure_category() {
         let provider = MockProvider::new(vec![response(
             r#"{"decision":"deny","reason":"api_key=secret-value at /etc/shadow"}"#,
@@ -843,6 +900,28 @@ mod tests {
         assert_eq!(
             gate.request(&context()).await.expect("gate result"),
             ApprovalDecision::Deny
+        );
+    }
+
+    #[tokio::test]
+    async fn allowed_tools_tier_fallback_records_main_label() {
+        let provider = MockProvider::new(vec![response(
+            r#"{"decision":"approve","reason":"looks fine"}"#,
+        )]);
+        let tiers = ProviderTiers::new(Arc::new(provider), None);
+        let mut gate = AutoReviewGate::with_allowed_tools_from_tiers(
+            &tiers,
+            Duration::from_secs(1),
+            ["run_command".to_string()],
+        );
+
+        assert_eq!(
+            gate.request(&context()).await.expect("gate result"),
+            ApprovalDecision::Approve
+        );
+        assert_eq!(
+            gate.take_audit().expect("audit").details["provider_model"],
+            "main"
         );
     }
 

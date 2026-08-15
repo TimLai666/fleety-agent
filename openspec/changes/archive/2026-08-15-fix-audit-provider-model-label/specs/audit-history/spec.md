@@ -1,10 +1,4 @@
-# audit-history Specification
-
-## Purpose
-
-TBD - created by archiving change 'baseline-tool-surface-specs'. Update Purpose after archive.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: List recent audit entries
 
@@ -43,13 +37,4 @@ code:
   - crates/fleety-server/src/auto_review.rs
   - crates/fleety-server/src/providers.rs
   - crates/fleety-server/src/storage.rs
--->
-
-<!-- @trace
-source: fix-audit-provider-model-label
-updated: 2026-08-15
-code:
-  - crates/fleety-server/src/providers.rs
-  - crates/fleety-server/src/auto_review.rs
-  - crates/fleety-server/src/scheduler.rs
 -->

@@ -25,8 +25,8 @@ fn schedule_gate(allowed_tools: Vec<String>) -> (Policy, Box<dyn ApprovalGate + 
         let tiers = crate::providers::ProviderTiers::from_env();
         return (
             Policy::AutoReview,
-            Box::new(AutoReviewGate::with_allowed_tools(
-                tiers.resolve("cheap"),
+            Box::new(AutoReviewGate::with_allowed_tools_from_tiers(
+                &tiers,
                 timeout_from_env(),
                 allowed_tools,
             )),

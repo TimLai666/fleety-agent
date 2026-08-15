@@ -380,6 +380,8 @@ pub struct ProviderTiers {
     roles: std::collections::HashMap<String, String>,
     /// The resolved fallback used for unknown selectors.
     main: Arc<dyn ModelProvider>,
+    /// The registry label of the resolved fallback provider.
+    main_label: String,
 }
 
 impl ProviderTiers {
@@ -430,31 +432,46 @@ impl ProviderTiers {
             providers.insert(role.clone(), provider);
         }
         // Fallback `main` for unknown selectors: the `main` role, else `cheap`,
-        // else any resolved role.
-        let main = providers
+        // else any resolved role. Keep the selected role label alongside the
+        // provider so audit metadata describes the same fallback.
+        let (main, main_label) = providers
             .get("main")
-            .or_else(|| providers.get("cheap"))
             .cloned()
-            .or_else(|| providers.values().next().cloned())?;
+            .map(|provider| (provider, "main".to_string()))
+            .or_else(|| {
+                providers
+                    .get("cheap")
+                    .cloned()
+                    .map(|provider| (provider, "cheap".to_string()))
+            })
+            .or_else(|| {
+                providers
+                    .iter()
+                    .next()
+                    .map(|(label, provider)| (Arc::clone(provider), label.clone()))
+            })?;
         Some(Self {
             providers,
             roles: std::collections::HashMap::new(),
             main,
+            main_label,
         })
     }
 
-    /// Construct from explicit providers (a `None` cheap aliases main). Holds
-    /// just `"main"` and `"cheap"`, like the legacy env build. Used by tests and
-    /// callers that wire providers directly.
+    /// Construct from explicit providers (a `None` cheap resolves to main).
+    /// Holds `"main"` and, when configured, `"cheap"`, like the legacy env
+    /// build. Used by tests and callers that wire providers directly.
     pub fn new(main: Arc<dyn ModelProvider>, cheap: Option<Arc<dyn ModelProvider>>) -> Self {
-        let cheap = cheap.unwrap_or_else(|| Arc::clone(&main));
         let mut providers = std::collections::HashMap::new();
         providers.insert("main".to_string(), Arc::clone(&main));
-        providers.insert("cheap".to_string(), cheap);
+        if let Some(cheap) = cheap {
+            providers.insert("cheap".to_string(), cheap);
+        }
         Self {
             providers,
             roles: std::collections::HashMap::new(),
             main,
+            main_label: "main".to_string(),
         }
     }
 
@@ -467,11 +484,19 @@ impl ProviderTiers {
     /// then look it up among the named providers/groups; an unknown selector
     /// resolves to `main`. Never errors.
     pub fn resolve(&self, tier: &str) -> Arc<dyn ModelProvider> {
+        self.resolve_with_label(tier).0
+    }
+
+    /// Resolve a tier/role selector and return the canonical label of the
+    /// provider that was actually selected. Unknown selectors use the stored
+    /// fallback label rather than repeating the requested tier.
+    pub fn resolve_with_label(&self, tier: &str) -> (Arc<dyn ModelProvider>, String) {
         let target = self.roles.get(tier).map(String::as_str).unwrap_or(tier);
         self.providers
             .get(target)
             .cloned()
-            .unwrap_or_else(|| Arc::clone(&self.main))
+            .map(|provider| (provider, target.to_string()))
+            .unwrap_or_else(|| (Arc::clone(&self.main), self.main_label.clone()))
     }
 }
 
@@ -557,6 +582,9 @@ mod tests {
         let tiers = ProviderTiers::from_env();
         // "Tier resolution and fallback": cheap unset → cheap resolves to main.
         assert!(Arc::ptr_eq(&tiers.resolve("cheap"), &tiers.resolve("main")));
+        let (provider, label) = tiers.resolve_with_label("cheap");
+        assert!(Arc::ptr_eq(&provider, &tiers.resolve("main")));
+        assert_eq!(label, "main");
         clear();
     }
 
@@ -572,6 +600,8 @@ mod tests {
             &tiers.resolve("cheap"),
             &tiers.resolve("main")
         ));
+        let (_, label) = tiers.resolve_with_label("cheap");
+        assert_eq!(label, "cheap");
         clear();
     }
 
