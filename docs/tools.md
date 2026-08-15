@@ -32,10 +32,10 @@ Last reviewed against `crates/` on 2026-06-28.
   filesystem (`device_exec`, `ssh_exec`) explicitly take a `device` argument.
 - **Risk class** (drives the access policy in `prompts/policy.md`):
   - `read` — no state change. Executes directly under any policy.
-  - `mutate` — changes state. Under `full_access` executes directly but is
+  - `mutate` — changes state. Under explicit `full_access` executes directly but is
     **audited + rollback-backed**. Under stricter policy returns
     `approval_required`.
-  - `critical` — irreversible / no rollback path. Under `full_access` and
+  - `critical` — irreversible / no rollback path. Under explicit `full_access` and
     `require_approval`, the deterministic command/path guards refuse it. Under
     `auto_review`, the guard emits a trusted warning to the cheap reviewer and
     the candidate runs only after an exact reviewer approval.
@@ -63,7 +63,7 @@ implementations register on `fleety-server` (relative paths against
 Call by bare name → hits the server; wrap in `device_exec(device="laptop",
 tool="read_file", args={…})` → hits the laptop's filesystem instead.
 
-**Filesystem scope.** By default (the `full_access` posture) these tools are
+**Filesystem scope.** By default (the unconfined filesystem scope) these tools are
 **not sandboxed to the root** — absolute paths and paths outside the root work
 (read or audited + rollback-backed write), since the root is just the base for
 *relative* paths. A sensitive-path guard still refuses **mutations** of critical
@@ -568,11 +568,11 @@ it settles; the part still being written stays in the viewport until it does.
 
 ## Risk class → policy (summary)
 
-| Class | `full_access` (default) | `require_approval` | `auto_review` |
+| Class | `auto_review` (default) | `full_access` | `require_approval` |
 |---|---|---|---|
 | `read` | direct | direct | direct |
-| `mutate` | direct, audited + rollback-backed | `ApprovalRequested` → re-call after `Approve` | cheap reviewer → execute only on exact `approve` |
-| `critical` | blocked by deterministic guard | `ApprovalRequested` then guard still blocks | trusted warning → cheap reviewer → execute only on exact `approve` |
+| `mutate` | cheap reviewer → execute only on exact `approve` | direct, audited + rollback-backed | `ApprovalRequested` → re-call after `Approve` |
+| `critical` | trusted warning → cheap reviewer → execute only on exact `approve` | blocked by deterministic guard | `ApprovalRequested` then guard still blocks |
 
 The same gate fires for scheduled (unattended) turns via `MandateGate` when
 `require_approval` is active: only `allowed_tools` named at schedule

@@ -1,9 +1,9 @@
 //! Approval gating for tool execution.
 //!
-//! Under `Policy::FullAccess` (the default) read/mutate run freely. Under
-//! `Policy::RequireApproval`, any non-read tool is sent to an [`ApprovalGate`]
-//! before it runs; a denial is fed back to the model as a tool result instead of
-//! executing. This is how critical/irreversible actions are confirmed.
+//! Under the default `Policy::AutoReview`, read tools run directly and every
+//! non-read tool is sent to an [`ApprovalGate`] before it runs. Explicit
+//! `Policy::FullAccess` and `Policy::RequireApproval` values retain their
+//! direct and interactive behaviors.
 
 use std::collections::HashSet;
 
@@ -16,13 +16,13 @@ use crate::Result;
 /// How tool execution is gated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Policy {
-    /// Read/mutate run directly; nothing is gated (the v0 default).
+    /// Non-read tools are reviewed by an unattended policy gate (the default).
     #[default]
+    AutoReview,
+    /// Read/mutate run directly; nothing is gated.
     FullAccess,
     /// Any non-read tool requires approval before running.
     RequireApproval,
-    /// Non-read tools are reviewed by an unattended policy gate before running.
-    AutoReview,
 }
 
 impl Policy {
@@ -178,6 +178,11 @@ mod tests {
         assert!(!Policy::AutoReview.needs_approval(RiskLevel::Read));
         assert!(Policy::AutoReview.needs_approval(RiskLevel::Mutate));
         assert!(Policy::AutoReview.needs_approval(RiskLevel::Critical));
+    }
+
+    #[test]
+    fn policy_default_is_auto_review() {
+        assert_eq!(Policy::default(), Policy::AutoReview);
     }
 
     #[test]

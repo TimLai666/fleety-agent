@@ -126,8 +126,8 @@ pub fn registry() -> &'static [Setting] {
         Setting {
             key: "FLEETY_POLICY",
             scope: Server,
-            default: "full_access",
-            description: "full_access, require_approval, or auto_review.",
+            default: "auto_review",
+            description: "auto_review by default; explicitly choose full_access or require_approval to override.",
             secret: false,
             validator: Some(v_policy),
         },
@@ -2143,7 +2143,7 @@ mod tests {
 
         let policy = find("FLEETY_POLICY").expect("FLEETY_POLICY registered");
         assert_eq!(policy.scope, Scope::Server);
-        assert_eq!(policy.default, "full_access");
+        assert_eq!(policy.default, "auto_review");
         assert!(validate(policy, "full_access").is_ok());
         assert!(validate(policy, "require_approval").is_ok());
         assert!(validate(policy, "auto_review").is_ok());
@@ -2448,7 +2448,7 @@ mod tests {
         // default when neither.
         let r = resolve("FLEETY_POLICY", &ConfigMap::new()).unwrap();
         assert_eq!(r.source, Source::Default);
-        assert_eq!(r.value, "full_access");
+        assert_eq!(r.value, "auto_review");
     }
 
     #[test]

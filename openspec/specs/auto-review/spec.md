@@ -8,47 +8,42 @@ TBD - created by archiving change 'auto-review'. Update Purpose after archive.
 
 ### Requirement: Auto review gates unattended tool execution
 
-The runtime SHALL provide an opt-in `auto_review` policy. When `auto_review` is active, read tools SHALL execute directly, while every mutate and critical tool call SHALL be submitted to the auto reviewer before execution. The policy SHALL apply to workspace tools, device-routed tools, remote execution, subagents, scheduled turns, WebSocket turns, SSE turns, and recovery continuations.
+The runtime SHALL provide `auto_review` as the default execution policy when `FLEETY_POLICY` is unset, empty, or unrecognized. When `auto_review` is active, read tools SHALL execute directly, while every mutate and critical tool call SHALL be submitted to the auto reviewer before execution. Explicit `full_access` and `require_approval` values SHALL retain their existing execution semantics. The policy SHALL apply to workspace tools, device-routed tools, remote execution, subagents, scheduled turns, WebSocket turns, SSE turns, and recovery continuations.
 
-#### Scenario: a read tool bypasses auto review
+#### Scenario: a fresh runtime uses auto review
 
-- **WHEN** `auto_review` is active and the agent calls a read tool
-- **THEN** the read tool executes without an auto-review model call
+- **WHEN** the runtime starts without an explicit policy
+- **THEN** it selects `auto_review` and applies the unattended reviewer to every mutate and critical tool call
 
-#### Scenario: a mutate tool requires auto review
+##### Example: unset policy is not full access
 
-- **WHEN** `auto_review` is active and the agent calls a mutate tool
-- **THEN** the candidate is not executed until the cheap reviewer returns a valid approval
+- **GIVEN** `FLEETY_POLICY` is unset and the server has no stored policy
+- **WHEN** a `run_command` candidate is produced
+- **THEN** the candidate is sent to the cheap reviewer before execution and no human approval frame is emitted
 
-#### Scenario: a critical tool requires auto review
+#### Scenario: an explicit direct policy remains an override
 
-- **WHEN** `auto_review` is active and the agent calls a critical tool
-- **THEN** the candidate is not rejected solely because it is critical and is submitted to the cheap reviewer before execution
+- **WHEN** `FLEETY_POLICY=full_access`
+- **THEN** mutate tools retain direct audited execution and critical tools retain their existing deterministic guard behavior
+
+#### Scenario: an explicit interactive policy remains an override
+
+- **WHEN** `FLEETY_POLICY=require_approval`
+- **THEN** non-read tools retain the interactive approval flow
 
 
 <!-- @trace
-source: auto-review
+source: default-auto-review-policy
 updated: 2026-08-15
 code:
-  - crates/fleety-server/src/storage.rs
-  - prompts/policy.md
   - crates/agent-core/src/approval.rs
-  - crates/fleety-server/src/conn.rs
-  - README.md
-  - crates/agent-core/src/agent.rs
-  - docs/tools.md
-  - crates/agent-core/src/subagent.rs
-  - crates/fleety-tools/src/config.rs
-  - crates/fleety-server/src/subagent.rs
-  - crates/fleety-tools/src/lib.rs
-  - crates/agent-core/src/tools.rs
   - crates/fleety-server/src/main.rs
+  - prompts/policy.md
+  - crates/fleety-tools/src/config.rs
+  - crates/fleety-tools/src/lib.rs
+  - README.md
   - docs/env.md
-  - crates/agent-core/src/lib.rs
-  - crates/agent-core/src/event.rs
-  - crates/fleety-server/src/auto_review.rs
-  - crates/fleety-server/src/bridge.rs
-  - crates/fleety-server/src/scheduler.rs
+  - docs/tools.md
 -->
 
 ---

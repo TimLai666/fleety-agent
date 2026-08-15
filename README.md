@@ -136,9 +136,9 @@ cargo run -p fleety-daemon            # fleetyd install → autostart; fleetyd u
 ```
 
 Common env vars: `FLEETY_MODEL_BASE_URL` / `FLEETY_MODEL` / `FLEETY_MODEL_KEY`
-(+ `FLEETY_MODEL_STREAM=1`), `FLEETY_POLICY=require_approval` or
-`auto_review` (cheap-model review for every non-read operation, with no human
-fallback), `FLEETY_AUTO_REVIEW_TIMEOUT_SECS`, `FLEETY_ADDR`,
+(+ `FLEETY_MODEL_STREAM=1`), `FLEETY_POLICY` (defaults to `auto_review`; set
+`full_access` or `require_approval` explicitly to override; auto_review uses
+cheap-model review for every non-read operation, with no human fallback), `FLEETY_AUTO_REVIEW_TIMEOUT_SECS`, `FLEETY_ADDR`,
 `FLEETY_WORKSPACE`, `FLEETY_AGENT_HOME`.
 
 See [`docs/env.md`](docs/env.md) for the **full reference** — every

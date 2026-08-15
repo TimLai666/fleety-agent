@@ -9,7 +9,7 @@
 //! untracked)/`git_log`/`git_show`. Relative paths resolve against `root`;
 //! mutations back up to `backups_dir`.
 //!
-//! **Filesystem scope:** by default (the `full_access` posture) the structured
+//! **Filesystem scope:** by default (the unconfined filesystem scope) the structured
 //! tools may read/write **anywhere on the device** — absolute paths and paths
 //! outside `root` are allowed, still audited + rollback-backed — with a
 //! `sensitive_write_reason` guard refusing mutations of truly critical paths

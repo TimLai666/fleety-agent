@@ -106,12 +106,13 @@ fn require_auth_from_env() -> bool {
     std::env::var("FLEETY_REQUIRE_AUTH").as_deref() != Ok("0")
 }
 
-/// Approval policy from `FLEETY_POLICY` (default full access).
+/// Approval policy from `FLEETY_POLICY` (default auto review).
 fn policy_from_env() -> agent_core::Policy {
     match std::env::var("FLEETY_POLICY").as_deref() {
         Ok("require_approval") => agent_core::Policy::RequireApproval,
+        Ok("full_access") => agent_core::Policy::FullAccess,
         Ok("auto_review") => agent_core::Policy::AutoReview,
-        _ => agent_core::Policy::FullAccess,
+        _ => agent_core::Policy::AutoReview,
     }
 }
 
@@ -1077,15 +1078,17 @@ mod tests {
     }
 
     #[test]
-    fn policy_from_env_defaults_to_full_access_unless_exact_match() {
+    fn policy_from_env_defaults_to_auto_review_unless_explicit_override() {
         let _lock = ENV_LOCK.lock().expect("env lock");
         let _guard = EnvGuard::new("policy");
 
-        assert_eq!(policy_from_env(), agent_core::Policy::FullAccess);
+        assert_eq!(policy_from_env(), agent_core::Policy::AutoReview);
         std::env::set_var("FLEETY_POLICY", "RequireApproval");
-        assert_eq!(policy_from_env(), agent_core::Policy::FullAccess);
+        assert_eq!(policy_from_env(), agent_core::Policy::AutoReview);
         std::env::set_var("FLEETY_POLICY", "require_approval");
         assert_eq!(policy_from_env(), agent_core::Policy::RequireApproval);
+        std::env::set_var("FLEETY_POLICY", "full_access");
+        assert_eq!(policy_from_env(), agent_core::Policy::FullAccess);
         std::env::set_var("FLEETY_POLICY", "auto_review");
         assert_eq!(policy_from_env(), agent_core::Policy::AutoReview);
     }

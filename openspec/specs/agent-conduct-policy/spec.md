@@ -6,55 +6,55 @@ TBD - created by archiving change 'baseline-prompt-specs'. Update Purpose after 
 
 ## Requirements
 
-### Requirement: Full access by default
+### Requirement: Default policy uses auto review
 
-The agent SHALL operate with full access by default: mutate tools run without per-call approval. Per-call interactive approval SHALL apply only when the runtime policy is `require_approval`. When the runtime policy is `auto_review`, every mutate and critical tool SHALL be reviewed by the unattended cheap-model gate before execution, while read tools SHALL remain direct.
+The agent SHALL use the unattended `auto_review` posture by default: read tools run directly, while mutate and critical tools pass through the cheap-model review before execution. Explicit `full_access` SHALL remain available for operators who deliberately choose direct audited execution, and explicit `require_approval` SHALL remain available for interactive approval. When the runtime policy is `auto_review`, every mutate and critical tool SHALL be reviewed by the unattended cheap-model gate while read tools SHALL remain direct.
 
-#### Scenario: default posture runs mutations directly
+#### Scenario: default posture reviews mutations
 
-- **WHEN** the runtime policy is the default and a mutate tool is invoked
-- **THEN** the action runs without a per-call approval prompt and is recorded in the audit log
+- **WHEN** the runtime policy is unset and a mutate tool is invoked
+- **THEN** the action waits for a cheap-model decision and no human prompt is required
 
-##### Example: default mutation runs without a gate
+##### Example: default write uses auto review
 
 - **GIVEN** `FLEETY_POLICY` is unset and the agent calls `write_file` to update `notes.txt`
 - **WHEN** the call reaches the shared execution gate
-- **THEN** `write_file` runs without a human or model approval request and the mutation is recorded in the audit log
+- **THEN** the read/write distinction selects `auto_review`, the cheap reviewer evaluates the mutation, and no human approval request is emitted
 
-#### Scenario: auto posture reviews a mutation
+#### Scenario: explicit full access runs mutations directly
 
-- **WHEN** the runtime policy is `auto_review` and a mutate tool is invoked
-- **THEN** the action waits for a cheap-model decision and no human prompt is required
+- **WHEN** the runtime policy is explicitly `full_access` and a mutate tool is invoked
+- **THEN** the action runs without a per-call approval prompt and is recorded in the audit log
 
-#### Scenario: auto posture reviews a critical action
+#### Scenario: explicit require approval pauses mutations
 
-- **WHEN** the runtime policy is `auto_review` and a critical tool is invoked
-- **THEN** the action is submitted to the cheap-model decision instead of being rejected solely for its risk class
+- **WHEN** the runtime policy is explicitly `require_approval` and a mutate tool is invoked
+- **THEN** the action waits for the interactive approval flow before execution
+
+#### Scenario: default posture reviews critical actions without human participation
+
+- **WHEN** the runtime policy is unset and a critical tool is invoked
+- **THEN** the action is submitted to the cheap-model decision instead of being rejected solely for its risk class or waiting for a human
+
+##### Example: default critical command uses the reviewer
+
+- **GIVEN** `FLEETY_POLICY` is unset and the candidate is `run_command` with `rm -rf /`
+- **WHEN** the critical-command detector produces its trusted danger signal
+- **THEN** the candidate is sent to the cheap reviewer with no human approval request, and only an exact reviewer approval can execute it
 
 
 <!-- @trace
-source: auto-review
+source: default-auto-review-policy
 updated: 2026-08-15
 code:
-  - crates/fleety-server/src/storage.rs
-  - prompts/policy.md
   - crates/agent-core/src/approval.rs
-  - crates/fleety-server/src/conn.rs
-  - README.md
-  - crates/agent-core/src/agent.rs
-  - docs/tools.md
-  - crates/agent-core/src/subagent.rs
-  - crates/fleety-tools/src/config.rs
-  - crates/fleety-server/src/subagent.rs
-  - crates/fleety-tools/src/lib.rs
-  - crates/agent-core/src/tools.rs
   - crates/fleety-server/src/main.rs
+  - prompts/policy.md
+  - crates/fleety-tools/src/config.rs
+  - crates/fleety-tools/src/lib.rs
+  - README.md
   - docs/env.md
-  - crates/agent-core/src/lib.rs
-  - crates/agent-core/src/event.rs
-  - crates/fleety-server/src/auto_review.rs
-  - crates/fleety-server/src/bridge.rs
-  - crates/fleety-server/src/scheduler.rs
+  - docs/tools.md
 -->
 
 ---
